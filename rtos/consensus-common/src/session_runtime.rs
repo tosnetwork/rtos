@@ -17,6 +17,64 @@ use std::collections::BTreeSet;
 
 pub type LocalRole = OverlayMemberRole;
 
+/// How the caller admits this node to a session. A validator is admitted by
+/// the stable validator identity its consensus-key custody selected, never by
+/// a transport key it happens to hold; its transport identity is then the one
+/// the committee descriptor records for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalAdmission {
+    /// The selected validator identity and its index in the ordered committee.
+    Validator { validator_id: UInt256, index: u32 },
+    /// A transport identity produced by the authorized observer selection.
+    Observer(AuthorizedObserver),
+}
+
+/// An observer transport identity. It can only be produced by `select`, which
+/// mirrors the reference observer selection: descriptors of the previous,
+/// current and next total validator sets that are not members of the session
+/// committee and that the caller's membership predicate accepts as its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedObserver {
+    adnl: PublicKeyHash,
+}
+
+impl AuthorizedObserver {
+    pub fn select(
+        config: &ConfigParams,
+        committee: &[ValidatorDescr],
+        is_local: impl Fn(&ValidatorDescr) -> bool,
+    ) -> Result<Vec<Self>> {
+        let mut selected = BTreeSet::new();
+        for descriptor in Self::candidates(config, committee)? {
+            if is_local(&descriptor) {
+                selected.insert(descriptor.adnl_addr()?);
+            }
+        }
+        Ok(selected.into_iter().map(|adnl| Self { adnl }).collect())
+    }
+    pub fn adnl(&self) -> &PublicKeyHash {
+        &self.adnl
+    }
+    fn candidates(
+        config: &ConfigParams,
+        committee: &[ValidatorDescr],
+    ) -> Result<Vec<ValidatorDescr>> {
+        let members =
+            committee.iter().map(ValidatorDescr::validator_id).collect::<Result<BTreeSet<_>>>()?;
+        let mut candidates = Vec::new();
+        for set in
+            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?]
+        {
+            for descriptor in set.list() {
+                if !members.contains(&descriptor.validator_id()?) {
+                    candidates.push(descriptor.clone());
+                }
+            }
+        }
+        Ok(candidates)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionNetworkPin {
     pub global_id: i32,
@@ -61,6 +119,64 @@ pub struct AuthenticatedSessionRuntime {
 }
 
 impl AuthenticatedSessionRuntime {
+    /// Construct a runtime for an explicit local admission. A validator must sit
+    /// at the expected committee index under exactly that validator identity,
+    /// and its local transport identity is the one its descriptor records. An
+    /// observer must come from the authorized observer selection over this same
+    /// configuration. The resulting role must be the admitted one. This does
+    /// not widen which protocols a session may run; that stays with the caller.
+    pub fn from_authenticated_admission(
+        pin: SessionNetworkPin,
+        config: &ConfigParams,
+        coordinates: SessionCoordinates<'_>,
+        committee: Vec<ValidatorDescr>,
+        admission: LocalAdmission,
+    ) -> Result<Self> {
+        let local_adnl = match &admission {
+            LocalAdmission::Validator { validator_id, index } => {
+                if validator_id.is_zero() {
+                    fail!("Validator admission names no validator identity");
+                }
+                let member = committee
+                    .get(*index as usize)
+                    .ok_or_else(|| error!("Admitted validator index is outside the committee"))?;
+                if member.validator_id()? != *validator_id {
+                    fail!("Admitted validator is not the committee member at its index");
+                }
+                for (other, descriptor) in committee.iter().enumerate() {
+                    if other != *index as usize && descriptor.validator_id()? == *validator_id {
+                        fail!("Admitted validator identity appears twice in the committee");
+                    }
+                }
+                member.adnl_addr()?
+            }
+            LocalAdmission::Observer(observer) => {
+                let candidates = AuthorizedObserver::candidates(config, &committee)?;
+                let mut authorized = false;
+                for descriptor in &candidates {
+                    if descriptor.adnl_addr()? == observer.adnl {
+                        authorized = true;
+                    }
+                }
+                if !authorized {
+                    fail!("Observer admission is not from this configuration's total sets");
+                }
+                observer.adnl.clone()
+            }
+        };
+        let runtime =
+            Self::from_authenticated_config(pin, config, coordinates, committee, local_adnl)?;
+        match (&admission, runtime.local_role) {
+            (LocalAdmission::Validator { index, .. }, LocalRole::Validator(role))
+                if role == *index =>
+            {
+                Ok(runtime)
+            }
+            (LocalAdmission::Observer(_), LocalRole::Observer) => Ok(runtime),
+            _ => fail!("Session role differs from the explicit local admission"),
+        }
+    }
+
     /// Config, coordinates and the ordered subset must originate from the same
     /// authenticated governing snapshot. Never construct this from peer claims.
     pub fn from_authenticated_config(
@@ -327,6 +443,9 @@ mod tests {
     use rtos_block::*;
 
     fn fixture() -> (SessionNetworkPin, ConfigParams, Vec<ValidatorDescr>) {
+        fixture_for(2)
+    }
+    fn fixture_for(protocol_version: u8) -> (SessionNetworkPin, ConfigParams, Vec<ValidatorDescr>) {
         let nodes: Vec<_> = (1..=3)
             .map(|i| {
                 let public_key = vec![i; 1312];
@@ -343,7 +462,7 @@ mod tests {
             })
             .collect();
         let selected =
-            SimplexConfig { protocol_version: 2, ..Default::default() }.serialize().unwrap();
+            SimplexConfig { protocol_version, ..Default::default() }.serialize().unwrap();
         let mut wrapper = BuilderData::new();
         wrapper.append_u8(0x10).unwrap();
         wrapper.append_bit_one().unwrap();
@@ -469,6 +588,88 @@ mod tests {
         assert_eq!(binding.coordinates.vertical_seqno, coords(&shard).vertical_seqno);
         assert_eq!(binding.coordinates.last_key_block_seqno, coords(&shard).last_key_block_seqno);
         assert_eq!(binding.coordinates.new_catchain_ids, coords(&shard).new_catchain_ids);
+    }
+
+    #[test]
+    fn validator_admission_selects_by_identity_and_descriptor_transport() {
+        for protocol in [0, 1, 2] {
+            let (pin, config, nodes) = fixture_for(protocol);
+            let shard = ShardIdent::masterchain();
+            let subset = vec![nodes[2].clone(), nodes[0].clone()];
+            let admit = |admission| {
+                AuthenticatedSessionRuntime::from_authenticated_admission(
+                    pin.clone(),
+                    &config,
+                    coords(&shard),
+                    subset.clone(),
+                    admission,
+                )
+            };
+            let runtime = admit(LocalAdmission::Validator {
+                validator_id: nodes[0].validator_id().unwrap(),
+                index: 1,
+            })
+            .unwrap();
+            assert_eq!(runtime.local_role(), LocalRole::Validator(1), "protocol {protocol}");
+            assert_eq!(runtime.local_adnl(), &nodes[0].adnl_addr().unwrap());
+            let legacy = AuthenticatedSessionRuntime::from_authenticated_config(
+                pin.clone(),
+                &config,
+                coords(&shard),
+                subset.clone(),
+                nodes[0].adnl_addr().unwrap(),
+            )
+            .unwrap();
+            assert!(runtime.same_admission(&legacy));
+            for (validator_id, index) in [
+                (nodes[2].validator_id().unwrap(), 1),
+                (nodes[0].validator_id().unwrap(), 0),
+                (nodes[0].validator_id().unwrap(), 2),
+                (nodes[1].validator_id().unwrap(), 0),
+                (UInt256::default(), 0),
+            ] {
+                assert!(
+                    admit(LocalAdmission::Validator { validator_id, index }).is_err(),
+                    "protocol {protocol}: admitted index {index}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn observer_admission_requires_the_authorized_selection() {
+        let (pin, config, nodes) = fixture();
+        let shard = ShardIdent::masterchain();
+        let subset = vec![nodes[2].clone(), nodes[0].clone()];
+        let local = nodes[1].validator_id().unwrap();
+        let selected = AuthorizedObserver::select(&config, &subset, |descriptor| {
+            descriptor.validator_id().is_ok_and(|id| id == local)
+        })
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].adnl(), &nodes[1].adnl_addr().unwrap());
+        // A committee member is never an observer candidate, whatever it holds.
+        assert!(AuthorizedObserver::select(&config, &subset, |_| true).unwrap().len() == 1);
+        assert!(AuthorizedObserver::select(&config, &subset, |_| false).unwrap().is_empty());
+        let observer = AuthenticatedSessionRuntime::from_authenticated_admission(
+            pin.clone(),
+            &config,
+            coords(&shard),
+            subset.clone(),
+            LocalAdmission::Observer(selected[0].clone()),
+        )
+        .unwrap();
+        assert_eq!(observer.local_role(), LocalRole::Observer);
+        for adnl in [KeyId::from_data([99; 32]), nodes[0].adnl_addr().unwrap()] {
+            let forged = AuthorizedObserver { adnl };
+            assert!(AuthenticatedSessionRuntime::from_authenticated_admission(
+                pin.clone(),
+                &config,
+                coords(&shard),
+                subset.clone(),
+                LocalAdmission::Observer(forged),
+            )
+            .is_err());
+        }
     }
 
     include!("session_runtime_bounded_tests.rs");
