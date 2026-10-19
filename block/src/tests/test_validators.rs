@@ -148,10 +148,16 @@ fn check_legacy_subset_fixture(key_block_file_name: &str, proof_file_name: &str)
 
         let pure_signatures = signatures.pure_signatures().unwrap();
 
-        let data =
-            Block::build_data_for_sign(&proof.proof_for.root_hash, &proof.proof_for.file_hash);
+        // The fixture was signed over the upstream block-id preimage, kept here
+        // only to verify these historical signatures.
+        let mut data = vec![0x70, 0x6e, 0x0b, 0xc5];
+        data.extend_from_slice(proof.proof_for.root_hash.as_slice());
+        data.extend_from_slice(proof.proof_for.file_hash.as_slice());
         let weight = pure_signatures.check_signatures(&validators, &data).unwrap();
         assert_eq!(weight, pure_signatures.weight());
+        let tos_data =
+            Block::build_data_for_sign(&proof.proof_for.root_hash, &proof.proof_for.file_hash);
+        assert!(pure_signatures.check_signatures(&validators, &tos_data).is_err());
     } else {
         assert_eq!(virt_info.gen_validator_list_hash_short(), legacy_hash);
     }

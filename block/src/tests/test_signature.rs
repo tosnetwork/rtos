@@ -761,9 +761,10 @@ fn test_check_block_signature() {
             block_bad_signatures_pure.add_sigpair(sign);
         }
 
-        // check signatures
+        // check signatures: the inherited fixture was signed over the upstream
+        // preimage, which the node itself no longer produces or accepts.
 
-        let data = Block::build_data_for_sign(&block_root.repr_hash(), &file_hash);
+        let data = legacy_upstream_data_for_sign(&block_root.repr_hash(), &file_hash);
 
         block_signatures_pure
             .check_signatures(cur_validators.cur_validators.list(), &data)
@@ -772,7 +773,52 @@ fn test_check_block_signature() {
         let result =
             block_bad_signatures_pure.check_signatures(cur_validators.cur_validators.list(), &data);
         assert!(result.is_err());
+
+        let tos_data = Block::build_data_for_sign(&block_root.repr_hash(), &file_hash);
+        assert!(block_signatures_pure
+            .check_signatures(cur_validators.cur_validators.list(), &tos_data)
+            .is_err());
     }
+}
+
+/// Test-only preimage of the inherited upstream fixtures (constructor 0xc50b6e70).
+fn legacy_upstream_data_for_sign(root_hash: &UInt256, file_hash: &UInt256) -> Vec<u8> {
+    let mut data = vec![0x70, 0x6e, 0x0b, 0xc5];
+    data.extend_from_slice(root_hash.as_slice());
+    data.extend_from_slice(file_hash.as_slice());
+    data
+}
+
+#[test]
+fn block_data_for_sign_matches_cpp_tos_block_id() {
+    // C++ create_serialize_tl_object<tos_api::tos_blockId>(root, file) at the
+    // fixed baseline, root = 0x00..0x1f and file = 0xff..0xe0.
+    let root_hash = UInt256::from_slice(&(0u8..32).collect::<Vec<_>>());
+    let file_hash = UInt256::from_slice(&(0u8..32).map(|i| 0xff - i).collect::<Vec<_>>());
+    let expected = hex::decode(
+        "ad968a91000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+         fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+    )
+    .unwrap();
+    assert_eq!(Block::build_data_for_sign(&root_hash, &file_hash).to_vec(), expected);
+}
+
+#[test]
+fn ordinary_signature_round_trip_over_tos_preimage() {
+    let key = Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap();
+    let public_key: &[u8] = key.pub_key().unwrap();
+    let descr = ValidatorDescr::with_params(SigPubKey::from_bytes(public_key).unwrap(), 17, None);
+    let root_hash = UInt256::rand();
+    let file_hash = UInt256::rand();
+    let data = Block::build_data_for_sign(&root_hash, &file_hash);
+    let mut signatures = BlockSignaturesPure::default();
+    signatures.add_sigpair(CryptoSignaturePair::with_params(
+        descr.compute_node_id_short().unwrap(),
+        CryptoSignature::from_bytes(&key.sign(&data).unwrap()).unwrap(),
+    ));
+    assert_eq!(signatures.check_signatures(std::slice::from_ref(&descr), &data).unwrap(), 17);
+    let legacy = legacy_upstream_data_for_sign(&root_hash, &file_hash);
+    assert!(signatures.check_signatures(std::slice::from_ref(&descr), &legacy).is_err());
 }
 
 #[test]

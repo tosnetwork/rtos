@@ -745,7 +745,9 @@ impl Block {
     }
 
     const DATA_FOR_SIGN_SIZE: usize = 4 + 32 + 32;
-    const DATA_FOR_SIGN_TAG: [u8; 4] = [0x70, 0x6e, 0x0b, 0xc5];
+    /// Boxed TL `tos.blockId root_cell_hash:int256 file_hash:int256` constructor
+    /// (0x918a96ad, little-endian), the preimage ordinary block signatures sign.
+    const DATA_FOR_SIGN_TAG: [u8; 4] = [0xad, 0x96, 0x8a, 0x91];
 
     pub fn build_data_for_sign(
         root_hash: &UInt256,
