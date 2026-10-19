@@ -205,6 +205,12 @@ impl ArchiveShardStateDb {
         Ok(())
     }
 
+    /// WAL synchronizations issued by this state database so far.
+    #[cfg(any(test, feature = "integration-test-support"))]
+    pub fn wal_synced_count(&self) -> Option<u64> {
+        self.index.physical_db().wal_synced_count()
+    }
+
     /// Cells and index are constructed from the same physical DB.
     pub fn sync_wal(&self) -> Result<()> {
         self.sync_wal_observed(None)

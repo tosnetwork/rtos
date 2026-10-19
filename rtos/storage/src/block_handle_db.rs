@@ -99,6 +99,15 @@ impl BlockHandle {
     fn serialize(&self) -> [u8; Self::SIZE] {
         let mut ret = [0u8; Self::SIZE];
         ret[..BlockMeta::SIZE].copy_from_slice(&self.meta.serialize());
+        // A stored state flag must imply a stored state. In memory the flag is
+        // set once the state is handed to the state writer, which persists it
+        // later; only the saved-state flag records that it is in the database.
+        let flags = self.meta.flags();
+        if flags & FLAG_STATE != 0 && flags & FLAG_STATE_SAVED == 0 {
+            if let Ok(word) = u64::deserialize(&ret[..8]) {
+                ret[..8].copy_from_slice(&(word & !((FLAG_STATE as u64) << 32)).serialize());
+            }
+        }
         let id = self.id();
         ret[BlockMeta::SIZE..BlockMeta::SIZE + ShardIdent::SIZE]
             .copy_from_slice(&id.shard().serialize());
@@ -480,11 +489,248 @@ pub trait Callback: Sync + Send {
     async fn invoke(&self, job: StoreJob, ok: bool);
 }
 
-enum HandleCommand {
-    Work(StoreJob, Option<Arc<dyn Callback>>, Option<crate::archives::io_owners::ArchiveIoTicket>),
-    Barrier(tokio::sync::oneshot::Sender<Result<()>>, crate::durability::SyncObservation,
-        Option<crate::archives::io_owners::ArchiveIoTicket>),
+/// Table written by one queued or direct write.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Target {
+    Handles,
+    FullNodeState,
+    ValidatorState,
 }
+
+/// Admission of one queued write. While any queued write is outstanding, a
+/// direct write records a newer generation for its key, and the writer drops
+/// every queued write of that key captured before it. Dropping the ticket
+/// (commit, refusal or a lost queue) ends the admission.
+struct QueueTicket(Arc<WriteSerializer>);
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// One captured write. The value is serialized when the write is queued: that
+/// call is the linearization point, so the stored bytes are exactly the state
+/// at that moment, never flags set later.
+struct WriteOp {
+    target: Target,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    generation: u64,
+    _ticket: QueueTicket,
+}
+
+impl WriteOp {
+    fn bytes(&self) -> usize {
+        self.key.len().saturating_add(self.value.as_ref().map_or(0, Vec::len))
+    }
+}
+
+#[derive(Default)]
+struct KeyGenerations {
+    generations: std::collections::HashMap<(Target, Vec<u8>), u64>,
+    queued: usize,
+}
+
+/// Serializes the ordered writer's commits with direct writes to the same
+/// tables, so an older queued value never overwrites a newer direct write.
+#[derive(Default)]
+struct WriteSerializer {
+    commit: std::sync::Mutex<()>,
+    keys: std::sync::Mutex<KeyGenerations>,
+}
+
+impl WriteSerializer {
+    fn capture(
+        self: &Arc<Self>,
+        target: Target,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<WriteOp> {
+        let mut keys = self.keys.lock().map_err(|_| error!("Handle write serializer poisoned"))?;
+        keys.queued =
+            keys.queued.checked_add(1).ok_or_else(|| error!("Handle write queue overflow"))?;
+        let generation = keys.generations.get(&(target, key.clone())).copied().unwrap_or(0);
+        drop(keys);
+        Ok(WriteOp { target, key, value, generation, _ticket: QueueTicket(self.clone()) })
+    }
+
+    fn release(&self) {
+        if let Ok(mut keys) = self.keys.lock() {
+            keys.queued = keys.queued.saturating_sub(1);
+            if keys.queued == 0 {
+                keys.generations.clear();
+            }
+        }
+    }
+
+    /// Records direct writes of `ops` as newer than every queued write of the
+    /// same keys. Caller holds `commit`.
+    fn supersede(&self, ops: &[(Target, &[u8])]) -> Result<()> {
+        let mut keys = self.keys.lock().map_err(|_| error!("Handle write serializer poisoned"))?;
+        if keys.queued == 0 {
+            return Ok(());
+        }
+        for (target, key) in ops {
+            let generation = keys.generations.entry((*target, key.to_vec())).or_insert(0);
+            *generation = generation
+                .checked_add(1)
+                .ok_or_else(|| error!("Handle write generation overflow"))?;
+        }
+        Ok(())
+    }
+
+    /// Whether a direct write superseded this queued write. Caller holds `commit`.
+    fn superseded(&self, op: &WriteOp) -> Result<bool> {
+        let keys = self.keys.lock().map_err(|_| error!("Handle write serializer poisoned"))?;
+        let current = keys.generations.get(&(op.target, op.key.clone())).copied().unwrap_or(0);
+        Ok(op.generation < current)
+    }
+}
+
+/// One direct write: table, key, and the value to put (`None` deletes).
+type DirectWrite<'a> = (Target, &'a [u8], Option<&'a [u8]>);
+
+/// The three tables owned by the ordered writer.
+#[derive(Clone)]
+struct HandleTables {
+    handles: Arc<BlockHandleDb>,
+    full_node_state: Arc<NodeStateDb>,
+    validator_state: Arc<NodeStateDb>,
+}
+
+impl HandleTables {
+    fn physical(&self, target: Target) -> &Arc<crate::db::rocksdb::RocksDb> {
+        match target {
+            Target::Handles => self.handles.physical_db(),
+            Target::FullNodeState => self.full_node_state.physical_db(),
+            Target::ValidatorState => self.validator_state.physical_db(),
+        }
+    }
+
+    fn add(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        target: Target,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        match target {
+            Target::Handles => self.handles.add_raw_to_batch(batch, key, value),
+            Target::FullNodeState => self.full_node_state.add_raw_to_batch(batch, key, value),
+            Target::ValidatorState => self.validator_state.add_raw_to_batch(batch, key, value),
+        }
+    }
+
+    /// Commits queued jobs in order: each maximal run of jobs on one physical
+    /// database is one synchronized batch. Returns how many leading jobs are
+    /// durable, and the error that stopped the rest.
+    fn commit_jobs(
+        &self,
+        serializer: &WriteSerializer,
+        jobs: Vec<Vec<WriteOp>>,
+    ) -> (usize, Option<rtos_block::Error>) {
+        let _commit = match serializer.commit.lock() {
+            Ok(guard) => guard,
+            Err(_) => return (0, Some(error!("Handle write serializer poisoned"))),
+        };
+        crate::durability::crash_point("handles.before_commit");
+        let mut committed = 0usize;
+        let mut index = 0usize;
+        while index < jobs.len() {
+            let physical = jobs[index].first().map(|op| self.physical(op.target).clone());
+            let mut end = index;
+            while end < jobs.len() {
+                let same = match (&physical, jobs[end].first()) {
+                    (Some(db), Some(op)) => Arc::ptr_eq(db, self.physical(op.target)),
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                };
+                if !same {
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(db) = physical {
+                let run = || -> Result<()> {
+                    let mut batch = rocksdb::WriteBatch::default();
+                    for op in jobs[index..end].iter().flatten() {
+                        if !serializer.superseded(op)? {
+                            self.add(&mut batch, op.target, &op.key, op.value.as_deref())?;
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write_batch_synced(batch)?;
+                    }
+                    Ok(())
+                };
+                if let Err(error) = run() {
+                    return (committed, Some(error));
+                }
+            }
+            committed = end;
+            index = end;
+            if index < jobs.len() {
+                crate::durability::crash_point("handles.between_runs");
+            }
+        }
+        crate::durability::crash_point("handles.after_commit");
+        (committed, None)
+    }
+
+    /// One batch of direct writes, serialized with the ordered writer's
+    /// commits and synchronized unless `synced` is false. All writes must
+    /// target one physical database.
+    fn write_direct(
+        &self,
+        serializer: &WriteSerializer,
+        writes: &[DirectWrite<'_>],
+        synced: bool,
+    ) -> Result<()> {
+        let Some((first, _, _)) = writes.first() else { return Ok(()) };
+        let physical = self.physical(*first).clone();
+        if writes.iter().any(|(target, _, _)| !Arc::ptr_eq(&physical, self.physical(*target))) {
+            fail!("Direct handle-storage writes must target one database");
+        }
+        let _commit =
+            serializer.commit.lock().map_err(|_| error!("Handle write serializer poisoned"))?;
+        let keys: Vec<(Target, &[u8])> =
+            writes.iter().map(|(target, key, _)| (*target, *key)).collect();
+        serializer.supersede(&keys)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for (target, key, value) in writes {
+            self.add(&mut batch, *target, key, *value)?;
+        }
+        if synced {
+            physical.write_batch_synced(batch)
+        } else {
+            Ok(physical.db().write(batch)?)
+        }
+    }
+}
+
+type DurableAck = tokio::sync::oneshot::Sender<Result<()>>;
+
+struct QueuedWork {
+    job: StoreJob,
+    ops: Vec<WriteOp>,
+    callback: Option<Arc<dyn Callback>>,
+    custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
+    ack: Option<DurableAck>,
+}
+
+enum HandleCommand {
+    Work(QueuedWork),
+    Barrier(
+        tokio::sync::oneshot::Sender<Result<()>>,
+        crate::durability::SyncObservation,
+        Option<crate::archives::io_owners::ArchiveIoTicket>,
+    ),
+}
+
+/// Bounds of one group commit of the ordered writer.
+const MAX_BATCH_COMMANDS: usize = 1024;
+const MAX_BATCH_BYTES: usize = 4 << 20;
 
 /// One page of a validator-state prefix scan: the entries read, the last key
 /// read, and whether the prefix range was exhausted.
@@ -507,6 +753,8 @@ pub struct BlockHandleStorage {
     full_node_state_db: Arc<NodeStateDb>,
     validator_state_db: Arc<NodeStateDb>,
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
+    tables: HandleTables,
+    serializer: Arc<WriteSerializer>,
     storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
     writer: Option<WriterCompletion>,
     #[cfg(test)]
@@ -525,6 +773,12 @@ impl BlockHandleStorage {
         allocated: Arc<StorageAlloc>,
     ) -> Self {
         let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
+        let tables = HandleTables {
+            handles: handle_db.clone(),
+            full_node_state: full_node_state_db.clone(),
+            validator_state: validator_state_db.clone(),
+        };
+        let serializer = Arc::new(WriteSerializer::default());
         let mut ret = Self {
             handle_db: handle_db.clone(),
             handle_cache: Arc::new(lockfree::map::Map::new()),
@@ -532,6 +786,8 @@ impl BlockHandleStorage {
             full_node_state_db: full_node_state_db.clone(),
             validator_state_db: validator_state_db.clone(),
             state_cache: lockfree::map::Map::new(),
+            tables: tables.clone(),
+            serializer: serializer.clone(),
             storer: sender,
             writer: None,
             #[cfg(test)]
@@ -543,104 +799,112 @@ impl BlockHandleStorage {
         #[cfg(test)]
         let writer_exit_hook = ret.writer_exit_hook.clone();
         let writer = tokio::spawn(async move {
-            fn save_state(key: &str, id: &Arc<BlockIdExt>, db: &Arc<NodeStateDb>) -> bool {
-                if let Err(e) = db.put_raw(key.as_bytes(), &id.serialize()) {
-                    log::error!(target: TARGET, "ERROR: {e} while saving state {id}");
-                    false
-                } else {
-                    true
-                }
-            }
-
-            fn save_handle(handle: &BlockHandle, db: &BlockHandleDb) -> Result<()> {
-                db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize())
-            }
-
-            let mut failed = false;
-            while let Some(command) = reader.recv().await {
-                let (job, callback, _archive_custody) = match command {
-                    HandleCommand::Work(job, callback, custody) => (job, callback, custody),
+            // First commit or barrier failure. Once set, nothing is written and
+            // nothing is acknowledged as durable: later work may depend on the
+            // failed write.
+            let mut failed: Option<String> = None;
+            let mut held: Option<HandleCommand> = None;
+            loop {
+                let command = match held.take() {
+                    Some(command) => command,
+                    None => match reader.recv().await {
+                        Some(command) => command,
+                        None => break,
+                    },
+                };
+                let first = match command {
                     HandleCommand::Barrier(reply, observer, _archive_custody) => {
-                        let result = if failed {
-                            Err(error!("Handle storage has an unacknowledged write failure"))
-                        } else {
-                            handle_db
-                                .sync_wal_observed(observer.as_deref())
-                                .and_then(|_| {
-                                    full_node_state_db.sync_wal_observed(observer.as_deref())
+                        let result = match &failed {
+                            Some(reason) => Err(error!(
+                                "Handle storage has an unacknowledged write failure: {reason}"
+                            )),
+                            None => {
+                                let tables = tables.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    tables.handles.sync_wal_observed(observer.as_deref())?;
+                                    tables
+                                        .full_node_state
+                                        .sync_wal_observed(observer.as_deref())?;
+                                    tables.validator_state.sync_wal_observed(observer.as_deref())
                                 })
-                                .and_then(|_| {
-                                    validator_state_db.sync_wal_observed(observer.as_deref())
+                                .await
+                                .unwrap_or_else(|join| {
+                                    Err(error!("Handle storage barrier task failed: {join}"))
                                 })
+                            }
                         };
-                        if result.is_err() {
-                            failed = true;
+                        if let Err(error) = &result {
+                            failed.get_or_insert_with(|| error.to_string());
                         }
                         let _ = reply.send(result);
                         continue;
                     }
+                    HandleCommand::Work(work) => work,
                 };
-                let ok = match &job {
-                    StoreJob::SaveHandle(handle) => {
-                        if let Err(e) = save_handle(handle, &handle_db) {
-                            log::error!(
-                                target: TARGET,
-                                "{} while storing handle {}",
-                                e, handle.id()
-                            );
-                            false
-                        } else {
-                            true
+                // Group commit: take what is already queued, bounded by count
+                // and bytes, and stop in front of the next barrier.
+                let mut bytes =
+                    first.ops.iter().map(WriteOp::bytes).fold(0usize, usize::saturating_add);
+                let mut batch = vec![first];
+                while batch.len() < MAX_BATCH_COMMANDS && bytes < MAX_BATCH_BYTES {
+                    match reader.try_recv() {
+                        Ok(HandleCommand::Work(work)) => {
+                            bytes = work
+                                .ops
+                                .iter()
+                                .map(WriteOp::bytes)
+                                .fold(bytes, usize::saturating_add);
+                            batch.push(work);
                         }
-                    }
-                    StoreJob::DropHandle(id) => {
-                        if let Err(e) = handle_db.delete(id) {
-                            log::error!(
-                                target: TARGET,
-                                "{} while deleting handle {}",
-                                e, id
-                            );
-                            false
-                        } else {
-                            true
+                        Ok(barrier) => {
+                            held = Some(barrier);
+                            break;
                         }
+                        Err(_) => break,
                     }
-                    StoreJob::SaveFullNodeState((key, id)) => {
-                        save_state(key, id, &full_node_state_db)
+                }
+                let ops: Vec<Vec<WriteOp>> =
+                    batch.iter_mut().map(|work| std::mem::take(&mut work.ops)).collect();
+                let committed = if failed.is_some() {
+                    drop(ops);
+                    0
+                } else {
+                    let tables = tables.clone();
+                    let serializer = serializer.clone();
+                    let (committed, error) =
+                        tokio::task::spawn_blocking(move || tables.commit_jobs(&serializer, ops))
+                            .await
+                            .unwrap_or_else(|join| {
+                                (0, Some(error!("Handle storage commit task failed: {join}")))
+                            });
+                    if let Some(error) = error {
+                        log::error!(target: TARGET, "Handle storage commit failed: {error}");
+                        failed.get_or_insert_with(|| error.to_string());
                     }
-                    StoreJob::SaveValidatorState((key, id)) => {
-                        save_state(key, id, &validator_state_db)
-                    }
-                    StoreJob::DropValidatorState(key) => {
-                        let result = validator_state_db.delete_raw(key.as_bytes());
-                        if let Err(e) = result {
-                            log::error!(
-                                target: TARGET,
-                                "{} while clearing state {}",
-                                e, key
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    StoreJob::DropFullNodeState(key) => {
-                        let result = full_node_state_db.delete_raw(key.as_bytes());
-                        if let Err(e) = result {
-                            log::error!(
-                                target: TARGET,
-                                "{} while clearing state {}",
-                                e, key
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    }
+                    committed
                 };
-                failed |= !ok;
-                if let Some(callback) = callback {
-                    callback.invoke(job, ok).await;
+                // Acknowledge and notify in queue order, and only for writes
+                // whose synchronized commit succeeded.
+                for (index, work) in batch.into_iter().enumerate() {
+                    let ok = index < committed;
+                    let QueuedWork { job, ops: _, callback, custody, ack } = work;
+                    if !ok {
+                        log::error!(target: TARGET, "Handle storage write not durable: {job:?}");
+                    }
+                    if let Some(ack) = ack {
+                        let _ = ack.send(if ok {
+                            Ok(())
+                        } else {
+                            Err(error!(
+                                "Handle storage write failed: {}",
+                                failed.as_deref().unwrap_or("unknown failure")
+                            ))
+                        });
+                    }
+                    if let Some(callback) = callback {
+                        callback.invoke(job, ok).await;
+                    }
+                    drop(custody);
                 }
             }
 
@@ -656,7 +920,7 @@ impl BlockHandleStorage {
                 }
             }
             // Keep all native provider captures alive through the exit boundary.
-            drop((handle_db, full_node_state_db, validator_state_db));
+            drop((tables, handle_db, full_node_state_db, validator_state_db));
         });
         ret.writer = Some(async move { writer.await.map_err(Arc::new) }.boxed().shared());
         ret
@@ -712,15 +976,15 @@ impl BlockHandleStorage {
 
     pub fn drop_validator_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
-        self.storer
-            .send(HandleCommand::Work(StoreJob::DropValidatorState(key), None, None))
+        let op = self.serializer.capture(Target::ValidatorState, key.as_bytes().to_vec(), None)?;
+        self.enqueue(StoreJob::DropValidatorState(key), vec![op], None, None, None)
             .map_err(|_| error!("Cannot drop validator state: storer thread dropped"))
     }
 
     pub fn drop_full_node_state(&self, key: String) -> Result<()> {
         self.delete_state(&key)?;
-        self.storer
-            .send(HandleCommand::Work(StoreJob::DropFullNodeState(key), None, None))
+        let op = self.serializer.capture(Target::FullNodeState, key.as_bytes().to_vec(), None)?;
+        self.enqueue(StoreJob::DropFullNodeState(key), vec![op], None, None, None)
             .map_err(|_| error!("Cannot drop fullnode state: storer thread dropped"))
     }
 
@@ -820,24 +1084,92 @@ impl BlockHandleStorage {
     ) -> Result<()> {
         if self.no_cache {
             let _custody = custody;
-            return self.handle_db.put_raw(handle.id().root_hash().as_slice(), &handle.serialize());
+            let value = handle.serialize();
+            // Bulk offline import: the importer owns its final barrier, so
+            // this stays an ordinary (unsynchronized) ordered write.
+            return self.tables.write_direct(
+                &self.serializer,
+                &[(Target::Handles, handle.id().root_hash().as_slice(), Some(&value))],
+                false,
+            );
         }
-        self.storer
-            .send(HandleCommand::Work(StoreJob::SaveHandle(handle.clone()), callback, custody))
+        let op = self.handle_op(handle)?;
+        self.enqueue(StoreJob::SaveHandle(handle.clone()), vec![op], callback, custody, None)
             .map_err(|_| error!("Cannot store handle {}: storer thread dropped", handle.id()))
     }
 
-    pub fn save_full_node_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
+    fn handle_op(&self, handle: &Arc<BlockHandle>) -> Result<WriteOp> {
+        self.serializer.capture(
+            Target::Handles,
+            handle.id().root_hash().as_slice().to_vec(),
+            Some(handle.serialize().to_vec()),
+        )
+    }
+
+    /// Saves the handle as it is now and returns after that write and every
+    /// earlier queued write are durable.
+    pub async fn save_handle_durable(&self, handle: &Arc<BlockHandle>) -> Result<()> {
+        if self.no_cache {
+            return self.save_handle(handle, None);
+        }
+        let op = self.handle_op(handle)?;
+        self.enqueue_durable(StoreJob::SaveHandle(handle.clone()), vec![op]).await
+    }
+
+    fn state_job(
+        &self,
+        target: Target,
+        key: String,
+        id: &BlockIdExt,
+    ) -> Result<(StoreJob, Vec<WriteOp>)> {
         let refid = self.create_state(key.clone(), id)?;
-        self.storer
-            .send(HandleCommand::Work(StoreJob::SaveFullNodeState((key, refid)), None, None))
+        let op = self.serializer.capture(
+            target,
+            key.as_bytes().to_vec(),
+            Some(refid.serialize().to_vec()),
+        )?;
+        let job = match target {
+            Target::ValidatorState => StoreJob::SaveValidatorState((key, refid)),
+            _ => StoreJob::SaveFullNodeState((key, refid)),
+        };
+        Ok((job, vec![op]))
+    }
+
+    pub fn save_full_node_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
+        let (job, ops) = self.state_job(Target::FullNodeState, key, id)?;
+        self.enqueue(job, ops, None, None, None)
             .map_err(|_| error!("Cannot store full node state {}: storer thread dropped", id))
     }
 
+    /// Like `save_full_node_state`, but returns only after the write and every
+    /// earlier queued write are durable.
+    pub async fn save_full_node_state_durable(&self, key: String, id: &BlockIdExt) -> Result<()> {
+        let (job, ops) = self.state_job(Target::FullNodeState, key, id)?;
+        self.enqueue_durable(job, ops).await
+    }
+
+    /// Deletes a full-node state key and waits until the deletion is durable.
+    pub async fn drop_full_node_state_durable(&self, key: String) -> Result<()> {
+        self.delete_state(&key)?;
+        let op = self.serializer.capture(Target::FullNodeState, key.as_bytes().to_vec(), None)?;
+        self.enqueue_durable(StoreJob::DropFullNodeState(key), vec![op]).await
+    }
+
+    /// Writes a raw full-node state value with a synchronized write that is
+    /// ordered against every queued write of the same key.
+    pub fn save_full_node_state_raw_sync(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.delete_state(key)?;
+        self.tables.write_direct(
+            &self.serializer,
+            &[(Target::FullNodeState, key.as_bytes(), Some(data))],
+            true,
+        )?;
+        self.delete_state(key)
+    }
+
     pub fn save_validator_state(&self, key: String, id: &BlockIdExt) -> Result<()> {
-        let refid = self.create_state(key.clone(), id)?;
-        self.storer
-            .send(HandleCommand::Work(StoreJob::SaveValidatorState((key, refid)), None, None))
+        let (job, ops) = self.state_job(Target::ValidatorState, key, id)?;
+        self.enqueue(job, ops, None, None, None)
             .map_err(|_| error!("Cannot store validator state {}: storer thread dropped", id))
     }
 
@@ -846,14 +1178,20 @@ impl BlockHandleStorage {
         self.validator_state_db.flush_family()
     }
 
+    /// Raw validator-state values are written synchronously: they record
+    /// session retirement, which the reference implementation also syncs.
     pub fn save_validator_state_raw(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.delete_state(key)?;
-        self.validator_state_db.put_raw(key.as_bytes(), data)
+        self.save_validator_state_raw_sync(key, data)
     }
 
     pub fn save_validator_state_raw_sync(&self, key: &str, data: &[u8]) -> Result<()> {
         self.delete_state(key)?;
-        self.validator_state_db.put_raw_sync(key.as_bytes(), data)
+        self.tables.write_direct(
+            &self.serializer,
+            &[(Target::ValidatorState, key.as_bytes(), Some(data))],
+            true,
+        )?;
+        self.delete_state(key)
     }
 
     pub fn load_validator_state_raw_bounded(
@@ -882,10 +1220,22 @@ impl BlockHandleStorage {
         for key in puts.iter().map(|(key, _)| key).chain(deletes) {
             self.delete_state(key)?;
         }
-        let puts: Vec<(&[u8], &[u8])> =
-            puts.iter().map(|(key, value)| (key.as_bytes(), value.as_slice())).collect();
-        let deletes: Vec<&[u8]> = deletes.iter().map(|key| key.as_bytes()).collect();
-        self.validator_state_db.write_batch_sync(&puts, &deletes)
+        let mut writes: Vec<DirectWrite<'_>> = Vec::new();
+        for (key, value) in puts.iter() {
+            writes.push((Target::ValidatorState, key.as_bytes(), Some(value.as_slice())));
+        }
+        for key in deletes {
+            writes.push((Target::ValidatorState, key.as_bytes(), None));
+        }
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.tables.write_direct(&self.serializer, &writes, true)?;
+        // A queued write admitted meanwhile may have refreshed the cache.
+        for key in puts.iter().map(|(key, _)| key).chain(deletes) {
+            self.delete_state(key)?;
+        }
+        Ok(())
     }
 
     /// Reads at most `max_keys` validator-state entries whose key starts with
@@ -957,17 +1307,45 @@ impl BlockHandleStorage {
         Ok(found)
     }
 
+    /// Deletes one raw validator-state key with a synchronized write.
     pub fn drop_validator_state_raw(&self, key: &str) -> Result<()> {
         self.delete_state(key)?;
-        self.validator_state_db.delete_raw(key.as_bytes())
+        self.tables.write_direct(
+            &self.serializer,
+            &[(Target::ValidatorState, key.as_bytes(), None)],
+            true,
+        )?;
+        self.delete_state(key)
     }
 
     pub fn drop_handle(&self, id: BlockIdExt, callback: Option<Arc<dyn Callback>>) -> Result<()> {
         let _ = self.handle_cache.remove(id.root_hash());
+        let op =
+            self.serializer.capture(Target::Handles, id.root_hash().as_slice().to_vec(), None)?;
+        self.enqueue(StoreJob::DropHandle(id.clone()), vec![op], callback, None, None)
+            .map_err(|_| error!("Cannot drop handle {}: storer thread dropped", id))
+    }
+
+    fn enqueue(
+        &self,
+        job: StoreJob,
+        ops: Vec<WriteOp>,
+        callback: Option<Arc<dyn Callback>>,
+        custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
+        ack: Option<DurableAck>,
+    ) -> Result<()> {
         self.storer
-            .send(HandleCommand::Work(StoreJob::DropHandle(id.clone()), callback, None))
-            .map_err(|_| error!("Cannot drop handle {}: storer thread dropped", id))?;
-        Ok(())
+            .send(HandleCommand::Work(QueuedWork { job, ops, callback, custody, ack }))
+            .map_err(|_| error!("Handle storer stopped"))
+    }
+
+    /// Queues `job` and waits until its synchronized commit succeeded.
+    async fn enqueue_durable(&self, job: StoreJob, ops: Vec<WriteOp>) -> Result<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.enqueue(job, ops, None, None, Some(send))?;
+        receive
+            .await
+            .map_err(|_| error!("Handle writer stopped before a durable acknowledgement"))?
     }
 
     pub fn for_each_keys(

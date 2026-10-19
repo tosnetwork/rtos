@@ -22,7 +22,7 @@ use crate::{
         package_index_db::{PackageIndexDb, PackageIndexEntry},
     },
     block_handle_db::BlockHandle,
-    db::rocksdb::RocksDb,
+    db::{rocksdb::RocksDb, DbKey, U32Key},
     StorageAlloc, TARGET,
 };
 use adnl::{
@@ -474,11 +474,15 @@ impl FileMap {
                 reinsert(&self.elements, entry).await;
                 continue;
             };
-            if let Err(e) = self.storage.delete(&key.into()) {
+            // The index removal is synchronized before any file is destroyed,
+            // so a restart never finds an index entry whose files are gone.
+            let index_key: U32Key = key.into();
+            if let Err(e) = self.storage.delete_raw_sync(index_key.key()) {
                 log::error!(target: TARGET, "Archives GC: can't delete {key} from index: {e}");
                 reinsert(&self.elements, entry).await;
                 continue;
             }
+            crate::durability::crash_point("archive_gc.after_index_delete");
             if let Err(e) = fd.destroy().await {
                 // Index entry already removed; orphan files until restart sweep.
                 log::error!(target: TARGET, "Archives GC: can't destroy archive slice {key}: {e}");

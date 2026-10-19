@@ -287,3 +287,153 @@ async fn state_owner_gc_admission_racing_stop_has_no_unjoined_db_owner() -> Resu
     drop(reopened);
     Ok(())
 }
+
+/// Resolver whose deletion boundary moves only through staged, committed
+/// progress, like the node's durable-progress gate.
+struct GatedResolver {
+    live: AtomicU32,
+    committed: AtomicU32,
+    staged: std::sync::Mutex<Option<(u64, u32)>>,
+    tickets: std::sync::atomic::AtomicU64,
+}
+
+impl AllowStateGcResolver for GatedResolver {
+    fn allow_state_gc(
+        &self,
+        block_id: &BlockIdExt,
+        _saved_at: u64,
+        _gc_utime: u64,
+    ) -> Result<bool> {
+        Ok(block_id.seq_no() < self.committed.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    fn stage_gc_progress(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let ticket = self.tickets.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.staged.lock().unwrap() = Some((ticket, self.live.load(Ordering::SeqCst)));
+        Some(ticket)
+    }
+    fn commit_gc_progress(&self, ticket: u64) {
+        let staged = self.staged.lock().unwrap().take();
+        if let Some((staged_ticket, value)) = staged {
+            if staged_ticket == ticket {
+                self.committed.store(value, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+struct HeldHandleWrite {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl crate::block_handle_db::Callback for HeldHandleWrite {
+    async fn invoke(&self, _job: crate::block_handle_db::StoreJob, _ok: bool) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Returns whether the oldest state was still present while the pointer
+/// write that justified its deletion was held in the handle writer, and
+/// whether it was deleted after the writer was released.
+async fn gc_while_pointer_write_is_held(with_barrier: bool) -> Result<(bool, bool)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir()?;
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
+    let states = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
+        CellsDbConfig::default(),
+        #[cfg(feature = "telemetry")]
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    let shard = ShardIdent::with_tagged_prefix(-1, 0x8000_0000_0000_0000)?;
+    let mut ids = Vec::new();
+    for seq_no in 2_467_080..2_467_084u32 {
+        let root = ss_from_file(seq_no);
+        let id = BlockIdExt::with_params(
+            shard.clone(),
+            seq_no,
+            root.repr_hash().clone(),
+            UInt256::default(),
+        );
+        states.put(&id, root, None).await?;
+        ids.push(id);
+    }
+    states.sync_pending().await?;
+    let (handles, _) = crate::tests::utils::create_block_handle_storage(db.clone());
+    let handles = Arc::new(handles);
+    let hold =
+        Arc::new(HeldHandleWrite { entered: Default::default(), release: Default::default() });
+    let blocker = handles
+        .create_handle(BlockIdExt::default(), crate::types::BlockMeta::default(), None)?
+        .ok_or_else(|| rtos_block::error!("blocker handle exists"))?;
+    handles.save_handle(&blocker, Some(hold.clone()))?;
+    hold.entered.notified().await;
+    // The pointer that makes the two oldest states unnecessary is queued, not
+    // durable; the resolver's live progress already reflects it.
+    handles.save_full_node_state("ShardClient".to_owned(), &ids[2])?;
+    let resolver = Arc::new(GatedResolver {
+        live: AtomicU32::new(ids[2].seq_no()),
+        committed: AtomicU32::new(0),
+        staged: Default::default(),
+        tickets: AtomicU64::new(0),
+    });
+    if with_barrier {
+        let barrier_handles = handles.clone();
+        let barrier: crate::shardstate_db_async::GcProgressBarrier = Arc::new(move || {
+            let handles = barrier_handles.clone();
+            Box::pin(async move { handles.sync_pending().await })
+        });
+        states.clone().start_gc_with_progress_barrier(
+            resolver.clone(),
+            Arc::new(AtomicU32::new(1)),
+            Some(barrier),
+        );
+    } else {
+        // Control: progress committed without any barrier.
+        resolver.committed.store(resolver.live.load(Ordering::SeqCst), Ordering::SeqCst);
+        states.clone().start_gc(resolver.clone(), Arc::new(AtomicU32::new(1)));
+    }
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let present_while_held = states.get(&ids[0]).is_ok();
+    hold.release.notify_one();
+    let mut deleted_after = false;
+    for _ in 0..60 {
+        if states.get(&ids[0]).is_err() {
+            deleted_after = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if with_barrier && deleted_after {
+        // Deletion followed the durable pointer.
+        let pointer =
+            crate::block_handle_db::NodeStateDb::with_db(db.clone(), "full_node_states", false)?;
+        assert!(pointer.try_get_raw(b"ShardClient")?.is_some());
+    }
+    assert!(states.get(&ids[3]).is_ok(), "state above the boundary was deleted");
+    states.stop().await?;
+    Ok((present_while_held, deleted_after))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_gc_waits_for_durable_progress_pointer() -> Result<()> {
+    let (present_while_held, deleted_after) = gc_while_pointer_write_is_held(true).await?;
+    assert!(present_while_held, "state deleted while its authorizing pointer was not durable");
+    assert!(deleted_after, "state not deleted after the pointer became durable");
+    Ok(())
+}
+
+/// Control for the test above: without the barrier the same fixture deletes
+/// while the pointer write is still held, so the test can see the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_gc_without_progress_barrier_deletes_before_pointer_is_durable() -> Result<()> {
+    let (present_while_held, _) = gc_while_pointer_write_is_held(false).await?;
+    assert!(!present_while_held, "control fixture did not exercise the race");
+    Ok(())
+}

@@ -36,7 +36,25 @@ use std::{
 pub trait AllowStateGcResolver: Send + Sync {
     fn allow_state_gc(&self, block_id: &BlockIdExt, save_utime: u64, gc_utime: u64)
         -> Result<bool>;
+
+    /// Captures the progress that will authorize the next GC cycle and
+    /// returns its ticket, or `None` when this resolver has no such gate.
+    fn stage_gc_progress(&self) -> Option<u64> {
+        None
+    }
+
+    /// Makes the progress staged under `ticket` the one deletion decisions
+    /// use. The GC worker calls this only after a barrier, issued after the
+    /// staging, has made every write that progress depends on durable.
+    fn commit_gc_progress(&self, _ticket: u64) {}
+
+    /// From now on, deletion decisions use committed progress only.
+    fn require_durable_progress(&self) {}
 }
+
+/// Barrier the state GC runs between staging and committing its progress.
+pub type GcProgressBarrier =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>;
 
 pub(crate) struct DbEntry {
     // Because key in db is not a full BlockIdExt it's need to store it here to use while GC.
@@ -282,11 +300,27 @@ impl ShardStateDb {
         gc_resolver: Arc<dyn AllowStateGcResolver>,
         run_interval_adjustable_sec: Arc<AtomicU32>,
     ) {
+        self.start_gc_with_progress_barrier(gc_resolver, run_interval_adjustable_sec, None)
+    }
+
+    /// Starts the state GC. With `progress_barrier`, every collection cycle
+    /// first stages the resolver's progress, runs the barrier and commits the
+    /// staged progress only if the barrier succeeded; deletion decisions use
+    /// committed progress only. A failed barrier skips the cycle.
+    pub fn start_gc_with_progress_barrier(
+        self: Arc<Self>,
+        gc_resolver: Arc<dyn AllowStateGcResolver>,
+        run_interval_adjustable_sec: Arc<AtomicU32>,
+        progress_barrier: Option<GcProgressBarrier>,
+    ) {
         // Register the actual owner under the same lock that closes admission.
         // A stop concurrent with start_gc either joins it or prevents its spawn.
         let owner = self.clone();
         let mut tasks = owner.task_owners.lock().unwrap();
         if tasks.closed { return; }
+        if progress_barrier.is_some() {
+            gc_resolver.require_durable_progress();
+        }
         if self.gc_resolver.set(gc_resolver.clone()).is_err() {
             log::error!(target: TARGET, "INTERNAL ERROR: Attempt to set GC resolver twice");
             return;
@@ -430,6 +464,26 @@ impl ShardStateDb {
                     #[cfg(any(test, feature = "integration-test-support"))]
                     {
                         self.test_gc_batches.lock().unwrap().completed = batch_epoch;
+                    }
+                }
+
+                if let Some(barrier) = &progress_barrier {
+                    // Deletion may rely only on progress whose prerequisite
+                    // writes were durable before this cycle selects anything.
+                    let ticket = gc_resolver.stage_gc_progress();
+                    match barrier().await {
+                        Ok(()) => {
+                            if let Some(ticket) = ticket {
+                                gc_resolver.commit_gc_progress(ticket);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                target: TARGET,
+                                "ShardStateDb GC: progress barrier failed, skipping cycle: {e}"
+                            );
+                            continue;
+                        }
                     }
                 }
 

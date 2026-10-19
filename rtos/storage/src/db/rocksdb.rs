@@ -268,6 +268,11 @@ impl RocksDb {
         options.enable_statistics();
         options.set_dump_malloc_stats(true);
 
+        #[cfg(any(test, feature = "integration-test-support"))]
+        if crate::durability::crash_model::buffered_wal() {
+            options.set_manual_wal_flush(true);
+        }
+
         // Specify the maximal size of the info log file. If the log file
         // is larger than `max_log_file_size`, a new info log file will
         // be created.
@@ -480,6 +485,26 @@ impl RocksDb {
         checkpoint.create_checkpoint(path)?;
         Ok(())
     }
+
+    /// Applies one batch atomically and returns only after its WAL record is
+    /// synchronized to stable storage.
+    pub(crate) fn write_batch_synced(&self, batch: WriteBatch) -> Result<()> {
+        let mut options = WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(true);
+        self.db().write_opt(batch, &options)?;
+        Ok(())
+    }
+
+    /// Number of WAL syncs this provider has issued since it was opened
+    /// (RocksDB `rocksdb.wal.synced` ticker); `None` when unavailable.
+    pub fn wal_synced_count(&self) -> Option<u64> {
+        let text = self.db().property_value("rocksdb.options-statistics").ok()??;
+        text.lines().find_map(|line| {
+            let rest = line.strip_prefix("rocksdb.wal.synced COUNT : ")?;
+            rest.trim().parse::<u64>().ok()
+        })
+    }
 }
 
 pub struct RocksDbTable<K> {
@@ -508,6 +533,31 @@ impl<K: DbKey + Send + Sync> RocksDbTable<K> {
     ) -> Result<()> {
         batch.put_cf(&self.cf()?, key, value);
         Ok(())
+    }
+
+    /// Appends a put (`Some`) or a delete (`None`) of a raw key to `batch`.
+    pub(crate) fn add_raw_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        let cf = self.cf()?;
+        match value {
+            Some(value) => batch.put_cf(&cf, key, value),
+            None => batch.delete_cf(&cf, key),
+        }
+        Ok(())
+    }
+
+    /// The physical database (and so the WAL) this table belongs to.
+    pub(crate) fn physical_db(&self) -> &Arc<RocksDb> {
+        &self.db
+    }
+
+    /// Deletes one key and waits for its WAL durability barrier.
+    pub fn delete_raw_sync(&self, key: &[u8]) -> Result<()> {
+        self.write_batch_sync(&[], &[key])
     }
 
     pub fn sync_wal(&self) -> Result<()> {

@@ -78,10 +78,131 @@ pub struct ArchiveManager {
     recovery_mutex: tokio::sync::Mutex<()>,
     shard_split_depth: Arc<AtomicU8>,
     unapplied_files_path: PathBuf,
+    unapplied_directory: UnappliedDirectory,
     create_slice_mutex: tokio::sync::Mutex<()>,
     #[cfg(feature = "telemetry")]
     telemetry: Arc<StorageTelemetry>,
     allocated: Arc<StorageAlloc>,
+}
+
+/// Suffix of temporary files an unapplied artifact is written to before it
+/// is published under its final name.
+pub(crate) const UNAPPLIED_TEMPORARY_SUFFIX: &str = "unapplied-tmp";
+
+static UNAPPLIED_WRITE_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Durable publication of loose artifacts in the unapplied directory.
+///
+/// The directory chain is synchronized once when it is opened. Each artifact
+/// is written to a unique temporary file, synchronized, renamed to its final
+/// name and then waits for a directory synchronization that started after its
+/// rename. Concurrent renames share one directory synchronization.
+pub(crate) struct UnappliedDirectory {
+    path: PathBuf,
+    renamed: std::sync::atomic::AtomicU64,
+    synced: tokio::sync::Mutex<u64>,
+}
+
+impl UnappliedDirectory {
+    pub(crate) async fn open(path: PathBuf, db_root: PathBuf) -> Result<Self> {
+        let directory = path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Remove temporaries of interrupted writes; none was published.
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name.to_str().is_some_and(|name| name.ends_with(UNAPPLIED_TEMPORARY_SUFFIX)) {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            // Make the directory chain durable once: the unapplied directory,
+            // the archive directory and the database root that contains them.
+            let mut current = Some(directory.as_path());
+            while let Some(dir) = current {
+                std::fs::File::open(dir)?.sync_all()?;
+                if dir == db_root.as_path() {
+                    break;
+                }
+                current = dir.parent();
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| error!("Unapplied directory preparation failed: {e}"))??;
+        Ok(Self { path, renamed: Default::default(), synced: tokio::sync::Mutex::new(0) })
+    }
+
+    /// Writes `data` under `final_name` and returns after the contents and
+    /// the name are durable.
+    pub(crate) async fn publish(&self, final_name: &std::ffi::OsStr, data: &[u8]) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let destination = self.path.join(final_name);
+        let mut selected = None;
+        for _ in 0..16 {
+            let attempt = UNAPPLIED_WRITE_ATTEMPT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                .map_err(|_| error!("Unapplied write attempt counter exhausted"))?;
+            let mut name = final_name.to_os_string();
+            name.push(format!(".{}.{attempt}.{UNAPPLIED_TEMPORARY_SUFFIX}", std::process::id()));
+            let temporary = self.path.join(name);
+            match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).await
+            {
+                Ok(file) => {
+                    selected = Some((temporary, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error!("{} : {}", error, temporary.display()));
+                }
+            }
+        }
+        let (temporary, mut file) =
+            selected.ok_or_else(|| error!("Unapplied temporary collision limit reached"))?;
+        let written: Result<()> = async {
+            file.write_all(data).await?;
+            // Drain buffered writes and surface their error before syncing.
+            file.flush().await?;
+            crate::durability::crash_point("unapplied.after_write");
+            file.sync_all().await?;
+            crate::durability::crash_point("unapplied.after_file_sync");
+            Ok(())
+        }
+        .await;
+        drop(file);
+        if let Err(error) = written {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error!("{} : {}", error, destination.display()));
+        }
+        crate::durability::crash_point("unapplied.after_rename");
+        let ticket = self.renamed.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        self.sync_through(ticket).await
+    }
+
+    /// Returns after a directory synchronization that started after rename
+    /// number `ticket` has succeeded.
+    async fn sync_through(&self, ticket: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut synced = self.synced.lock().await;
+        if *synced >= ticket {
+            return Ok(());
+        }
+        let covered = self.renamed.load(Ordering::SeqCst);
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            std::fs::File::open(&path)?.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| error!("Unapplied directory sync task failed: {e}"))??;
+        crate::durability::crash_point("unapplied.after_dir_sync");
+        *synced = (*synced).max(covered);
+        Ok(())
+    }
 }
 
 impl ArchiveManager {
@@ -145,6 +266,9 @@ impl ArchiveManager {
         tokio::fs::create_dir_all(unapplied_files_path.as_path()).await.map_err(|e| {
             error!("Cannot create unapplied files directory {:?}: {}", unapplied_files_path, e)
         })?;
+        let unapplied_directory =
+            UnappliedDirectory::open(unapplied_files_path.clone(), db_root_path.as_ref().clone())
+                .await?;
         let ret = Self {
             published: std::sync::RwLock::new(Arc::new(PublishedArchive { view, file_maps, db_provider })),
             db,
@@ -154,6 +278,7 @@ impl ArchiveManager {
             recovery_mutex: tokio::sync::Mutex::new(()),
             shard_split_depth,
             unapplied_files_path,
+            unapplied_directory,
             create_slice_mutex: tokio::sync::Mutex::new(()),
             #[cfg(feature = "telemetry")]
             telemetry,
@@ -200,17 +325,11 @@ impl ArchiveManager {
         if data.is_empty() {
             fail!("Added file's {entry_id} data can't have zero length");
         }
-        let filename = self.unapplied_files_path.join(entry_id.filename_short());
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&filename)
+        // The caller sets the handle flag after this returns, so the artifact
+        // must be durable under its final name first.
+        self.unapplied_directory
+            .publish(std::ffi::OsStr::new(&entry_id.filename_short()), data)
             .await
-            .map_err(|err| error!("{} : {}", err, filename.display()))?;
-        file.write_all(data).await?;
-        file.flush().await?;
-        Ok(())
     }
 
     pub fn check_file<B: Borrow<BlockIdExt>>(
