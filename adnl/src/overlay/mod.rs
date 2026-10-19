@@ -580,6 +580,10 @@ declare_counted!(
         overlay_id: Arc<OverlayShortId>,
         owned_broadcasts: lockfree::map::Map<BroadcastId, OwnedBroadcast>,
         plumtree: OnceLock<PlumtreeTransport>,
+        // Configured overlay.node member flags of this node, and the flags
+        // assumed for a permanent member that has not advertised itself
+        member_flags: AtomicU32,
+        permanent_member_flags: AtomicU32,
         // Common broadcast verifier: issuer limiters and signature rejections
         verifier: Arc<privacy::BroadcastVerifier>,
         // Explicit privacy rules of a public overlay; none keeps the overlay
@@ -622,6 +626,24 @@ declare_counted!(
 );
 
 impl Overlay {
+    const MEMBER_DO_NOT_RECEIVE_BROADCASTS: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_BROADCASTS;
+    const MEMBER_DO_NOT_RECEIVE_PLUMTREE: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_PLUMTREE;
+    const MEMBER_PLUMTREE_DENY: u32 =
+        Self::MEMBER_DO_NOT_RECEIVE_BROADCASTS | Self::MEMBER_DO_NOT_RECEIVE_PLUMTREE;
+
+    /// The member flags this node signs into its overlay.node, as the
+    /// reference overlay computes them: a public overlay adds "no Plumtree"
+    /// when Plumtree is off or this node is an original sender; any other
+    /// overlay signs its configured flags.
+    fn local_member_flags(&self) -> u32 {
+        let configured = self.member_flags.load(Ordering::Relaxed);
+        if !self.overlay_type.is_public() {
+            return configured;
+        }
+        let plumtree_receiver = self.plumtree.get().is_some_and(|p| !p.original_sender);
+        configured | if plumtree_receiver { 0 } else { Self::MEMBER_DO_NOT_RECEIVE_PLUMTREE }
+    }
+
     const FLAG_OVERLAY_OTHER_WORKCHAIN: u8 = 0x01;
     const MAX_HOPS: u8 = 15;
     const MAX_BROADCAST_LOG: u32 = 1000;
@@ -1047,7 +1069,7 @@ impl Overlay {
     ) -> Result<OverlayNodeInfo<NodeV1, NodeV2>> {
         let key = self.overlay_key().unwrap_or(default_key);
         let overlay_id = UInt256::with_array(*self.overlay_id.data());
-        let flags = if self.plumtree.get().is_some_and(|p| !p.original_sender) { 0 } else { 2 };
+        let flags = i32::try_from(self.local_member_flags())?;
         let version = Version::get();
         let local_node = OverlayUtils::get_node_to_sign(key, &overlay_id, flags, version);
         let node = if v2 {
@@ -2653,6 +2675,8 @@ impl OverlayNode {
             overlay_type,
             owned_broadcasts: lockfree::map::Map::new(),
             plumtree: OnceLock::new(),
+            member_flags: AtomicU32::new(0),
+            permanent_member_flags: AtomicU32::new(0),
             verifier: Arc::new(privacy::BroadcastVerifier::default()),
             public_policy: public_rules.map(privacy::PublicBroadcastPolicy::new),
             certificates: std::sync::RwLock::new(HashMap::new()),
@@ -3235,7 +3259,25 @@ impl Subscriber for OverlayNode {
                 peers,
                 verdict: BroadcastCheckResult::Allowed,
             };
+            // As the reference overlay does, a node whose flags say it receives
+            // no broadcasts drops regular broadcasts, and one that receives no
+            // Plumtree broadcasts drops Plumtree payloads and announcements.
+            let local_flags = overlay.local_member_flags();
             let message = match first.downcast::<Broadcast>() {
+                Ok(Broadcast::Overlay_BroadcastFec(_) | Broadcast::Overlay_Broadcast(_))
+                    if local_flags & Overlay::MEMBER_DO_NOT_RECEIVE_BROADCASTS != 0 =>
+                {
+                    return Ok(true);
+                }
+                Ok(
+                    Broadcast::Overlay_BroadcastPlumtreeSimple(_)
+                    | Broadcast::Overlay_BroadcastPlumtreeFec(_)
+                    | Broadcast::Overlay_BroadcastPlumtreeIHave(_),
+                ) if overlay.plumtree.get().is_some()
+                    && local_flags & Overlay::MEMBER_PLUMTREE_DENY != 0 =>
+                {
+                    return Ok(true);
+                }
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
                     if let Err(e) = Self::check_fec_broadcast_message(&bcast) {
                         // Ignore invalid messages as early as possible
@@ -3510,7 +3552,11 @@ impl Overlay {
                                 && version as i64 <= now as i64 + 60))
                 })
             } else {
+                // A permanent member that has not advertised itself carries the
+                // overlay's default permanent member flags.
                 !self.overlay_type.is_public()
+                    && self.permanent_member_flags.load(Ordering::Relaxed) & Self::MEMBER_PLUMTREE_DENY
+                        == 0
             };
             if eligible && self.check_peer(&peer, None).is_ok() {
                 peers.push(*peer.data());
@@ -3658,6 +3704,38 @@ impl Overlay {
 }
 
 impl OverlayNode {
+    /// overlay.node member flag: the member receives no broadcast.
+    pub const MEMBER_DO_NOT_RECEIVE_BROADCASTS: u32 = 1;
+    /// overlay.node member flag: the member receives no Plumtree broadcast.
+    pub const MEMBER_DO_NOT_RECEIVE_PLUMTREE: u32 = 2;
+
+    /// Set the overlay.node member flags this node signs for `overlay_id`
+    /// (a public overlay adds its Plumtree flag to them) and the flags assumed
+    /// for a permanent member that has not advertised itself, as the
+    /// reference overlay options local_overlay_member_flags and
+    /// default_permanent_members_flags do.
+    pub fn set_member_flags(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        local: u32,
+        permanent_default: u32,
+    ) -> Result<()> {
+        if local & !Overlay::MEMBER_PLUMTREE_DENY != 0
+            || permanent_default & !Overlay::MEMBER_PLUMTREE_DENY != 0
+        {
+            fail!("Unsupported overlay member flags {local}/{permanent_default}");
+        }
+        let overlay = self.get_overlay(overlay_id, "Cannot set member flags of unknown overlay")?;
+        overlay.member_flags.store(local, Ordering::Relaxed);
+        overlay.permanent_member_flags.store(permanent_default, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The overlay.node member flags this node signs for `overlay_id`.
+    pub fn local_member_flags(&self, overlay_id: &Arc<OverlayShortId>) -> Result<u32> {
+        Ok(self.get_overlay(overlay_id, "Unknown overlay")?.local_member_flags())
+    }
+
     /// Explicit opt-in for the transport implementation. This does not admit
     /// protocol v2 at the consensus manager or create any signing journal.
     pub fn configure_plumtree(
@@ -3765,6 +3843,10 @@ mod wire_profile_tests;
 #[cfg(test)]
 #[path = "tos_node_tests.rs"]
 mod tos_node_tests;
+
+#[cfg(test)]
+#[path = "member_flags_tests.rs"]
+mod member_flags_tests;
 
 #[cfg(test)]
 mod owned_shutdown_tests;

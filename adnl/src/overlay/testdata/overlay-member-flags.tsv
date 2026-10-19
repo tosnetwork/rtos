@@ -1,0 +1,10 @@
+public plumtree=0 original=0	local_flags=2	permanent_default=0	plumtree=0
+public plumtree=0 original=1	local_flags=2	permanent_default=0	plumtree=0
+public plumtree=1 original=0	local_flags=0	permanent_default=0	plumtree=1
+public plumtree=1 original=1	local_flags=2	permanent_default=0	plumtree=1
+public plumtree=1 nosender original=0	local_flags=2	permanent_default=0	plumtree=0
+fastsync plumtree=1 receive=1 member=0	local_flags=0	permanent_default=1	plumtree=1
+fastsync plumtree=1 receive=0 member=1	local_flags=1	permanent_default=1	plumtree=1
+fastsync plumtree=0 receive=1 member=1 mc	local_flags=0	permanent_default=0	plumtree=0
+fastsync plumtree=0 receive=1 member=1 shard	local_flags=0	permanent_default=1	plumtree=0
+private	local_flags=0	permanent_default=0	plumtree=0

@@ -2237,7 +2237,9 @@ mod transport_tests {
                 panic!("pinned C++ target supports overlay.getRandomPeers, not getRandomPeersV2");
             };
             assert_eq!(peers.nodes.len(), 1);
-            assert_eq!(peers.nodes[0].flags, if original_sender { 2 } else { 0 });
+            // Only a public overlay adds its Plumtree flag; a certificated-member
+            // overlay signs its configured flags.
+            assert_eq!(peers.nodes[0].flags, if original_sender && !semiprivate { 2 } else { 0 });
             assert_eq!(peers.nodes[0].certificate, certificate.clone().map(IntoBoxed::into_boxed).unwrap_or_default());
             let bytes = rtos_api::WireProfile::T0.serialize(&GetRandomPeers { peers }).unwrap();
             // Native generated tos_api.h overlay_getRandomPeers::ID, baseline8812403.
@@ -2249,7 +2251,7 @@ mod transport_tests {
             forged.flags ^= 2;
             assert!(OverlayUtils::verify_node(&id, &forged).is_err());
             let OverlayNodeInfo::V1(node) = overlay.get_signed_node(&endpoint.key, false).unwrap() else { unreachable!() };
-            assert_eq!(node.flags, if original_sender { 2 } else { 0 });
+            assert_eq!(node.flags, if original_sender && !semiprivate { 2 } else { 0 });
             endpoint.overlay.delete_public_overlay(&id).unwrap();
         }
     }

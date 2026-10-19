@@ -167,7 +167,20 @@ impl FullNodeOverlaysRouter {
         client: &FastSyncOverlayClient,
     ) -> Result<()> {
         let config = self.propagation_config.read().unwrap();
-        if let Some(config) = config.as_ref().filter(|c| c.enabled(client.shard())) {
+        let enabled = config.as_ref().filter(|c| c.enabled(client.shard()));
+        // The reference fast-sync overlay: a node that monitors the shard
+        // receives broadcasts unless Plumtree is on and it is a validator
+        // (one of the overlay's validator transports); permanent members are
+        // assumed not to receive under Plumtree or in a shard overlay.
+        let validator = enabled.is_some_and(|config| config.policy(true).original_sender);
+        let (local, permanent) =
+            fast_sync_member_flags(enabled.is_some(), validator, client.shard().is_masterchain());
+        self.network.context().stack.overlay.set_member_flags(
+            &rtos_block::KeyId::from_data(*client.client().id().data()),
+            local,
+            permanent,
+        )?;
+        if let Some(config) = enabled {
             if !self.plumtree_sender_available("fast-sync", client.shard()) {
                 return Ok(());
             }
@@ -175,6 +188,20 @@ impl FullNodeOverlaysRouter {
         }
         Ok(())
     }
+}
+
+/// The member flags a fast-sync overlay signs and assumes for permanent
+/// members, by whether Plumtree is on, the node is a validator and the overlay
+/// is the masterchain one.
+fn fast_sync_member_flags(plumtree: bool, validator: bool, masterchain: bool) -> (u32, u32) {
+    let local =
+        if plumtree && validator { adnl::OverlayNode::MEMBER_DO_NOT_RECEIVE_BROADCASTS } else { 0 };
+    let permanent = if plumtree || !masterchain {
+        adnl::OverlayNode::MEMBER_DO_NOT_RECEIVE_BROADCASTS
+    } else {
+        0
+    };
+    (local, permanent)
 }
 
 /// Structural serialization only. Callers must retain the accepted block token;
@@ -709,6 +736,41 @@ mod tests {
         assert!(!approval.is_final());
         assert!(approval.block_id().shard().is_masterchain());
         assert!(pq_finality_wire(&approval).is_err());
+    }
+
+    /// The fast-sync member flags against the reference fast-sync overlays: a
+    /// receiving non-member, a validator member under Plumtree, and members
+    /// without Plumtree in the masterchain and in a shard overlay.
+    #[test]
+    fn fast_sync_member_flags_match_the_reference_overlays() {
+        let table: std::collections::HashMap<_, _> =
+            include_str!("../../../../adnl/src/overlay/testdata/overlay-member-flags.tsv")
+                .lines()
+                .map(|line| {
+                    let fields: Vec<_> = line.split('\t').collect();
+                    let value = |name: &str| {
+                        fields
+                            .iter()
+                            .find_map(|f| f.strip_prefix(&format!("{name}=")))
+                            .unwrap()
+                            .parse::<u32>()
+                            .unwrap()
+                    };
+                    (fields[0].to_owned(), (value("local_flags"), value("permanent_default")))
+                })
+                .collect();
+        for (name, plumtree, validator, masterchain) in [
+            ("fastsync plumtree=1 receive=1 member=0", true, false, true),
+            ("fastsync plumtree=1 receive=0 member=1", true, true, true),
+            ("fastsync plumtree=0 receive=1 member=1 mc", false, true, true),
+            ("fastsync plumtree=0 receive=1 member=1 shard", false, true, false),
+        ] {
+            assert_eq!(
+                fast_sync_member_flags(plumtree, validator, masterchain),
+                table[name],
+                "{name}"
+            );
+        }
     }
 
     /// The final and the approve set of one shard block, built from the same
