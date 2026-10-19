@@ -27,7 +27,7 @@ use rtos_api::{
         },
     },
 };
-use rtos_block::UInt256;
+use rtos_block::{ShardIdent, UInt256};
 use std::sync::Mutex;
 
 const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/data/control-surface/");
@@ -308,10 +308,20 @@ async fn get_config_projects_the_node_in_the_reference_schema() {
     node.handler.stop_and_wait().await.unwrap();
 }
 
-struct StateEngine(Arc<crate::shard_state::ShardStateStuff>);
+struct StateEngine(
+    Arc<crate::shard_state::ShardStateStuff>,
+    Arc<crate::engine_traits::EngineAlloc>,
+);
 
 #[async_trait::async_trait]
 impl EngineOperations for StateEngine {
+    fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
+        &self.1
+    }
+    #[cfg(feature = "telemetry")]
+    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> {
+        Box::leak(Box::new(crate::collator_test_bundle::create_engine_telemetry()))
+    }
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         Ok(Some(Arc::new(self.0.block_id().clone())))
     }
@@ -320,6 +330,13 @@ impl EngineOperations for StateEngine {
     }
     fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         Ok(Some(Arc::new(self.0.block_id().clone())))
+    }
+    // No block handles: the block time falls back to the state's time.
+    fn load_block_handle(
+        &self,
+        _id: &BlockIdExt,
+    ) -> Result<Option<Arc<storage::block_handle_db::BlockHandle>>> {
+        Ok(None)
     }
 }
 
@@ -352,7 +369,8 @@ async fn get_stats_reports_the_masterchain_under_the_reference_names() {
         None,
         None,
     );
-    let node = Node::start_with_engine(Arc::new(StateEngine(state.clone()))).await;
+    let engine = StateEngine(state.clone(), crate::collator_test_bundle::create_engine_allocated());
+    let node = Node::start_with_engine(Arc::new(engine)).await;
     let answer = ask_object(&node, 1, GetStats::default()).await.unwrap();
     let stats = answer.downcast::<StatsBoxed>().unwrap().only().stats;
     let stats: Vec<(String, String)> =

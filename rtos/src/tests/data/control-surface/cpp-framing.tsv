@@ -1,0 +1,49 @@
+# Control-port outcomes observed on the reference validator engine.
+# name	client	query	outcome
+getTime	15	c0bd76a404d1be40e1000000	answer fea15fdf
+getTime_perm0	0	c0bd76a404d1be40e1000000	error 602 forbidden
+getTime_perm2	2	c0bd76a404d1be40e1000000	error 602 not authorized
+getTime_unlisted	unlisted	c0bd76a404d1be40e1000000	error 602 forbidden
+unlisted_garbage	unlisted	0102030467617262616765	error 602 forbidden
+garbage_outer	15	0102030467617262616765	error 0 failed to parse validator query: Wrong constructor found at 4
+empty_outer	15		error 0 failed to parse validator query: Not enough data to read at 0
+controlQuery_garbage_inner	15	c0bd76a40401020304000000	error 0 failed to parse validator query: Unknown constructor found 0x04030201 at 4
+controlQuery_empty_inner	15	c0bd76a400000000	error 0 failed to parse validator query: Not enough data to read at 0
+controlQuery_trailing	15	c0bd76a408d1be40e100000000000000	error 0 failed to parse validator query: Too much data to fetch at 4
+controlQuery_outer_trailing	15	c0bd76a404d1be40e100000000000000	error 0 failed to parse validator query: Too much data to fetch at 12
+controlQuery_lite_getTime	15	c0bd76a404345aad16000000	error 0 failed to parse validator query: Unknown constructor found 0x16ad5a34 at 4
+controlQuery_lite_getMasterchainInfo	15	c0bd76a4042ee6b589000000	error 0 failed to parse validator query: Unknown constructor found 0x89b5e62e at 4
+controlQuery_lite_sendMessage	15	c0bd76a40882d40a6901780000000000	error 0 failed to parse validator query: Unknown constructor found 0x690ad482 at 4
+controlQuery_raw_getShardAccountState	15	c0bd76a4480ac0ad34432d313a33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333000000	error 0 failed to parse validator query: Unknown constructor found 0x34adc00a at 4
+controlQuery_getBundle_rust_id	15	c0bd76a40476303493000000	error 0 failed to parse validator query: Unknown constructor found 0x93343076 at 4
+controlQuery_getSelectedStats_rust_id	15	c0bd76a4086515dabb00000000000000	error 0 failed to parse validator query: Unknown constructor found 0xbbda1565 at 4
+controlQuery_getAppliedShardsInfo_rust_id	15	c0bd76a404bbcd01fc000000	error 0 failed to parse validator query: Unknown constructor found 0xfc01cdbb at 4
+function_without_handler	15	c0bd76a404531b46c4000000	error 621 query not supported
+function_without_handler_perm0	0	c0bd76a404531b46c4000000	error 602 forbidden
+lite_query_getTime	15	df068c7904345aad16000000	lite
+lite_query_getTime_perm0	0	df068c7904345aad16000000	error 602 forbidden
+lite_query_getTime_unlisted	unlisted	df068c7904345aad16000000	error 602 forbidden
+lite_query_getMasterchainInfo	15	df068c79042ee6b589000000	lite
+lite_query_garbage	15	df068c790401020304000000	lite
+lite_bare_getTime	15	345aad16	error 0 failed to parse validator query: Wrong constructor found at 4
+exportPrivateKey_perm7	7	c0bd76a424488072cc1111111111111111111111111111111111111111111111111111111111111111000000	error 651 not implemented
+exportPrivateKey_perm4	4	c0bd76a424488072cc1111111111111111111111111111111111111111111111111111111111111111000000	error 651 not implemented
+exportPrivateKey_perm2	2	c0bd76a424488072cc1111111111111111111111111111111111111111111111111111111111111111000000	error 602 not authorized
+addAdnlId_unknown_key_perm1	1	c0bd76a428ab5485ed111111111111111111111111111111111111111111111111111111111111111100000000000000	error 602 not authorized
+outer_short_2	15	c0bd	error 0 failed to parse validator query: Not enough data to read at 0
+outer_ctl_no_len	15	c0bd76a4	error 0 failed to parse validator query: Not enough data to read at 4
+outer_ctl_len_overrun	15	c0bd76a40a0102	error 0 failed to parse validator query: Not enough data to read at 4
+outer_ctl_len_overrun_aligned	15	c0bd76a40a010203	error 0 failed to parse validator query: Not enough data to read at 8
+outer_ctl_bad_padding	15	c0bd76a401020304	error 0 failed to parse validator query: Not enough data to read at 0
+outer_ctl_long_len	15	c0bd76a4fe040000d1be40e1	answer fea15fdf
+outer_ctl_ff	15	c0bd76a4ff000000	error 0 failed to parse validator query: Not enough data to read at 8
+inner_short_2	15	c0bd76a402d1be00	error 0 failed to parse validator query: Not enough data to read at 0
+inner_addAdnlId_truncated_hash	15	c0bd76a40eab5485ed1111111111111111111100	error 0 failed to parse validator query: Not enough data to read at 4
+inner_addAdnlId_no_category	15	c0bd76a424ab5485ed1111111111111111111111111111111111111111111111111111111111111111000000	error 0 failed to parse validator query: Not enough data to read at 36
+inner_addAdnlId_short_category	15	c0bd76a426ab5485ed1111111111111111111111111111111111111111111111111111111111111111000000	error 0 failed to parse validator query: Not enough data to read at 36
+inner_addAdnlId_trailing	15	c0bd76a42cab5485ed11111111111111111111111111111111111111111111111111111111111111110000000000000000000000	error 0 failed to parse validator query: Too much data to fetch at 40
+inner_setExt_bad_bool	15	c0bd76a408da09918a01020304000000	error 0 failed to parse validator query: Bool expected at 8
+inner_setExt_trailing	15	c0bd76a409da09918ab5757299000000	error 0 failed to parse validator query: Too much data to fetch at 8
+inner_sign_truncated_bytes	15	c0bd76a426281aea1a1111111111111111111111111111111111111111111111111111111111111111100100	error 0 failed to parse validator query: Not enough data to read at 36
+inner_exportPublicKey_truncated	15	c0bd76a423b9a8346211111111111111111111111111111111111111111111111111111111111111	error 0 failed to parse validator query: Not enough data to read at 4
+inner_unhandled_truncated	15	c0bd76a40472bd2fbe000000	error 0 failed to parse validator query: Not enough data to read at 4

@@ -13,29 +13,20 @@ use rtos_api::{
     serialize_boxed,
     ton::{
         self,
-        accountaddress::AccountAddress,
         engine::validator::{onestat::OneStat, ControlQueryError},
-        raw::ShardAccountState,
         rpc::engine::validator::ControlQuery,
         Bool,
     },
     AnyBoxedSerialize, IntoBoxed, TLObject,
 };
 use rtos_block::{
-    base64_decode, base64_encode, ed25519_create_private_key, error, fail, read_single_root_boc,
-    write_boc, AccountStatus, BlockIdExt, BuilderData, Deserializable,
-    ExternalInboundMessageHeader, IBitstring, Message, MsgAddressInt, Result, Serializable,
-    ShardAccount, ShardIdent, SliceData, UInt256, UnixTime,
+    base64_decode, base64_encode, error, fail, write_boc, BlockIdExt, BuilderData, Deserializable,
+    IBitstring, Result, Serializable, ShardAccount, SliceData, UInt256, UnixTime,
 };
-use rtos_block_json::{parse_config, parse_state};
+use rtos_block_json::parse_state;
 use secrets_vault::vault_block::get_key_option_factory;
-use std::{
-    convert::TryInto, env, fs::File, io::BufReader, net::SocketAddr, str::FromStr, time::Duration,
-};
-use tokio::io::AsyncReadExt;
+use std::{convert::TryInto, env, fs::File, io::BufReader, str::FromStr, time::Duration};
 
-#[cfg(test)]
-const SECRET_CONFIG_KEY: &str = "vXUACWlse0AB1GmVEMzZrm/eftCfRYATDp+OUAGve84=";
 #[cfg(test)]
 const PUBLIC_CONFIG_KEY: &str = "y+54dF9ZIQoIRQuH2+wE10fF5SV4GWrEv9m0lXHEmLU=";
 
@@ -99,30 +90,8 @@ commands! {
         "addpermkey <keyhash> <election-date> <expire-at>\tadd validator permanent key"
     AddValidatorTempKey, "addtempkey",
         "addtempkey <permkeyhash> <keyhash> <expire-at>\tadd validator temp key"
-    Bundle, "bundle",
-        "bundle <block_id>\tprepare bundle"
     ExportPub, "exportpub",
         "exportpub <keyhash>\texports public key by key hash"
-    FutureBundle, "future_bundle",
-        "future_bundle <block_id>\tprepare future bundle"
-    GetAccount, "getaccount",
-        "getaccount <account id> <Option<file name>> <Option<block_id>>\tget account info"
-    GetAccountState, "getaccountstate",
-        "getaccountstate <account id> <file name>\tsave accountstate to the file"
-    GetAccountByBlock, "getaccountstate_byblock",
-        "getaccountstate_byblock <block root hash or masterchain block seq no> <account id> \
-        <Option<file name>>\tsave masterchain accountstate from old block to the file"
-    GetBlock, "getblock",
-        "getblock <block id or root hash of block or masterchain seq no> <file name>\t\
-         find block by masterchain seq_no or block id or root hash of block then save it to the file"
-    GetBlockchainConfig, "getblockchainconfig",
-        "getblockchainconfig\tget current config from masterchain state"
-    GetConfigParam, "get_config_param",
-        "getconfig <param_number>\tget current config param from masterchain state"
-    GetSessionStats, "getconsensusstats",
-        "getconsensusstats\tget consensus statistics for the node"
-    GetSelectedStats, "getstatsnew",
-        "getstatsnew\tget status full node or validator in new format"
     GetStats, "getstats",
         "getstats\tget status full node or validator"
     NewKeypair, "newkey",
@@ -131,8 +100,6 @@ commands! {
         "importprivatekey <keytype> <key>\timports private key on server"
     GetValidatorConfig, "get_validator_config",
         "get_validator_config\tget config from node or validator"
-    SendMessage, "sendmessage",
-        "sendmessage <filename>\tload a serialized message from <filename> and send it to server"
     Sign, "sign",
         "sign <keyhash> <data>\tsigns bytestring with privkey"
     AddCustomOverlay, "add_custom_overlay",
@@ -190,10 +157,6 @@ fn parse_int<Q: ToString>(param_opt: Option<Q>, name: &str) -> Result<ton::int> 
     parse_any(param_opt, name, |value| Ok(ton::int::from_str(value)?))
 }
 
-fn parse_blockid<Q: ToString>(param_opt: Option<Q>, name: &str) -> Result<BlockIdExt> {
-    parse_any(param_opt, name, BlockIdExt::from_str)
-}
-
 fn stats_to_json<'a>(stats: impl IntoIterator<Item = &'a OneStat>) -> serde_json::Value {
     let map = stats
         .into_iter()
@@ -222,39 +185,6 @@ impl<Q: ToString> SendReceive<Q> for GetStats {
         let stats = downcast::<rtos_api::ton::engine::validator::Stats>(answer)?;
         let description = stats_to_json(stats.stats().iter());
         let description = format!("{:#}", description);
-        Ok((description, data))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetSelectedStats {
-    fn send(_params: &mut impl Iterator) -> Result<TLObject> {
-        let req = ton::rpc::engine::validator::GetSelectedStats { filter: "*".to_string() };
-        Ok(req.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let data = serialize_boxed(&answer)?;
-        let stats = downcast::<rtos_api::ton::engine::validator::Stats>(answer)?;
-        let description = stats_to_json(stats.stats().iter());
-        let description = format!("{:#}", description);
-        Ok((description, data))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetSessionStats {
-    fn send(_params: &mut impl Iterator) -> Result<TLObject> {
-        Ok(ton::rpc::engine::validator::GetSessionStats.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let data = serialize_boxed(&answer)?;
-        let stats = downcast::<rtos_api::ton::engine::validator::SessionStats>(answer)?;
-        let description = stats
-            .stats()
-            .iter()
-            .map(|session_stat| {
-                (session_stat.session_id.clone(), stats_to_json(session_stat.stats.iter()))
-            })
-            .collect::<serde_json::Map<_, _>>();
-        let description = format!("{:#}", serde_json::Value::from(description));
         Ok((description, data))
     }
 }
@@ -403,230 +333,6 @@ impl<Q: ToString> SendReceive<Q> for AddAdnlAddr {
     }
 }
 
-impl<Q: ToString> SendReceive<Q> for Bundle {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let ret = ton::rpc::engine::validator::GetBundle {
-            block_id: parse_blockid(params.next(), "block_id")?,
-        };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for FutureBundle {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let mut prev_block_ids = vec![parse_blockid(params.next(), "block_id")?];
-        if let Ok(block_id) = parse_blockid(params.next(), "block_id") {
-            prev_block_ids.push(block_id);
-        }
-        let ret = ton::rpc::engine::validator::GetFutureBundle { prev_block_ids };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for SendMessage {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let filename = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let body = std::fs::read(&filename)
-            .map_err(|e| error!("Can't read file {} with message: {}", filename, e))?;
-        let ret = ton::rpc::lite_server::SendMessage { body };
-        Ok(ret.into_tl_object())
-    }
-}
-
-struct SendMessageBinary;
-impl<Q: AsRef<Vec<u8>>> SendReceive<Q> for SendMessageBinary {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let mut body = Vec::new();
-        body.extend_from_slice(
-            &params.next().ok_or_else(|| error!("No binary message body"))?.as_ref()[..],
-        );
-        let ret = ton::rpc::lite_server::SendMessage { body };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetBlock {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let id = params.next().ok_or_else(|| error!("you need to set block_id"))?.to_string();
-        let id = if let Ok(seq_no) = id.parse() {
-            BlockIdExt { shard_id: ShardIdent::masterchain(), seq_no, ..Default::default() }
-        } else {
-            id.parse().map_err(|err| error!("Can`t parse block_id {}: {}", id, err))?
-        };
-        let ret = ton::rpc::lite_server::GetBlock { id };
-        Ok(ret.into_tl_object())
-    }
-
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let data = downcast::<ton::lite_server::BlockData>(answer)?;
-
-        if data.data().is_empty() {
-            fail!("block not found!")
-        }
-
-        // skip block_id
-        params.next();
-
-        let boc_name = params.next().map_or_else(
-            || format!("block_boc_{:x}.boc", data.id().root_hash()),
-            |s| s.to_string(),
-        );
-
-        std::fs::write(&boc_name, data.data())
-            .map_err(|err| error!("Can`t create file {}: {}", boc_name, err))?;
-
-        Ok((
-            format!("{} {}", hex::encode(data.data()), base64_encode(data.data())),
-            data.only().data,
-        ))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetBlockchainConfig {
-    fn send(_params: &mut impl Iterator) -> Result<TLObject> {
-        Ok(ton::rpc::lite_server::GetConfigAll::default().into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let config_info = downcast::<rtos_api::ton::lite_server::ConfigInfo>(answer)?;
-
-        // We use config_proof because we use standard struct ConfigInfo from ton-tl and
-        // ConfigInfo doesn`t contain more suitable fields
-        let config_param = hex::encode(config_info.config_proof().clone());
-        Ok((config_param.to_string(), config_info.config_proof().clone()))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetConfigParam {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let param_number = parse_int(params.next(), "paramnumber")?;
-        let param_list = vec![param_number];
-        let ret = ton::rpc::lite_server::GetConfigParams {
-            mode: 0,
-            id: BlockIdExt::default(),
-            param_list,
-        };
-        Ok(ret.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let config_info = downcast::<rtos_api::ton::lite_server::ConfigInfo>(answer)?;
-        let config_proof = config_info.only().config_proof;
-        let config_param = String::from_utf8(config_proof.clone())?;
-        Ok((config_param, config_proof))
-    }
-}
-
-fn account_address<Q: ToString>(params: &mut impl Iterator<Item = Q>) -> Result<AccountAddress> {
-    let account_address =
-        params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-    Ok(AccountAddress { account_address })
-}
-
-fn receive_and_save_shard_account_state<Q: ToString>(
-    answer: TLObject,
-    params: &mut impl Iterator<Item = Q>,
-) -> Result<(String, Vec<u8>)> {
-    let shard_account_state = downcast::<ShardAccountState>(answer)?;
-
-    params.next(); // account address
-    let boc_name =
-        params.next().ok_or_else(|| error!("bad params (boc name not found)!"))?.to_string();
-
-    let shard_account_state =
-        shard_account_state.shard_account().ok_or_else(|| error!("account not found!"))?;
-
-    let shard_account = ShardAccount::construct_from_bytes(shard_account_state)?;
-    let account_state = write_boc(&shard_account.account_cell())?;
-    std::fs::write(&boc_name, &account_state)
-        .map_err(|err| error!("Can`t create file {boc_name}: {err}"))?;
-
-    Ok((base64_encode(&account_state), account_state))
-}
-
-impl<Q: ToString> SendReceive<Q> for GetAccount {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let ret = ton::rpc::raw::GetShardAccountState { account_address: account_address(params)? };
-        Ok(ret.into_tl_object())
-    }
-
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let account_info = match downcast::<ShardAccountState>(answer)? {
-            ShardAccountState::Raw_ShardAccountNone => {
-                serde_json::json!({
-                    "acc_type": "Nonexist"
-                })
-            }
-            ShardAccountState::Raw_ShardAccountState(account_state) => {
-                let shard_account =
-                    ShardAccount::construct_from_bytes(&account_state.shard_account)?;
-                let account = shard_account.read_account()?;
-
-                let account_type = match account.status() {
-                    AccountStatus::AccStateUninit => "Uninit",
-                    AccountStatus::AccStateFrozen => "Frozen",
-                    AccountStatus::AccStateActive => "Active",
-                    AccountStatus::AccStateNonexist => "Nonexist",
-                };
-                serde_json::json!({
-                    "acc_type": account_type,
-                    "balance": account.balance().map_or(0, |val| val.coins.as_u128()),
-                    "last_paid": account.last_paid(),
-                    "last_trans": format!("{:#x}", shard_account.last_trans_lt()),
-                    "data(boc)": hex::encode(write_boc(&shard_account.account_cell())?)
-                })
-            }
-        };
-
-        params.next();
-        let account_info = serde_json::to_string_pretty(&account_info)?;
-        let account_data = account_info.as_bytes().to_vec();
-        if let Some(boc_name) = params.next() {
-            let boc_name = boc_name.to_string();
-            std::fs::write(&boc_name, &account_info)
-                .map_err(|err| error!("Can`t create file {}: {}", boc_name, err))?;
-        }
-
-        Ok((account_info, account_data))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetAccountState {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let ret = ton::rpc::raw::GetShardAccountState { account_address: account_address(params)? };
-        Ok(ret.into_tl_object())
-    }
-
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        receive_and_save_shard_account_state(answer, params)
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetAccountByBlock {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let block_root_hash =
-            params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string().parse()?;
-        let account_id =
-            params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string().parse()?;
-        let ret = ton::rpc::raw::GetAccountByBlock { block_root_hash, account_id };
-        Ok(ret.into_tl_object())
-    }
-
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        params.next(); // block_id
-        receive_and_save_shard_account_state(answer, params)
-    }
-}
 
 impl<Q: ToString> SendReceive<Q> for AddCustomOverlay {
     fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
@@ -818,11 +524,9 @@ impl ControlClient {
         let mut params = result.iter();
         match params.next().expect("takes_value set for COMMANDS").as_str() {
             "config_param" | "cparam" => self.process_config_param(&mut params).await,
-            "set_config_param" | "setcparam" => self.process_set_config_param(&mut params).await,
             "ebid" | "election-bid" | "election_bid" => {
                 self.process_election_bid(&mut params).await
             }
-            "ext_msg_proxy" => self.process_ext_msg_proxy(&mut params).await,
             "recover_stake" => self.process_recover_stake(&mut params).await,
             name => self.process_command(name, &mut params).await,
         }
@@ -856,22 +560,6 @@ impl ControlClient {
             },
             Ok(error) => fail!("Error response to {:?}: {:?}", query, error),
         }
-    }
-
-    async fn process_binary_command<Q: AsRef<Vec<u8>>>(
-        &mut self,
-        name: &str,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        if name != "sendmessage_binary" {
-            fail!("Wrong command name {}", name)
-        }
-        self.process_any_type_command(
-            name,
-            |_| SendMessageBinary::send(params),
-            |_, answer| SendMessageBinary::receive(answer, &mut Vec::<Vec<u8>>::new().iter()),
-        )
-        .await
     }
 
     async fn process_command<Q: ToString>(
@@ -1012,94 +700,6 @@ impl ControlClient {
 
     // @input <tcp-port-to-listen-to>
     // @output <number-of-proxied-messages>
-    async fn process_ext_msg_proxy<Q: ToString>(
-        &mut self,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        async fn read_stream(
-            stream: &mut tokio::net::TcpStream,
-            token: &tokio_util::sync::CancellationToken,
-        ) -> Result<Vec<u8>> {
-            let mut buf = [0u8; 2];
-            tokio::select! {
-                len = stream.read_exact(&mut buf) => len?,
-                _ = token.cancelled() => fail!("Proxy cancelled")
-            };
-            let len = ((buf[0] as usize) << 8) | (buf[1] as usize);
-            let mut buf = vec![0u8; len];
-            tokio::select! {
-                len = stream.read_exact(&mut buf) => len?,
-                _ = token.cancelled() => fail!("Proxy cancelled")
-            };
-            Ok(buf)
-        }
-
-        let Some(port) = params.next() else { fail!("No TCP port specified") };
-        let token = tokio_util::sync::CancellationToken::new();
-        let addr = SocketAddr::new([0, 0, 0, 0].into(), port.to_string().parse()?);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let token_clone = token.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let mut stream = tokio::select! {
-                    x = listener.accept() => match x {
-                        Err(e) => {
-                            log::warn!("Error in proxy listener: {}", e);
-                            break
-                        }
-                        Ok((stream, _)) => stream
-                    },
-                    _ = token_clone.cancelled() => break
-                };
-                let token = token_clone.clone();
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let msg = match read_stream(&mut stream, &token).await {
-                            Err(e) => {
-                                log::warn!("Proxy error: {}", e);
-                                break;
-                            }
-                            Ok(msg) => msg,
-                        };
-                        if &msg[..] == b"close_proxy" {
-                            log::warn!("Close proxy signal received");
-                            token.cancel();
-                            break;
-                        }
-                        if let Err(e) = sender.send(msg) {
-                            log::warn!("Proxy error: {}", e);
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut count: u32 = 0;
-        loop {
-            let res = tokio::select! {
-                x = receiver.recv() => match x {
-                    None => break,
-                    Some(msg) => self.process_binary_command(
-                        "sendmessage_binary",
-                         &mut [msg].iter()
-                    ).await
-                },
-                _ = token.cancelled() => break
-            };
-            if let Err(e) = res {
-                log::warn!("External message proxy error: {}", e);
-            }
-            count += 1;
-        }
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&count.to_be_bytes());
-        Ok((format!("{} external messages proxied", count), bytes))
-    }
 
     // @input index zerostate.json <config-param.boc>
     // @output config-param.boc
@@ -1151,110 +751,6 @@ impl ControlClient {
     // @input <config-param-json-path> <key-bin-path> <output-message-boc-path>
     // @output base64_boc and boc
     // prepare message to set config param valid for 30 seconds
-    async fn process_set_config_param<Q: ToString>(
-        &mut self,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let config = parse_any(params.next(), "config.json", |path| Ok(path.to_string()))?;
-        let config = std::fs::read_to_string(&config)
-            .map_err(|err| error!("Can't read config file {config}: {err}"))?;
-        let config = serde_json::from_str(&config)
-            .map_err(|err| error!("Can't parse json config file: {err}"))?;
-        let config = parse_config(&config)
-            .map_err(|err| error!("Can't parse config param from json file: {err}"))?;
-        let (config_cell, config_index) = config
-            .serialize_single_param()
-            .map_err(|err| error!("Can't serialize config param: {err}"))?;
-
-        let secret_key = parse_any(params.next(), "secret_key.bin", |path| Ok(path.to_string()))?;
-        let secret_key = std::fs::read(&secret_key)
-            .map_err(|err| error!("Can't read secret key file {secret_key}: {err}"))?;
-        let secret_key = ed25519_create_private_key(&secret_key).map_err(|err| {
-            error!("Can't parse secret key file {}: {err}", base64_encode(&secret_key))
-        })?;
-
-        let output_path = parse_any(params.next(), "output.bin", |path| Ok(path.to_string()))?;
-
-        let params = [
-            "-1:5555555555555555555555555555555555555555555555555555555555555555".to_string(),
-            output_path.clone(),
-        ];
-        let (_, config_boc) = self
-            .process_command("getaccountstate", &mut params.into_iter())
-            .await
-            .map_err(|err| error!("Can't get config account state: {err}"))?;
-        let config_smc_cell = read_single_root_boc(&config_boc)
-            .map_err(|err| error!("Can't parse config account state boc: {err}"))?;
-        let data = config_smc_cell
-            .reference(1)
-            .map_err(|err| error!("Can't get config account data cell: {err}"))?;
-        let mut slice = SliceData::load_cell(data)
-            .map_err(|err| error!("Can't load config account data cell: {err}"))?;
-        let seqno = slice.get_next_u32()?;
-        // println!("seqno: {seqno}");
-        let public_key = slice.get_next_u256()?;
-        if public_key != secret_key.verifying_key() {
-            fail!("public key from config account doesn't match secret key")
-        }
-        let valid_until = UnixTime::now() as u32 + 30; // valid for 30 seconds
-
-        let mut builder = BuilderData::new();
-        builder.append_u32(0x43665021)?; // change one configuration parameter
-        builder.append_u32(seqno)?;
-        builder.append_u32(valid_until)?;
-        builder.append_u32(config_index)?;
-        builder.checked_append_reference(config_cell)?;
-
-        assert_eq!(builder.bits_used(), 32 + 32 + 32 + 32);
-        assert_eq!(builder.references_used(), 1);
-
-        let cell = builder.clone().into_cell()?;
-        let signature = secret_key.sign(cell.repr_hash().as_slice());
-        let mut body = BuilderData::with_bytes(&signature)?;
-        body.append_builder(&builder)?;
-
-        assert_eq!(body.bits_used(), 512 + 32 + 32 + 32 + 32);
-        assert_eq!(body.references_used(), 1);
-
-        let body = body.into_cell()?;
-
-        let h = ExternalInboundMessageHeader::new(
-            Default::default(),
-            MsgAddressInt::standard(-1, [0x55; 32]),
-        );
-        let msg = Message::with_ext_in_header_and_body(h, SliceData::load_cell(body)?);
-        let msg_cell = msg.serialize()?;
-        println!("msg hash: {:x}", msg_cell.repr_hash());
-        let msg_data = write_boc(&msg_cell)?;
-        std::fs::write(&output_path, &msg_data)?;
-
-        // let mut config_smc = rtos_block::Account::construct_from_cell(config_smc_cell)
-        //     .map_err(|err| error!("Can't construct config account from cell: {err}"))?;
-        // let block_lt = config_smc.last_tr_time().unwrap() + 1;
-        // let params = rtos_executor::ExecuteParams {
-        //     block_unixtime: UnixTime::now() as u32,
-        //     block_lt,
-        //     last_tr_lt: block_lt + 1,
-        //     debug: true,
-        //     ..Default::default()
-        // };
-        // let config = config_smc.get_config()?;
-        // let config = rtos_executor::BlockchainConfig::with_config(config)?;
-        // let executor = rtos_executor::OrdinaryTransactionExecutor::new(config);
-        // let in_msg_cell = msg.serialize()?;
-        // let _trans = rtos_executor::TransactionExecutor::execute_with_params(
-        //     &executor,
-        //     Some(in_msg_cell),
-        //     &mut config_smc,
-        //     params,
-        // )?;
-        // let mut slice = SliceData::load_cell_ref(config_smc.data().unwrap())?;
-        // let new_seqno = slice.get_next_u32()?;
-        // assert_eq!(new_seqno, seqno + 1);
-        // println!("transaction checked, new seqno {new_seqno}");
-
-        Ok((base64_encode(&msg_data), msg_data))
-    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1374,7 +870,6 @@ async fn main() {
 mod test {
 
     use super::*;
-    use rand::{Rng, SeedableRng};
     use rtos::{
         collator_test_bundle::create_engine_allocated,
         config::TonNodeConfig,
@@ -1397,7 +892,6 @@ mod test {
         ShardAccounts, ShardIdent, ShardStateUnsplit, StateInit, StorageInfo, TickTock,
     };
     use std::{
-        cmp::min,
         collections::HashMap,
         fs,
         path::Path,
@@ -1406,10 +900,9 @@ mod test {
             Arc,
         },
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
     use storage::block_handle_db::BlockHandle;
-    use tokio::io::AsyncWriteExt;
 
     include!("../../block/src/tests/test_utils.rs");
 
@@ -1653,6 +1146,14 @@ mod test {
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
+        // The control port's lite-server path accounts its work here.
+        fn engine_allocated(&self) -> &Arc<EngineAlloc> {
+            &self.allocated
+        }
+        #[cfg(feature = "telemetry")]
+        fn engine_telemetry(&self) -> &Arc<EngineTelemetry> {
+            &self.telemetry
+        }
         fn calc_tps(&self, _period: u64) -> Result<u32> {
             Ok(0)
         }
@@ -1765,7 +1266,8 @@ mod test {
                 "list": [
                     {
                         "type_id": 1209251014,
-                        "pub_key": "RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw="
+                        "pub_key": "RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw=",
+                        "permissions": 7
                     }
                 ]
             }
@@ -2089,137 +1591,10 @@ mod test {
         done_test(server, client, engine).await;
     }
 
-    async fn test_one_cmd_fail(cmd: &str) {
-        let (server, mut client, engine) = init_test(None).await;
-        let err = client.command(cmd).await.unwrap_err();
-        println!("{} => {}", cmd, err);
-        done_test(server, client, engine).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_getblock() {
-        let cmd = "getblock 17 ../target/17.boc";
-        test_one_cmd(cmd, |result| {
-            assert_eq!(result.len(), 344);
-            let block = Block::construct_from_bytes(&result).unwrap();
-            assert_eq!(block.read_info().unwrap().seq_no(), 17);
-        })
-        .await;
-        let cmd = "getblock 19 ../target/19.boc";
-        test_one_cmd(cmd, |result| {
-            assert_eq!(result.len(), 344);
-            let block = Block::construct_from_bytes(&result).unwrap();
-            assert_eq!(block.read_info().unwrap().seq_no(), 19);
-        })
-        .await;
-        let cmd = "getblock 15";
-        test_one_cmd_fail(cmd).await;
-        let cmd = "getblock \"\"";
-        test_one_cmd_fail(cmd).await;
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_new_key_one() {
         let cmd = "newkey";
         test_one_cmd(cmd, |result| assert_eq!(result.len(), 32)).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_nonexist_account() {
-        // let account = "-1:5555555555555555555555555555555555555555555555555555555555555555";
-        let account = "-1:7777777777777777777777777777777777777777777777777777777777777777";
-        let cmd = format!("getaccount {}", account);
-        let etalon_result = "{\n  \"acc_type\": \"Nonexist\"\n}";
-        test_one_cmd(&cmd, |result| {
-            let result = String::from_utf8(result).unwrap();
-            pretty_assertions::assert_eq!(&result, etalon_result)
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_active_account() {
-        let account = "0:000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-        let cmd = format!("getaccount {}", account);
-        let etalon_result = b"{\n  \"acc_type\": \"Active\",";
-        test_one_cmd(&cmd, |result| {
-            pretty_assertions::assert_eq!(&result[..etalon_result.len()], etalon_result)
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_account_state() {
-        const OUT_FILE: &str = "../target/test_get_account_state_file.boc";
-        let account = "0:000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-        let cmd = format!("getaccountstate {} {}", account, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 253);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_account_old_state() {
-        const OUT_FILE: &str = "../target/test_get_account_old_state_file.boc";
-        // config
-        let account = "5555555555555555555555555555555555555555555555555555555555555555";
-        // // first read from zerostate
-        // let cmd = format!("getaccountstate_byblock 0 {} {}", account, OUT_FILE);
-        // test_one_cmd(
-        //     &cmd,
-        //     |result| {
-        //         assert_eq!(result.len(), 235);
-        //         let account = Account::construct_from_bytes(&result).unwrap();
-        //         assert_eq!(account.balance().unwrap().coins.as_u128(), 1_000_000_000);
-        //         assert!(account.code().is_none());
-        //         fs::remove_file(OUT_FILE).unwrap();
-        //     }
-        // ).await;
-
-        // read from block 17 (masterchain)
-        let id = "1111111111111111111111111111111111111111111111111111111111111111"; // 17
-        let cmd = format!("getaccountstate_byblock {} {} {}", id, account, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 1031);
-            let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().coins.as_u128(), 17_000_000_000);
-            let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
-            assert_eq!(code, 171717);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-
-        // read from block 19 (masterchain)
-        let id = "1313131313131313131313131313131313131313131313131313131313131313"; // 19
-        let cmd = format!("getaccountstate_byblock {} {} {}", id, account, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 1031);
-            let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
-            let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
-            assert_eq!(code, 191919);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-
-        // read from wrong block
-        let id = "7777777777777777777777777777777777777777777777777777777777777777";
-        let cmd = format!("getaccountstate_byblock {} {} {}", id, account, OUT_FILE);
-        test_one_cmd_fail(&cmd).await;
-
-        // read from last block (19) (masterchain)
-        let cmd = format!("getaccountstate -1:{} {}", account, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 1031);
-            let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
-            let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
-            assert_eq!(code, 191919);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2253,22 +1628,6 @@ mod test {
             ("validation_status", "\"Active\""),
         ];
         test_one_cmd("getstats", |result| check(result, &ethalon_stats)).await;
-
-        let ethalon_stats_new = [
-            ("in_current_vset_p34", "false"),
-            ("in_next_vset_p36", "false"),
-            ("global_id", "42"),
-            ("last_validation_ago_sec", "{}"),
-            ("last_collation_ago_sec", "{}"),
-            ("masterchainblocknumber", "19"),
-            ("masterchainblocktime", "19"),
-            ("node_status", "\"no_set_status\""),
-            ("public_overlay_key_id", "\"b52Bb8xv6roWwIDGQnBIdL7hsl3Sy3Ro9ITEV9UlIz8=\""),
-            ("tps_10", "0"),
-            ("tps_300", "0"),
-            ("validation_status", "\"Active\""),
-        ];
-        test_one_cmd("getstatsnew", |result| check(result, &ethalon_stats_new)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2321,44 +1680,6 @@ mod test {
         let (_, result) = client.command(&cmd).await.unwrap();
         assert_eq!(result.len(), 32);
         done_test(server, client, engine).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_set_config_param() {
-        const IN_FILE: &str = "../target/test_set_config_param.json";
-        const OUT_FILE: &str = "../target/test_set_config_param.boc";
-        const KEY_FILE: &str = "../target/test_set_config_param.key";
-        // read from last block (19) (masterchain)
-        let cmd = format!(
-            "getaccountstate -1:5555555555555555555555555555555555555555555555555555555555555555 {OUT_FILE}"
-        );
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 1031);
-            let account = Account::construct_from_bytes(&result).unwrap();
-            assert_eq!(account.data().unwrap().bit_length(), 32 + 256 + 1);
-            assert_eq!(account.balance().unwrap().coins.as_u128(), 19_000_000_000);
-            let code = u32::construct_from_cell(account.code().unwrap().clone()).unwrap();
-            assert_eq!(code, 191919);
-            std::fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-        let _ = std::fs::remove_file(OUT_FILE);
-        let json = r#"{
-            "p8": {
-                "version": 11,
-                "capabilities_dec": "46",
-                "capabilities": "12e"
-            }
-        }"#;
-        std::fs::write(IN_FILE, &json).unwrap();
-        std::fs::write(KEY_FILE, base64_decode(SECRET_CONFIG_KEY).unwrap()).unwrap();
-        let cmd = format!("setcparam {IN_FILE} {KEY_FILE} {OUT_FILE}");
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 144);
-            assert_eq!(std::fs::metadata(OUT_FILE).unwrap().len(), 144);
-            std::fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
     }
 
     macro_rules! parse_test {
@@ -2433,82 +1754,6 @@ mod test {
         assert_eq!(ethalon, value);
     }
 
-    fn generate_boc(mut size: u32) -> Result<Vec<u8>> {
-        // Raw data, withoud BOC format
-        // let data: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
-        // Ok(data)
-
-        let mut cells = Vec::new();
-
-        // Time per 100000 iterations
-        // 0 ms
-        size *= 8;
-        while size > 0 {
-            let mut builder = BuilderData::new();
-            let bits = min(1023, size);
-            let data: Vec<u8> = (0..(bits + 7) / 8).map(|_| rand::random::<u8>()).collect();
-            // 300 ms
-            builder.append_raw(&data, bits as usize)?;
-            size -= bits;
-            // 330 ms
-            if let Some(child) = cells.pop() {
-                builder.checked_append_reference(child)?;
-            }
-            // 330 ms
-            let cell = builder.into_cell()?;
-            // 520 ms
-            cells.push(cell);
-            // 550 ms
-        }
-
-        let Some(cell) = cells.pop() else { fail!("BOC generation failed") };
-        // 550 ms
-        write_boc(&cell)
-        // 850 ms
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_ext_msg_proxy() {
-        let counter = Arc::new(AtomicU64::new(0));
-        let counter_clone = counter.clone();
-        tokio::spawn(async move {
-            let addr: SocketAddr = "127.0.0.1:4001".parse().unwrap();
-            let mut stream = loop {
-                if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
-                    break stream;
-                }
-            };
-            let mut rng = rand::rngs::StdRng::seed_from_u64(0);
-            let start = Instant::now();
-            let count = 100000;
-            for _ in 0..count {
-                let range = rand::distributions::Uniform::new(256, 1024);
-                let len = rng.sample(range);
-                let msg = generate_boc(len).unwrap();
-                let len = (msg.len() as u16).to_be_bytes();
-                stream.write_all(&len[..]).await.unwrap();
-                stream.write_all(&msg[..]).await.unwrap();
-            }
-            println!("Generated {} messages during {} ms", count, start.elapsed().as_millis());
-            while counter_clone.load(Ordering::Relaxed) < count {
-                tokio::time::sleep(Duration::from_millis(1)).await
-            }
-            println!("Proxied {} messages during {} ms", count, start.elapsed().as_millis());
-            let close = b"close_proxy";
-            let len = (close.len() as u16).to_be_bytes();
-            stream.write_all(&len[..]).await.unwrap();
-            stream.write_all(close).await.unwrap();
-        });
-
-        let (server, mut client, engine) = init_test(Some(counter.clone())).await;
-        let (_, result) = client.command("ext_msg_proxy 4001").await.unwrap();
-        let mut count: u64 = 0;
-        for i in &result {
-            count = (count << 8) | (*i as u64);
-        }
-        assert_eq!(count, counter.load(Ordering::Relaxed));
-        done_test(server, client, engine).await;
-    }
 }
 
 #[cfg(test)]

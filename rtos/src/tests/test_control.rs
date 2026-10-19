@@ -16,18 +16,13 @@ use crate::{
     config::TonNodeConfig,
     engine::Engine,
     engine_traits::EngineOperations,
-    internal_db::{state_gc_resolver::AllowStateGcSmartResolver, InternalDb, InternalDbConfig},
+    internal_db::{InternalDb, InternalDbConfig},
     network::{
-        control::{ControlQuerySubscriber, ControlServer, DataSource, StatusReporter},
+        control::{ControlServer, DataSource, StatusReporter},
         node_network::NodeNetwork,
     },
     shard_state::ShardStateStuff,
-    shard_states_keeper::PinnedShardStateGuard,
-    test_helper::{
-        create_network, gen_master_state, gen_shard_state, gen_test_account, init_test_log,
-        test_async, GenMasterStateParams,
-    },
-    validating_utils::{supported_capabilities, supported_version},
+    test_helper::{create_network, gen_master_state, init_test_log, test_async},
     validator::validator_manager::ValidationStatus,
 };
 use adnl::{
@@ -38,32 +33,17 @@ use rtos_api::{
     serialize_boxed,
     ton::{
         self,
-        accountaddress::AccountAddress,
         engine::validator::{ControlQueryError, JsonConfig, KeyHash, Stats, Success},
-        lite_server::ConfigInfo,
-        raw::{AppliedShardsInfo, ShardAccountMeta, ShardAccountState},
-        rpc::{
-            engine::validator::{
-                AddAdnlId, AddValidatorAdnlAddress, AddValidatorPermanentKey, ControlQuery,
-                GenerateKeyPair, GetConfig, GetSelectedStats, GetStats, ImportPrivateKey,
-            },
-            lite_server::GetConfigAll,
-            raw::{
-                GetAccountByBlock, GetAccountMetaByBlock, GetAppliedShardsInfo,
-                GetShardAccountMeta, GetShardAccountState,
-            },
+        rpc::engine::validator::{
+            AddAdnlId, AddValidatorAdnlAddress, AddValidatorPermanentKey, ControlQuery,
+            GenerateKeyPair, GetConfig, GetStats, ImportPrivateKey,
         },
     },
     AnyBoxedSerialize, TLObject,
 };
-use rtos_block::{
-    base64_encode, error, fail, Account, AccountId, BlockIdExt, ConfigParamEnum, ConfigParams,
-    Deserializable, KeyId, Message, Result, Serializable, ShardIdent, UInt256, UnixTime,
-};
+use rtos_block::{base64_encode, error, fail, BlockIdExt, KeyId, Result, ShardIdent, UInt256};
 use std::{
-    collections::HashMap,
     fs::remove_dir_all,
-    ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering},
         Arc,
@@ -109,7 +89,7 @@ const ADNL_CLIENT_CONFIG: &str = r#"{
 }"#;
 
 const IP_NODE: &str = "127.0.0.1:4191";
-const DEFAULT_CONFIG: &str = "../rtos/configs/default_config_localhost.json";
+
 const DEFAULT_CONTROL_PORT: u16 = 4925;
 
 async fn generate_keypair(client: &mut AdnlClient) -> Result<UInt256> {
@@ -183,300 +163,6 @@ async fn start_control(
     start_control_with_options(data_source, None, test_name).await
 }
 
-async fn start_control_with_config(
-    data_source: DataSource,
-    config: TonNodeConfig,
-    test_name: &str,
-) -> Result<(ControlServer, AdnlClient, String, Arc<KeyId>)> {
-    start_control_with_options(data_source, Some(config), test_name).await
-}
-
-async fn recreate_client(old_client: AdnlClient, config: &str) -> AdnlClient {
-    old_client.shutdown().await.unwrap();
-    let (_, config) = AdnlClientConfig::from_json(config).unwrap();
-    AdnlClient::connect(&config).await.unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_get_all_config_params() {
-    struct TestEngine {
-        config_addr: AccountId,
-        state_id: BlockIdExt,
-        state: Arc<ShardStateStuff>,
-    }
-
-    impl TestEngine {
-        fn new() -> Self {
-            let state = gen_master_state(
-                Default::default(),
-                #[cfg(feature = "telemetry")]
-                None,
-                None,
-            );
-            let state_id = state.block_id().clone();
-            Self {
-                config_addr: state
-                    .state()
-                    .unwrap()
-                    .read_custom()
-                    .unwrap()
-                    .unwrap()
-                    .config
-                    .config_address()
-                    .unwrap(),
-                state_id,
-                state,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EngineOperations for TestEngine {
-        async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
-            Ok(self.state.clone())
-        }
-    }
-
-    init_test_log();
-    let engine = Arc::new(TestEngine::new());
-    let (control, mut client, _, _) =
-        start_control(DataSource::Engine(engine.clone()), "test_get_all_config_params")
-            .await
-            .unwrap();
-    let answer: ConfigInfo =
-        request(&mut client, GetConfigAll { mode: 0, id: engine.state_id.clone() }).await.unwrap();
-
-    let config_params = ConfigParams::construct_from_bytes(answer.config_proof()).unwrap();
-    let param0 = config_params.config(0).unwrap().unwrap();
-    let param0 = match param0 {
-        ConfigParamEnum::ConfigParam0(param) => param,
-        _ => panic!("ConfigParams id bad!"),
-    };
-    assert_eq!(param0.config_addr, engine.config_addr);
-
-    client.shutdown().await.unwrap();
-    control.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_getaccount() {
-    struct TestEngine {
-        account: Account,
-        master_state_id: BlockIdExt,
-        master_state: Arc<ShardStateStuff>,
-        shard_state_id: BlockIdExt,
-        shard_state: Arc<ShardStateStuff>,
-    }
-
-    impl TestEngine {
-        fn new() -> Self {
-            #[cfg(feature = "telemetry")]
-            let telemetry = create_engine_telemetry();
-            let allocated = create_engine_allocated();
-
-            let account = gen_test_account();
-            let (shard_state_id, shard_state) = gen_shard_state(
-                None,
-                &[&account],
-                #[cfg(feature = "telemetry")]
-                Some(telemetry.clone()),
-                Some(allocated.clone()),
-                None,
-            );
-            let master_state = gen_master_state(
-                GenMasterStateParams {
-                    shard_state_id: Some(shard_state_id.clone()),
-                    ..Default::default()
-                },
-                #[cfg(feature = "telemetry")]
-                Some(telemetry.clone()),
-                Some(allocated.clone()),
-            );
-            let master_state_id = master_state.block_id().clone();
-            Self { account, master_state_id, master_state, shard_state_id, shard_state }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EngineOperations for TestEngine {
-        async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
-            Ok(self.master_state.clone())
-        }
-        fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
-            Ok(Some(Arc::new(self.master_state_id.clone())))
-        }
-        async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
-            if *block_id == self.master_state_id {
-                Ok(self.master_state.clone())
-            } else if *block_id == self.shard_state_id {
-                Ok(self.shard_state.clone())
-            } else {
-                fail!("Wrong block ID {}", block_id)
-            }
-        }
-        async fn load_and_pin_state(&self, block_id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            if *block_id == self.master_state_id {
-                PinnedShardStateGuard::new(
-                    self.master_state.clone(),
-                    Arc::new(AllowStateGcSmartResolver::new(10)),
-                )
-            } else if *block_id == self.shard_state_id {
-                PinnedShardStateGuard::new(
-                    self.shard_state.clone(),
-                    Arc::new(AllowStateGcSmartResolver::new(10)),
-                )
-            } else {
-                fail!("Wrong block ID {}", block_id)
-            }
-        }
-
-        fn find_full_block_id(&self, root_hash: &UInt256) -> Result<Option<BlockIdExt>> {
-            Ok(if *root_hash == self.master_state_id.root_hash {
-                Some(self.master_state_id.clone())
-            } else if *root_hash == self.shard_state_id.root_hash {
-                Some(self.shard_state_id.clone())
-            } else {
-                None
-            })
-        }
-    }
-
-    init_test_log();
-    let engine = Arc::new(TestEngine::new());
-    let (control, mut client, config, _) =
-        start_control(DataSource::Engine(engine.clone()), "test_getaccount").await.unwrap();
-
-    /* let account1 = AccountAddress {
-        account_address: "-1:7777777777777777777777777777777777777777777777777777777777777777".to_string()
-    };
-    let empty_answer: ShardAccountState = request(
-        &mut client, GetShardAccountState {account_address: account1}
-    ).await.unwrap();
-    println!("{:?}", empty_answer);
-    */
-    let account2 =
-        AccountAddress { account_address: format!("{}", engine.account.get_addr().unwrap()) };
-    let answer: ShardAccountState =
-        request(&mut client, GetShardAccountState { account_address: account2.clone() })
-            .await
-            .unwrap();
-    assert!(answer.shard_account().is_some());
-
-    let mut client = recreate_client(client, &config).await;
-    let answer: ShardAccountMeta =
-        request(&mut client, GetShardAccountMeta { account_address: account2.clone() })
-            .await
-            .unwrap();
-    assert!(answer.shard_account_meta().is_some());
-
-    let mut client = recreate_client(client, &config).await;
-    let account_id = UInt256::from(engine.account.get_id().unwrap().get_bytestring(0).as_slice());
-    let answer: ShardAccountState = request(
-        &mut client,
-        GetAccountByBlock {
-            account_id: account_id.clone(),
-            block_root_hash: engine.shard_state_id.root_hash.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(answer.shard_account().is_some());
-
-    let mut client = recreate_client(client, &config).await;
-    let answer: ShardAccountMeta = request(
-        &mut client,
-        GetAccountMetaByBlock {
-            account_id,
-            block_root_hash: engine.shard_state_id.root_hash.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(answer.shard_account_meta().is_some());
-
-    client.shutdown().await.unwrap();
-    control.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_get_applied_shards_info() {
-    struct TestEngine {
-        applied_master_block_id: BlockIdExt,
-        applied_shard_block_id: BlockIdExt,
-        shard_client_master_state_id: BlockIdExt,
-        shard_client_master_state: Arc<ShardStateStuff>,
-    }
-
-    impl TestEngine {
-        fn new() -> Self {
-            #[cfg(feature = "telemetry")]
-            let telemetry = create_engine_telemetry();
-            let allocated = create_engine_allocated();
-
-            let (applied_shard_block_id, _) = gen_shard_state(
-                None,
-                &[],
-                #[cfg(feature = "telemetry")]
-                Some(telemetry.clone()),
-                Some(allocated.clone()),
-                None,
-            );
-            let shard_client_master_state = gen_master_state(
-                GenMasterStateParams {
-                    shard_state_id: Some(applied_shard_block_id.clone()),
-                    ..Default::default()
-                },
-                #[cfg(feature = "telemetry")]
-                Some(telemetry.clone()),
-                Some(allocated.clone()),
-            );
-            let shard_client_master_state_id = shard_client_master_state.block_id().clone();
-
-            let mut applied_master_block_id = shard_client_master_state_id.clone();
-            applied_master_block_id.seq_no += 1;
-
-            Self {
-                applied_master_block_id,
-                applied_shard_block_id,
-                shard_client_master_state_id,
-                shard_client_master_state,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EngineOperations for TestEngine {
-        fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
-            Ok(Some(Arc::new(self.applied_master_block_id.clone())))
-        }
-        fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
-            Ok(Some(Arc::new(self.shard_client_master_state_id.clone())))
-        }
-        async fn load_state(&self, block_id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
-            if *block_id == self.shard_client_master_state_id {
-                Ok(self.shard_client_master_state.clone())
-            } else {
-                fail!("Wrong block ID {}", block_id)
-            }
-        }
-    }
-
-    init_test_log();
-    let engine = Arc::new(TestEngine::new());
-    let (control, mut client, _, _) =
-        start_control(DataSource::Engine(engine.clone()), "test_get_applied_shards_info")
-            .await
-            .unwrap();
-
-    let answer: AppliedShardsInfo = request(&mut client, GetAppliedShardsInfo {}).await.unwrap();
-    assert_eq!(
-        answer.shards(),
-        &vec![engine.applied_shard_block_id.clone(), engine.applied_master_block_id.clone()]
-    );
-
-    client.shutdown().await.unwrap();
-    control.shutdown().await;
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_connect_to_control() {
@@ -501,14 +187,10 @@ async fn test_connect_to_control() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_connect_to_control_with_import_private_key() {
-    // Key commands need a started engine; this one serves nothing else.
-    struct StartedEngine;
-    #[async_trait::async_trait]
-    impl EngineOperations for StartedEngine {}
-
     init_test_log();
+    // Key commands need a started engine; this one serves nothing else.
     let (control, mut client, _, _) = start_control(
-        DataSource::Engine(Arc::new(StartedEngine)),
+        DataSource::Engine(super::key_tests::StartedEngine::new()),
         "test_connect_to_control_with_import_private_key",
     )
     .await
@@ -557,49 +239,6 @@ async fn test_connect_to_control_with_import_private_key() {
     control.shutdown().await;
 }
 
-struct TestSendMsgEngine {
-    expected_data: Vec<u8>,
-}
-
-#[async_trait::async_trait]
-impl EngineOperations for TestSendMsgEngine {
-    async fn redirect_external_message(&self, message_data: &[u8]) -> Result<()> {
-        assert_eq!(message_data, &self.expected_data);
-        Ok(())
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_control_send_message() {
-    init_test_log();
-    std::fs::create_dir_all("../target").unwrap();
-
-    let body = Message::default().write_to_bytes().unwrap();
-    let engine = TestSendMsgEngine { expected_data: body.clone() };
-    let config = TonNodeConfig::from_file(
-        "../target",
-        "config_test_control.json",
-        None,
-        DEFAULT_CONFIG,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let (control, mut client, _, _) = start_control_with_config(
-        DataSource::Engine(Arc::new(engine)),
-        config,
-        "test_control_send_message",
-    )
-    .await
-    .unwrap();
-
-    let _answer: Success =
-        request(&mut client, ton::rpc::lite_server::SendMessage { body }).await.unwrap();
-    client.shutdown().await.unwrap();
-    control.shutdown().await;
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_control_db_restore() {
     struct TestSource {
@@ -621,56 +260,16 @@ async fn test_control_db_restore() {
     let (control, mut client, _, _) =
         start_control(DataSource::Status(status.clone()), "test_control_db_restore").await.unwrap();
 
-    let answer: Stats =
-        request(&mut client, GetSelectedStats { filter: "node_status".to_string() }).await.unwrap();
-    let answer = answer.only();
-    let answer = &answer.stats.deref()[0];
-    assert_eq!(answer.key, "node_status");
-    assert_eq!(answer.value, "\"checking_db\"");
-
-    status.broken.store(true, Ordering::Relaxed);
-
-    let answer: Stats =
-        request(&mut client, GetSelectedStats { filter: "node_status".to_string() }).await.unwrap();
-    let answer = answer.only();
-    let answer = &answer.stats.deref()[0];
-    assert_eq!(answer.key, "node_status");
-    assert_eq!(answer.value, "\"db_broken\"");
+    // While the database is checked the engine has not started: statistics
+    // are refused as the reference engine refuses them before start.
+    for broken in [false, true] {
+        status.broken.store(broken, Ordering::Relaxed);
+        let error = query(&mut client, &GetStats.into_tl_object()).await.unwrap_err().to_string();
+        assert!(error.contains("code: 651"), "{error}");
+        assert!(error.contains("message: \"validator manager not started\""), "{error}");
+    }
     client.shutdown().await.unwrap();
     control.shutdown().await;
-}
-
-#[test]
-fn test_convert_for_stats() {
-    assert_eq!("Disabled", &format!("{:?}", ValidationStatus::from_u8(5)));
-    assert_eq!("Disabled", &format!("{:?}", ValidationStatus::from_u8(0)));
-    assert_eq!("Waiting", &format!("{:?}", ValidationStatus::from_u8(1)));
-    assert_eq!("Active", &format!("{:?}", ValidationStatus::from_u8(2)));
-
-    let shard_id = ShardIdent::with_tagged_prefix(15, 0xABCD_0000_0000_0000u64).unwrap();
-    let root_hash =
-        "bac24be401b3489f90018d08137c4063f24bfc6def86a61836060d6dbc32e703".parse().unwrap();
-    let file_hash =
-        "3baf367e57116fcf5df3c7333a7ea4aa5704dac36e696b4c7dfbda383babe9ae".parse().unwrap();
-    let block_id = BlockIdExt::with_params(shard_id.clone(), 100500, root_hash, file_hash);
-    assert_eq!(
-        r#"{"shard":"15:abcd000000000000","seq_no":100500,"rh":"bac24be401b3489f90018d08137c4063f24bfc6def86a61836060d6dbc32e703","fh":"3baf367e57116fcf5df3c7333a7ea4aa5704dac36e696b4c7dfbda383babe9ae"}"#,
-        ControlQuerySubscriber::block_id_to_json(&block_id).as_str()
-    );
-
-    let now = UnixTime::now();
-    let map = lockfree::map::Map::new();
-    map.insert(ShardIdent::masterchain(), now - 5);
-    assert_eq!(
-        "{\n  \"-1:8000000000000000\": 5\n}",
-        ControlQuerySubscriber::statistics_to_json(&map, now as i64, true).as_str()
-    );
-    let map = lockfree::map::Map::new();
-    map.insert(shard_id, now - 130);
-    assert_eq!(
-        "{\n  \"15:abcd000000000000\": 130\n}",
-        ControlQuerySubscriber::statistics_to_json(&map, now as i64, true).as_str()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -682,6 +281,9 @@ async fn test_stats() {
         master_state_id: BlockIdExt,
         master_state: Arc<ShardStateStuff>,
         last_validation_time: lockfree::map::Map<ShardIdent, u64>,
+        allocated: Arc<crate::engine_traits::EngineAlloc>,
+        #[cfg(feature = "telemetry")]
+        telemetry: Arc<crate::engine_traits::EngineTelemetry>,
     }
 
     impl TestEngine {
@@ -724,12 +326,22 @@ async fn test_stats() {
                 master_state_id,
                 master_state,
                 last_validation_time: lockfree::map::Map::new(),
+                allocated,
+                #[cfg(feature = "telemetry")]
+                telemetry,
             }
         }
     }
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
+        fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
+            &self.allocated
+        }
+        #[cfg(feature = "telemetry")]
+        fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> {
+            &self.telemetry
+        }
         fn calc_tps(&self, _period: u64) -> Result<u32> {
             Ok(0)
         }
@@ -759,116 +371,10 @@ async fn test_stats() {
         }
     }
 
-    struct Ethalon<'a> {
-        val: &'a str,
-        mask: u32,
-    }
-
-    fn add_ethalon<'a>(map: &mut HashMap<&'a str, Ethalon<'a>>, key: &'a str, val: &'a str) {
-        let ethalon = Ethalon { val, mask: 1u32 << map.iter().count() };
-        map.insert(key, ethalon);
-    }
-
-    fn value_ok(val: &str, ethalon: &str) -> Option<()> {
-        if val != ethalon {
-            None
-        } else {
-            Some(())
-        }
-    }
-
-    fn check_stats(
-        stats: &Stats,
-        engine: &Arc<TestEngine>,
-        key_id: &Arc<KeyId>,
-        new_format: bool,
-        request_started: u64,
-    ) {
-        let master_block_id = ControlQuerySubscriber::block_id_to_json(&engine.master_state_id);
-        let node_version = format!("\"{}\"", env!("CARGO_PKG_VERSION"));
-        let overlay_key = format!("\"{}\"", key_id);
-        let supported_capabilities = format!("{}", supported_capabilities());
-        let supported_version = format!("{}", supported_version());
-        let response_received = UnixTime::now();
-        let mut ethalon_stats = HashMap::new();
-        if !new_format {
-            add_ethalon(&mut ethalon_stats, "collation_stats", "{}");
-        }
-        if new_format {
-            add_ethalon(&mut ethalon_stats, "global_id", "0");
-        }
-        add_ethalon(&mut ethalon_stats, "in_current_vset_p34", "false");
-        add_ethalon(&mut ethalon_stats, "in_next_vset_p36", "false");
-        add_ethalon(&mut ethalon_stats, "last_applied_masterchain_block_id", &master_block_id);
-        if new_format {
-            add_ethalon(&mut ethalon_stats, "last_collation_ago_sec", "{}");
-            add_ethalon(&mut ethalon_stats, "last_validation_ago_sec", "{}");
-        }
-        add_ethalon(&mut ethalon_stats, "masterchainblocknumber", "0");
-        add_ethalon(&mut ethalon_stats, "masterchainblocktime", "1");
-        if new_format {
-            add_ethalon(&mut ethalon_stats, "node_status", "\"synchronization_by_blocks\"");
-        }
-        add_ethalon(&mut ethalon_stats, "node_version", &node_version);
-        add_ethalon(&mut ethalon_stats, "public_overlay_key_id", &overlay_key);
-        add_ethalon(&mut ethalon_stats, "shards_timediff", "timediff");
-        if new_format {
-            add_ethalon(&mut ethalon_stats, "supported_block", &supported_version);
-            add_ethalon(&mut ethalon_stats, "supported_capabilities", &supported_capabilities);
-        }
-        if !new_format {
-            add_ethalon(&mut ethalon_stats, "sync_status", "\"synchronization_by_blocks\"");
-        }
-        add_ethalon(&mut ethalon_stats, "timediff", "timediff");
-        add_ethalon(&mut ethalon_stats, "tps_10", "0");
-        add_ethalon(&mut ethalon_stats, "tps_300", "0");
-        if !new_format {
-            add_ethalon(&mut ethalon_stats, "validation_stats", "{}");
-        }
-        add_ethalon(&mut ethalon_stats, "validation_status", "\"Active\"");
-
-        let mut mask = u32::MAX >> (32 - ethalon_stats.len());
-        for stat in stats.stats().deref() {
-            let ethalon = ethalon_stats
-                .get(&stat.key as &str)
-                .unwrap_or_else(|| panic!("Key {} is not found in Stats ethalon", stat.key));
-            if (mask & ethalon.mask) == 0 {
-                panic!("Doubled stat {} in Stat reply", stat.key)
-            } else {
-                mask &= !ethalon.mask
-            }
-            match ethalon.val {
-                "timediff" => {
-                    // The server samples its clock during the request, not when
-                    // this task is eventually scheduled to inspect the reply.
-                    // Both fixture block timestamps are one second after epoch.
-                    stat.value.parse::<u64>().ok().and_then(|diff| {
-                        diff.checked_add(1)
-                            .filter(|sampled| {
-                                (request_started..=response_received).contains(sampled)
-                            })
-                            .map(|_| ())
-                    })
-                }
-                _ => value_ok(&stat.value, ethalon.val),
-            }
-            .unwrap_or_else(|| {
-                panic!(
-                    "Value for key {} does not match: {}, expected {}",
-                    stat.key, stat.value, ethalon.val
-                )
-            })
-        }
-
-        if mask != 0 {
-            panic!("Some stats ({:x}) did not found in Stat reply", mask)
-        }
-    }
-
     async fn test() -> Result<()> {
         init_test_log();
         let engine = Arc::new(TestEngine::new().await);
-        let (control, mut client, _, key_id) =
+        let (control, mut client, _, _) =
             start_control(DataSource::Engine(engine.clone()), "test_stats").await?;
 
         // getStats answers under the reference engine's names.
@@ -878,11 +384,6 @@ async fn test_stats() {
         assert!(names.contains(&"masterchainblock"), "{names:?}");
         assert!(names.contains(&"masterchainblocktime"), "{names:?}");
         assert_eq!(names.last(), Some(&"stateserializerenabled"));
-
-        let request_started = UnixTime::now();
-        let answer: Stats =
-            request(&mut client, GetSelectedStats { filter: "*".to_string() }).await?;
-        check_stats(&answer, &engine, &key_id, true, request_started);
 
         client.shutdown().await?;
         control.shutdown().await;

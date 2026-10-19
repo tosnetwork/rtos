@@ -16,14 +16,14 @@ use crate::client_api::{
 use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
 use anyhow::Context;
 use rtos_api::{
-    AnyBoxedSerialize, IntoBoxed, TLObject, serialize_boxed,
+    AnyBoxedSerialize, IntoBoxed, TLObject, WireProfile, serialize_boxed,
     ton::{
         self, engine::validator::ControlQueryError as TonControlQueryError,
-        raw::ShardAccountState as TonShardAccountState,
         rpc::engine::validator::ControlQuery as TonControlQuery,
     },
 };
-use rtos_block::{BlockIdExt, Deserializable, ShardAccount, UInt256, write_boc};
+use rtos_block::{BlockIdExt, Deserializable, MsgAddressInt, UInt256};
+use std::str::FromStr;
 
 pub trait ToFromTL {
     type Rq;
@@ -37,62 +37,6 @@ fn downcast<T: rtos_api::AnyBoxedSerialize>(data: TLObject) -> anyhow::Result<T>
     match data.downcast::<T>() {
         Ok(result) => Ok(result),
         Err(obj) => anyhow::bail!("Wrong downcast {:?} to {}", obj, std::any::type_name::<T>()),
-    }
-}
-
-struct GetAccountRqRs {}
-
-impl ToFromTL for GetAccountRqRs {
-    type Rq = String;
-    type Rs = Account;
-
-    fn serialize(address: &Self::Rq) -> anyhow::Result<TLObject> {
-        Ok(ton::rpc::raw::GetShardAccountState {
-            account_address: rtos_api::ton::accountaddress::AccountAddress {
-                account_address: address.to_owned(),
-            },
-        }
-        .into_tl_object())
-    }
-
-    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
-        Ok(match downcast::<TonShardAccountState>(rs)? {
-            TonShardAccountState::Raw_ShardAccountNone => Account::Nonexist,
-            TonShardAccountState::Raw_ShardAccountState(account_state) => {
-                let shard_account =
-                    ShardAccount::construct_from_bytes(&account_state.shard_account)?;
-                let account = shard_account.read_account()?;
-                let sas = ShardAccountState {
-                    status: account.status(),
-                    balance: account.balance().map_or(0, |val| val.coins.as_u128()),
-                    last_paid: account.last_paid(),
-                    last_trans: shard_account.last_trans_lt(),
-                    data: write_boc(&shard_account.account_cell())?,
-                };
-
-                Account::ShardAccountState(sas)
-            }
-        })
-    }
-}
-
-struct GetBlockchainConfigRqRs {}
-
-impl ToFromTL for GetBlockchainConfigRqRs {
-    type Rq = ();
-    type Rs = BlockchainConfigInfo;
-
-    fn serialize(_: &Self::Rq) -> anyhow::Result<TLObject> {
-        Ok(ton::rpc::lite_server::GetConfigAll::default().into_tl_object())
-    }
-
-    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
-        let config_info = downcast::<rtos_api::ton::lite_server::ConfigInfo>(rs)?;
-
-        Ok(BlockchainConfigInfo {
-            state_proof: config_info.state_proof().clone(),
-            config_proof: config_info.config_proof().clone(),
-        })
     }
 }
 
@@ -110,30 +54,6 @@ impl ToFromTL for GetValidatorConfigRqRs {
         let config = downcast::<rtos_api::ton::engine::validator::JsonConfig>(rs)?;
         let engine_validator_config = serde_json::from_str::<EngineValidatorConfig>(config.data())?;
         Ok(engine_validator_config)
-    }
-}
-
-struct GetConfigParamRqRs {}
-
-impl ToFromTL for GetConfigParamRqRs {
-    type Rq = u32;
-    type Rs = Vec<u8>;
-
-    fn serialize(id: &Self::Rq) -> anyhow::Result<TLObject> {
-        let param_id =
-            i32::try_from(*id).map_err(|_| anyhow::anyhow!("id value does not fit into i32"))?;
-        let param_list = vec![param_id];
-        Ok(ton::rpc::lite_server::GetConfigParams {
-            mode: 0,
-            id: BlockIdExt::default(),
-            param_list,
-        }
-        .into_tl_object())
-    }
-
-    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
-        let config_info = downcast::<rtos_api::ton::lite_server::ConfigInfo>(rs)?;
-        Ok(config_info.only().config_proof)
     }
 }
 
@@ -286,22 +206,6 @@ impl ToFromTL for AddValidatorAdnlAddrRqRs {
             ttl,
         };
 
-        Ok(ret.into_tl_object())
-    }
-
-    fn deserialize(_: TLObject) -> anyhow::Result<Self::Rs> {
-        Ok(())
-    }
-}
-
-struct SendBocRqRs {}
-
-impl ToFromTL for SendBocRqRs {
-    type Rq = Vec<u8>;
-    type Rs = ();
-
-    fn serialize(boc: &Self::Rq) -> anyhow::Result<TLObject> {
-        let ret = ton::rpc::lite_server::SendMessage { body: boc.to_owned() };
         Ok(ret.into_tl_object())
     }
 
@@ -497,14 +401,145 @@ impl ControlClientAdnl {
     }
 }
 
+/// Account, configuration and message queries go to the node's lite-server
+/// path on the control port: a `liteServer.query` whose function and answer
+/// are encoded in the network wire profile, as the reference engine and its
+/// lite-server clients exchange them.
+impl ControlClientAdnl {
+    async fn lite_query<Q, A>(&mut self, function: &Q) -> anyhow::Result<A>
+    where
+        Q: rtos_api::BoxedSerialize + std::fmt::Debug,
+        A: rtos_api::AnyBoxedSerialize,
+    {
+        let data = WireProfile::T0.serialize(function)?;
+        let wrapped: TLObject = ton::rpc::lite_server::Query { data }.into_tl_object();
+        let wrapped = wrapped.into();
+        self.connect().await?;
+        let mut attempt = 1;
+        let answer = loop {
+            let adnl = self.adnl.as_mut().context("control client not connected")?;
+            match adnl.query_raw(&wrapped, WireProfile::Legacy).await {
+                Ok(answer) => break answer,
+                Err(err) if attempt < self.max_rq_attempts => {
+                    tracing::debug!(target: "control-client", "lite query error: {err}");
+                    self.reconnect().await?;
+                    attempt += 1;
+                }
+                Err(err) => anyhow::bail!("lite query error: {err}"),
+            }
+        };
+        let object = WireProfile::T0.deserialize(&answer)?;
+        let object = match object.downcast::<ton::lite_server::Error>() {
+            Ok(error) => {
+                let error = error.only();
+                anyhow::bail!("Error response to {:?}: {} {}", function, error.code, error.message)
+            }
+            Err(object) => object,
+        };
+        downcast::<A>(object)
+    }
+
+    async fn last_masterchain_block(&mut self) -> anyhow::Result<BlockIdExt> {
+        let info: ton::lite_server::MasterchainInfo =
+            self.lite_query(&ton::rpc::lite_server::GetMasterchainInfo).await?;
+        Ok(info.only().last)
+    }
+
+    async fn lite_account_state(&mut self, address: &str) -> anyhow::Result<Account> {
+        let address = MsgAddressInt::from_str(address)
+            .map_err(|e| anyhow::anyhow!("bad account address {address}: {e}"))?;
+        let id = self.last_masterchain_block().await?;
+        let account = ton::lite_server::accountid::AccountId {
+            workchain: address.workchain_id(),
+            id: UInt256::from_slice(&address.address().get_bytestring(0)),
+        };
+        let query = ton::rpc::lite_server::GetAccountState { id, account };
+        let state: ton::lite_server::AccountState = self.lite_query(&query).await?;
+        let state = state.only();
+        account_from_lite_state(&address, &state.state, &state.proof)
+    }
+
+    async fn lite_config(
+        &mut self,
+        param: Option<u32>,
+    ) -> anyhow::Result<ton::lite_server::configinfo::ConfigInfo> {
+        let id = self.last_masterchain_block().await?;
+        let info: ton::lite_server::ConfigInfo = match param {
+            None => self.lite_query(&ton::rpc::lite_server::GetConfigAll { mode: 0, id }).await?,
+            Some(param) => {
+                let param = i32::try_from(param)
+                    .map_err(|_| anyhow::anyhow!("id value does not fit into i32"))?;
+                let query =
+                    ton::rpc::lite_server::GetConfigParams { mode: 0, id, param_list: vec![param] };
+                self.lite_query(&query).await?
+            }
+        };
+        Ok(info.only())
+    }
+
+    /// One configuration parameter in the JSON form the callers read, taken
+    /// from the configuration proof.
+    async fn lite_config_param(&mut self, param: u32) -> anyhow::Result<Vec<u8>> {
+        let info = self.lite_config(Some(param)).await?;
+        config_param_from_proof(&info.config_proof, param)
+    }
+
+    async fn lite_send_boc(&mut self, boc: &[u8]) -> anyhow::Result<()> {
+        let query = ton::rpc::lite_server::SendMessage { body: boc.to_vec() };
+        let _: ton::lite_server::SendMsgStatus = self.lite_query(&query).await?;
+        Ok(())
+    }
+}
+
+/// An account from a lite-server account state. An empty state is an account
+/// that does not exist. The proof holds two roots, the block-to-state proof
+/// and the state-to-account proof; the shard account in the second carries
+/// the last transaction.
+fn account_from_lite_state(
+    address: &MsgAddressInt,
+    state: &[u8],
+    proof: &[u8],
+) -> anyhow::Result<Account> {
+    if state.is_empty() {
+        return Ok(Account::Nonexist);
+    }
+    let account = rtos_block::Account::construct_from_bytes(state)?;
+    let roots = rtos_block::read_boc(proof)?.roots;
+    let state_proof = roots.get(1).context("account state proof without a state proof")?;
+    let shard_state: rtos_block::ShardStateUnsplit =
+        rtos_block::MerkleProof::construct_from_cell(state_proof.clone())?.virtualize()?;
+    let shard_account = shard_state
+        .read_accounts()?
+        .account(address.address())?
+        .context("the state proof does not hold the account")?;
+    Ok(Account::ShardAccountState(ShardAccountState {
+        status: account.status(),
+        balance: account.balance().map_or(0, |val| val.coins.as_u128()),
+        last_paid: account.last_paid(),
+        last_trans: shard_account.last_trans_lt(),
+        data: state.to_vec(),
+    }))
+}
+
+/// One configuration parameter, in the JSON form the callers read, from a
+/// configuration proof of the masterchain state.
+fn config_param_from_proof(config_proof: &[u8], param: u32) -> anyhow::Result<Vec<u8>> {
+    let state: rtos_block::ShardStateUnsplit =
+        rtos_block::MerkleProof::construct_from_bytes(config_proof)?.virtualize()?;
+    let config =
+        state.read_custom()?.context("the configuration proof holds no masterchain state")?.config;
+    Ok(rtos_block_json::serialize_config_param(&config, param)?.into_bytes())
+}
+
 #[async_trait::async_trait]
 impl ClientAPI for ControlClientAdnl {
     async fn get_account_state(&mut self, address: &str) -> anyhow::Result<Account> {
-        self.do_rq::<GetAccountRqRs>(&address.to_string()).await
+        self.lite_account_state(address).await
     }
 
     async fn get_blockchain_config(&mut self) -> anyhow::Result<BlockchainConfigInfo> {
-        self.do_rq::<GetBlockchainConfigRqRs>(&()).await
+        let info = self.lite_config(None).await?;
+        Ok(BlockchainConfigInfo { state_proof: info.state_proof, config_proof: info.config_proof })
     }
 
     async fn get_validator_config(&mut self) -> anyhow::Result<EngineValidatorConfig> {
@@ -512,7 +547,7 @@ impl ClientAPI for ControlClientAdnl {
     }
 
     async fn get_config_param(&mut self, id: u32) -> anyhow::Result<Vec<u8>> {
-        self.do_rq::<GetConfigParamRqRs>(&id).await
+        self.lite_config_param(id).await
     }
 
     async fn sign(&mut self, rq: &SignRq) -> anyhow::Result<Vec<u8>> {
@@ -544,7 +579,7 @@ impl ClientAPI for ControlClientAdnl {
     }
 
     async fn send_boc(&mut self, boc: &[u8]) -> anyhow::Result<()> {
-        self.do_rq::<SendBocRqRs>(&boc.to_vec()).await
+        self.lite_send_boc(boc).await
     }
 
     async fn sign_shard_overlay_certificate(
@@ -732,5 +767,124 @@ mod certificate_tests {
             .downcast::<ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled>()
             .unwrap();
         assert_eq!(query.disabled, ton::Bool::BoolTrue);
+    }
+}
+
+#[cfg(test)]
+mod lite_answer_tests {
+    use super::*;
+    use rtos_block::{
+        AccountStatus, BocWriter, ConfigParam15, ConfigParamEnum, ConfigParams, CurrencyCollection,
+        McStateExtra, MerkleProof, Serializable, ShardIdent, ShardStateUnsplit, UsageTree,
+    };
+    use std::collections::HashSet;
+
+    fn address() -> MsgAddressInt {
+        MsgAddressInt::from_str(
+            "0:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap()
+    }
+
+    /// A lite-server account answer built as the node's lite server builds it:
+    /// the account proof is the second root of the proof bag of cells.
+    fn account_answer(address: &MsgAddressInt, last_trans_lt: u64) -> (Vec<u8>, Vec<u8>) {
+        let account = rtos_block::Account::with_address_and_ballance(
+            address,
+            &CurrencyCollection::with_coins(7_000),
+        );
+        let mut state = ShardStateUnsplit::with_ident(ShardIdent::full(0));
+        let shard_account =
+            rtos_block::ShardAccount::with_params(&account, UInt256::default(), last_trans_lt)
+                .unwrap();
+        state.insert_account(&address.address(), &shard_account).unwrap();
+        let root = state.serialize().unwrap();
+        let usage = UsageTree::with_params(root.clone(), true);
+        let used = ShardStateUnsplit::construct_from_cell(usage.root_cell()).unwrap();
+        let found = used.read_accounts().unwrap().account(&address.address()).unwrap().unwrap();
+        let account_boc = write_boc_of(&found.account_cell());
+        let proof = MerkleProof::create_by_usage_tree(&root, &usage).unwrap();
+        let block_proof = rtos_block::BuilderData::new().into_cell().unwrap();
+        let proof = BocWriter::with_roots([block_proof, proof.serialize().unwrap()])
+            .unwrap()
+            .write_to_vec()
+            .unwrap();
+        (account_boc, proof)
+    }
+
+    fn write_boc_of(cell: &rtos_block::Cell) -> Vec<u8> {
+        BocWriter::with_roots([cell.clone()]).unwrap().write_to_vec().unwrap()
+    }
+
+    #[test]
+    fn account_answer_reads_the_account_and_its_last_transaction() {
+        let address = address();
+        let (state, proof) = account_answer(&address, 0x1234);
+        let Account::ShardAccountState(account) =
+            account_from_lite_state(&address, &state, &proof).unwrap()
+        else {
+            panic!("the account exists");
+        };
+        assert_eq!(account.status, AccountStatus::AccStateUninit);
+        assert_eq!(account.balance, 7_000);
+        assert_eq!(account.last_trans, 0x1234);
+        assert_eq!(account.data, state, "the account bag of cells is returned as received");
+    }
+
+    #[test]
+    fn empty_account_answer_is_an_account_that_does_not_exist() {
+        assert!(matches!(
+            account_from_lite_state(&address(), &[], &[]).unwrap(),
+            Account::Nonexist
+        ));
+    }
+
+    #[test]
+    fn account_answer_without_the_account_in_its_proof_is_refused() {
+        let (state, proof) = account_answer(&address(), 1);
+        let other = MsgAddressInt::from_str(
+            "0:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        assert!(account_from_lite_state(&other, &state, &proof).is_err());
+        // A proof with a single root has no state proof.
+        let single = write_boc_of(&rtos_block::BuilderData::new().into_cell().unwrap());
+        let error = account_from_lite_state(&address(), &state, &single).unwrap_err();
+        assert!(error.to_string().contains("without a state proof"), "{error}");
+    }
+
+    #[test]
+    fn config_param_comes_from_the_pruned_configuration_proof() {
+        let mut config = ConfigParams::default();
+        let param = ConfigParam15 {
+            validators_elected_for: 65536,
+            elections_start_before: 32768,
+            elections_end_before: 8192,
+            stake_held_for: 4096,
+        };
+        config.set_config(ConfigParamEnum::ConfigParam15(param)).unwrap();
+        let expected = rtos_block_json::serialize_config_param(&config, 15).unwrap();
+        let extra = McStateExtra { config, ..Default::default() };
+        let mut state = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
+        state.write_custom(Some(&extra)).unwrap();
+        let root = state.serialize().unwrap();
+        // The lite server proves the path to the parameter and its subtree.
+        let usage = UsageTree::with_params(root.clone(), true);
+        let used = ShardStateUnsplit::construct_from_cell(usage.root_cell()).unwrap();
+        let config = used.read_custom().unwrap().unwrap().config;
+        let key = rtos_block::SliceData::load_builder(15u32.write_to_new_cell().unwrap()).unwrap();
+        let leaf = config.config_params.get(key).unwrap().unwrap();
+        let subtrees: HashSet<UInt256> =
+            [leaf.cell().unwrap().repr_hash().clone()].into_iter().collect();
+        let proof = MerkleProof::create_with_subtrees(
+            &root,
+            |h| usage.contains(h),
+            |h| subtrees.contains(h),
+        )
+        .unwrap();
+        let proof = proof.write_to_bytes().unwrap();
+        let answer = config_param_from_proof(&proof, 15).unwrap();
+        assert_eq!(String::from_utf8(answer).unwrap(), expected);
+        assert!(expected.contains("65536"), "{expected}");
     }
 }

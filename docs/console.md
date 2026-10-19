@@ -178,126 +178,12 @@ console -c "getstats"
 
 Returns JSON with fields: `sync_status`, `masterchainblocktime`, `masterchainblocknumber`, `timediff`, `in_current_vset_p34`, `in_current_vset_p36`, `last applied masterchain block id`, `processed workchain`, `validation_stats`, `tps_10`, `tps_300`.
 
-#### getstatsnew
-
-Get node status in new format.
-
-```bash
-console -c "getstatsnew"
-```
-
-#### getconsensusstats
-
-Get consensus statistics for the node.
-
-```bash
-console -c "getconsensusstats"
-```
-
 #### get_validator_config
 
 Get config from node or validator.
 
 ```bash
 console -c "get_validator_config"
-```
-
-### Blockchain queries
-
-#### getaccount
-
-Load and save (optional) account information in JSON format.
-
-- `account_address` — account address.
-- `file_name` — (optional) file name to save account info.
-- `block_id` — (optional) block id for historical query.
-
-```bash
-console -c "getaccount 0:000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"
-```
-
-#### getaccountstate
-
-Save account to file (in bag of cells format).
-
-- `account_address` — account address.
-- `file_name` — file name to save account's boc.
-
-```bash
-console -c "getaccountstate 0:000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F account.boc"
-```
-
-#### getaccountstate_byblock
-
-Save masterchain account state from a specific block to file.
-
-- `block_root_hash_or_seqno` — block root hash or masterchain block sequence number.
-- `account_address` — account address.
-- `file_name` — (optional) file name to save account's boc.
-
-```bash
-console -c "getaccountstate_byblock 12345 0:000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F account.boc"
-```
-
-#### getblock
-
-Find block by masterchain seq_no, block id or root hash, then save to file.
-
-- `block_id` — block id, root hash of block, or masterchain sequence number.
-- `file_name` — file name to save the block.
-
-```bash
-console -c "getblock 12345 block.boc"
-```
-
-#### getblockchainconfig
-
-Get current config from masterchain state.
-
-```bash
-console -c "getblockchainconfig"
-```
-
-#### get_config_param
-
-Get current config param from masterchain state.
-
-- `param_number` — config parameter number.
-
-```bash
-console -c "get_config_param 15"
-```
-
-#### sendmessage
-
-Load a serialized message from file and send it to nodes as an external message.
-
-- `file_name` — serialized message file (in bag of cells format).
-
-```bash
-console -c "sendmessage message.boc"
-```
-
-### Debugging
-
-#### bundle
-
-Prepare bundle for a given block.
-
-- `block_id` — block identifier.
-
-```bash
-console -c "bundle <block_id>"
-```
-
-#### future_bundle
-
-Prepare future bundle for a given block.
-
-- `block_id` — block identifier.
-
-```bash
-console -c "future_bundle <block_id>"
 ```
 
 ### Custom overlays

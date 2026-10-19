@@ -759,7 +759,6 @@ engine.validator.success = engine.validator.Success;
 
 engine.validator.jsonConfig data:string = engine.validator.JsonConfig;
 
-engine.validator.electionBid election_date:int perm_key:int256 adnl_addr:int256 to_send_payload:bytes = engine.validator.ElectionBid;
 engine.validator.proposalVote perm_key:int256 to_send:bytes = engine.validator.ProposalVote;
 
 engine.validator.dhtServerStatus id:int256 status:int = engine.validator.DhtServerStatus;
@@ -791,8 +790,6 @@ engine.validator.shardOutQueueSize size:long = engine.validator.ShardOutQueueSiz
 engine.validator.exportedPrivateKeys encrypted_data:bytes = engine.validator.ExportedPrivateKeys;
 
 // Rust node extensions
-engine.validator.oneSessionStat session_id:string stats:(vector engine.validator.oneStat) = engine.OneSessionStat;
-engine.validator.sessionStats stats:(vector engine.validator.oneSessionStat) = engine.validator.SessionStats;
 
 ---functions---
 
@@ -830,7 +827,6 @@ engine.validator.getConfig = engine.validator.JsonConfig;
 
 engine.validator.setVerbosity verbosity:int = engine.validator.Success;
 
-engine.validator.createElectionBid election_date:int election_addr:string wallet:string = engine.validator.ElectionBid;
 engine.validator.createProposalVote vote:bytes = engine.validator.ProposalVote;
 engine.validator.createComplaintVote election_id:int vote:bytes = engine.validator.ProposalVote;
 
@@ -864,10 +860,6 @@ engine.validator.addShard shard:tonNode.shardId = engine.validator.Success;
 engine.validator.delShard shard:tonNode.shardId = engine.validator.Success;
 
 // Rust node extensions
-engine.validator.getBundle block_id:tonNode.blockIdExt = engine.validator.Success;
-engine.validator.getFutureBundle prev_block_ids:(vector tonNode.blockIdExt) = engine.validator.Success;
-engine.validator.getSelectedStats filter:string = engine.validator.Stats;
-engine.validator.getSessionStats = engine.validator.SessionStats;
 
 ---types---
 

@@ -63,7 +63,6 @@ fn test_check_all_structs_with_vecs() {
         ("crate::ton::PublicKey", std::mem::size_of::<crate::ton::PublicKey>()),
         ("crate::ton::engine::validator::customoverlaynode::CustomOverlayNode", std::mem::size_of::<crate::ton::engine::validator::customoverlaynode::CustomOverlayNode>()),
         ("crate::ton::engine::validator::PerfTimerStatsByName", std::mem::size_of::<crate::ton::engine::validator::PerfTimerStatsByName>()),
-        ("crate::ton::engine::validator::onesessionstat::OneSessionStat", std::mem::size_of::<crate::ton::engine::validator::onesessionstat::OneSessionStat>()),
         ("crate::ton::engine::validator::onestat::OneStat", std::mem::size_of::<crate::ton::engine::validator::onestat::OneStat>()),
         ("crate::ton::liteserver::config::Local", std::mem::size_of::<crate::ton::liteserver::config::Local>()),
         ("crate::ton::liteserver::desc_v2::Slice", std::mem::size_of::<crate::ton::liteserver::desc_v2::Slice>()),

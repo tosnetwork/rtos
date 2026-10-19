@@ -21,7 +21,7 @@ use rtos_api::{
             ControlQueryError as ControlQueryErrorBoxed, KeyHash as KeyHashBoxed,
             Signature as SignatureBoxed,
         },
-        rpc::engine::validator::{AddDhtId, GetTime},
+        rpc::engine::validator::{AddDhtId, ControlQuery, GetTime},
     },
     AnyBoxedSerialize,
 };
@@ -201,18 +201,6 @@ fn served_queries_require_the_reference_bits() {
         (AddCustomOverlay::default().into_tl_object(), VEP_MODIFY),
         (DelCustomOverlay::default().into_tl_object(), VEP_MODIFY),
         (ShowCustomOverlays::default().into_tl_object(), VEP_DEFAULT),
-        (GetBlock::default().into_tl_object(), 0),
-        (GetConfigAll::default().into_tl_object(), 0),
-        (GetConfigParams::default().into_tl_object(), 0),
-        (SendMessage::default().into_tl_object(), 0),
-        (GetShardAccountState::default().into_tl_object(), VEP_DEFAULT),
-        (GetShardAccountMeta::default().into_tl_object(), VEP_DEFAULT),
-        (GetAccountByBlock::default().into_tl_object(), VEP_DEFAULT),
-        (GetAccountMetaByBlock::default().into_tl_object(), VEP_DEFAULT),
-        (GetAppliedShardsInfo::default().into_tl_object(), VEP_DEFAULT),
-        (GetSelectedStats::default().into_tl_object(), VEP_DEFAULT),
-        (GetBundle::default().into_tl_object(), VEP_MODIFY),
-        (GetFutureBundle::default().into_tl_object(), VEP_MODIFY),
         (SignShardOverlayCertificate::default().into_tl_object(), VEP_MODIFY),
         (ImportShardOverlayCertificate::default().into_tl_object(), VEP_MODIFY),
         (SetExtMessagesBroadcastDisabled::default().into_tl_object(), VEP_MODIFY),
@@ -357,11 +345,6 @@ async fn modify_bits_run_modify_and_entry_only_queries() {
     // The handler runs and refuses: a status-only server is not started.
     let reply = ask(&mut connection, AddValidatorTempKey::default()).await;
     assert_eq!(refusal(reply), Some((651, "not started".to_string())));
-    // A lite-server query needs only the entry; its handler runs and fails
-    // here because this server has no engine.
-    let (code, message) = refusal(ask(&mut connection, GetConfigAll::default()).await).unwrap();
-    assert_eq!(code, -1);
-    assert!(message.contains("engine is not set"), "{message}");
     server.shutdown().await;
 }
 

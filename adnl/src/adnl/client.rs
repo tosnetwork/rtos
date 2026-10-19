@@ -194,6 +194,34 @@ impl AdnlClient {
         }
     }
 
+    /// Query server with the query encoded in `profile`, and return the
+    /// answer's bytes as received, for a caller that decodes them itself.
+    pub async fn query_raw(
+        &mut self,
+        query: &TaggedTlObject,
+        profile: rtos_api::WireProfile,
+    ) -> Result<Vec<u8>> {
+        let (query_id, msg) = Query::build(None, query, profile)?;
+        let mut buf = serialize_boxed(&msg.object)?;
+        self.crypto.send(&mut self.stream, &mut buf).await?;
+        loop {
+            self.crypto.receive(&mut buf, &mut self.stream).await?;
+            if !buf.is_empty() {
+                break;
+            }
+        }
+        match deserialize_typed(buf)? {
+            AdnlMessage::Adnl_Message_Answer(answer) => {
+                if &query_id == answer.query_id.as_slice() {
+                    Ok(answer.answer.to_vec())
+                } else {
+                    fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
+                }
+            }
+            answer => fail!("Unexpected answer to query {:?}: {:?}", query.object, answer),
+        }
+    }
+
     async fn send_init_packet(
         stream: &mut AdnlStream,
         config: &AdnlClientConfig,

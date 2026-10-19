@@ -10,16 +10,13 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    collator_test_bundle::CollatorTestBundle,
     config::{KeyCommand, KeyCommandError, KeyRing, NodeConfigHandler},
-    engine::Engine,
     engine_traits::{EngineOperations, Stoppable},
     network::{
+        liteserver::LiteServerQuerySubscriber,
         node_network::NodeNetwork,
         shard_overlay_certificates::{error_code, ShardCertificateEndpoint, WireShard},
     },
-    shard_states_keeper::PinnedShardStateGuard,
-    validating_utils::{supported_capabilities, supported_version},
 };
 use adnl::{
     common::{AdnlPeers, QueryAnswer, QueryResult, Subscriber},
@@ -28,55 +25,27 @@ use adnl::{
 use rtos_api::{
     deserialize_boxed,
     ton::{
-        self,
-        accountaddress::AccountAddress,
         engine::validator::{
-            controlqueryerror::ControlQueryError,
-            customoverlay::CustomOverlay,
-            exportedprivatekeys::ExportedPrivateKeys,
-            jsonconfig::JsonConfig,
-            keyhash::KeyHash,
-            onestat::OneStat,
-            signature::Signature,
-            stats::Stats,
-            time::Time,
-            //ControlQueryError as ControlQueryErrorBoxed,
-            Success,
+            controlqueryerror::ControlQueryError, customoverlay::CustomOverlay,
+            exportedprivatekeys::ExportedPrivateKeys, jsonconfig::JsonConfig, keyhash::KeyHash,
+            onestat::OneStat, signature::Signature, stats::Stats, time::Time, Success,
         },
-        lite_server::configinfo::ConfigInfo,
-        raw::{
-            appliedshardsinfo::AppliedShardsInfo, shardaccountmeta::ShardAccountMeta,
-            shardaccountstate::ShardAccountState, AppliedShardsInfo as AppliedShardsInfoBoxed,
-            ShardAccountMeta as ShardAccountMetaBoxed, ShardAccountState as ShardAccountStateBoxed,
-        },
-        rpc::{
-            engine::validator::{
-                AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
-                AddValidatorTempKey, ControlQuery, DelAdnlId, DelCustomOverlay,
-                DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
-                ExportAllPrivateKeys, ExportPrivateKey, ExportPublicKey, GenerateKeyPair,
-                GetBundle, GetConfig, GetFutureBundle, GetSelectedStats, GetStats, GetTime,
-                ImportPrivateKey, ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled,
-                SetVerbosity, ShowCustomOverlays, Sign, SignShardOverlayCertificate,
-            },
-            lite_server::{
-                GetBlock, GetConfigAll, GetConfigParams, Query as LiteServerQuery, SendMessage,
-            },
-            raw::{
-                GetAccountByBlock, GetAccountMetaByBlock, GetAppliedShardsInfo,
-                GetShardAccountMeta, GetShardAccountState,
-            },
+        rpc::engine::validator::{
+            AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
+            AddValidatorTempKey, DelAdnlId, DelCustomOverlay, DelValidatorAdnlAddress,
+            DelValidatorPermanentKey, DelValidatorTempKey, ExportAllPrivateKeys, ExportPrivateKey,
+            ExportPublicKey, GenerateKeyPair, GetConfig, GetStats, GetTime, ImportPrivateKey,
+            ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled, SetVerbosity,
+            ShowCustomOverlays, Sign, SignShardOverlayCertificate,
         },
         PrivateKey, PublicKey,
     },
     IntoBoxed, TLObject,
 };
 use rtos_block::{
-    base64_encode, error, fail, sha256_digest, AccountId, BlockIdExt, KeyId, KeyOption,
-    MerkleProof, MsgAddressInt, Result, Serializable, ShardAccount, ShardIdent, UInt256,
+    base64_encode, error, fail, sha256_digest, BlockIdExt, KeyId, KeyOption, Result, UInt256,
     ED25519_KEY_TYPE,
 };
-use rtos_block_json::serialize_config_param;
 use secrets_vault::vault_block::get_key_option_factory;
 use std::sync::Arc;
 
@@ -85,14 +54,20 @@ pub(crate) const VEP_DEFAULT: u32 = 1;
 pub(crate) const VEP_MODIFY: u32 = 2;
 pub(crate) const VEP_UNSAFE: u32 = 4;
 
+/// Limits of the lite-server path of the control port: the lite server's
+/// defaults.
+const CONTROL_LITE_FAST_QUERIES: u64 = 256;
+const CONTROL_LITE_SLOW_QUERIES: u64 = 16;
+const CONTROL_LITE_ACCOUNT_CACHE_MB: u64 = 256;
+
 /// Reference engine error codes used in control replies.
 const ERROR_CODE_ERROR: i32 = 602;
 const ERROR_CODE_PROTOVIOLATION: i32 = 621;
 const ERROR_CODE_NOTREADY: i32 = 651;
 
-/// The permission bits a served control query needs. Zero means that being a
-/// listed client is enough, as for lite-server queries on the control port.
-/// `None` is a query this server does not serve.
+/// The permission bits a served control query needs; `None` is a query this
+/// server does not serve. A lite-server query on the control port needs only
+/// that its client is listed.
 pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
     macro_rules! table {
         ($($ty:ty => $bits:expr),* $(,)?) => {
@@ -121,18 +96,6 @@ pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
         AddCustomOverlay => VEP_MODIFY,
         DelCustomOverlay => VEP_MODIFY,
         ShowCustomOverlays => VEP_DEFAULT,
-        GetBlock => 0,
-        GetConfigAll => 0,
-        GetConfigParams => 0,
-        SendMessage => 0,
-        GetShardAccountState => VEP_DEFAULT,
-        GetShardAccountMeta => VEP_DEFAULT,
-        GetAccountByBlock => VEP_DEFAULT,
-        GetAccountMetaByBlock => VEP_DEFAULT,
-        GetAppliedShardsInfo => VEP_DEFAULT,
-        GetSelectedStats => VEP_DEFAULT,
-        GetBundle => VEP_MODIFY,
-        GetFutureBundle => VEP_MODIFY,
         SignShardOverlayCertificate => VEP_MODIFY,
         ImportShardOverlayCertificate => VEP_MODIFY,
         SetExtMessagesBroadcastDisabled => VEP_MODIFY,
@@ -587,6 +550,338 @@ pub fn apply_verbosity(level: log::LevelFilter) -> Result<()> {
     }
 }
 
+/// The constructor ids of every function of the reference engine's schema,
+/// sorted; a control query naming any other constructor fails to parse.
+const REFERENCE_FUNCTIONS: [u32; 170] = [
+    0x00c1a022, 0x01457726, 0x03806c81, 0x093ddd78, 0x0a7a545b, 0x0b02248f, 0x0b94a40a, 0x0bbfa683,
+    0x11b7d099, 0x128333c0, 0x15807ac7, 0x15c29fb1, 0x15cd0649, 0x1621ef14, 0x1661fe60, 0x174ac8fa,
+    0x1ac30a58, 0x1ae2e498, 0x1aea1a28, 0x1db3216d, 0x1faaa1bf, 0x222cbc61, 0x2335fb5a, 0x26bcbb98,
+    0x281f5acc, 0x293a74f2, 0x2ba1e7ea, 0x2bc35b22, 0x2d35f2a0, 0x2fc05215, 0x315bb84f, 0x333d79db,
+    0x348bf3fc, 0x34934212, 0x352f8a56, 0x3946614c, 0x3b3fe208, 0x3baeb69b, 0x3c82c0cf, 0x3f64895b,
+    0x4174b4e2, 0x421c283a, 0x42db9f96, 0x4397d69b, 0x44f3f211, 0x48ee64ab, 0x4c42def9, 0x4d082b9a,
+    0x4d3135d2, 0x4f95e21f, 0x52d5c311, 0x5431bf77, 0x543fba6c, 0x54590a3b, 0x55086f12, 0x55e184bd,
+    0x565ffcb0, 0x5973e88c, 0x599b5d80, 0x59ad2225, 0x5ae0f750, 0x5c973c56, 0x5c9a4066, 0x5daac511,
+    0x604f2d1c, 0x6074ab78, 0x61b191e1, 0x6234a8b9, 0x680449ad, 0x68061fa0, 0x68a0ecd0, 0x690cb481,
+    0x6ce2ce6b, 0x6d0c9297, 0x6e80ea19, 0x6f5ecfa6, 0x6ffb5781, 0x731d3bf4, 0x735d2df1, 0x747a5d9d,
+    0x7578cc7d, 0x769fc0e8, 0x7949426c, 0x7a9c09d5, 0x7bd0590d, 0x7d530769, 0x7db1e7e5, 0x7def77c7,
+    0x7fff7bfa, 0x8060d7f9, 0x807ae660, 0x812857f5, 0x84fd5b3e, 0x87ad0787, 0x87fd94eb, 0x8a9109da,
+    0x8d336f32, 0x8d7aa279, 0x8dacb78c, 0x8f123202, 0x90745d0c, 0x91c4962a, 0x92150578, 0x92767f31,
+    0x92cd9671, 0x939fdee3, 0x93fa5a3e, 0x94271ee8, 0x94ffc3e9, 0x9aae907f, 0x9c50ff1f, 0x9d99bc2b,
+    0xa0e6e0d1, 0xa40b09fe, 0xa476bdc0, 0xa97948ed, 0xad2a7842, 0xae4b6011, 0xb083ff2a, 0xb1825e82,
+    0xb535689e, 0xb659165e, 0xb942153b, 0xbe2fbd72, 0xbe7b2522, 0xbec6c985, 0xc13d3142, 0xc4461b53,
+    0xc6f4b24e, 0xc81fde27, 0xcbeb3f18, 0xcc728048, 0xccfd8443, 0xcd5653f2, 0xcf280039, 0xd06cced8,
+    0xd1e420ca, 0xd4b8bb5f, 0xd4bcd72a, 0xd7252362, 0xd72dd1ee, 0xd7cfcf0b, 0xdacba682, 0xdb721f89,
+    0xdbb8eac6, 0xdc44a7f3, 0xde2d22c9, 0xe0d59ac5, 0xe0fd3df5, 0xe140bed1, 0xe57f583d, 0xe65241fc,
+    0xe9abff94, 0xea42f8ef, 0xea6b89b5, 0xeb25607b, 0xed8554ab, 0xee07d861, 0xf08a0f47, 0xf3acb726,
+    0xf50c1e8c, 0xf677ab10, 0xf6fd33f5, 0xf708435a, 0xf7e24955, 0xf7e28640, 0xf9c3b1c6, 0xfcd8acce,
+    0xfdbcbff1, 0xff8f0f47,
+];
+
+/// The control-port framing as the reference engine reads it: a lite-server
+/// query is told apart first, then the control query envelope and its
+/// function are parsed with the reference parser's rules, positions and
+/// messages, before this server decodes the function itself.
+mod frame {
+    use super::REFERENCE_FUNCTIONS;
+    use rtos_api::{
+        ton::rpc::engine::validator::{
+            AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
+            AddValidatorTempKey, ControlQuery, DelAdnlId, DelCustomOverlay,
+            DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
+            ExportAllPrivateKeys, ExportPrivateKey, ExportPublicKey, GenerateKeyPair, GetConfig,
+            GetStats, GetTime, ImportPrivateKey, ImportShardOverlayCertificate,
+            SetExtMessagesBroadcastDisabled, SetVerbosity, ShowCustomOverlays, Sign,
+            SignShardOverlayCertificate,
+        },
+        Constructor,
+    };
+
+    const LITE_SERVER_QUERY: u32 = 0x798c_06df;
+    const BOOL_TRUE: u32 = 0x9972_75b5;
+    const BOOL_FALSE: u32 = 0xbc79_9737;
+    const KEY_HASH: u32 = 0xc2c6_a54e;
+
+    /// A field as the reference parser reads it.
+    pub(super) enum Field {
+        Int,
+        Long,
+        Int256,
+        Bytes,
+        Bool,
+        /// A boxed type with one constructor.
+        Exact(u32, &'static [Field]),
+        /// A boxed type with several constructors.
+        OneOf(&'static [(u32, &'static [Field])]),
+        /// A bare vector of bare elements.
+        Vector(&'static [Field]),
+    }
+
+    use Field::*;
+
+    const PUBLIC_KEY: &[(u32, &[Field])] = &[
+        (0xb61f_450a, &[Bytes]),
+        (0x4813_b4c6, &[Int256]),
+        (0x2dbc_add4, &[Int256]),
+        (0x34ba_45cb, &[Bytes]),
+    ];
+    const PRIVATE_KEY: &[(u32, &[Field])] = &[
+        (0xb1db_9b30, &[Bytes]),
+        (0x4968_2317, &[Int256]),
+        (0xa5e8_5137, &[Int256]),
+        (0x37a5_f65b, &[Bytes]),
+    ];
+    const OVERLAY_CERTIFICATE: &[(u32, &[Field])] = &[
+        (0xe09e_d731, &[OneOf(PUBLIC_KEY), Int, Int, Bytes]),
+        (0xb43f_9c83, &[OneOf(PUBLIC_KEY), Int, Int, Int, Bytes]),
+        (0x32da_bccf, &[]),
+    ];
+    const CUSTOM_OVERLAY: &[Field] =
+        &[Bytes, Vector(&[Int256, Bool, Int, Bool]), Vector(&[Int, Long]), Bool, Bool];
+
+    /// The fields of every function this server serves; any other function
+    /// of the reference schema is refused as unsupported without decoding.
+    pub(super) fn served_fields(constructor: u32) -> Option<&'static [Field]> {
+        let table: &[(u32, &'static [Field])] = &[
+            (GetTime::constructor_const(), &[]),
+            (ImportPrivateKey::constructor_const(), &[OneOf(PRIVATE_KEY)]),
+            (ExportPrivateKey::constructor_const(), &[Int256]),
+            (ExportPublicKey::constructor_const(), &[Int256]),
+            (GenerateKeyPair::constructor_const(), &[]),
+            (AddAdnlId::constructor_const(), &[Int256, Int]),
+            (AddValidatorPermanentKey::constructor_const(), &[Int256, Int, Int]),
+            (AddValidatorTempKey::constructor_const(), &[Int256, Int256, Int]),
+            (AddValidatorAdnlAddress::constructor_const(), &[Int256, Int256, Int]),
+            (DelAdnlId::constructor_const(), &[Int256]),
+            (DelValidatorPermanentKey::constructor_const(), &[Int256]),
+            (DelValidatorTempKey::constructor_const(), &[Int256, Int256]),
+            (DelValidatorAdnlAddress::constructor_const(), &[Int256, Int256]),
+            (GetConfig::constructor_const(), &[]),
+            (Sign::constructor_const(), &[Int256, Bytes]),
+            (ExportAllPrivateKeys::constructor_const(), &[OneOf(PUBLIC_KEY)]),
+            (SetVerbosity::constructor_const(), &[Int]),
+            (GetStats::constructor_const(), &[]),
+            (
+                SignShardOverlayCertificate::constructor_const(),
+                &[Int, Long, Exact(KEY_HASH, &[Int256]), Int, Int],
+            ),
+            (
+                ImportShardOverlayCertificate::constructor_const(),
+                &[Int, Long, Exact(KEY_HASH, &[Int256]), OneOf(OVERLAY_CERTIFICATE)],
+            ),
+            (SetExtMessagesBroadcastDisabled::constructor_const(), &[Bool]),
+            (AddCustomOverlay::constructor_const(), CUSTOM_OVERLAY),
+            (DelCustomOverlay::constructor_const(), &[Bytes]),
+            (ShowCustomOverlays::constructor_const(), &[]),
+        ];
+        table.iter().find(|(id, _)| *id == constructor).map(|(_, fields)| *fields)
+    }
+
+    /// The reference parser: a read past the end fails at the position the
+    /// successful reads reached, and the first failure is the one reported.
+    struct Parser<'a> {
+        data: &'a [u8],
+        pos: usize,
+        error: Option<(String, usize)>,
+    }
+
+    impl<'a> Parser<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self { data, pos: 0, error: None }
+        }
+
+        fn fail(&mut self, message: &str) {
+            if self.error.is_none() {
+                self.error = Some((message.to_string(), self.pos));
+            }
+        }
+
+        /// Takes `len` bytes, or fails as the reference length check fails.
+        fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+            if self.error.is_some() {
+                return None;
+            }
+            match self.pos.checked_add(len).filter(|end| *end <= self.data.len()) {
+                Some(end) => {
+                    let bytes = &self.data[self.pos..end];
+                    self.pos = end;
+                    Some(bytes)
+                }
+                None => {
+                    self.fail("Not enough data to read");
+                    None
+                }
+            }
+        }
+
+        fn int(&mut self) -> Option<u32> {
+            self.take(4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+
+        /// A string: the reference parser reads the length word, then the
+        /// rest rounded as it rounds it.
+        fn bytes(&mut self) -> Option<&'a [u8]> {
+            let start = self.pos;
+            let head = self.take(4)?;
+            let (len, begin, aligned) = match head[0] {
+                len @ 0..=253 => {
+                    let len = usize::from(len);
+                    (len, start + 1, (len >> 2) << 2)
+                }
+                254 => {
+                    let len = usize::from(head[1])
+                        | usize::from(head[2]) << 8
+                        | usize::from(head[3]) << 16;
+                    (len, start + 4, len.checked_add(3)? >> 2 << 2)
+                }
+                _ => {
+                    let more = self.take(4)?;
+                    let mut len: u64 = 0;
+                    for (shift, byte) in head[1..].iter().chain(more.iter()).enumerate() {
+                        len |= u64::from(*byte) << (8 * shift);
+                    }
+                    let Some(len) = usize::try_from(len).ok().filter(|len| *len <= usize::MAX - 3)
+                    else {
+                        self.fail("Too big string found");
+                        return None;
+                    };
+                    (len, start + 8, (len + 3) >> 2 << 2)
+                }
+            };
+            self.take(aligned)?;
+            self.data.get(begin..begin.checked_add(len)?)
+        }
+
+        fn fields(&mut self, fields: &[Field]) {
+            for field in fields {
+                if self.error.is_some() {
+                    return;
+                }
+                self.field(field);
+            }
+        }
+
+        fn field(&mut self, field: &Field) {
+            match field {
+                Int => {
+                    self.int();
+                }
+                Long => {
+                    self.take(8);
+                }
+                Int256 => {
+                    self.take(32);
+                }
+                Bytes => {
+                    self.bytes();
+                }
+                Bool => {
+                    if let Some(value) = self.int() {
+                        if value != BOOL_TRUE && value != BOOL_FALSE {
+                            self.fail("Bool expected");
+                        }
+                    }
+                }
+                Exact(id, fields) => {
+                    if let Some(value) = self.int() {
+                        if value != *id {
+                            self.fail("Wrong constructor found");
+                            return;
+                        }
+                        self.fields(fields);
+                    }
+                }
+                OneOf(constructors) => {
+                    if let Some(value) = self.int() {
+                        match constructors.iter().find(|(id, _)| *id == value) {
+                            Some((_, fields)) => self.fields(fields),
+                            None => self.fail(&format!("Unknown constructor found 0x{value:08x}")),
+                        }
+                    }
+                }
+                Vector(element) => {
+                    if let Some(count) = self.int() {
+                        let left = self.data.len().saturating_sub(self.pos);
+                        if left < count as usize {
+                            self.fail("Wrong vector length");
+                            return;
+                        }
+                        for _ in 0..count {
+                            self.fields(element);
+                            if self.error.is_some() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn end(&mut self) {
+            if self.error.is_none() && self.pos != self.data.len() {
+                self.fail("Too much data to fetch");
+            }
+        }
+
+        fn result(&self) -> Result<(), String> {
+            match &self.error {
+                Some((message, pos)) => Err(format!("{message} at {pos}")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// What the bytes of a control-port query are.
+    pub(super) enum Frame<'a> {
+        /// A lite-server query, for the lite-server path.
+        Lite,
+        /// A function this server serves, already checked as the reference
+        /// parser checks it; its bytes are to be decoded.
+        Served(&'a [u8]),
+        /// A function of the reference schema this server does not serve.
+        Unserved,
+    }
+
+    /// Reads a control-port query; a failure is the reference parser's
+    /// message with its position.
+    pub(super) fn read(bytes: &[u8]) -> Result<Frame<'_>, String> {
+        let mut lite = Parser::new(bytes);
+        if lite.int() == Some(LITE_SERVER_QUERY) {
+            lite.bytes();
+            lite.end();
+            if lite.result().is_ok() {
+                return Ok(Frame::Lite);
+            }
+        }
+        let mut outer = Parser::new(bytes);
+        let mut data: &[u8] = &[];
+        if let Some(value) = outer.int() {
+            if value != ControlQuery::constructor_const() {
+                outer.fail("Wrong constructor found");
+            } else if let Some(inner) = outer.bytes() {
+                data = inner;
+            }
+        }
+        outer.end();
+        outer.result()?;
+        let mut inner = Parser::new(data);
+        let Some(constructor) = inner.int() else {
+            inner.result()?;
+            return Err("Not enough data to read at 0".to_string());
+        };
+        if REFERENCE_FUNCTIONS.binary_search(&constructor).is_err() {
+            inner.fail(&format!("Unknown constructor found 0x{constructor:08x}"));
+            inner.result()?;
+        }
+        let Some(fields) = served_fields(constructor) else {
+            return Ok(Frame::Unserved);
+        };
+        inner.fields(fields);
+        inner.end();
+        inner.result()?;
+        Ok(Frame::Served(data))
+    }
+}
+
 fn into_answer(result: QueryResult) -> Result<Option<QueryAnswer>> {
     match result {
         QueryResult::Consumed(answer) => Ok(Some(answer)),
@@ -615,16 +910,29 @@ impl ControlServer {
         if permissions.is_empty() {
             log::warn!("Control server lists no permitted client: every query is forbidden");
         }
+        // The control subscriber comes first, so that a client it does not
+        // list never reaches the lite-server path.
+        let lite = match &data_source {
+            DataSource::Engine(engine) => {
+                Some(Arc::new(LiteServerQuerySubscriber::new_with_profile(
+                    rtos_api::WireProfile::T0,
+                    tokio::runtime::Handle::current(),
+                    engine.clone(),
+                    CONTROL_LITE_FAST_QUERIES,
+                    CONTROL_LITE_SLOW_QUERIES,
+                    CONTROL_LITE_ACCOUNT_CACHE_MB,
+                )?) as Arc<dyn Subscriber>)
+            }
+            DataSource::Status(_) => None,
+        };
+        let mut subscribers: Vec<Arc<dyn Subscriber>> = vec![Arc::new(
+            ControlQuerySubscriber::new(data_source, key_ring, node_config, network, permissions)?,
+        )];
+        subscribers.extend(lite);
         let ret = Self {
             adnl: AdnlServer::listen(
                 config,
-                vec![Arc::new(ControlQuerySubscriber::new(
-                    data_source,
-                    key_ring,
-                    node_config,
-                    network,
-                    permissions,
-                )?)],
+                subscribers,
                 #[cfg(feature = "telemetry")]
                 "ControlServer",
             )
@@ -652,20 +960,24 @@ impl Stoppable for ControlServer {
     }
 }
 
+/// The engine's start-up status. Before the engine has started the reference
+/// engine answers every engine query with "not started", so the control port
+/// holds the status but does not read it.
 pub trait StatusReporter: Send + Sync {
+    #[allow(dead_code)]
     fn get_report(&self) -> u32;
 }
 
+/// What the control port serves from.
 pub enum DataSource {
     Engine(Arc<dyn EngineOperations>),
-    Status(Arc<dyn StatusReporter>),
+    Status(#[allow(dead_code)] Arc<dyn StatusReporter>),
 }
 
 struct ControlQuerySubscriber {
     data_source: DataSource,
     key_ring: Arc<dyn KeyRing>,
     config: Arc<NodeConfigHandler>,
-    public_overlay_adnl_id: Option<Arc<KeyId>>,
     certificates: Option<Arc<ShardCertificateEndpoint>>,
     permissions: Arc<ClientPermissions>,
 }
@@ -678,20 +990,8 @@ impl ControlQuerySubscriber {
         network: Option<&NodeNetwork>,
         permissions: Arc<ClientPermissions>,
     ) -> Result<Self> {
-        let key_id = if let Some(network) = network {
-            Some(network.get_key_id_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?)
-        } else {
-            None
-        };
         let certificates = network.map(|network| network.shard_certificate_endpoint().clone());
-        let ret = Self {
-            data_source,
-            key_ring,
-            config,
-            public_overlay_adnl_id: key_id,
-            certificates,
-            permissions,
-        };
+        let ret = Self { data_source, key_ring, config, certificates, permissions };
         Ok(ret)
     }
 
@@ -702,376 +1002,8 @@ impl ControlQuerySubscriber {
         }
     }
 
-    async fn get_all_config_params(&self) -> Result<ConfigInfo> {
-        let engine = self.engine()?;
-        let mc_state = engine.load_last_applied_mc_state().await?;
-        let block_id = mc_state.block_id();
-        let config_params = mc_state.config_params()?;
-        let config_info = ConfigInfo {
-            mode: 0,
-            id: block_id.clone(),
-            state_proof: vec![],
-            config_proof: config_params.write_to_bytes()?,
-        };
-        Ok(config_info)
-    }
-
-    async fn get_config_params(&self, param_number: u32) -> Result<ConfigInfo> {
-        let engine = self.engine()?;
-        let mc_state = engine.load_last_applied_mc_state().await?;
-        let config_params = mc_state.config_params()?;
-        let config_param = serialize_config_param(config_params, param_number)?;
-        let config_info = ConfigInfo {
-            mode: 0,
-            id: mc_state.block_id().clone(),
-            state_proof: vec![],
-            config_proof: config_param.into_bytes(),
-        };
-        Ok(config_info)
-    }
-
-    async fn get_account_state(&self, address: AccountAddress) -> Result<ShardAccountStateBoxed> {
-        let address: MsgAddressInt = address.account_address.parse()?;
-        Self::convert_account_state(self.find_account(&address).await?)
-    }
-
-    async fn get_account_by_block(
-        &self,
-        account_id: UInt256,
-        block_root_hash: UInt256,
-    ) -> Result<ShardAccountStateBoxed> {
-        Self::convert_account_state(
-            self.find_account_by_block(&account_id.into(), &block_root_hash).await?,
-        )
-    }
-
-    async fn get_account_meta(&self, address: AccountAddress) -> Result<ShardAccountMetaBoxed> {
-        let address: MsgAddressInt = address.account_address.parse()?;
-        Self::convert_account_meta(self.find_account(&address).await?)
-    }
-
-    async fn get_account_meta_by_block(
-        &self,
-        account_id: UInt256,
-        block_root_hash: UInt256,
-    ) -> Result<ShardAccountMetaBoxed> {
-        Self::convert_account_meta(
-            self.find_account_by_block(&account_id.into(), &block_root_hash).await?,
-        )
-    }
-
-    async fn find_account(
-        &self,
-        addr: &MsgAddressInt,
-    ) -> Result<Option<(ShardAccount, PinnedShardStateGuard)>> {
-        let engine = self.engine()?;
-        let state = if addr.is_masterchain() {
-            let mc_block_id = engine
-                .load_last_applied_mc_block_id()?
-                .ok_or_else(|| error!("Cannot load last_applied_mc_block_id!"))?;
-            engine.load_and_pin_state(&mc_block_id).await?
-        } else {
-            let mc_block_id = engine.load_shard_client_mc_block_id()?;
-            let mc_block_id =
-                mc_block_id.ok_or_else(|| error!("Cannot load shard_client_mc_block_id!"))?;
-            let mc_state = engine.load_and_pin_state(&mc_block_id).await?;
-            let mut shard_state = None;
-            for id in mc_state.state().top_blocks(addr.workchain_id())? {
-                if id.shard().contains_account(addr.address())? {
-                    shard_state = engine.load_and_pin_state(&id).await.ok();
-                    break;
-                }
-            }
-            shard_state.ok_or_else(|| error!("Cannot find actual shard for account {}", addr))?
-        };
-        Ok(state.state().shard_account(&addr.address())?.map(|acc| (acc, state)))
-    }
-
-    async fn find_account_by_block(
-        &self,
-        account_id: &AccountId,
-        block_root_hash: &UInt256,
-    ) -> Result<Option<(ShardAccount, PinnedShardStateGuard)>> {
-        let engine = self.engine()?;
-        let block_id = engine.find_full_block_id(block_root_hash)?.ok_or_else(|| {
-            error!("Cannot find full block id by root hash {:x}", block_root_hash)
-        })?;
-        let shard_state = engine.load_and_pin_state(&block_id).await?;
-        Ok(shard_state.state().shard_account(account_id)?.map(|acc| (acc, shard_state)))
-    }
-
-    fn convert_account_state(
-        shard_account: Option<(ShardAccount, PinnedShardStateGuard)>,
-    ) -> Result<ShardAccountStateBoxed> {
-        Ok(match shard_account {
-            Some((account, _state_guard)) => {
-                let shard_account = account.write_to_bytes()?;
-                ShardAccountStateBoxed::Raw_ShardAccountState(ShardAccountState { shard_account })
-            }
-            None => ShardAccountStateBoxed::Raw_ShardAccountNone,
-        })
-    }
-
-    fn convert_account_meta(
-        shard_account: Option<(ShardAccount, PinnedShardStateGuard)>,
-    ) -> Result<ShardAccountMetaBoxed> {
-        Ok(match shard_account {
-            Some((shard_account, _state_guard)) => {
-                let account = shard_account.read_account()?;
-                let code = account.get_code().map(|cell| cell.repr_hash().clone());
-                let data = account.get_data().map(|cell| cell.repr_hash().clone());
-                let libs = account.libraries().root().map(|cell| cell.repr_hash().clone());
-
-                let cell = shard_account.account_cell();
-                let proof = MerkleProof::create(&cell, |hash| {
-                    Some(hash) != code.as_ref()
-                        && Some(hash) != data.as_ref()
-                        && Some(hash) != libs.as_ref()
-                })
-                .unwrap();
-                ShardAccountMetaBoxed::Raw_ShardAccountMeta(ShardAccountMeta {
-                    shard_account_meta: proof.write_to_bytes()?,
-                })
-            }
-            None => ShardAccountMetaBoxed::Raw_ShardAccountMetaNone,
-        })
-    }
-
-    async fn get_applied_shards_info(&self) -> Result<AppliedShardsInfoBoxed> {
-        let engine = self.engine()?;
-        let mc_block_id = engine
-            .load_last_applied_mc_block_id()?
-            .ok_or_else(|| error!("Cannot load load_last_applied_mc_block_id"))?;
-        let shards_mc_block_id = engine
-            .load_shard_client_mc_block_id()?
-            .ok_or_else(|| error!("Cannot load shard_client_mc_block_id"))?;
-        let mut applied_blocks = engine.load_state(&shards_mc_block_id).await?.top_blocks_all()?;
-        applied_blocks.push(mc_block_id.as_ref().clone());
-        Ok(AppliedShardsInfoBoxed::Raw_AppliedShardsInfo(AppliedShardsInfo {
-            shards: applied_blocks,
-        }))
-    }
-
-    fn convert_sync_status(&self, sync_status: u32) -> String {
-        match sync_status {
-            Engine::SYNC_STATUS_START_BOOT => "start_boot".to_string(),
-            Engine::SYNC_STATUS_LOAD_STATES => "load_states".to_string(),
-            Engine::SYNC_STATUS_FINISH_BOOT => "finish_boot".to_string(),
-            Engine::SYNC_STATUS_SYNC_ARCHIVES => "synchronization_by_archives".to_string(),
-            Engine::SYNC_STATUS_SYNC_BLOCKS => "synchronization_by_blocks".to_string(),
-            Engine::SYNC_STATUS_FINISH_SYNC => "synchronization_finished".to_string(),
-            Engine::SYNC_STATUS_CHECKING_DB => "checking_db".to_string(),
-            Engine::SYNC_STATUS_DB_BROKEN => "db_broken".to_string(),
-            _ => "no_set_status".to_string(),
-        }
-    }
-
-    fn block_id_to_json(block_id: &BlockIdExt) -> String {
-        serde_json::json!({
-            "shard":  block_id.shard().to_string(),
-            "seq_no": block_id.seq_no(),
-            "rh":     format!("{:x}", block_id.root_hash),
-            "fh":     format!("{:x}", block_id.file_hash)
-        })
-        .to_string()
-    }
-
     fn add_stats(stats: &mut Vec<OneStat>, key: impl ToString, value: impl ToString) {
         stats.push(OneStat { key: key.to_string(), value: value.to_string() })
-    }
-
-    fn statistics_to_json(
-        map: &lockfree::map::Map<ShardIdent, u64>,
-        now: i64,
-        new_format: bool,
-    ) -> String {
-        let mut json_map = serde_json::Map::new();
-        for item in map.iter() {
-            let value = if new_format {
-                match *item.val() {
-                    0 => -1,
-                    value => now - value as i64,
-                }
-                .into()
-            } else {
-                match *item.val() {
-                    0 => "never".to_string(),
-                    value => format!("{} sec ago", now - value as i64),
-                }
-                .into()
-            };
-            json_map.insert(item.key().to_string(), value);
-        }
-        format!("{:#}", serde_json::Value::from(json_map))
-    }
-
-    fn get_shards_time_diff(engine: &Arc<dyn EngineOperations>, now: u32) -> Result<u32> {
-        let shard_client_mc_block_id = engine
-            .load_shard_client_mc_block_id()?
-            .ok_or_else(|| error!("Cannot load shard_mc_block_id"))?;
-        let shard_client_mc_block_handle = engine
-            .load_block_handle(&shard_client_mc_block_id)?
-            .ok_or_else(|| error!("Cannot load handle for block {}", &shard_client_mc_block_id))?;
-        Ok(now - shard_client_mc_block_handle.gen_utime())
-    }
-
-    async fn get_selected_stats(&self, filter: Option<&str>) -> Result<Stats> {
-        let mut stats = Vec::new();
-        let new_format = filter.is_some();
-
-        // sync status
-        let sync_status = match &self.data_source {
-            DataSource::Engine(engine) => engine.get_sync_status(),
-            DataSource::Status(status) => status.get_report(),
-        };
-        let sync_status = format!("\"{}\"", self.convert_sync_status(sync_status));
-        Self::add_stats(
-            &mut stats,
-            if new_format { "node_status" } else { "sync_status" },
-            sync_status,
-        );
-        if let DataSource::Status(_) = &self.data_source {
-            return Ok(Stats { stats });
-        }
-
-        let engine = self.engine()?;
-        let now = engine.now();
-
-        let mc_block_id = if let Some(id) = engine.load_last_applied_mc_block_id()? {
-            id
-        } else {
-            Self::add_stats(&mut stats, "masterchainblock", "\"not set\"");
-            return Ok(Stats { stats });
-        };
-
-        let mc_block_handle = engine
-            .load_block_handle(&mc_block_id)?
-            .ok_or_else(|| error!("Cannot load handle for block {}", &mc_block_id))?;
-
-        // masterchainblocktime
-        Self::add_stats(&mut stats, "masterchainblocktime", mc_block_handle.gen_utime());
-
-        // masterchainblocknumber
-        Self::add_stats(&mut stats, "masterchainblocknumber", mc_block_handle.id().seq_no());
-
-        Self::add_stats(&mut stats, "node_version", format!("\"{}\"", env!("CARGO_PKG_VERSION")));
-        let public_overlay_adnl_id = self
-            .public_overlay_adnl_id
-            .as_ref()
-            .ok_or_else(|| error!("Public overlay key id didn`t set!"))?;
-        Self::add_stats(
-            &mut stats,
-            "public_overlay_key_id",
-            format!("\"{}\"", &public_overlay_adnl_id),
-        );
-
-        if new_format {
-            Self::add_stats(&mut stats, "supported_block", supported_version());
-            Self::add_stats(&mut stats, "supported_capabilities", supported_capabilities());
-        }
-
-        // timediff
-        let diff = now - mc_block_handle.gen_utime();
-        Self::add_stats(&mut stats, "timediff", diff);
-
-        // shards timediff
-        match Self::get_shards_time_diff(engine, now) {
-            Err(_) => Self::add_stats(&mut stats, "shards_timediff", "\"unknown\""),
-            Ok(shards_timediff) => Self::add_stats(&mut stats, "shards_timediff", shards_timediff),
-        };
-
-        let mc_state = engine.load_last_applied_mc_state().await.ok();
-
-        // global network ID
-        if new_format {
-            if let Some(mc_state) = &mc_state {
-                Self::add_stats(&mut stats, "global_id", mc_state.state()?.global_id())
-            } else {
-                Self::add_stats(&mut stats, "global_id", "\"unknown\"")
-            }
-        }
-
-        // in_current_vset_p34
-        let adnl_ids = self.config.get_actual_validator_adnl_key_ids()?;
-        if let Some(mc_state) = &mc_state {
-            let current = mc_state.config_params()?.validator_set()?.list().iter().any(|val| {
-                let Ok(adnl_id) = val.adnl_addr() else {
-                    return false;
-                };
-                let is_validator = adnl_ids.contains(&adnl_id);
-                if is_validator {
-                    Self::add_stats(
-                        &mut stats,
-                        "current_vset_p34_adnl_id",
-                        format!("\"{}\"", &adnl_id),
-                    );
-                }
-                is_validator
-            });
-            Self::add_stats(&mut stats, "in_current_vset_p34", current)
-        } else {
-            Self::add_stats(&mut stats, "in_current_vset_p34", "\"unknown\"")
-        }
-
-        // in_next_vset_p36
-        if let Some(mc_state) = &mc_state {
-            let next = mc_state.config_params()?.next_validator_set()?.list().iter().any(|val| {
-                let Ok(adnl_id) = val.adnl_addr() else {
-                    return false;
-                };
-                let is_validator = adnl_ids.contains(&adnl_id);
-                if is_validator {
-                    Self::add_stats(
-                        &mut stats,
-                        "next_vset_p36_adnl_id",
-                        format!("\"{}\"", &adnl_id),
-                    );
-                }
-                is_validator
-            });
-            Self::add_stats(&mut stats, "in_next_vset_p36", next)
-        } else {
-            Self::add_stats(&mut stats, "in_next_vset_p36", "\"unknown\"")
-        }
-
-        let value = match engine.load_last_applied_mc_block_id() {
-            Ok(Some(block_id)) => Self::block_id_to_json(&block_id),
-            Ok(None) => "\"no last applied masterchain block{}\"".to_string(),
-            Err(err) => format!("\"{}\"", err),
-        };
-        Self::add_stats(&mut stats, "last_applied_masterchain_block_id", value);
-
-        let value = Self::statistics_to_json(engine.last_validation_time(), now as i64, new_format);
-        if new_format {
-            Self::add_stats(&mut stats, "last_validation_ago_sec", value)
-        } else {
-            Self::add_stats(&mut stats, "validation_stats", value)
-        }
-
-        let value = Self::statistics_to_json(engine.last_collation_time(), now as i64, new_format);
-        if new_format {
-            Self::add_stats(&mut stats, "last_collation_ago_sec", value)
-        } else {
-            Self::add_stats(&mut stats, "collation_stats", value)
-        }
-
-        // tps_10
-        if let Ok(tps) = engine.calc_tps(10) {
-            Self::add_stats(&mut stats, "tps_10", tps);
-        }
-
-        // tps_300
-        if let Ok(tps) = engine.calc_tps(300) {
-            Self::add_stats(&mut stats, "tps_300", tps);
-        }
-
-        Self::add_stats(
-            &mut stats,
-            "validation_status",
-            format!("\"{:?}\"", engine.validation_status()),
-        );
-
-        Ok(Stats { stats })
     }
 
     /// The configuration as the reference engine reports it: its schema,
@@ -1097,7 +1029,12 @@ impl ControlQuerySubscriber {
         if let Some(mc_block_id) = engine.load_last_applied_mc_block_id()? {
             Self::add_stats(&mut stats, "masterchainblock", block_id_to_str(&mc_block_id));
             let state = engine.load_last_applied_mc_state().await?;
-            Self::add_stats(&mut stats, "masterchainblocktime", state.state()?.gen_time());
+            // The reference engine reports the block handle's time.
+            let time = match engine.load_block_handle(&mc_block_id)? {
+                Some(handle) => handle.gen_utime(),
+                None => state.state()?.gen_time(),
+            };
+            Self::add_stats(&mut stats, "masterchainblocktime", time);
             // A state without a key block reference reports none.
             if let Ok(key_block) = state.last_keyblock_id() {
                 Self::add_stats(&mut stats, "keymasterchainblock", block_id_to_str(&key_block));
@@ -1219,36 +1156,6 @@ impl ControlQuerySubscriber {
         }
     }
 
-    async fn prepare_bundle(&self, block_id: BlockIdExt) -> Result<Success> {
-        if let DataSource::Engine(ref engine) = self.data_source {
-            let handle = engine
-                .load_block_handle(&block_id)?
-                .ok_or_else(|| error!("Cannot load handle for block {}", block_id))?;
-            let block = engine.load_block(&handle).await?;
-            let bundle = CollatorTestBundle::build_with_ethalon(engine, block).await?;
-            tokio::task::spawn_blocking(move || {
-                bundle.save("target/bundles").ok();
-            });
-        }
-        Ok(Success::Engine_Validator_Success)
-    }
-
-    async fn prepare_future_bundle(&self, prev_block_ids: Vec<BlockIdExt>) -> Result<Success> {
-        if let DataSource::Engine(ref engine) = self.data_source {
-            let bundle = CollatorTestBundle::build_for_collating_block(
-                engine,
-                prev_block_ids,
-                None,
-                Vec::new(),
-            )
-            .await?;
-            tokio::task::spawn_blocking(move || {
-                bundle.save("target/bundles").ok();
-            });
-        }
-        Ok(Success::Engine_Validator_Success)
-    }
-
     /// The full node, when it serves requests. The key ring the reference
     /// engine also waits for exists before this server does, so only the
     /// full node can be not ready.
@@ -1326,12 +1233,6 @@ impl ControlQuerySubscriber {
         }
     }
 
-    async fn redirect_external_message(&self, message_data: &[u8]) -> Result<Success> {
-        let engine = self.engine()?;
-        engine.redirect_external_message(message_data).await?;
-        Ok(Success::Engine_Validator_Success)
-    }
-
     /// Answers a query from a listed client, in the reference engine's order:
     /// an unserved query is refused as unsupported, then the permission bits
     /// are checked, and only then the handler runs.
@@ -1382,64 +1283,6 @@ impl ControlQuerySubscriber {
         };
         let query = match query.downcast::<ExportAllPrivateKeys>() {
             Ok(query) => return self.export_all_private_keys(&query.encryption_key).await,
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetShardAccountState>() {
-            Ok(account) => {
-                let answer = self.get_account_state(account.account_address).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetShardAccountMeta>() {
-            Ok(account) => {
-                let answer = self.get_account_meta(account.account_address).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetAccountByBlock>() {
-            Ok(account) => {
-                let answer =
-                    self.get_account_by_block(account.account_id, account.block_root_hash).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetAccountMetaByBlock>() {
-            Ok(account) => {
-                let answer = self
-                    .get_account_meta_by_block(account.account_id, account.block_root_hash)
-                    .await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetAppliedShardsInfo>() {
-            Ok(_) => {
-                let answer = self.get_applied_shards_info().await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
             Err(query) => query,
         };
         let query = match query.downcast::<GenerateKeyPair>() {
@@ -1601,92 +1444,8 @@ impl ControlQuerySubscriber {
             }
             Err(query) => query,
         };
-        let query = match query.downcast::<GetBundle>() {
-            Ok(query) => {
-                return QueryResult::consume_boxed(
-                    self.prepare_bundle(query.block_id.clone()).await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                )
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetFutureBundle>() {
-            Ok(query) => {
-                let prev_block_ids = query.prev_block_ids.to_vec();
-                return QueryResult::consume_boxed(
-                    self.prepare_future_bundle(prev_block_ids).await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<SendMessage>() {
-            Ok(query) => {
-                let message_data = query.body;
-                return QueryResult::consume_boxed(
-                    self.redirect_external_message(&message_data).await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetConfigParams>() {
-            Ok(query) => {
-                let param_number =
-                    query.param_list.first().ok_or_else(|| error!("Invalid param_number"))?;
-                let answer = self.get_config_params(*param_number as u32).await?;
-
-                return QueryResult::consume_boxed(
-                    answer.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetBlock>() {
-            Ok(GetBlock { id }) => {
-                let engine = self.engine()?;
-                let (full_id, data) = engine
-                    .lookup_block_by_seqno(&id.shard().into(), id.seq_no)
-                    .await?
-                    .ok_or_else(|| error!("Block not found: {:?}", id))?;
-                let answer = ton::lite_server::blockdata::BlockData { id: full_id, data };
-                return QueryResult::consume_boxed(
-                    answer.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetConfigAll>() {
-            Ok(_) => {
-                let answer = self.get_all_config_params().await?;
-                return QueryResult::consume_boxed(
-                    answer.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
-            Err(query) => query,
-        };
         let query = match query.downcast::<GetStats>() {
             Ok(_) => return self.get_stats().await,
-            Err(query) => query,
-        };
-        let query = match query.downcast::<GetSelectedStats>() {
-            Ok(get_stats) => {
-                let answer = self.get_selected_stats(Some(&get_stats.filter)).await?;
-                return QueryResult::consume_boxed(
-                    answer.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
             Err(query) => query,
         };
 
@@ -1763,28 +1522,20 @@ impl ControlQuerySubscriber {
         let Some(permissions) = self.permissions.get(peers.other().data()).copied() else {
             return control_error(ERROR_CODE_ERROR, "forbidden").map(Some);
         };
-        let object = match deserialize_boxed(bytes) {
-            Ok(object) => object,
+        let data = match frame::read(bytes) {
+            // The lite-server path; before the engine starts nothing answers
+            // it and the connection closes, as with the reference engine.
+            Ok(frame::Frame::Lite) => return Ok(None),
+            Ok(frame::Frame::Unserved) => {
+                return control_error(ERROR_CODE_PROTOVIOLATION, "query not supported").map(Some)
+            }
+            Ok(frame::Frame::Served(data)) => data,
             Err(error) => {
                 return control_error(0, format!("failed to parse validator query: {error}"))
                     .map(Some)
             }
         };
-        if object.is::<LiteServerQuery>() {
-            // The lite-server path of the control port is not served here.
-            return Ok(None);
-        }
-        let query = match object.downcast::<ControlQuery>() {
-            Ok(query) => query,
-            Err(object) => {
-                return control_error(
-                    0,
-                    format!("failed to parse validator query: not a control query {object:?}"),
-                )
-                .map(Some)
-            }
-        };
-        let query = match deserialize_boxed(&query.data[..]) {
+        let query = match deserialize_boxed(data) {
             Ok(query) => query,
             Err(error) => {
                 return control_error(0, format!("failed to parse validator query: {error}"))
@@ -1795,7 +1546,7 @@ impl ControlQuerySubscriber {
             Ok(result) => result,
             Err(err) if err.downcast_ref::<CloseConnection>().is_some() => return Err(err),
             Err(err) => QueryResult::consume_boxed(
-                ControlQueryError { code: -1, message: err.to_string() }.into_boxed(),
+                ControlQueryError { code: reply_code(&err), message: err.to_string() }.into_boxed(),
                 #[cfg(feature = "telemetry")]
                 None,
             )?,
@@ -1840,3 +1591,7 @@ mod pq_section_tests;
 #[cfg(test)]
 #[path = "../tests/test_control_handlers.rs"]
 mod handler_tests;
+
+#[cfg(test)]
+#[path = "../tests/test_control_framing.rs"]
+mod framing_tests;

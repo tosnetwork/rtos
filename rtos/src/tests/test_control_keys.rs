@@ -19,8 +19,8 @@ use rtos_api::{
         engine::validator::{ControlQueryError as ControlQueryErrorBoxed, KeyHash as KeyHashBoxed},
         rpc::engine::validator::{
             AddAdnlId, AddValidatorAdnlAddress, AddValidatorPermanentKey, AddValidatorTempKey,
-            DelAdnlId, DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
-            ExportPublicKey, GenerateKeyPair, Sign,
+            ControlQuery, DelAdnlId, DelValidatorAdnlAddress, DelValidatorPermanentKey,
+            DelValidatorTempKey, ExportPublicKey, GenerateKeyPair, Sign,
         },
     },
     AnyBoxedSerialize,
@@ -34,10 +34,33 @@ const SERVER_KEY: &str =
 const SERVER_PUB: &str =
     r#"{"type_id":1209251014,"pub_key":"cujCRU4rQbSw48yHVHxQtRPhUlbo+BuZggFTQSu04Y8="}"#;
 
-struct StartedEngine;
+/// An engine that has started and serves nothing else; the lite-server
+/// path of the control port needs its allocation counters.
+pub(super) struct StartedEngine {
+    allocated: Arc<crate::engine_traits::EngineAlloc>,
+    #[cfg(feature = "telemetry")]
+    telemetry: Arc<crate::engine_traits::EngineTelemetry>,
+}
+
+impl StartedEngine {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            allocated: crate::collator_test_bundle::create_engine_allocated(),
+            #[cfg(feature = "telemetry")]
+            telemetry: crate::collator_test_bundle::create_engine_telemetry(),
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl EngineOperations for StartedEngine {
+    fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
+        &self.allocated
+    }
+    #[cfg(feature = "telemetry")]
+    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> {
+        &self.telemetry
+    }
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<rtos_block::BlockIdExt>>> {
         Ok(None)
     }
@@ -96,7 +119,7 @@ impl Node {
     /// with `extra` fields.
     pub(super) async fn start_with(started: bool, extra: serde_json::Value) -> Self {
         let source = if started {
-            DataSource::Engine(Arc::new(StartedEngine))
+            DataSource::Engine(StartedEngine::new())
         } else {
             DataSource::Status(Arc::new(NotStarted))
         };
