@@ -1,0 +1,1 @@
+NXT persistent_error seconds 3.003317 attempts 30

@@ -14,7 +14,7 @@ use crate::{
     block_proof::BlockProofStuff,
     engine::Engine,
     engine_traits::EngineOperations,
-    error::{AuthPolicyRefused, NodeError},
+    error::NodeError,
     network::{BlockBroadcastV2, NetworkSignatureSet},
     shard_state::ShardStateStuff,
     validating_utils::{build_checked_data, fmt_block_id_short},
@@ -77,14 +77,42 @@ pub fn start_shards_client(
 
 // Remember about ShardStatesKeeper::MAX_CATCH_UP_DEPTH and ShardStateDb::MAX_QUEUE_LEN
 pub const MC_MAX_SUPERIORITY: u32 = 500;
-const AUTH_REFUSAL_BACKOFF: Duration = Duration::from_millis(100);
+// The reference waits this long after every failed attempt to get the next
+// masterchain block, whatever the error; a success goes on at once.
+const NEXT_MASTER_BLOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+// Expected failures are logged at INFO on every this-many attempts.
+const EXPECTED_FAILURE_LOG_PERIOD: u32 = 128;
+
+/// Logs a failed attempt as the reference does: a warning for an unexpected
+/// failure, and for an expected one (a timeout) INFO on every
+/// EXPECTED_FAILURE_LOG_PERIOD-th attempt and DEBUG otherwise. A "not ready"
+/// failure has no type of its own here, so it is logged as unexpected.
+fn next_master_block_failure_level(attempt: u32, error: &rtos_block::Error) -> log::Level {
+    let expected = matches!(error.downcast_ref::<NodeError>(), Some(NodeError::Timeout(_)));
+    if !expected {
+        log::Level::Warn
+    } else if attempt.is_multiple_of(EXPECTED_FAILURE_LOG_PERIOD) {
+        log::Level::Info
+    } else {
+        log::Level::Debug
+    }
+}
+
+fn log_next_master_block_failure(prev: &BlockIdExt, attempt: u32, error: &rtos_block::Error) {
+    let level = next_master_block_failure_level(attempt, error);
+    log::log!(
+        level,
+        "Error while load and apply next master block, prev: {prev}: attempt: {attempt}, err: {error:?}"
+    );
+}
 
 async fn load_master_blocks_cycle(
     engine: Arc<dyn EngineOperations>,
     mut last_got_block_id: BlockIdExt,
 ) -> Result<()> {
-    let mut attempt = 0;
+    let mut attempt = 0u32;
     loop {
+        // Checked before every attempt, so a stop waits at most one delay.
         if engine.check_stop() {
             break Ok(());
         }
@@ -104,19 +132,9 @@ async fn load_master_blocks_cycle(
                 id
             }
             Err(e) => {
-                log::error!(
-                    "Error while load and apply next master block, prev: {}: attempt: {}, err: {:?}",
-                    last_got_block_id,
-                    attempt,
-                    e
-                );
-                attempt += 1;
-                // A refused next block is refused again on every retry; back off
-                // briefly instead of spinning, as the reference does (0.1 s).
-                if AuthPolicyRefused::is(&e) {
-                    tokio::time::sleep(AUTH_REFUSAL_BACKOFF).await;
-                }
-                // TODO make method to ban bad peer who gave bad block
+                attempt = attempt.saturating_add(1);
+                log_next_master_block_failure(&last_got_block_id, attempt, &e);
+                tokio::time::sleep(NEXT_MASTER_BLOCK_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -826,3 +844,7 @@ async fn process_block_broadcast_v2_inner(
     }
     Ok(Some(block))
 }
+
+#[cfg(test)]
+#[path = "../network/tests/test_next_master_block_retry.rs"]
+mod next_master_block_retry_tests;
