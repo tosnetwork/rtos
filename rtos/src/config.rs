@@ -734,11 +734,15 @@ const LOCAL_HOST: &str = "127.0.0.1";
 impl TonNodeConfig {
     pub const DEFAULT_DB_ROOT: &'static str = "node_db";
     pub const CUSTOM_OVERLAYS_CONFIG_NAME: &'static str = "custom-overlays.json";
+    /// Permission bits of the console client a created configuration lists.
+    pub const BOOTSTRAP_CONTROL_PERMISSIONS: i32 = 0x7fffffff;
 
     pub fn boot_from_zerostate(&self) -> bool {
         self.boot_from_zerostate.unwrap_or(false)
     }
 
+    // The node binary uses `load_or_create`; tests and tools use this.
+    #[allow(dead_code)]
     pub async fn from_file(
         configs_dir: &str,
         json_file_name: &str,
@@ -861,7 +865,10 @@ impl TonNodeConfig {
     }
 
     pub fn control_server(&self) -> Result<Option<AdnlServerConfig>> {
-        self.control_server.as_ref().map(AdnlServerConfig::from_json_config).transpose()
+        self.control_server
+            .as_ref()
+            .map(AdnlServerConfig::from_json_config_with_permissions)
+            .transpose()
     }
 
     pub fn lite_server(&self) -> Result<Option<LiteServerConfig>> {
@@ -1048,6 +1055,7 @@ impl TonNodeConfig {
         port: Option<u16>,
         client_config_name: &str,
         client_pub_keys: Option<Vec<String>>,
+        client_permissions: Option<i32>,
     ) -> Result<Option<AdnlServerConfigJson>> {
         let server_address = if let Some(port) = port {
             format!("{}:{}", LOCAL_HOST, port)
@@ -1084,12 +1092,20 @@ impl TonNodeConfig {
             None
         };
 
-        let server_config = AdnlServerConfigJson::with_params(
-            server_address,
-            server_private_key,
-            client_keys,
-            None,
-        );
+        let server_config = match (client_permissions, client_keys) {
+            (Some(permissions), Some(keys)) => AdnlServerConfigJson::with_client_permissions(
+                server_address,
+                server_private_key,
+                keys.into_iter().map(|key| (key, permissions)).collect(),
+                None,
+            ),
+            (_, client_keys) => AdnlServerConfigJson::with_params(
+                server_address,
+                server_private_key,
+                client_keys,
+                None,
+            ),
+        };
         Ok(Some(server_config))
     }
 
@@ -1104,6 +1120,8 @@ impl TonNodeConfig {
                 self.control_server_port.clone(),
                 "console_config.json",
                 Some(client_pub_key.map(|key| vec![key]).unwrap_or(vec![])),
+                // The bootstrap console client gets every permission.
+                Some(Self::BOOTSTRAP_CONTROL_PERMISSIONS),
             )
             .await?;
         self.control_server_port = None;
@@ -1116,6 +1134,7 @@ impl TonNodeConfig {
                 configs_dir,
                 self.lite_server_port.clone(),
                 "lite_client_config.json",
+                None,
                 None,
             )
             .await?

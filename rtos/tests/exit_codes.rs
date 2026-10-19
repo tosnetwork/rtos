@@ -138,6 +138,27 @@ fn creating_the_configuration_exits_0_without_starting_the_engine() {
 }
 
 #[test]
+fn a_created_configuration_grants_the_console_client_every_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut value = serde_json::json!({
+        "ip_address": format!("127.0.0.1:{}", free_udp_port()),
+        "internal_db_path": dir.path().join("db"),
+        "control_server_port": free_udp_port(),
+    });
+    value["log_config_name"] = serde_json::Value::Null;
+    fs::write(dir.path().join("default_config.json"), value.to_string()).unwrap();
+    let console =
+        r#"{"type_id":1209251014,"pub_key":"RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw="}"#;
+    let (status, text) = run_configs(dir.path(), &["--ckey", console]);
+    assert_eq!(status.code(), Some(0), "{text}");
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+    let client = &config["control_server"]["clients"]["list"][0];
+    assert_eq!(client["pub_key"], "RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw=");
+    assert_eq!(client["permissions"], 0x7fffffff);
+}
+
+#[test]
 fn a_held_configuration_lock_exits_2_and_its_release_admits_the_node() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("config.json"), "{}").unwrap();

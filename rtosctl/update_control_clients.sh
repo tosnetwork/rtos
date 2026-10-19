@@ -78,9 +78,10 @@ for KEY in $KEYS; do
     echo "  Public key: $PUBLIC_KEY"
     
     # Update config.json with the new public key
-    # Create new client entry and set it in the clients list
+    # Create new client entry and set it in the clients list. Permissions 7
+    # grant default, modify and unsafe queries; elections sign with node keys.
     TEMP_FILE=$(mktemp)
-    jq --arg pubkey "$PUBLIC_KEY" '.control_server.clients.list = [{"type_id": 1209251014, "pub_key": $pubkey}]' "$CONFIG_FILE" > "$TEMP_FILE"
+    jq --arg pubkey "$PUBLIC_KEY" '.control_server.clients.list = [{"type_id": 1209251014, "pub_key": $pubkey, "permissions": 7}]' "$CONFIG_FILE" > "$TEMP_FILE"
     mv "$TEMP_FILE" "$CONFIG_FILE"
     
     echo "  Updated $CONFIG_FILE"

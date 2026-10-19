@@ -89,7 +89,8 @@ const ADNL_SERVER_CONFIG: &str = r#"{
         "list": [
             {
                 "type_id": 1209251014,
-                "pub_key": "RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw="
+                "pub_key": "RYokIiD5AFkzfTBgC6NhtAGFKm0+gwhN4suTzaW0Sjw=",
+                "permissions": 7
             }
         ]
     }
@@ -160,7 +161,7 @@ async fn start_control_with_options(
     let key_id = network.get_key_id_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
     let port = format!(":{}", get_next_control_port());
     let config = ADNL_SERVER_CONFIG.replace(":port", &port);
-    let config = AdnlServerConfig::from_json(&config)?;
+    let config = AdnlServerConfig::from_json_with_permissions(&config)?;
     let control = ControlServer::with_params(
         config,
         data_source,

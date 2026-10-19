@@ -35,6 +35,7 @@ use secrets_vault::vault_block::get_key_option_factory;
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
+    collections::HashMap,
     convert::TryInto,
     io::ErrorKind,
     net::SocketAddr,
@@ -43,11 +44,44 @@ use std::{
 };
 use stream_cancel::StreamExt;
 
+/// A listed client: its public key and, for a server that authorizes each
+/// query, its permission bits. As in the reference config schema the bits are
+/// a signed 32-bit integer, written as a number or a decimal string, and an
+/// absent value means no permissions.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct AdnlServerClientJson {
+    #[serde(flatten)]
+    key: KeyOptionJson,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_permissions"
+    )]
+    permissions: Option<i32>,
+}
+
+fn deserialize_permissions<'de, D>(deserializer: D) -> std::result::Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::{de::Error, Deserialize};
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let parsed = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Number(number)) => {
+            number.as_i64().and_then(|v| i32::try_from(v).ok())
+        }
+        Some(serde_json::Value::String(text)) => text.parse::<i32>().ok(),
+        Some(_) => None,
+    };
+    parsed.map(Some).ok_or_else(|| D::Error::custom("permissions must be a 32-bit signed integer"))
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum AdnlServerClients {
     Any,
-    List(Vec<KeyOptionJson>),
+    List(Vec<AdnlServerClientJson>),
 }
 
 impl Default for AdnlServerClients {
@@ -82,18 +116,48 @@ impl AdnlServerConfigJson {
         timeouts: Option<Timeouts>,
     ) -> Self {
         let clients = if let Some(client_keys) = client_keys {
-            AdnlServerClients::List(client_keys)
+            AdnlServerClients::List(
+                client_keys
+                    .into_iter()
+                    .map(|key| AdnlServerClientJson { key, permissions: None })
+                    .collect(),
+            )
         } else {
             AdnlServerClients::Any
         };
         Self { address, clients, server_key, timeouts }
     }
+
+    /// A server whose listed clients carry permission bits.
+    pub fn with_client_permissions(
+        address: String,
+        server_key: KeyOptionJson,
+        clients: Vec<(KeyOptionJson, i32)>,
+        timeouts: Option<Timeouts>,
+    ) -> Self {
+        let clients = AdnlServerClients::List(
+            clients
+                .into_iter()
+                .map(|(key, permissions)| AdnlServerClientJson {
+                    key,
+                    permissions: Some(permissions),
+                })
+                .collect(),
+        );
+        Self { address, clients, server_key, timeouts }
+    }
 }
+
+/// Permission bits of each admitted client, keyed by its short key id.
+pub type ClientPermissions = HashMap<[u8; 32], u32>;
 
 /// ADNL server configuration
 pub struct AdnlServerConfig {
     address: SocketAddr,
     clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
+    /// Set for a server that admits any key at the handshake and authorizes
+    /// each query from this table instead.
+    permissions: Option<Arc<ClientPermissions>>,
     server_key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>>,
     server_id: Arc<KeyId>,
     timeouts: Timeouts,
@@ -116,8 +180,8 @@ impl AdnlServerConfig {
             AdnlServerClients::Any => None,
             AdnlServerClients::List(list) => {
                 let clients = lockfree::map::Map::new();
-                for key in list {
-                    let key = get_key_option_factory().from_public_key_json(key)?;
+                for client in list {
+                    let key = get_key_option_factory().from_public_key_json(&client.key)?;
                     let key = key.pub_key()?;
                     if clients.insert(key.try_into()?, 0).is_some() {
                         fail!("Duplicated client key {} in server config", base64_encode(key))
@@ -129,6 +193,7 @@ impl AdnlServerConfig {
         let ret = AdnlServerConfig {
             address: json_config.address.parse()?,
             clients: Arc::new(clients),
+            permissions: None,
             server_key: Arc::new(server_key),
             server_id,
             timeouts: if let Some(timeouts) = &json_config.timeouts {
@@ -140,9 +205,57 @@ impl AdnlServerConfig {
         Ok(ret)
     }
 
+    /// Constructs a server that authorizes each query, from JSON data
+    pub fn from_json_with_permissions(json: &str) -> Result<Self> {
+        let json_config: AdnlServerConfigJson = serde_json::from_str(json)?;
+        Self::from_json_config_with_permissions(&json_config)
+    }
+
+    /// Constructs a server that accepts any key at the handshake and keeps a
+    /// permission table for its own clients. Entries apply in order, as the
+    /// reference engine loads them: a later nonzero value replaces an earlier
+    /// one and zero removes the client. `any` lists no client.
+    pub fn from_json_config_with_permissions(json_config: &AdnlServerConfigJson) -> Result<Self> {
+        let key = get_key_option_factory().from_private_key_json(&json_config.server_key)?;
+        let server_key = lockfree::map::Map::new();
+        let server_id = key.id().clone();
+        server_key.insert(key.id().clone(), key);
+        let mut permissions = ClientPermissions::new();
+        if let AdnlServerClients::List(list) = &json_config.clients {
+            for client in list {
+                let key = get_key_option_factory().from_public_key_json(&client.key)?;
+                let id = *key.id().data();
+                // Signed in the schema, a bit set in the engine.
+                let bits = u32::from_ne_bytes(client.permissions.unwrap_or(0).to_ne_bytes());
+                if bits == 0 {
+                    permissions.remove(&id);
+                } else {
+                    permissions.insert(id, bits);
+                }
+            }
+        }
+        Ok(AdnlServerConfig {
+            address: json_config.address.parse()?,
+            clients: Arc::new(None),
+            permissions: Some(Arc::new(permissions)),
+            server_key: Arc::new(server_key),
+            server_id,
+            timeouts: if let Some(timeouts) = &json_config.timeouts {
+                timeouts.clone()
+            } else {
+                Timeouts::default()
+            },
+        })
+    }
+
     /// Check clients list
     pub fn is_any_client(&self) -> bool {
         self.clients.is_none()
+    }
+
+    /// The permission table of a server that authorizes each query.
+    pub fn client_permissions(&self) -> Option<Arc<ClientPermissions>> {
+        self.permissions.clone()
     }
 
     /// Get timeouts
@@ -790,3 +903,7 @@ impl AdnlServer {
 #[cfg(all(test, feature = "client", feature = "server"))]
 #[path = "../tests/test_server.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "server_permissions_tests.rs"]
+mod permissions_tests;

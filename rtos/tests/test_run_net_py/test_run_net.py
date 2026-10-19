@@ -851,7 +851,8 @@ def add_control_client_key_to_nodes(pub_key_b64: str):
         with open(node_cfg_path) as f:
             cfg = json.load(f)
         clients_list = cfg.get("control_server", {}).get("clients", {}).get("list", [])
-        clients_list.append({"type_id": 1209251014, "pub_key": pub_key_b64})
+        # Default, modify and unsafe control permissions.
+        clients_list.append({"type_id": 1209251014, "pub_key": pub_key_b64, "permissions": 7})
         cfg.setdefault("control_server", {}).setdefault("clients", {})["list"] = clients_list
         with open(node_cfg_path, "w") as f:
             json.dump(cfg, f, indent=2)

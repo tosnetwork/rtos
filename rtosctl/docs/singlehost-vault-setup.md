@@ -262,7 +262,7 @@ cd ../../../rtosctl
 This script will:
 
 1. Fetch public keys from Vault for each `control-clients-nodeX` key
-2. Update each node's `config.json` with the client public key in `control_server.clients.list`
+2. Update each node's `config.json` with the client public key in `control_server.clients.list`, with `"permissions": 7` (default, modify and unsafe queries). A listed client without `permissions` is refused every query.
 
 ### 4.3 Verify Configuration Updates
 

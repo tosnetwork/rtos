@@ -19,8 +19,8 @@ use crate::{
     validating_utils::{supported_capabilities, supported_version},
 };
 use adnl::{
-    common::{AdnlPeers, QueryResult, Subscriber},
-    server::{AdnlServer, AdnlServerConfig},
+    common::{AdnlPeers, QueryAnswer, QueryResult, Subscriber},
+    server::{AdnlServer, AdnlServerConfig, ClientPermissions},
 };
 use rtos_api::{
     deserialize_boxed,
@@ -51,7 +51,9 @@ use rtos_api::{
                 GenerateKeyPair, GetBundle, GetConfig, GetFutureBundle, GetSelectedStats, GetStats,
                 ImportPrivateKey, ShowCustomOverlays, Sign,
             },
-            lite_server::{GetBlock, GetConfigAll, GetConfigParams, SendMessage},
+            lite_server::{
+                GetBlock, GetConfigAll, GetConfigParams, Query as LiteServerQuery, SendMessage,
+            },
             raw::{
                 GetAccountByBlock, GetAccountMetaByBlock, GetAppliedShardsInfo,
                 GetShardAccountMeta, GetShardAccountState,
@@ -68,6 +70,70 @@ use rtos_block::{
 use rtos_block_json::serialize_config_param;
 use std::{collections::HashSet, sync::Arc};
 
+/// Permission bits of a control client, as the reference engine defines them.
+pub(crate) const VEP_DEFAULT: u32 = 1;
+pub(crate) const VEP_MODIFY: u32 = 2;
+pub(crate) const VEP_UNSAFE: u32 = 4;
+
+/// Reference engine error codes used in control replies.
+const ERROR_CODE_ERROR: i32 = 602;
+const ERROR_CODE_PROTOVIOLATION: i32 = 621;
+
+/// The permission bits a served control query needs. Zero means that being a
+/// listed client is enough, as for lite-server queries on the control port.
+/// `None` is a query this server does not serve.
+pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
+    macro_rules! table {
+        ($($ty:ty => $bits:expr),* $(,)?) => {
+            $(if query.is::<$ty>() { return Some($bits); })*
+        };
+    }
+    table!(
+        GenerateKeyPair => VEP_DEFAULT,
+        ImportPrivateKey => VEP_DEFAULT,
+        ExportPublicKey => VEP_DEFAULT,
+        Sign => VEP_UNSAFE,
+        AddValidatorPermanentKey => VEP_MODIFY,
+        AddValidatorTempKey => VEP_MODIFY,
+        AddValidatorAdnlAddress => VEP_MODIFY,
+        AddAdnlId => VEP_MODIFY,
+        GetStats => VEP_DEFAULT,
+        GetConfig => VEP_DEFAULT,
+        AddCustomOverlay => VEP_MODIFY,
+        DelCustomOverlay => VEP_MODIFY,
+        ShowCustomOverlays => VEP_DEFAULT,
+        GetBlock => 0,
+        GetConfigAll => 0,
+        GetConfigParams => 0,
+        SendMessage => 0,
+        GetShardAccountState => VEP_DEFAULT,
+        GetShardAccountMeta => VEP_DEFAULT,
+        GetAccountByBlock => VEP_DEFAULT,
+        GetAccountMetaByBlock => VEP_DEFAULT,
+        GetAppliedShardsInfo => VEP_DEFAULT,
+        GetSelectedStats => VEP_DEFAULT,
+        GetBundle => VEP_MODIFY,
+        GetFutureBundle => VEP_MODIFY,
+    );
+    None
+}
+
+fn control_error(code: i32, message: impl Into<String>) -> Result<QueryResult> {
+    QueryResult::consume_boxed(
+        ControlQueryError { code, message: message.into() }.into_boxed(),
+        #[cfg(feature = "telemetry")]
+        None,
+    )
+}
+
+fn into_answer(result: QueryResult) -> Result<Option<QueryAnswer>> {
+    match result {
+        QueryResult::Consumed(answer) => Ok(Some(answer)),
+        QueryResult::Rejected(query) => fail!("Control query was not answered: {query:?}"),
+        QueryResult::RejectedBundle(_) => fail!("Control query bundle was not answered"),
+    }
+}
+
 pub struct ControlServer {
     adnl: AdnlServer,
 }
@@ -80,10 +146,14 @@ impl ControlServer {
         node_config: Arc<NodeConfigHandler>,
         network: Option<&NodeNetwork>,
     ) -> Result<Self> {
-        // Allow any client for control server
-        //if config.is_any_client() {
-        //    fail!("Control server is configured without client authorization");
-        //}
+        // Any key may connect; each query is authorized from this server's
+        // own client table.
+        let permissions = config
+            .client_permissions()
+            .ok_or_else(|| error!("Control server must authorize each query"))?;
+        if permissions.is_empty() {
+            log::warn!("Control server lists no permitted client: every query is forbidden");
+        }
         let ret = Self {
             adnl: AdnlServer::listen(
                 config,
@@ -92,6 +162,7 @@ impl ControlServer {
                     key_ring,
                     node_config,
                     network,
+                    permissions,
                 )?)],
                 #[cfg(feature = "telemetry")]
                 "ControlServer",
@@ -134,6 +205,7 @@ struct ControlQuerySubscriber {
     key_ring: Arc<dyn KeyRing>,
     config: Arc<NodeConfigHandler>,
     public_overlay_adnl_id: Option<Arc<KeyId>>,
+    permissions: Arc<ClientPermissions>,
 }
 
 impl ControlQuerySubscriber {
@@ -142,13 +214,15 @@ impl ControlQuerySubscriber {
         key_ring: Arc<dyn KeyRing>,
         config: Arc<NodeConfigHandler>,
         network: Option<&NodeNetwork>,
+        permissions: Arc<ClientPermissions>,
     ) -> Result<Self> {
         let key_id = if let Some(network) = network {
             Some(network.get_key_id_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?)
         } else {
             None
         };
-        let ret = Self { data_source, key_ring, config, public_overlay_adnl_id: key_id };
+        let ret =
+            Self { data_source, key_ring, config, public_overlay_adnl_id: key_id, permissions };
         Ok(ret)
     }
 
@@ -703,17 +777,18 @@ impl ControlQuerySubscriber {
         Ok(Success::Engine_Validator_Success)
     }
 
-    async fn try_consume_query_impl(
-        &self,
-        object: TLObject,
-        _peers: &AdnlPeers,
-    ) -> Result<QueryResult> {
-        log::debug!("recieve object (control server): {:?}", object);
-        let query = match object.downcast::<ControlQuery>() {
-            Ok(query) => deserialize_boxed(&query.data[..])?,
-            Err(object) => return Ok(QueryResult::Rejected(object)),
-        };
+    /// Answers a query from a listed client, in the reference engine's order:
+    /// an unserved query is refused as unsupported, then the permission bits
+    /// are checked, and only then the handler runs.
+    async fn dispatch(&self, query: TLObject, permissions: u32) -> Result<QueryResult> {
         log::debug!("query (control server): {:?}", query);
+        let Some(required) = required_permission(&query) else {
+            log::warn!("Unsupported ControlQuery (control server): {:?}", query);
+            return control_error(ERROR_CODE_PROTOVIOLATION, "query not supported");
+        };
+        if permissions & required != required {
+            return control_error(ERROR_CODE_ERROR, "not authorized");
+        }
         let query = match query.downcast::<GetShardAccountState>() {
             Ok(account) => {
                 let answer = self.get_account_state(account.account_address).await?;
@@ -1008,21 +1083,67 @@ impl ControlQuerySubscriber {
         };
 
         log::warn!("Unsupported ControlQuery (control server): {:?}", query);
-        Ok(QueryResult::Rejected(query))
+        control_error(ERROR_CODE_PROTOVIOLATION, "query not supported")
+    }
+
+    /// Authorizes the client before the query body is decoded: a client this
+    /// server does not list is refused whatever it sent, and the connection
+    /// stays open.
+    async fn consume_raw(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<Option<QueryResult>> {
+        let Some(permissions) = self.permissions.get(peers.other().data()).copied() else {
+            return control_error(ERROR_CODE_ERROR, "forbidden").map(Some);
+        };
+        let object = match deserialize_boxed(bytes) {
+            Ok(object) => object,
+            Err(error) => {
+                return control_error(0, format!("failed to parse validator query: {error}"))
+                    .map(Some)
+            }
+        };
+        if object.is::<LiteServerQuery>() {
+            // The lite-server path of the control port is not served here.
+            return Ok(None);
+        }
+        let query = match object.downcast::<ControlQuery>() {
+            Ok(query) => query,
+            Err(object) => {
+                return control_error(
+                    0,
+                    format!("failed to parse validator query: not a control query {object:?}"),
+                )
+                .map(Some)
+            }
+        };
+        let query = match deserialize_boxed(&query.data[..]) {
+            Ok(query) => query,
+            Err(error) => {
+                return control_error(0, format!("failed to parse validator query: {error}"))
+                    .map(Some)
+            }
+        };
+        let result = match self.dispatch(query, permissions).await {
+            Ok(result) => result,
+            Err(err) => QueryResult::consume_boxed(
+                ControlQueryError { code: -1, message: err.to_string() }.into_boxed(),
+                #[cfg(feature = "telemetry")]
+                None,
+            )?,
+        };
+        Ok(Some(result))
     }
 }
 
 #[async_trait::async_trait]
 impl Subscriber for ControlQuerySubscriber {
-    async fn try_consume_query(&self, object: TLObject, peers: &AdnlPeers) -> Result<QueryResult> {
+    async fn try_consume_raw_query(
+        &self,
+        bytes: &[u8],
+        peers: &AdnlPeers,
+    ) -> Result<Option<QueryAnswer>> {
         let now = std::time::Instant::now();
-        let result = match self.try_consume_query_impl(object, peers).await {
-            Ok(result) => Ok(result),
-            Err(err) => QueryResult::consume_boxed(
-                ControlQueryError { code: -1, message: err.to_string() }.into_boxed(),
-                #[cfg(feature = "telemetry")]
-                None,
-            ),
+        let result = match self.consume_raw(bytes, peers).await? {
+            Some(result) => into_answer(result),
+            None => Ok(None),
         };
         log::trace!("Control server operation {} TIME", now.elapsed().as_millis());
         result
@@ -1032,3 +1153,7 @@ impl Subscriber for ControlQuerySubscriber {
 #[cfg(test)]
 #[path = "../tests/test_control.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/test_control_permissions.rs"]
+mod permissions_tests;
