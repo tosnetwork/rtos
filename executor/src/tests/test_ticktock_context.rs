@@ -108,10 +108,10 @@ fn ticktock_context_matches_cpp_transactions() {
                     let (tx, account)=run(&name,cfg,account,tt,true,&mut rows);
                     let rtos_block::TransactionDescr::TickTock(desc)=tx.read_description().unwrap() else {panic!("ticktock")};
                     let rtos_block::TrComputePhase::Vm(compute)=desc.compute_ph else { assert_eq!(balance,0,"{name}"); continue; };
-                    let success=match probe {"fields"|"throw"=>false,"null"=>version>=17,p if p.starts_with("msg-")=>version>=11,_=>true};
+                    let success=match probe {"fields"|"throw"=>false,"null"=>version>=16,p if p.starts_with("msg-")=>version>=11,_=>true};
                     assert_eq!(compute.success,success,"{name}");
-                    if probe=="length" {assert_eq!(SliceData::load_cell(account.get_data().unwrap()).unwrap().get_next_byte().unwrap(),if version>=17{19}else if version>=11{18}else{17},"{name}");}
-                    if probe=="null" && version>=17 {assert_eq!(SliceData::load_cell(account.get_data().unwrap()).unwrap().get_next_byte().unwrap(),255,"{name}");}
+                    if probe=="length" {assert_eq!(SliceData::load_cell(account.get_data().unwrap()).unwrap().get_next_byte().unwrap(),if version>=16{19}else if version>=11{18}else{17},"{name}");}
+                    if probe=="null" && version>=16 {assert_eq!(SliceData::load_cell(account.get_data().unwrap()).unwrap().get_next_byte().unwrap(),255,"{name}");}
                 }
             }
         }
