@@ -103,26 +103,32 @@ async fn send(
     endpoint.node.broadcast(id, &tagged, Some(source), flags, AdnlSendMethod::Fast).await
 }
 
+// Observations are collected first and checked after both nodes stop, so a
+// failed expectation reports instead of leaving the transport running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn certified_ephemeral_source_reaches_an_enforcing_peer() {
     let (a, mut b, id) = pair(120).await;
     let ephemeral = seed_key(121);
     let data: Vec<u8> = (0..4000u32).map(|i| (i * 5) as u8).collect();
     // Without a certificate the any-sender FEC source is refused locally.
-    assert!(send(&a, &id, &ephemeral, &data, BROADCAST_FLAG_ANY_SENDER).await.is_err());
+    let refused = send(&a, &id, &ephemeral, &data, BROADCAST_FLAG_ANY_SENDER).await.is_err();
     a.node
         .update_certificate(&id, ephemeral.id(), Some(self_certificate(&id, &ephemeral)))
         .unwrap();
-    send(&a, &id, &ephemeral, &data, BROADCAST_FLAG_ANY_SENDER).await.unwrap();
-    assert_eq!(delivered(&mut b, 3000).await.unwrap(), data);
+    let sent = send(&a, &id, &ephemeral, &data, BROADCAST_FLAG_ANY_SENDER).await.is_ok();
+    let fec = delivered(&mut b, 3000).await;
     // The simple carrier attaches the certificate too.
-    send(&a, &id, &ephemeral, b"small", BROADCAST_FLAG_ANY_SENDER).await.unwrap();
-    assert_eq!(delivered(&mut b, 3000).await.unwrap(), b"small");
+    let sent_small = send(&a, &id, &ephemeral, b"small", BROADCAST_FLAG_ANY_SENDER).await.is_ok();
+    let small = delivered(&mut b, 3000).await;
     // Removing the certificate stops the source again.
     a.node.update_certificate(&id, ephemeral.id(), None).unwrap();
-    assert!(send(&a, &id, &ephemeral, &data[1..], BROADCAST_FLAG_ANY_SENDER).await.is_err());
+    let refused_again =
+        send(&a, &id, &ephemeral, &data[1..], BROADCAST_FLAG_ANY_SENDER).await.is_err();
     a.adnl.stop_checked().await.unwrap();
     b.adnl.stop_checked().await.unwrap();
+    assert!(refused && sent && sent_small && refused_again);
+    assert_eq!(fec, Some(data));
+    assert_eq!(small.as_deref(), Some(&b"small"[..]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -130,24 +136,29 @@ async fn need_check_source_sends_after_its_own_application_check() {
     let (a, mut b, id) = pair(122).await;
     let stranger = seed_key(123);
     // NeedCheck without an application check: refused before sending.
-    assert!(send(&a, &id, &stranger, b"payload", 0).await.is_err());
+    let unchecked = send(&a, &id, &stranger, b"payload", 0).await.is_err();
     let own = TestCheck::new(true, false);
     a.node.set_public_broadcast_check(&id, Some(own.clone())).unwrap();
     let remote = TestCheck::new(true, false);
     b.node.set_public_broadcast_check(&id, Some(remote.clone())).unwrap();
-    send(&a, &id, &stranger, b"payload", 0).await.unwrap();
-    assert_eq!(own.calls(), 1);
-    assert_eq!(delivered(&mut b, 3000).await.unwrap(), b"payload");
-    assert_eq!(remote.calls(), 1);
+    let sent = send(&a, &id, &stranger, b"payload", 0).await.is_ok();
+    let own_calls = own.calls();
+    let first = delivered(&mut b, 3000).await;
+    let remote_calls = remote.calls();
     // A refusing local check stops the broadcast.
     a.node.set_public_broadcast_check(&id, Some(TestCheck::new(false, false))).unwrap();
-    assert!(send(&a, &id, &stranger, b"refused", 0).await.is_err());
-    assert!(delivered(&mut b, 300).await.is_none());
+    let refused = send(&a, &id, &stranger, b"refused", 0).await.is_err();
+    let none = delivered(&mut b, 300).await;
     // NeedCheck FEC with FixedNeighbours is admitted the same way.
     a.node.set_public_broadcast_check(&id, Some(own.clone())).unwrap();
     let data: Vec<u8> = (0..2400u32).map(|i| i as u8).collect();
-    send(&a, &id, &stranger, &data, BROADCAST_FLAG_FIXED_NEIGHBOURS).await.unwrap();
-    assert_eq!(delivered(&mut b, 3000).await.unwrap(), data);
+    let sent_fec = send(&a, &id, &stranger, &data, BROADCAST_FLAG_FIXED_NEIGHBOURS).await.is_ok();
+    let fec = delivered(&mut b, 3000).await;
     a.adnl.stop_checked().await.unwrap();
     b.adnl.stop_checked().await.unwrap();
+    assert!(unchecked && sent && refused && sent_fec);
+    assert_eq!((own_calls, remote_calls), (1, 1));
+    assert_eq!(first.as_deref(), Some(&b"payload"[..]));
+    assert!(none.is_none());
+    assert_eq!(fec, Some(data));
 }
