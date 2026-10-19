@@ -686,8 +686,9 @@ impl Engine {
         switch_to_c0(self)?;
         Ok(None)
     }
+    // Entering a PushInt continuation is part of the jump that reached it, not a separate VM
+    // step (the reference resolves it inside the same jump).
     fn step_pushint(&mut self, code: i32) -> Result<Option<i32>> {
-        self.step += 1;
         self.log_string = Some("implicit PUSHINT");
         self.cc.stack.push_int(code);
         switch(self, ctrl!(0))?;

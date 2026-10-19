@@ -10949,5 +10949,245 @@
     "setup": "PUSHINT 5",
     "tail": "PUSHINT 7",
     "gas": 95
+  },
+  {
+    "name": "pushint-ret-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-retalt-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 RETALT } BOOLEVAL",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-ret-tail-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-retalt-tail-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 RETALT } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-explicit-ret-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 RET PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-callx-c1-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 PUSHCTR c1 CALLX PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-ifret-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 PUSHINT -1 IFRET PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-nested-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHCONT { RETALT } BOOLEVAL } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-nested3-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHCONT { PUSHCONT { PUSHINT 1 } BOOLEVAL } BOOLEVAL } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-repeat-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHINT 3 PUSHCONT { PUSHCONT { PUSHINT 1 } BOOLEVAL DROP } REPEAT PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-throw-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { ADD } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-try-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHCONT { ADD } BOOLEVAL } PUSHCONT { 2DROP PUSHINT 8 } TRY PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-gas60-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 60
+  },
+  {
+    "name": "pushint-gas66-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 66
+  },
+  {
+    "name": "pushint-gas72-v4",
+    "code": "",
+    "bits": 0,
+    "version": 4,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 72
+  },
+  {
+    "name": "pushint-ret-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-retalt-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 RETALT } BOOLEVAL",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-ret-tail-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-retalt-tail-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 RETALT } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-explicit-ret-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 RET PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-callx-c1-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 PUSHCTR c1 CALLX PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-ifret-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 PUSHINT -1 IFRET PUSHINT 6 } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-nested-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHCONT { RETALT } BOOLEVAL } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-nested3-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHCONT { PUSHCONT { PUSHINT 1 } BOOLEVAL } BOOLEVAL } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-repeat-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHINT 3 PUSHCONT { PUSHCONT { PUSHINT 1 } BOOLEVAL DROP } REPEAT PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-throw-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { ADD } BOOLEVAL PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-try-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHCONT { ADD } BOOLEVAL } PUSHCONT { 2DROP PUSHINT 8 } TRY PUSHINT 7",
+    "gas": 1000
+  },
+  {
+    "name": "pushint-gas60-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 60
+  },
+  {
+    "name": "pushint-gas66-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 66
+  },
+  {
+    "name": "pushint-gas72-v16",
+    "code": "",
+    "bits": 0,
+    "version": 16,
+    "setup": "PUSHCONT { PUSHINT 5 } BOOLEVAL PUSHINT 7",
+    "gas": 72
   }
 ]
