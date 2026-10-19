@@ -5,15 +5,15 @@ use std::collections::BTreeMap;
 use tokio::sync::{Notify, Semaphore};
 
 pub(crate) struct ApplyGate {
-    seen: std::sync::Mutex<BTreeMap<u32, BlockIdExt>>,
+    pub(crate) seen: std::sync::Mutex<BTreeMap<u32, BlockIdExt>>,
     changed: Notify,
-    release: Semaphore,
+    pub(crate) release: Semaphore,
     cancel_at: std::sync::Mutex<
         Option<(u32, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Sender<()>)>,
     >,
 }
 impl ApplyGate {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             seen: Default::default(),
             changed: Notify::new(),
@@ -21,7 +21,7 @@ impl ApplyGate {
             cancel_at: Default::default(),
         })
     }
-    async fn target(&self, seqno: u32) -> BlockIdExt {
+    pub(crate) async fn target(&self, seqno: u32) -> BlockIdExt {
         loop {
             let changed = self.changed.notified();
             if let Some(id) = self.seen.lock().unwrap().get(&seqno).cloned() {

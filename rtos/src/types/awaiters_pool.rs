@@ -11,7 +11,10 @@
  */
 #[cfg(feature = "telemetry")]
 use crate::engine_traits::EngineTelemetry;
-use crate::{engine_traits::EngineAlloc, error::NodeError};
+use crate::{
+    engine_traits::EngineAlloc,
+    error::{AuthPolicyRefused, NodeError},
+};
 use adnl::{
     common::{add_counted_object_to_map, CountedObject, Counter},
     declare_counted,
@@ -31,6 +34,10 @@ use std::{
 #[cfg(test)]
 #[path = "tests/test_awaiters_pool.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/test_awaiters_pool_typed_errors.rs"]
+mod typed_error_tests;
 
 declare_counted!(
     struct OperationAwaiters<R> {
@@ -56,6 +63,16 @@ impl<R: Clone> OperationAwaiters<R> {
         #[cfg(feature = "telemetry")]
         telemetry.awaiters.update(allocated.awaiters.load(Ordering::Relaxed));
         Arc::new(ret)
+    }
+}
+
+// The error type is not Clone, so every observer of a published failure gets a
+// reconstruction. Classifications that callers act on survive it; any other
+// error keeps its message only, as before.
+fn clone_published_error(error: &rtos_block::Error) -> rtos_block::Error {
+    match error.downcast_ref::<AuthPolicyRefused>() {
+        Some(refused) => refused.clone().into(),
+        None => error!("{}", error),
     }
 }
 
@@ -223,7 +240,7 @@ where
     fn published_result(&self, op_awaiters: &OperationAwaiters<R>) -> Result<R> {
         match &*op_awaiters.rx.borrow() {
             Some(Ok(r)) => Ok(r.clone()),
-            Some(Err(e)) => Err(error!("{}", e)),
+            Some(Err(e)) => Err(clone_published_error(e)),
             None => Err(error!("{}: operation completed without a result", self.description)),
         }
     }
@@ -266,7 +283,7 @@ where
 
             let r = match &*rx.borrow() {
                 Some(Ok(r)) => Ok(Some(r.clone())),
-                Some(Err(e)) => Err(error!("{}", e)),
+                Some(Err(e)) => Err(clone_published_error(e)),
                 None => continue,
             };
             log::trace!("{}: wait_operation: done {}", self.description, id);
@@ -300,8 +317,7 @@ where
                 log::trace!("{}: do_operation: done {}", self.description, id);
                 let r = match result {
                     Ok(ref r) => Ok(r.clone()),
-                    Err(ref e) => Err(error!("{}", e)), // The Error doesn't impl Clone,
-                                                        // so it is impossible to clone full result
+                    Err(ref e) => Err(clone_published_error(e)),
                 };
                 if self.finalize(id, op_awaiters, r) {
                     result

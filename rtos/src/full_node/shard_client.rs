@@ -14,7 +14,7 @@ use crate::{
     block_proof::BlockProofStuff,
     engine::Engine,
     engine_traits::EngineOperations,
-    error::NodeError,
+    error::{AuthPolicyRefused, NodeError},
     network::{BlockBroadcastV2, NetworkSignatureSet},
     shard_state::ShardStateStuff,
     validating_utils::{build_checked_data, fmt_block_id_short},
@@ -77,6 +77,7 @@ pub fn start_shards_client(
 
 // Remember about ShardStatesKeeper::MAX_CATCH_UP_DEPTH and ShardStateDb::MAX_QUEUE_LEN
 pub const MC_MAX_SUPERIORITY: u32 = 500;
+const AUTH_REFUSAL_BACKOFF: Duration = Duration::from_millis(100);
 
 async fn load_master_blocks_cycle(
     engine: Arc<dyn EngineOperations>,
@@ -110,6 +111,11 @@ async fn load_master_blocks_cycle(
                     e
                 );
                 attempt += 1;
+                // A refused next block is refused again on every retry; back off
+                // briefly instead of spinning, as the reference does (0.1 s).
+                if AuthPolicyRefused::is(&e) {
+                    tokio::time::sleep(AUTH_REFUSAL_BACKOFF).await;
+                }
                 // TODO make method to ban bad peer who gave bad block
                 continue;
             }

@@ -23,3 +23,15 @@ pub enum NodeError {
     #[error("Timeout {0}")]
     Timeout(String),
 }
+
+/// A masterchain state was refused by AUTH policy admission and is never
+/// adopted. Callers classify by this type, never by the message text.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct AuthPolicyRefused(pub String);
+
+impl AuthPolicyRefused {
+    pub fn is(error: &rtos_block::Error) -> bool {
+        error.downcast_ref::<AuthPolicyRefused>().is_some()
+    }
+}

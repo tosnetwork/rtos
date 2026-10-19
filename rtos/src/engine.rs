@@ -135,6 +135,14 @@ pub struct Engine {
     pub(crate) test_finality_received_ids: std::sync::Mutex<std::collections::HashSet<BlockIdExt>>,
     #[cfg(test)]
     pub(crate) parent_apply_test_gate: std::sync::Mutex<Option<Arc<parent_apply_tests::ApplyGate>>>,
+    #[cfg(test)]
+    pub(crate) mc_publication_test_gate:
+        std::sync::Mutex<Option<Arc<auth_admission_tests::PublicationGate>>>,
+    // Serializes masterchain adoption: AUTH admission, applied marking, head
+    // advancement and post-apply publication of one block complete before the
+    // next block is admitted, so the published head is the admitted predecessor
+    // and never moves backwards.
+    mc_head_publication: tokio::sync::Mutex<()>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
@@ -946,6 +954,9 @@ impl Engine {
                     served_masterchain: Default::default(),
                     #[cfg(test)]
                     parent_apply_test_gate: std::sync::Mutex::new(None),
+                    #[cfg(test)]
+                    mc_publication_test_gate: std::sync::Mutex::new(None),
+                    mc_head_publication: tokio::sync::Mutex::new(()),
                     #[cfg(test)]
                     overlay_init_test_gate: std::sync::Mutex::new(None),
                     db,
@@ -1906,6 +1917,38 @@ impl Engine {
         }
     }
 
+    /// AUTH admission of a masterchain block about to be adopted; the caller holds
+    /// `mc_head_publication`. Returns whether the block advances the published
+    /// head. As in the reference, a block at or below the head is already
+    /// processed: it is neither re-admitted nor allowed to move the head back.
+    /// Otherwise its state is admitted as a transition from its predecessor's
+    /// state, which is the published head whenever the block is the next one.
+    async fn admit_next_mc_block(&self, block: &BlockStuff) -> Result<bool> {
+        let id = block.id();
+        let head = self
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("No published masterchain head to admit {id} after"))?;
+        if id.seq_no <= head.seq_no {
+            log::debug!("Masterchain block {id} is already processed (head {head})");
+            return Ok(false);
+        }
+        let (prev_id, prev2) = block.construct_prev_id()?;
+        if prev2.is_some() || prev_id.seq_no.checked_add(1) != Some(id.seq_no) {
+            fail!("Masterchain block {id} does not extend a single predecessor");
+        }
+        if prev_id.seq_no == head.seq_no && prev_id != *head {
+            fail!("Masterchain block {id} does not extend the published head {head}");
+        }
+        let candidate = self.load_state(id).await?;
+        let previous = self.load_state(&prev_id).await?;
+        crate::auth_admission::admit_auth_policy_state(
+            "refusing masterchain AUTH policy of",
+            &candidate,
+            Some(&previous),
+        )?;
+        Ok(true)
+    }
+
     pub async fn apply_hardfork_block(
         self: Arc<Self>,
         handle: &Arc<BlockHandle>,
@@ -2018,6 +2061,22 @@ impl Engine {
         )
         .await?;
 
+        // The stored state (and its next link) may remain after a refusal, as in
+        // the reference; nothing below runs for a refused masterchain block.
+        let mut advances_head = false;
+        let _publication = if id.shard().is_masterchain() && !pre_apply {
+            #[cfg(test)]
+            self.hold_mc_admission_for_test(id).await;
+            let publication = self.mc_head_publication.lock().await;
+            if handle.is_applied() {
+                return Ok(());
+            }
+            advances_head = self.admit_next_mc_block(block).await?;
+            Some(publication)
+        } else {
+            None
+        };
+
         if !id.shard().is_masterchain() {
             let source = if pre_apply {
                 ConfirmedBlockSource::PRE_APPLIED
@@ -2047,10 +2106,14 @@ impl Engine {
 
                 let first_time_applied = self.set_applied(handle, block.id().seq_no()).await?;
 
-                if first_time_applied {
+                #[cfg(test)]
+                self.hold_mc_publication_for_test(block.id()).await;
+                if advances_head {
                     if let Err(e) = self.save_last_applied_mc_block_id(block.id()) {
                         log::error!("Can't save last applied mc block {}: {}", block.id(), e);
                     }
+                    #[cfg(test)]
+                    self.record_mc_head_for_test(block.id());
                 }
                 self.last_applied_mc_block_utime.store(gen_utime, Ordering::Relaxed);
                 metrics::gauge!("rtos_node_engine_last_mc_block_seqno")
@@ -3919,6 +3982,10 @@ pub async fn start_metrics_server(
 #[cfg(test)]
 #[path = "tests/test_parent_apply.rs"]
 pub(crate) mod parent_apply_tests;
+
+#[cfg(test)]
+#[path = "tests/test_auth_admission.rs"]
+pub(crate) mod auth_admission_tests;
 
 #[cfg(test)]
 #[path = "tests/test_stopper.rs"]
