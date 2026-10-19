@@ -1,5 +1,7 @@
 /*
  * RTOS project modifications (2026-10-10): historical base gas, persistent exception handlers and OOG results.
+ * RTOS project modifications (2026-10-19): exception dispatch and implicit returns go through the
+ * common jump resolver; VM termination is recorded when a quit continuation is reached.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -12,11 +14,10 @@
 use crate::{
     error::{tvm_exception_code, tvm_exception_full, tvm_exception_or_custom_code, TvmError},
     executor::{
-        continuation::{switch, switch_to_c0},
+        continuation::{jump, ret},
         engine::{fix_gas::check_too_short_code, handlers::Handlers},
         gas::gas_state::Gas,
         math::DivMode,
-        microcode::{CTRL, VAR},
         storage::fetch_stack,
         types::{
             Instruction, InstructionExt, InstructionOptions, InstructionParameter, LengthAndIndex,
@@ -119,6 +120,11 @@ pub struct Engine {
     max_data_depth: u16,
     capabilities: u64,
     block_version: u32,
+    /// Exit code recorded when a jump reached a quit continuation.
+    finished: Option<i32>,
+    /// Exception being dispatched; reported as is when the dispatch terminates the VM with its
+    /// code (keeps the system/custom kind of the original exception).
+    dispatched: Option<Exception>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,6 +236,8 @@ impl Engine {
             max_data_depth: 512,
             capabilities,
             block_version: 0,
+            finished: None,
+            dispatched: None,
         }
     }
 
@@ -679,143 +687,57 @@ impl Engine {
         *self.cc.code_mut() = code;
         Ok(None)
     }
-    fn step_ordinary(&mut self) -> Result<Option<i32>> {
+    fn step_ordinary(&mut self) -> Status {
         self.step += 1;
         self.log_string = Some("implicit RET");
         self.try_use_gas(Gas::implicit_ret_price())?;
-        if self.ctrls.get(0).is_none() {
-            return Ok(Some(0));
-        }
-        switch_to_c0(self)?;
-        Ok(None)
-    }
-    // Entering a PushInt continuation is part of the jump that reached it, not a separate VM
-    // step (the reference resolves it inside the same jump).
-    fn step_pushint(&mut self, code: i32) -> Result<Option<i32>> {
-        self.log_string = Some("implicit PUSHINT");
-        self.cc.stack.push_int(code);
-        switch(self, ctrl!(0))?;
-        Ok(None)
-    }
-    fn step_try_catch(&mut self) -> Result<Option<i32>> {
-        self.step += 1;
-        self.log_string = Some("IMPLICIT RET FROM TRY-CATCH");
-        self.try_use_gas(Gas::implicit_ret_price())?;
-        self.ctrls.remove(2);
-        switch(self, ctrl!(0))?;
-        Ok(None)
-    }
-    fn step_while_loop(&mut self, body: SliceData, cond: SliceData) -> Result<Option<i32>> {
-        match self.check_while_loop_condition() {
-            Ok(true) => {
-                self.log_string = Some("NEXT WHILE ITERATION");
-                self.discharge_nargs();
-                let mut cond = ContinuationData::with_code(cond);
-                let mut while_ = ContinuationData::move_without_stack(&mut self.cc, body);
-                while_.savelist.put_opt(0, self.ctrl_mut(0)?.withdraw());
-                cond.savelist.put_opt(0, StackItem::continuation(while_));
-                self.ctrls.put_opt(0, StackItem::continuation(cond));
-            }
-            Ok(false) => {
-                self.log_string = Some("RET FROM WHILE");
-                switch(self, ctrl!(0))?;
-            }
-            Err(err) => {
-                let quit = ContinuationType::Quit(ExceptionCode::NormalTermination as i32);
-                self.ctrls.put(0, StackItem::continuation(ContinuationData::with_type(quit)))?;
-                return Err(err);
-            }
-        }
-        Ok(None)
-    }
-    fn step_repeat_loop(&mut self, body: SliceData) -> Result<Option<i32>> {
-        if let ContinuationType::RepeatLoopBody(_, ref mut counter) = self.cc.type_of {
-            if *counter > 1 {
-                *counter -= 1;
-                self.log_string = Some("NEXT REPEAT ITERATION");
-                self.discharge_nargs();
-                let mut repeat = ContinuationData::move_without_stack(&mut self.cc, body);
-                repeat.savelist.put_opt(0, self.ctrl_mut(0)?.withdraw());
-                self.ctrls.put_opt(0, StackItem::continuation(repeat));
-            } else {
-                self.log_string = Some("RET FROM REPEAT");
-                switch(self, ctrl!(0))?;
-            }
-        }
-        Ok(None)
-    }
-    fn step_until_loop(&mut self, body: SliceData) -> Result<Option<i32>> {
-        match self.check_until_loop_condition() {
-            Ok(true) => {
-                self.log_string = Some("NEXT UNTIL ITERATION");
-                self.discharge_nargs();
-                let mut until = ContinuationData::move_without_stack(&mut self.cc, body);
-                until.savelist.put_opt(0, self.ctrl_mut(0)?.withdraw());
-                self.ctrls.put_opt(0, StackItem::continuation(until));
-            }
-            Ok(false) => {
-                self.log_string = Some("RET FROM UNTIL");
-                switch(self, ctrl!(0))?;
-            }
-            Err(err) => return Err(err),
-        }
-        Ok(None)
-    }
-    fn step_again_loop(&mut self, body: SliceData) -> Result<Option<i32>> {
-        self.log_string = Some("NEXT AGAIN ITERATION");
-        self.discharge_nargs();
-        let again = ContinuationData::move_without_stack(&mut self.cc, body);
-        self.ctrls.put_opt(0, StackItem::continuation(again));
-        Ok(None)
+        ret(self)
     }
 
-    fn discharge_nargs(&mut self) {
-        if self.cc.nargs != -1 {
-            let depth = self.cc.stack.depth();
-            let _ = self.cc.stack.drop_range_straight((depth - self.cc.nargs as usize)..depth);
-            self.cc.nargs = -1;
-        }
+    /// Records the exit code of a quit continuation reached by a jump.
+    pub(in crate::executor) fn finish(&mut self, code: i32) {
+        self.cc.move_to_end();
+        self.finished = Some(code);
     }
 
-    fn make_external_error(&mut self) -> Result<Option<i32>> {
-        let number = self.cc.stack.drop(0)?.as_integer_value(0..=0xffffi32)?;
-        if number == ExceptionCode::NormalTermination as i32
-            || number == ExceptionCode::AlternativeTermination as i32
+    /// Ends the run with `code`: 0 and 1 are normal terminations; any other code is reported
+    /// as an exception with the code pushed on top of the final stack (API convention) and the
+    /// former top of stack as its value.
+    fn terminate(&mut self, code: i32) -> Result<i32> {
+        if code == ExceptionCode::NormalTermination as i32
+            || code == ExceptionCode::AlternativeTermination as i32
         {
-            return Ok(Some(number));
+            return Ok(code);
         }
-        let value = match self.cc.stack.drop(0) {
-            Ok(item) => item.as_integer().cloned().unwrap_or_default(),
-            Err(_) => IntegerData::zero(),
+        let value = self.cc.stack.get(0).cloned().unwrap_or_else(|_| StackItem::int(0));
+        self.cc.stack.push(int!(code));
+        let exception = match self.dispatched.take() {
+            Some(exception) if exception.exception_or_custom_code() == code => exception,
+            _ => match ExceptionCode::from_i32(code) {
+                Some(known) if known != ExceptionCode::OutOfGas => {
+                    Exception::from_code(known, String::new(), file!(), line!())
+                }
+                _ => Exception::from_number(code, String::new(), file!(), line!()),
+            },
         };
-        let exception = match ExceptionCode::from_i32(number) {
-            Some(code) => Exception::from_code(code, String::new(), file!(), line!()),
-            None => Exception::from_number(number, String::new(), file!(), line!()),
-        };
-        fail!(TvmError::new(exception, StackItem::int(value)))
+        fail!(TvmError::new(exception, value))
     }
 
     // return Ok(Some(exit_code)) - if you want to stop execution
     pub(in crate::executor) fn seek_next_cmd(&mut self) -> Result<Option<i32>> {
-        while self.cc.code().remaining_bits() == 0 {
+        loop {
+            if let Some(code) = self.finished.take() {
+                return self.terminate(code).map(Some);
+            }
+            if self.cc.code().remaining_bits() != 0 {
+                return Ok(None);
+            }
             let gas = self.gas_used();
             self.log_string = None;
             let result = if let Some(reference) = self.cc.code().reference_opt(0) {
-                self.step_next_ref(reference)
+                self.step_next_ref(reference).map(|_| ())
             } else {
-                match self.cc.type_of.clone() {
-                    ContinuationType::Ordinary => self.step_ordinary(),
-                    ContinuationType::PushInt(code) => self.step_pushint(code),
-                    ContinuationType::Quit(exit_code) => Ok(Some(exit_code)),
-                    ContinuationType::TryCatch => self.step_try_catch(),
-                    ContinuationType::WhileLoopCondition(body, cond) => {
-                        self.step_while_loop(body, cond)
-                    }
-                    ContinuationType::RepeatLoopBody(code, _counter) => self.step_repeat_loop(code),
-                    ContinuationType::UntilLoopCondition(body) => self.step_until_loop(body),
-                    ContinuationType::AgainLoopBody(slice) => self.step_again_loop(slice),
-                    ContinuationType::ExcQuit => Ok(self.make_external_error()?),
-                }
+                self.step_ordinary()
             };
             if self.is_trace_enabled() {
                 if let Some(log_string) = self.log_string {
@@ -826,17 +748,10 @@ impl Engine {
                     );
                 }
             }
-            match self.gas.check_gas_remaining().and(result) {
-                Ok(None) => (),
-                Ok(Some(exit_code)) => return Ok(Some(exit_code)),
-                Err(err) => match self.raise_exception(err) {
-                    Ok(Some(exit_code)) => return Ok(Some(exit_code)),
-                    Ok(None) => (),
-                    Err(err) => return Err(err),
-                },
+            if let Err(err) = self.gas.check_gas_remaining().and(result) {
+                self.raise_exception(err)?;
             }
         }
-        Ok(None)
     }
 
     fn resolve_init_code_cell(&mut self, code: Cell) -> Result<SliceData> {
@@ -1180,6 +1095,8 @@ impl Engine {
             max_data_depth: self.max_data_depth,
             capabilities: self.capabilities,
             block_version: self.block_version,
+            finished: None,
+            dispatched: None,
         };
         if params.push_0 {
             child.cc.stack.push_int(0);
@@ -1256,15 +1173,28 @@ impl Engine {
             self.visited_cells = child.visited_cells;
         }
         debug_assert!(self.block_version >= 11 || (!params.return_data && !params.return_actions));
-        let (data, actions) = child.cstate.unwrap_or_default();
-        if params.return_data {
-            self.cc.stack.push_cell(data);
-        }
-        if params.return_actions {
-            self.cc.stack.push_cell(actions);
+        // A child that did not commit returns null data and actions.
+        match child.cstate.take() {
+            Some((data, actions)) => {
+                if params.return_data {
+                    self.cc.stack.push_cell(data);
+                }
+                if params.return_actions {
+                    self.cc.stack.push_cell(actions);
+                }
+            }
+            None => {
+                if params.return_data {
+                    self.cc.stack.push(StackItem::None);
+                }
+                if params.return_actions {
+                    self.cc.stack.push(StackItem::None);
+                }
+            }
         }
         if params.return_gas {
-            self.cc.stack.push_int(child.gas.get_gas_used());
+            // The full consumed amount, also past the limit after an out-of-gas child.
+            self.cc.stack.push_int(child.gas.get_gas_used_full());
         }
         Ok(())
     }
@@ -1337,16 +1267,6 @@ impl Engine {
     ///Interface to gas state set_gas_limit method
     pub fn new_gas_limit(&mut self, gas: i64) {
         self.gas.new_gas_limit(gas)
-    }
-
-    fn check_while_loop_condition(&mut self) -> Result<bool> {
-        let x = self.cc.stack.drop(0)?;
-        let y = x.as_integer()?;
-        Ok(!y.is_zero())
-    }
-
-    fn check_until_loop_condition(&mut self) -> Result<bool> {
-        Ok(!self.check_while_loop_condition()?)
     }
 
     fn extract_slice(
@@ -1674,6 +1594,9 @@ impl Engine {
     // raises the exception and tries to dispatch it via c(2).
     // If c(2) is not set, returns that exception, otherwise, returns None
     fn raise_exception(&mut self, err: Error) -> Result<Option<i32>> {
+        // THROW-family instructions dispatch their exception directly (no VM error, no step);
+        // every other exception is a VM error raised by the instruction.
+        let direct = tvm_exception_code(&err).is_none();
         if let Some(code) = tvm_exception_code(&err) {
             self.step += 1;
             if code == ExceptionCode::OutOfGas {
@@ -1688,7 +1611,6 @@ impl Engine {
             self.step += 1;
             return Err(err);
         }
-        let n = self.cmd.vars.len();
         self.trace_info(
             EngineTraceInfoType::Exception,
             self.gas_used(),
@@ -1700,28 +1622,31 @@ impl Engine {
         let (exception, value) = tvm_exception_full(err).inspect_err(
             |err| log::trace!(target: "tvm", "BAD CODE: {}: {}\n", self.cmd_code_string(), err),
         )?;
-        if let Ok(c2) = c2.as_continuation() {
-            if c2.type_of == ContinuationType::ExcQuit {
-                if let Some(exit_code) = exception.is_normal_termination() {
-                    let cont = ContinuationData::with_type(ContinuationType::Quit(exit_code));
-                    self.cmd.push_var(StackItem::Continuation(Arc::new(cont)));
-                    self.cc.stack.push(value);
-                    self.cmd.vars[n].as_continuation_mut()?.nargs = 1;
-                    switch(self, var!(n))?;
-                    return Ok(None);
-                } else {
-                    self.cc.stack = Stack::new();
-                    self.cc.stack.push(value);
-                    self.cc.stack.push(int!(exception.exception_or_custom_code()));
-                    fail!(exception)
-                }
-            }
-        }
-        self.cmd.push_var(c2);
+        let c2 = c2.as_continuation()?.clone();
+        self.cc.stack = Stack::new();
         self.cc.stack.push(value);
         self.cc.stack.push(int!(exception.exception_or_custom_code()));
-        self.cmd.vars[n].as_continuation_mut()?.nargs = 2;
-        switch(self, var!(n))?;
+        self.cc.move_to_end();
+        self.dispatched = Some(exception);
+        let result = jump(self, c2);
+        if self.finished.is_none() {
+            self.dispatched = None;
+        }
+        if let Err(err) = result {
+            if tvm_exception_code(&err) == Some(ExceptionCode::OutOfGas) {
+                self.step += 1;
+                let (exception, _) = tvm_exception_full(err)?;
+                fail!(TvmError::new(exception, StackItem::int(self.gas_used())));
+            }
+            if direct {
+                // The failure of a direct dispatch is an error of the THROW instruction itself
+                // and is dispatched once more.
+                return self.raise_exception(err);
+            }
+            // A failure while dispatching a VM error terminates the VM with that code.
+            self.finished = Some(tvm_exception_or_custom_code(&err));
+            self.dispatched = tvm_exception_full(err).ok().map(|(exception, _)| exception);
+        }
         Ok(None)
     }
 

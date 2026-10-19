@@ -733,52 +733,43 @@ fn setaltctr() {
 
 #[test]
 fn setaltctr_setretctr_duplicate_savelist_slot_v14() {
+    // Values from the reference VM (rows setaltctr-*/setretctr-* of the continuation evidence):
+    // from v14 a continuation written into an occupied slot is a silent no-op, before v14 it is a
+    // type check error; a value of the wrong type is a type check error at every version.
     let mut alt = test_continuation("NOP");
     alt.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
 
-    let setaltctr_case = "
-        PUSHCONT {
-            NOP
-        }
-        PUSHCONT {
-            NOP
-        }
-        SWAP
-        SETCONTCTR c0
-        POPCTR c1
-        PUSHINT 1
-        SETALTCTR c0
-    ";
-
-    test_case(setaltctr_case)
+    let setaltctr_case = |value: &str| {
+        format!(
+            "PUSHCONT {{ NOP }} PUSHCONT {{ NOP }} SWAP SETCONTCTR c0 POPCTR c1 {value} SETALTCTR c0"
+        )
+    };
+    test_case(setaltctr_case("PUSHCONT { INC }"))
         .expect_empty_stack()
         .expect_ctrl(1, &StackItem::continuation(alt.clone()));
+    test_case(setaltctr_case("PUSHCONT { INC }"))
+        .with_block_version(13)
+        .expect_failure(ExceptionCode::TypeCheckError);
+    test_case(setaltctr_case("PUSHINT 1")).expect_failure(ExceptionCode::TypeCheckError);
 
-    test_case(setaltctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
-
-    let setretctr_case = "
-        PUSHCONT {
-            PUSHINT 7
-        }
-        PUSHCONT {
-            NOP
-        }
-        SWAP
-        SETCONTCTR c0
-        POPCTR c0
-        PUSHINT 1
-        SETRETCTR c0
-    ";
-
-    test_case(setretctr_case).expect_int_stack(&[7]);
-
-    test_case(setretctr_case).with_block_version(13).expect_failure(ExceptionCode::TypeCheckError);
+    let setretctr_case = |value: &str| {
+        format!(
+            "PUSHCONT {{ PUSHINT 7 }} PUSHCONT {{ NOP }} SWAP SETCONTCTR c0 POPCTR c0 {value} SETRETCTR c0"
+        )
+    };
+    test_case(setretctr_case("PUSHCONT { INC }")).expect_int_stack(&[7]);
+    test_case(setretctr_case("PUSHCONT { INC }"))
+        .with_block_version(13)
+        .expect_failure(ExceptionCode::TypeCheckError);
+    test_case(setretctr_case("PUSHINT 1")).expect_failure(ExceptionCode::TypeCheckError);
 }
 
 #[test]
 fn setcontargs() {
+    // BLESSARGS 2, 2 then SETCONTARGS 2, 2: two arguments are copied, so the remaining argument
+    // count is 0 (reference row setcontargs-test of the continuation evidence).
     let mut cont = ContinuationData::with_code(compile_code("PUSH s0").unwrap());
-    cont.nargs = 2;
+    cont.nargs = 0;
     cont.stack.push(int!(1));
     cont.stack.push(int!(2));
     cont.stack.push(int!(2));
@@ -848,74 +839,33 @@ fn setcontctrx() {
 
 #[test]
 fn setcontctr_duplicate_savelist_slot_v14() {
+    // Values from the reference VM (rows setcontctr-*/setcontctrx-* of the continuation
+    // evidence): an occupied slot is kept silently from v14 and is a type check error before;
+    // a value of the wrong type is a type check error at every version.
     let mut expected = test_continuation("PUSH s0");
     expected.put_to_savelist(0, StackItem::continuation(test_continuation("NOP"))).unwrap();
 
-    test_case(
-        "PUSHCONT {
-             PUSH s0
-         }
-         PUSHCONT {
-             NOP
-         }
-         SWAP
-         SETCONTCTR c0
-         PUSHINT 1
-         SWAP
-         SETCONTCTR c0",
-    )
-    .expect_stack(Stack::new().push_cont(expected.clone()));
+    let setcontctr = |value: &str| {
+        format!("PUSHCONT {{ PUSH s0 }} PUSHCONT {{ NOP }} SWAP SETCONTCTR c0 {value} SWAP SETCONTCTR c0")
+    };
+    test_case(setcontctr("PUSHCONT { INC }"))
+        .expect_stack(Stack::new().push_cont(expected.clone()));
+    test_case(setcontctr("PUSHCONT { INC }"))
+        .with_block_version(13)
+        .expect_failure(ExceptionCode::TypeCheckError);
+    test_case(setcontctr("PUSHINT 1")).expect_failure(ExceptionCode::TypeCheckError);
 
-    test_case(
-        "PUSHCONT {
-             PUSH s0
-         }
-         PUSHCONT {
-             NOP
-         }
-         SWAP
-         SETCONTCTR c0
-         PUSHINT 1
-         SWAP
-         SETCONTCTR c0",
-    )
-    .with_block_version(13)
-    .expect_failure(ExceptionCode::TypeCheckError);
-
-    test_case(
-        "PUSHCONT {
-             PUSH s0
-         }
-         PUSHCONT {
-             NOP
-         }
-         SWAP
-         PUSHINT 0
-         SETCONTCTRX
-         PUSHINT 1
-         SWAP
-         PUSHINT 0
-         SETCONTCTRX",
-    )
-    .expect_stack(Stack::new().push_cont(expected.clone()));
-
-    test_case(
-        "PUSHCONT {
-             PUSH s0
-         }
-         PUSHCONT {
-             NOP
-         }
-         SWAP
-         PUSHINT 0
-         SETCONTCTRX
-         PUSHINT 1
-         SWAP
-         PUSHINT 0
-         SETCONTCTRX",
-    )
-    .with_block_version(13)
-    .expect_failure(ExceptionCode::TypeCheckError);
+    let setcontctrx = |value: &str| {
+        format!(
+            "PUSHCONT {{ PUSH s0 }} PUSHCONT {{ NOP }} SWAP PUSHINT 0 SETCONTCTRX {value} SWAP \
+             PUSHINT 0 SETCONTCTRX"
+        )
+    };
+    test_case(setcontctrx("PUSHCONT { INC }")).expect_stack(Stack::new().push_cont(expected));
+    test_case(setcontctrx("PUSHCONT { INC }"))
+        .with_block_version(13)
+        .expect_failure(ExceptionCode::TypeCheckError);
+    test_case(setcontctrx("PUSHINT 1")).expect_failure(ExceptionCode::TypeCheckError);
 }
 
 #[test]
@@ -964,6 +914,8 @@ fn setcontctrmany_normal() {
 
 #[test]
 fn setcontctrmany_duplicate_savelist_slot_v14() {
+    // Values from the reference VM (rows setcontctrmany-* of the continuation evidence): an
+    // occupied slot is kept silently from v14 and is a type check error before v14.
     let old_c0 = test_continuation("ZERO");
     let new_c0 = test_continuation("ONE");
     let new_c1 = test_continuation("TWO");
@@ -972,12 +924,8 @@ fn setcontctrmany_duplicate_savelist_slot_v14() {
     input.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
 
     let mut expected_v14 = test_continuation("PUSH s0");
-    expected_v14.put_to_savelist(0, StackItem::continuation(old_c0.clone())).unwrap();
+    expected_v14.put_to_savelist(0, StackItem::continuation(old_c0)).unwrap();
     expected_v14.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
-
-    let mut expected_v13 = test_continuation("PUSH s0");
-    expected_v13.put_to_savelist(0, StackItem::continuation(new_c0.clone())).unwrap();
-    expected_v13.put_to_savelist(1, StackItem::continuation(new_c1.clone())).unwrap();
 
     test_case("SETCONTCTRMANY 3")
         .with_stack(stack_with_cont(input.clone()))
@@ -990,7 +938,7 @@ fn setcontctrmany_duplicate_savelist_slot_v14() {
         .with_ctrl(0, StackItem::continuation(new_c0.clone()))
         .with_ctrl(1, StackItem::continuation(new_c1.clone()))
         .with_block_version(13)
-        .expect_stack(Stack::new().push_cont(expected_v13.clone()).push_int(1));
+        .expect_failure(ExceptionCode::TypeCheckError);
 
     test_case("PUSHINT 3 SETCONTCTRMANYX")
         .with_stack(stack_with_cont(input.clone()))
@@ -1003,7 +951,7 @@ fn setcontctrmany_duplicate_savelist_slot_v14() {
         .with_ctrl(0, StackItem::continuation(new_c0))
         .with_ctrl(1, StackItem::continuation(new_c1))
         .with_block_version(13)
-        .expect_stack(Stack::new().push_cont(expected_v13).push_int(1));
+        .expect_failure(ExceptionCode::TypeCheckError);
 }
 
 #[test]

@@ -1,5 +1,7 @@
 /*
  * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-19): TRY/TRYARGS follow the reference handler setup
+ * (captured continuation with saved c0..c2, handler envelope); no special implicit return.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -12,51 +14,16 @@
 use crate::{
     error::TvmError,
     executor::{
-        continuation::callx,
-        engine::{
-            storage::{copy_to_var, fetch_stack, swap},
-            Engine,
-        },
-        microcode::{CC, CTRL, SAVELIST, VAR},
+        continuation::try_catch,
+        engine::{storage::fetch_stack, Engine},
         types::{Instruction, InstructionOptions},
     },
-    stack::{continuation::ContinuationType, StackItem},
+    stack::StackItem,
 };
-use rtos_block::{fail, Exception, ExceptionCode, Status};
+use rtos_block::{fail, Exception, Status};
 use std::ops::Range;
 
 //Utilities **********************************************************************************
-//(c c' -)
-//c'.nargs = c'.stack.depth + 2
-//c'.savelist[2] = c2, cc.savelist[2] = c2
-//c'.savelist[0] = cc, c.savelist[0] = cc
-//callx c
-fn init_try_catch(engine: &mut Engine) -> Status {
-    fetch_stack(engine, 2)?;
-    if engine.cc.stack.depth() < engine.cmd.pargs() {
-        fail!(ExceptionCode::StackUnderflow)
-    }
-    engine.cmd.var(1).as_continuation()?;
-    engine.cmd.var_mut(0).as_continuation_mut().map(|catch_cont| {
-        catch_cont.type_of = ContinuationType::TryCatch;
-    })?;
-    engine.cmd.var_mut(1).as_continuation_mut().map(|try_cont| try_cont.remove_from_savelist(0))?;
-    if engine.ctrl(2).is_ok() {
-        copy_to_var(engine, ctrl!(2))?;
-        swap(engine, savelist!(var!(0), 2), var!(2))?;
-        copy_to_var(engine, ctrl!(2))?;
-        swap(engine, savelist!(CC, 2), var!(3))?;
-    }
-    // special swapping for callx: it calls a cont from var0, but at this point var0 holds catch cont
-    swap(engine, var!(0), var!(1))?;
-    swap(engine, ctrl!(2), var!(1))?;
-    callx(engine, 0, false)?;
-    copy_to_var(engine, ctrl!(0))?;
-    let length = engine.cmd.var_count();
-    swap(engine, savelist!(ctrl!(2), 0), var!(length - 1))?;
-    Ok(())
-}
-
 fn do_throw(
     engine: &mut Engine,
     number_index: Option<usize>,
@@ -228,7 +195,7 @@ pub(super) fn execute_throwargifnot(engine: &mut Engine) -> Status {
 // (c c' - )
 pub(super) fn execute_try(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("TRY"))?;
-    init_try_catch(engine)
+    try_catch(engine, None)
 }
 
 // (c c' - )
@@ -237,5 +204,7 @@ pub(super) fn execute_tryargs(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("TRYARGS").set_opts(InstructionOptions::ArgumentAndReturnConstraints),
     )?;
-    init_try_catch(engine)
+    let params = engine.cmd.pargs();
+    let retvals = engine.cmd.rargs();
+    try_catch(engine, Some((params, retvals)))
 }

@@ -1,5 +1,7 @@
 /*
  * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-19): continuation items are moved out and released without
+ * allocating placeholders; nested continuation children are released iteratively.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -22,8 +24,12 @@ use std::{
     fmt, mem,
     ops::{Range, RangeInclusive},
     slice::Iter,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
+
+/// Placeholder left behind when a continuation is moved out of a stack item.
+static EMPTY_CONTINUATION: LazyLock<Arc<ContinuationData>> =
+    LazyLock::new(|| Arc::new(ContinuationData::new_empty()));
 
 pub mod continuation;
 pub mod savelist;
@@ -91,19 +97,15 @@ fn collect_items(stack: &mut Vec<StackItem>, item: &mut StackItem) {
             }
             Err(data) => drop(data),
         },
-        StackItem::Continuation(data) => match Arc::try_unwrap(std::mem::take(data)) {
-            Ok(ref mut cont) => {
-                for creg in [0, 1, 2, 3, 7] {
-                    if let Some(item) = cont.savelist.get_mut(creg) {
-                        stack.push(std::mem::take(item))
-                    }
-                }
-                for item in &mut cont.stack.storage {
-                    stack.push(std::mem::take(item))
+        StackItem::Continuation(data) => {
+            // A shared continuation is only released by its last owner.
+            if Arc::strong_count(data) == 1 {
+                let data = mem::replace(data, EMPTY_CONTINUATION.clone());
+                if let Ok(mut cont) = Arc::try_unwrap(data) {
+                    cont.take_owned_items(stack)
                 }
             }
-            Err(data) => drop(data),
-        },
+        }
         _ => (),
     }
 }
@@ -359,6 +361,14 @@ impl StackItem {
 
     pub fn is_continuation(&self) -> bool {
         matches!(self, StackItem::Continuation(_))
+    }
+
+    /// Moves the continuation out of the item (left holding an empty placeholder).
+    pub fn take_continuation(&mut self) -> Result<Arc<ContinuationData>> {
+        match self {
+            StackItem::Continuation(data) => Ok(mem::replace(data, EMPTY_CONTINUATION.clone())),
+            _ => fail!(ExceptionCode::TypeCheckError, "item {} is not a continuation", self),
+        }
     }
 
     pub fn withdraw(&mut self) -> StackItem {

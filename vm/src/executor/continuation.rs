@@ -1,5 +1,8 @@
 /*
  * RTOS project modifications (2026-10-10): historical continuation save semantics and snapshot preservation.
+ * RTOS project modifications (2026-10-19): jumps resolve continuation chains in one place, with
+ * the nested-jump charge; loops, envelopes and PushInt keep full continuations; control-data
+ * writes follow the reference force-cdata rules.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -10,18 +13,16 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
+    error::tvm_exception_or_custom_code,
     executor::{
         engine::{
             data::convert,
-            storage::{
-                apply_savelist, apply_savelist_excluding_c0_c1, copy_to_var, fetch_reference,
-                fetch_stack, pop_all, pop_range, swap,
-            },
+            storage::{copy_to_var, fetch_reference, fetch_stack, swap},
             Engine,
         },
         gas::gas_state::Gas,
-        microcode::{CC, CELL, CONTINUATION, CTRL, SAVELIST, SLICE, VAR},
-        types::{Instruction, InstructionOptions, InstructionParameter},
+        microcode::{CC, CELL, CONTINUATION, CTRL, VAR},
+        types::{Instruction, InstructionOptions},
         RunChildVm,
     },
     stack::{
@@ -31,87 +32,640 @@ use crate::{
         Stack, StackItem,
     },
 };
-use rtos_block::{fail, ExceptionCode, Mask, Status};
+use rtos_block::{fail, ExceptionCode, Mask, Result, Status};
 use std::{
     mem,
-    ops::{Range, RangeInclusive},
+    ops::Range,
+    sync::{Arc, LazyLock},
 };
 
 const CALLX: u8 = 0x40; // CALLX to found value
 const SWITCH: u8 = 0x80; // SWITCH to found value
 const PREPARE: u8 = 0xC0; // pass found value to stack
 const TVM_VERSION_14: u32 = 14;
+/// Jumps resolved inside one jump that are free of charge; each further one costs 1 gas.
+const FREE_NESTED_CONT_JUMP: usize = 8;
+/// First global version with the nested-jump charge and the in-chain stack adjustment.
+const NESTED_JUMP_VERSION: u32 = 9;
 
-// Utilities ******************************************************************
+// Continuation values ********************************************************
 
-// (continuation - ),
-// pargs = cmd.pargs if any else cc.stack.depth
-// if pargs > cc.stack.depth {
-//     StackOverflow
-// }
-// move_out = cc.stack[0..pargs]
-// move_in  = if continuation.nargs < 0 {
-//     move_out
-// } else if continuation.nargs > pargs {
-//     StackOverflow
-// } else {
-//     move_out[0..pargs + continuation.nargs - continuation.stack.depth]
-// }
-// cc.stack -= move_out, continuation.stack += move_in,
-// if cmd.nargs exists {
-//     if cmd.nargs < 0 {
-//         cc.nargs = -1
-//     } else {
-//         cc.nargs = cc.stack.depth + cmd.nargs
-//     }
-// }
-// continuation.stack.push(cc), cc = continuation, c[*] = cc.savelist[*]
-fn callcc(engine: &mut Engine, callee: usize) -> Status {
-    let vars = engine.cmd.var_count();
-    match vars.cmp(&callee) {
-        std::cmp::Ordering::Less => fail!("callcc: {:X}", callee),
-        std::cmp::Ordering::Equal => fetch_stack(engine, 1)?,
-        _ => (),
+static QUIT0: LazyLock<StackItem> = LazyLock::new(|| {
+    let quit = ContinuationType::Quit(ExceptionCode::NormalTermination as i32);
+    StackItem::continuation(ContinuationData::with_type(quit))
+});
+static QUIT1: LazyLock<StackItem> = LazyLock::new(|| {
+    let quit = ContinuationType::Quit(ExceptionCode::AlternativeTermination as i32);
+    StackItem::continuation(ContinuationData::with_type(quit))
+});
+
+/// The shared quit continuation for exit code 0 or 1.
+fn quit(code: i32) -> StackItem {
+    if code == ExceptionCode::NormalTermination as i32 {
+        QUIT0.clone()
+    } else {
+        QUIT1.clone()
     }
-    pop_all(engine, var!(callee))?;
-    swap(engine, var!(callee), CC)?;
-    apply_savelist(engine)?;
-    let mut old_cc = engine.cmd.var_mut(callee).as_continuation_mut()?.withdraw();
-    if let Some(nargs) = engine.cmd.nargs_raw() {
-        old_cc.nargs = nargs
+}
+
+fn unwrap_arc(data: Arc<ContinuationData>) -> ContinuationData {
+    Arc::try_unwrap(data).unwrap_or_else(|data| (*data).clone())
+}
+
+/// Takes the continuation out of a stack item (type check as in the reference `as_cont`).
+fn item_into_cont(mut item: StackItem) -> Result<ContinuationData> {
+    Ok(unwrap_arc(item.take_continuation()?))
+}
+
+/// A continuation being jumped to: owned, or shared with other holders.
+// Short-lived on the stack of a jump; boxing the owned variant would allocate on every jump.
+#[allow(clippy::large_enum_variant)]
+enum Cont {
+    Owned(ContinuationData),
+    Shared(Arc<ContinuationData>),
+}
+
+impl Cont {
+    fn get(&self) -> &ContinuationData {
+        match self {
+            Cont::Owned(cont) => cont,
+            Cont::Shared(cont) => cont,
+        }
     }
-    engine.cc.stack.push_cont(old_cc);
+
+    fn into_owned(self) -> ContinuationData {
+        match self {
+            Cont::Owned(cont) => cont,
+            Cont::Shared(cont) => unwrap_arc(cont),
+        }
+    }
+}
+
+/// A copy of control register `index`; an empty register reads as a type error.
+fn ctrl_cont(engine: &Engine, index: usize) -> Result<ContinuationData> {
+    match engine.ctrls.get(index) {
+        Some(item) => Ok(item.as_continuation()?.clone()),
+        None => fail!(ExceptionCode::TypeCheckError, "control register c{} is empty", index),
+    }
+}
+
+fn set_ctrl_cont(engine: &mut Engine, index: usize, cont: ContinuationData) {
+    engine.ctrls.put_opt(index, StackItem::continuation(cont));
+}
+
+// Stack and gas helpers (reference stack and gas semantics) ******************
+
+pub(in crate::executor) fn consume_gas(engine: &mut Engine, gas: i64) -> Status {
+    if engine.block_version() >= 4 {
+        engine.try_use_gas(gas)
+    } else {
+        engine.use_gas(gas);
+        Ok(())
+    }
+}
+
+fn consume_stack_gas(engine: &mut Engine, depth: usize) -> Status {
+    consume_gas(engine, Gas::stack_price(depth))
+}
+
+fn check_underflow(engine: &Engine, depth: usize) -> Status {
+    if engine.cc.stack.depth() < depth {
+        fail!(
+            ExceptionCode::StackUnderflow,
+            "stack underflow: {} needed, depth {}",
+            depth,
+            engine.cc.stack.depth()
+        )
+    }
     Ok(())
 }
 
-// (continuation - ),
-// pargs = cmd.pargs if any else cc.stack.depth
-// if pargs > cc.stack.depth {
-//     StackOverflow
-// }
-// move_out = cc.stack[0..pargs]
-// move_in  = if continuation.nargs < 0 {
-//     move_out
-// } else if continuation.nargs > pargs {
-//     StackOverflow
-// } else {
-//     move_out[0..pargs + continuation.nargs - continuation.stack.depth]
-// }
-// cc.stack -= move_out, continuation.stack += move_in,
-// if cmd.nargs exists {
-//     if cmd.nargs < 0 {
-//         cc.nargs = -1
-//     } else {
-//         cc.nargs = cc.stack.depth + cmd.nargs
-//     }
-// } else if cmd.rargs exists {
-//     cc.nargs = cc.stack.depth + cmd.rargs
-// }
-// if continuation.savelist[0].is_none {
-//     cc.savelist[0] = c[0]
-//     continuation.savelist[0] = cc
-// }
-// cc = continuation, c[*] = cc.savelist[*]
+/// Splits off the top `count` items (caller has checked the depth), order preserved.
+fn split_top(stack: &mut Stack, count: usize) -> Stack {
+    let depth = stack.depth();
+    Stack::with_storage(stack.storage.split_off(depth - count))
+}
+
+/// Moves the top `count` items of `src` onto the top of `dst` (caller has checked the depth).
+fn move_from_stack(dst: &mut Stack, src: &mut Stack, count: usize) {
+    let depth = src.depth();
+    let mut moved = src.storage.split_off(depth - count);
+    dst.storage.append(&mut moved);
+}
+
+fn pop_cont(engine: &mut Engine) -> Result<ContinuationData> {
+    let item = engine.cc.stack.pop()?;
+    item_into_cont(item)
+}
+
+fn pop_bool(engine: &mut Engine) -> Result<bool> {
+    engine.cc.stack.pop()?.as_bool()
+}
+
+fn pop_smallint_range(engine: &mut Engine, max: isize, min: isize) -> Result<isize> {
+    let item = engine.cc.stack.pop()?;
+    item.as_integer()?.as_integer_value(min..=max)
+}
+
+fn push_code(engine: &mut Engine) {
+    let code = engine.cc.code().clone();
+    engine.cc.stack.push(StackItem::Slice(code));
+}
+
+// Jumps, calls and returns ***************************************************
+
+/// Captures the current continuation (`extract_cc`): `save_cr` bits 1/2/4 move c0/c1/c2 into
+/// it (c0 and c1 are reset to the quit continuations); `stack_copy` top items stay current.
+pub(in crate::executor) fn extract_cc(
+    engine: &mut Engine,
+    save_cr: u8,
+    stack_copy: isize,
+    cc_args: isize,
+) -> Result<ContinuationData> {
+    let depth = engine.cc.stack.depth();
+    let cc_stack = if stack_copy < 0 || stack_copy as usize == depth {
+        Stack::new()
+    } else if stack_copy > 0 {
+        let copy = stack_copy as usize;
+        check_underflow(engine, copy)?;
+        let top = split_top(&mut engine.cc.stack, copy);
+        let rest = mem::replace(&mut engine.cc.stack, top);
+        consume_stack_gas(engine, copy)?;
+        rest
+    } else {
+        mem::take(&mut engine.cc.stack)
+    };
+    let code = mem::take(engine.cc.code_mut());
+    let mut cc = ContinuationData::with_code_and_stack(code, cc_stack);
+    cc.nargs = cc_args;
+    if save_cr & 1 != 0 {
+        if let Some(c0) = engine.ctrls.remove(0) {
+            cc.savelist.put_opt(0, c0);
+        }
+        engine.ctrls.put_opt(0, quit(ExceptionCode::NormalTermination as i32));
+    }
+    if save_cr & 2 != 0 {
+        if let Some(c1) = engine.ctrls.remove(1) {
+            cc.savelist.put_opt(1, c1);
+        }
+        engine.ctrls.put_opt(1, quit(ExceptionCode::AlternativeTermination as i32));
+    }
+    if save_cr & 4 != 0 {
+        if let Some(c2) = engine.ctrls.remove(2) {
+            cc.savelist.put_opt(2, c2);
+        }
+    }
+    Ok(cc)
+}
+
+/// Prepares the stack for a jump to `cont` (`adjust_jump_cont`): checks the argument counts,
+/// merges a captured stack or drops the bottom of the current one.
+fn adjust_jump_cont(engine: &mut Engine, cont: Cont, pass_args: isize) -> Result<Cont> {
+    let depth = engine.cc.stack.depth() as isize;
+    let data = cont.get();
+    if data.has_cdata() {
+        if pass_args > depth || data.nargs > depth {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while jumping to a continuation: not enough arguments on stack"
+            )
+        }
+        if data.nargs > pass_args && pass_args >= 0 {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while jumping to closure continuation: not enough arguments passed"
+            )
+        }
+        let mut copy = data.nargs;
+        if pass_args >= 0 && copy < 0 {
+            copy = pass_args;
+        }
+        if !data.stack.is_empty() {
+            if copy < 0 {
+                copy = depth;
+            }
+            let mut cont = cont.into_owned();
+            let mut new_stack = mem::take(&mut cont.stack);
+            move_from_stack(&mut new_stack, &mut engine.cc.stack, copy as usize);
+            let new_depth = new_stack.depth();
+            engine.cc.stack = new_stack;
+            consume_stack_gas(engine, new_depth)?;
+            return Ok(Cont::Owned(cont));
+        } else if copy >= 0 && copy < depth {
+            engine.cc.stack.storage.drain(..(depth - copy) as usize);
+            consume_stack_gas(engine, copy as usize)?;
+        }
+    } else if pass_args >= 0 {
+        if pass_args > depth {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while jumping to a continuation: not enough arguments on stack"
+            )
+        } else if pass_args < depth {
+            engine.cc.stack.storage.drain(..(depth - pass_args) as usize);
+            consume_stack_gas(engine, pass_args as usize)?;
+        }
+    }
+    Ok(cont)
+}
+
+fn apply_shared_savelist(engine: &mut Engine, cont: &ContinuationData) {
+    for index in SaveList::REGS {
+        if let Some(item) = cont.savelist.get(index) {
+            engine.ctrls.put_opt(index, item.clone());
+        }
+    }
+}
+
+/// One link of a loop continuation held uniquely: updated in place and installed as c0 again
+/// (the reference reuses the object in this case). Returns the continuation to hand over to,
+/// or gives the loop back when the general path applies.
+fn loop_in_place(
+    engine: &mut Engine,
+    mut cont: Arc<ContinuationData>,
+) -> Result<std::result::Result<Cont, Arc<ContinuationData>>> {
+    let Some(data) = Arc::get_mut(&mut cont) else {
+        return Ok(Err(cont));
+    };
+    let next = match &mut data.type_of {
+        ContinuationType::Repeat { count, body, .. } if *count > 0 && !body.has_c0() => {
+            *count -= 1;
+            body.clone()
+        }
+        ContinuationType::Again { body } if !body.has_c0() => body.clone(),
+        ContinuationType::While { check_cond: check_cond @ false, cond, .. } if !cond.has_c0() => {
+            *check_cond = true;
+            cond.clone()
+        }
+        ContinuationType::While { check_cond: check_cond @ true, body, after, .. } => {
+            if !pop_bool(engine)? {
+                return Ok(Ok(Cont::Shared(after.clone())));
+            }
+            if body.has_c0() {
+                return Ok(Ok(Cont::Shared(body.clone())));
+            }
+            *check_cond = false;
+            body.clone()
+        }
+        ContinuationType::Until { body, after } => {
+            if pop_bool(engine)? {
+                return Ok(Ok(Cont::Shared(after.clone())));
+            }
+            if body.has_c0() {
+                return Ok(Ok(Cont::Shared(body.clone())));
+            }
+            body.clone()
+        }
+        _ => return Ok(Err(cont)),
+    };
+    engine.ctrls.put_opt(0, StackItem::Continuation(cont));
+    Ok(Ok(Cont::Shared(next)))
+}
+
+/// Resolves one link of a jump; returns the continuation the link hands over to, if any.
+fn jump_once(engine: &mut Engine, cont: Cont) -> Result<Option<Cont>> {
+    let shared = match cont {
+        Cont::Owned(cont) => return jump_once_owned(engine, cont),
+        Cont::Shared(cont) => cont,
+    };
+    let shared = match loop_in_place(engine, shared)? {
+        Ok(next) => return Ok(Some(next)),
+        Err(shared) => shared,
+    };
+    match Arc::try_unwrap(shared) {
+        Ok(cont) => jump_once_owned(engine, cont),
+        Err(shared) => match &shared.type_of {
+            ContinuationType::Ordinary => {
+                apply_shared_savelist(engine, &shared);
+                *engine.cc.code_mut() = shared.code().clone();
+                engine.cc.nargs = -1;
+                Ok(None)
+            }
+            ContinuationType::Envelope(next) => {
+                apply_shared_savelist(engine, &shared);
+                Ok(Some(Cont::Shared(next.clone())))
+            }
+            ContinuationType::PushInt(value, next) => {
+                engine.cc.stack.push(int!(*value));
+                Ok(Some(Cont::Shared(next.clone())))
+            }
+            _ => jump_once_owned(engine, (*shared).clone()),
+        },
+    }
+}
+
+fn jump_once_owned(engine: &mut Engine, mut cont: ContinuationData) -> Result<Option<Cont>> {
+    match mem::take(&mut cont.type_of) {
+        ContinuationType::Ordinary => {
+            engine.ctrls.apply(&mut cont.savelist);
+            *engine.cc.code_mut() = mem::take(cont.code_mut());
+            engine.cc.nargs = -1;
+            Ok(None)
+        }
+        ContinuationType::Envelope(next) => {
+            engine.ctrls.apply(&mut cont.savelist);
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::PushInt(value, next) => {
+            engine.cc.stack.push(int!(value));
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::Quit(code) => {
+            engine.finish(code);
+            Ok(None)
+        }
+        ContinuationType::ExcQuit => {
+            let code = match pop_smallint_range(engine, 0xffff, 0) {
+                Ok(code) => code as i32,
+                Err(err) => tvm_exception_or_custom_code(&err),
+            };
+            engine.finish(code);
+            Ok(None)
+        }
+        ContinuationType::Repeat { count, body, after } => {
+            if count <= 0 {
+                return Ok(Some(Cont::Shared(after)));
+            }
+            if body.has_c0() {
+                return Ok(Some(Cont::Shared(body)));
+            }
+            let next = body.clone();
+            let repeat = ContinuationType::Repeat { count: count - 1, body, after };
+            set_ctrl_cont(engine, 0, ContinuationData::with_type(repeat));
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::Again { body } => {
+            if body.has_c0() {
+                return Ok(Some(Cont::Shared(body)));
+            }
+            let next = body.clone();
+            set_ctrl_cont(engine, 0, ContinuationData::with_type(ContinuationType::Again { body }));
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::Until { body, after } => {
+            if pop_bool(engine)? {
+                return Ok(Some(Cont::Shared(after)));
+            }
+            if body.has_c0() {
+                return Ok(Some(Cont::Shared(body)));
+            }
+            let next = body.clone();
+            let until = ContinuationType::Until { body, after };
+            set_ctrl_cont(engine, 0, ContinuationData::with_type(until));
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::While { check_cond: true, cond, body, after } => {
+            if !pop_bool(engine)? {
+                return Ok(Some(Cont::Shared(after)));
+            }
+            if body.has_c0() {
+                return Ok(Some(Cont::Shared(body)));
+            }
+            let next = body.clone();
+            let loop_ = ContinuationType::While { check_cond: false, cond, body, after };
+            set_ctrl_cont(engine, 0, ContinuationData::with_type(loop_));
+            Ok(Some(Cont::Shared(next)))
+        }
+        ContinuationType::While { check_cond: false, cond, body, after } => {
+            if cond.has_c0() {
+                return Ok(Some(Cont::Shared(cond)));
+            }
+            let next = cond.clone();
+            let loop_ = ContinuationType::While { check_cond: true, cond, body, after };
+            set_ctrl_cont(engine, 0, ContinuationData::with_type(loop_));
+            Ok(Some(Cont::Shared(next)))
+        }
+    }
+}
+
+/// Resolves a whole jump (`jump_to`). Every link counts; from the nested-jump version each
+/// link after the first eight costs 1 gas, and a link with a captured stack or a fixed
+/// argument count is stack-adjusted before it is entered.
+fn resolve(engine: &mut Engine, cont: Cont) -> Status {
+    let nested = engine.block_version() >= NESTED_JUMP_VERSION;
+    let mut next = Some(cont);
+    let mut count = 0usize;
+    while let Some(cont) = next.take() {
+        next = jump_once(engine, cont)?;
+        count += 1;
+        if nested && count > FREE_NESTED_CONT_JUMP {
+            consume_gas(engine, 1)?;
+        }
+        if nested {
+            if let Some(cont) = next.take() {
+                next = Some(if cont.get().needs_stack_adjust() {
+                    adjust_jump_cont(engine, cont, -1)?
+                } else {
+                    cont
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::executor) fn jump_to(engine: &mut Engine, cont: ContinuationData) -> Status {
+    resolve(engine, Cont::Owned(cont))
+}
+
+fn jump_cont(engine: &mut Engine, cont: Cont) -> Status {
+    if cont.get().needs_stack_adjust() {
+        let cont = adjust_jump_cont(engine, cont, -1)?;
+        resolve(engine, cont)
+    } else {
+        resolve(engine, cont)
+    }
+}
+
+/// Simple jump (`jump(cont)`).
+pub(in crate::executor) fn jump(engine: &mut Engine, cont: ContinuationData) -> Status {
+    jump_cont(engine, Cont::Owned(cont))
+}
+
+/// Jump passing `pass_args` stack items (-1 for all), `jump(cont, pass_args)`.
+pub(in crate::executor) fn jump_args(
+    engine: &mut Engine,
+    cont: ContinuationData,
+    pass_args: isize,
+) -> Status {
+    let cont = adjust_jump_cont(engine, Cont::Owned(cont), pass_args)?;
+    resolve(engine, cont)
+}
+
+/// The return continuation of a call: the rest of the current code with c0 saved.
+fn return_cont(engine: &mut Engine, stack: Stack, ret_args: isize) -> ContinuationData {
+    let code = mem::take(engine.cc.code_mut());
+    let mut ret = ContinuationData::with_code_and_stack(code, stack);
+    ret.nargs = ret_args;
+    if let Some(c0) = engine.ctrls.remove(0) {
+        ret.savelist.put_opt(0, c0);
+    }
+    ret
+}
+
+/// Simple call (`call(cont)`).
+pub(in crate::executor) fn call(engine: &mut Engine, cont: ContinuationData) -> Status {
+    if cont.has_cdata() {
+        if cont.has_c0() {
+            return jump(engine, cont);
+        }
+        if cont.needs_stack_adjust() {
+            return call_args(engine, cont, -1, -1);
+        }
+    }
+    let ret = return_cont(engine, Stack::new(), -1);
+    set_ctrl_cont(engine, 0, ret);
+    jump_to(engine, cont)
+}
+
+/// Call passing `pass_args` items and expecting `ret_args` results (-1 for all).
+pub(in crate::executor) fn call_args(
+    engine: &mut Engine,
+    mut cont: ContinuationData,
+    pass_args: isize,
+    ret_args: isize,
+) -> Status {
+    let depth = engine.cc.stack.depth() as isize;
+    if cont.has_cdata() {
+        if cont.has_c0() {
+            return jump_args(engine, cont, pass_args);
+        }
+        if pass_args > depth || cont.nargs > depth {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while calling a continuation: not enough arguments on stack"
+            )
+        }
+        if cont.nargs > pass_args && pass_args >= 0 {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while calling a closure continuation: not enough arguments passed"
+            )
+        }
+        let mut copy = cont.nargs;
+        let mut skip = 0;
+        if pass_args >= 0 {
+            if copy >= 0 {
+                skip = pass_args - copy;
+            } else {
+                copy = pass_args;
+            }
+        }
+        let new_stack = if !cont.stack.is_empty() {
+            if copy < 0 {
+                copy = depth;
+            }
+            let mut new_stack = mem::take(&mut cont.stack);
+            move_from_stack(&mut new_stack, &mut engine.cc.stack, copy as usize);
+            if skip > 0 {
+                let left = engine.cc.stack.depth();
+                engine.cc.stack.storage.truncate(left - skip as usize);
+            }
+            let new_depth = new_stack.depth();
+            consume_stack_gas(engine, new_depth)?;
+            new_stack
+        } else if copy >= 0 {
+            let new_stack = split_top(&mut engine.cc.stack, copy as usize);
+            if skip > 0 {
+                let left = engine.cc.stack.depth();
+                engine.cc.stack.storage.truncate(left - skip as usize);
+            }
+            consume_stack_gas(engine, copy as usize)?;
+            new_stack
+        } else {
+            mem::take(&mut engine.cc.stack)
+        };
+        let rest = mem::replace(&mut engine.cc.stack, new_stack);
+        let ret = return_cont(engine, rest, ret_args);
+        set_ctrl_cont(engine, 0, ret);
+        jump_to(engine, cont)
+    } else {
+        if pass_args > depth {
+            fail!(
+                ExceptionCode::StackUnderflow,
+                "stack underflow while calling a continuation: not enough arguments on stack"
+            )
+        }
+        let new_stack = if pass_args >= 0 {
+            let new_stack = split_top(&mut engine.cc.stack, pass_args as usize);
+            consume_stack_gas(engine, pass_args as usize)?;
+            new_stack
+        } else {
+            mem::take(&mut engine.cc.stack)
+        };
+        let rest = mem::replace(&mut engine.cc.stack, new_stack);
+        let ret = return_cont(engine, rest, ret_args);
+        set_ctrl_cont(engine, 0, ret);
+        jump_to(engine, cont)
+    }
+}
+
+fn take_ctrl_for_return(engine: &mut Engine, index: usize, code: i32) -> Result<Cont> {
+    let item = engine.ctrls.remove(index);
+    engine.ctrls.put_opt(index, quit(code));
+    match item {
+        Some(mut item) => Ok(Cont::Shared(item.take_continuation()?)),
+        None => Ok(Cont::Owned(ContinuationData::with_type(ContinuationType::Quit(code)))),
+    }
+}
+
+/// Return to c0, which is replaced by the quit continuation.
+pub(in crate::executor) fn ret(engine: &mut Engine) -> Status {
+    let cont = take_ctrl_for_return(engine, 0, ExceptionCode::NormalTermination as i32)?;
+    jump_cont(engine, cont)
+}
+
+fn ret_args(engine: &mut Engine, ret_args: isize) -> Status {
+    let cont = take_ctrl_for_return(engine, 0, ExceptionCode::NormalTermination as i32)?;
+    let cont = adjust_jump_cont(engine, cont, ret_args)?;
+    resolve(engine, cont)
+}
+
+/// Return to c1, which is replaced by the alternative quit continuation.
+fn ret_alt(engine: &mut Engine) -> Status {
+    let cont = take_ctrl_for_return(engine, 1, ExceptionCode::AlternativeTermination as i32)?;
+    jump_cont(engine, cont)
+}
+
+/// `c1_envelope`: optionally saves c1 and c0 into `cont`, then installs it as c1.
+fn c1_envelope(engine: &mut Engine, mut cont: ContinuationData, save: bool) -> ContinuationData {
+    if save {
+        let c1 = engine.ctrls.get(1).cloned();
+        let c0 = engine.ctrls.get(0).cloned();
+        let cdata = cont.force_cdata();
+        cdata.define_opt(1, c1);
+        cdata.define_opt(0, c0);
+    }
+    set_ctrl_cont(engine, 1, cont.clone());
+    cont
+}
+
+fn c1_envelope_if(engine: &mut Engine, cond: bool, cont: ContinuationData) -> ContinuationData {
+    if cond {
+        c1_envelope(engine, cont, true)
+    } else {
+        cont
+    }
+}
+
+/// `c1_save_set`: saves c1 into c0, then c1 = c0.
+fn c1_save_set(engine: &mut Engine) -> Status {
+    let mut c0 = ctrl_cont(engine, 0)?;
+    let c1 = engine.ctrls.get(1).cloned();
+    c0.force_cdata().define_opt(1, c1);
+    set_ctrl_cont(engine, 0, c0.clone());
+    set_ctrl_cont(engine, 1, c0);
+    Ok(())
+}
+
+// Wrappers for continuations taken from instruction variables ****************
+
+fn take_var_cont(engine: &mut Engine, index: usize) -> Result<ContinuationData> {
+    let item = mem::take(engine.cmd.var_mut(index));
+    item_into_cont(item)
+}
+
+/// Simple call of the continuation in variable `callee` (converted from a cell if asked).
 pub(super) fn callx(engine: &mut Engine, callee: usize, need_convert: bool) -> Status {
     let vars = engine.cmd.var_count();
     if vars < callee {
@@ -121,137 +675,17 @@ pub(super) fn callx(engine: &mut Engine, callee: usize, need_convert: bool) -> S
     } else if need_convert && engine.cmd.var(callee).as_cell().is_ok() {
         convert(engine, var!(callee), CONTINUATION, CELL)?;
     }
-    pop_all(engine, var!(callee))?;
-    let has_c0 = engine.cmd.var(callee).as_continuation()?.savelist.get(0).is_some();
-    if has_c0 {
-        swap(engine, var!(callee), CC)?;
-    } else {
-        swap(engine, ctrl!(0), savelist!(CC, 0))?;
-        swap(engine, var!(callee), CC)?;
-        swap(engine, var!(callee), ctrl!(0))?;
-    }
-    apply_savelist(engine)?;
-    if let Some(nargs) = engine.cmd.nargs_raw() {
-        continuation_mut_by_address!(engine, ctrl!(0))?.nargs = nargs
-    } else if let Some(rargs) = engine.cmd.rargs_raw() {
-        continuation_mut_by_address!(engine, ctrl!(0))?.nargs = rargs as isize
-    } else {
-        continuation_mut_by_address!(engine, ctrl!(0))?.nargs = -1;
-    }
-    Ok(())
+    let cont = take_var_cont(engine, callee)?;
+    call(engine, cont)
 }
 
-type NRange = RangeInclusive<isize>;
-type PRange = RangeInclusive<isize>;
-
-fn fetch_nargs(engine: &mut Engine, idx: usize, nrange: NRange) -> Status {
-    let nargs = engine.cmd.var(idx).as_integer_value(nrange)?;
-    engine.cmd.params.push(InstructionParameter::Nargs(nargs));
-    Ok(())
-}
-
-fn fetch_pargs(engine: &mut Engine, idx: usize, prange: PRange) -> Status {
-    let pargs = engine.cmd.var(idx).as_integer_value(prange)?;
-    if pargs >= 0 {
-        engine.cmd.params.push(InstructionParameter::Pargs(pargs as usize));
+/// Simple jump to the continuation in the variable at `address`.
+pub(super) fn switch(engine: &mut Engine, address: u16) -> Status {
+    if address_tag!(address) != VAR {
+        fail!("switch: {:X}", address)
     }
-    Ok(())
-}
-
-fn fetch_nargs_pargs(engine: &mut Engine, nrange: NRange, prange: PRange) -> Status {
-    fetch_nargs(engine, 0, nrange)?;
-    fetch_pargs(engine, 1, prange)
-}
-
-// (continuation - ),
-// move_out = cc.stack
-// move_in  = if continuation.nargs < 0 {
-//     move_out
-// } else if continuation.nargs > cc.stack.depth {
-//     StackOverflow
-// } else {
-//     move_out[0..cc.stack.depth + continuation.nargs - continuation.stack.depth]
-// }
-// cc.stack -= move_out, continuation.stack += move_in,
-// tmp = cc, cc = continuation, c[*] = cc.savelist[*], cc.stack.push(slice(tmp))
-fn jmpxdata(engine: &mut Engine) -> Status {
-    pop_all(engine, var!(0))?;
-    swap(engine, var!(0), CC)?;
-    apply_savelist(engine)?;
-    let slice = engine.cmd.var(0).as_continuation()?.code().clone();
-    engine.cc.stack.push(StackItem::Slice(slice));
-    Ok(())
-}
-
-// checks special case for REPEAT*, UNTIL*, WHILE*
-// works as a continue, not as a break
-pub(super) fn ret(engine: &mut Engine) -> Status {
-    switch(engine, ctrl!(0))
-}
-
-fn retalt(engine: &mut Engine) -> Status {
-    switch(engine, ctrl!(1))
-}
-
-// ( - ), if c[?].savelist[i].is_none() { c[?].savelist[i] = c[i] }
-fn save(engine: &mut Engine, index: usize) -> Status {
-    let creg = engine.cmd.creg();
-    let skip = match engine.ctrls.get(index) {
-        Some(c) => c.as_continuation()?.savelist.get(creg).is_some(),
-        None => fail!(ExceptionCode::TypeCheckError),
-    };
-    if !skip {
-        let v = engine.cmd.var_count() as u16;
-        copy_to_var(engine, ctrl!(creg))?;
-        swap(engine, var!(v), savelist!(ctrl!(index), creg))
-    } else if creg == 7 || engine.block_version() >= TVM_VERSION_14 {
-        Ok(())
-    } else {
-        fail!(ExceptionCode::TypeCheckError)
-    }
-}
-
-fn is_filled_savelist_slot_for_v14(
-    block_version: u32,
-    cont: &ContinuationData,
-    creg: usize,
-) -> bool {
-    block_version >= TVM_VERSION_14
-        && SaveList::REGS.contains(&creg)
-        && cont.savelist.get(creg).is_some()
-}
-
-// (x1 ... xR y {R N} - continuation), y->continuation, continuation.stack.push(x1 ... xR)
-fn setcont(engine: &mut Engine, v: usize, need_to_convert: bool) -> Status {
-    fetch_stack(engine, v + 1)?; // fetch slice or continuation from stack and nargs/parags
-    match v {
-        0 => {}
-        1 => fetch_nargs(engine, 0, -1..=255)?,
-        2 => fetch_nargs_pargs(engine, -1..=255, 0..=255)?,
-        _ => fail!(ExceptionCode::FatalError),
-    }
-    if need_to_convert {
-        engine.cmd.var(v).as_slice()?;
-    } else {
-        engine.cmd.var(v).as_continuation()?;
-    }
-    if engine.cc.stack.depth() < engine.cmd.pargs() {
-        fail!(ExceptionCode::StackUnderflow)
-    } else if need_to_convert {
-        convert(engine, var!(v as u16), CONTINUATION, SLICE)?
-    }
-    let pargs = engine.cmd.pargs();
-    if pargs != 0 {
-        pop_range(engine, 0..pargs, var!(v as u16))?
-    }
-    // update nargs
-    let nargs = engine.cmd.nargs();
-    if nargs >= 0 {
-        engine.cmd.var_mut(v).as_continuation_mut()?.nargs = nargs;
-    }
-    // return continuation to stack
-    engine.cc.stack.push(engine.cmd.pop_var()?);
-    Ok(())
+    let cont = take_var_cont(engine, storage_index!(address))?;
+    jump(engine, cont)
 }
 
 // switch to continuation from var!(0)
@@ -259,199 +693,428 @@ fn jmpx(engine: &mut Engine, need_convert: bool) -> Status {
     if need_convert && engine.cmd.var(0).as_cell().is_ok() {
         convert(engine, var!(0), CONTINUATION, CELL)?;
     }
-    pop_all(engine, var!(0))?;
-    swap(engine, var!(0), CC)?;
-    apply_savelist_excluding_c0_c1(engine)
+    let cont = take_var_cont(engine, 0)?;
+    jump(engine, cont)
 }
 
-// (continuation - ),
-// pargs = cmd.pargs if any else cc.stack.depth
-// if pargs > cc.stack.depth {
-//     StackOverflow
-// }
-// move_out = cc.stack[0..pargs]
-// move_in  = if continuation.nargs < 0 {
-//     move_out
-// } else if continuation.nargs > pargs {
-//     StackOverflow
-// } else {
-//     move_out[0..pargs + continuation.nargs - continuation.stack.depth]
-// }
-// cc.stack -= move_out, continuation.stack += move_in,
-// cc = continuation, c[*] = cc.savelist[*]
-pub(super) fn switch(engine: &mut Engine, continuation: u16) -> Status {
-    pop_all(engine, continuation)?;
-    swap(engine, continuation, CC)?;
-    let drop_c0 = (continuation == ctrl!(0)) && engine.cc.savelist.get(0).is_none();
-    let drop_c1 = (continuation == ctrl!(1)) && engine.cc.savelist.get(1).is_none();
-    apply_savelist(engine)?;
-    if drop_c0 {
-        engine.ctrls.remove(0);
-    }
-    if drop_c1 {
-        let cont = ContinuationData::with_type(ContinuationType::Quit(1));
-        engine.ctrls.put(1, StackItem::continuation(cont))?;
-    }
-    Ok(())
+fn ref_cont(engine: &mut Engine) -> Result<ContinuationData> {
+    let index = engine.cmd.var_count();
+    fetch_reference(engine, CC)?;
+    convert(engine, var!(index), CONTINUATION, CELL)?;
+    take_var_cont(engine, index)
 }
 
-pub(super) fn switch_to_c0(engine: &mut Engine) -> Status {
-    pop_all(engine, ctrl!(0))?;
-    let c0 = engine.ctrls.get_mut(0).ok_or(ExceptionCode::FatalError)?.as_continuation_mut()?;
-    mem::swap(&mut engine.cc, c0);
-    let drop_c0 = engine.cc.savelist.get(0).is_none();
-    engine.ctrls.apply(&mut engine.cc.savelist);
-    if drop_c0 {
-        engine.ctrls.remove(0);
+// Loops **********************************************************************
+
+fn repeat(
+    engine: &mut Engine,
+    body: ContinuationData,
+    after: ContinuationData,
+    count: isize,
+) -> Status {
+    if count <= 0 {
+        drop(body);
+        jump(engine, after)
+    } else {
+        let repeat = ContinuationType::Repeat {
+            count: count as i64,
+            body: Arc::new(body),
+            after: Arc::new(after),
+        };
+        jump(engine, ContinuationData::with_type(repeat))
     }
-    Ok(())
 }
 
-// Continuation related instructions ******************************************
+fn again(engine: &mut Engine, body: ContinuationData) -> Status {
+    jump(engine, ContinuationData::with_type(ContinuationType::Again { body: Arc::new(body) }))
+}
+
+fn until(engine: &mut Engine, body: ContinuationData, after: ContinuationData) -> Status {
+    if !body.has_c0() {
+        let until =
+            ContinuationType::Until { body: Arc::new(body.clone()), after: Arc::new(after) };
+        set_ctrl_cont(engine, 0, ContinuationData::with_type(until));
+    }
+    jump(engine, body)
+}
+
+fn loop_while(
+    engine: &mut Engine,
+    cond: ContinuationData,
+    body: ContinuationData,
+    after: ContinuationData,
+) -> Status {
+    if !cond.has_c0() {
+        let loop_ = ContinuationType::While {
+            check_cond: true,
+            cond: Arc::new(cond.clone()),
+            body: Arc::new(body),
+            after: Arc::new(after),
+        };
+        set_ctrl_cont(engine, 0, ContinuationData::with_type(loop_));
+    }
+    jump(engine, cond)
+}
+
+fn exec_repeat(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 2)?;
+    let body = pop_cont(engine)?;
+    let count = pop_smallint_range(engine, 0x7fffffff, -0x80000000)?;
+    if count <= 0 {
+        return Ok(());
+    }
+    let cc = extract_cc(engine, 1, -1, -1)?;
+    let after = c1_envelope_if(engine, brk, cc);
+    repeat(engine, body, after, count)
+}
+
+fn exec_repeat_end(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 1)?;
+    let count = pop_smallint_range(engine, 0x7fffffff, -0x80000000)?;
+    if count <= 0 {
+        return ret(engine);
+    }
+    let body = extract_cc(engine, 0, -1, -1)?;
+    let c0 = ctrl_cont(engine, 0)?;
+    let after = c1_envelope_if(engine, brk, c0);
+    repeat(engine, body, after, count)
+}
+
+fn exec_until(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 1)?;
+    let body = pop_cont(engine)?;
+    let cc = extract_cc(engine, 1, -1, -1)?;
+    let after = c1_envelope_if(engine, brk, cc);
+    until(engine, body, after)
+}
+
+fn exec_until_end(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    let body = extract_cc(engine, 0, -1, -1)?;
+    let c0 = ctrl_cont(engine, 0)?;
+    let after = c1_envelope_if(engine, brk, c0);
+    until(engine, body, after)
+}
+
+fn exec_while(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 2)?;
+    let body = pop_cont(engine)?;
+    let cond = pop_cont(engine)?;
+    let cc = extract_cc(engine, 1, -1, -1)?;
+    let after = c1_envelope_if(engine, brk, cc);
+    loop_while(engine, cond, body, after)
+}
+
+fn exec_while_end(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 1)?;
+    let cond = pop_cont(engine)?;
+    let body = extract_cc(engine, 0, -1, -1)?;
+    let c0 = ctrl_cont(engine, 0)?;
+    let after = c1_envelope_if(engine, brk, c0);
+    loop_while(engine, cond, body, after)
+}
+
+fn exec_again(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    if brk {
+        let cc = extract_cc(engine, 3, -1, -1)?;
+        set_ctrl_cont(engine, 1, cc);
+    }
+    check_underflow(engine, 1)?;
+    let body = pop_cont(engine)?;
+    again(engine, body)
+}
+
+fn exec_again_end(engine: &mut Engine, name: &'static str, brk: bool) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    if brk {
+        c1_save_set(engine)?;
+    }
+    let body = extract_cc(engine, 0, -1, -1)?;
+    again(engine, body)
+}
+
 // (c - ), execute C infinitely
 pub(super) fn execute_again(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("AGAIN"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::AgainLoopBody(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    copy_to_var(engine, CC)?;
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // again.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // continuation.savelist[0] = again
-    switch(engine, var!(0))
+    exec_again(engine, "AGAIN", false)
 }
 
-// Continuation related instructions ******************************************
 // (c - ), execute C infinitely with break
 pub(super) fn execute_again_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("AGAINBRK"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::AgainLoopBody(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    swap(engine, savelist!(CC, 1), ctrl!(1))?; // cc.savelist[1] = c[1]
-    copy_to_var(engine, CC)?; // var[2] = cc
-    copy_to_var(engine, var!(2))?; // var[3] = cc
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // again.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = again
-    swap(engine, savelist!(var!(0), 1), var!(3))?; // body.savelist[1] = cc
-    switch(engine, var!(0)) // jump to body
+    exec_again(engine, "AGAINBRK", true)
 }
 
 // ( - ), execute CC infinitely
 pub(super) fn execute_againend(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("AGAINEND"))?;
-    let body = engine.cc.code_mut().withdraw();
-    let cont = ContinuationData::with_code(body.clone());
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    let cont = ContinuationData::with_type(ContinuationType::AgainLoopBody(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    copy_to_var(engine, CC)?;
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // again.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // continuation.savelist[0] = again
-    switch(engine, var!(0))
+    exec_again_end(engine, "AGAINEND", false)
 }
 
 // ( - ), execute CC infinitely with break
 pub(super) fn execute_againend_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("AGAINENDBRK"))?;
-    let body = engine.cc.code_mut().withdraw();
-    let cont = ContinuationData::with_code(body.clone());
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    let cont = ContinuationData::with_type(ContinuationType::AgainLoopBody(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    copy_to_var(engine, CC)?; // var[2] = cc
-    copy_to_var(engine, var!(2))?; // var[3] = cc
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // again.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = again
-    swap(engine, savelist!(var!(0), 1), var!(3))?; // body.savelist[1] = cc
-    switch(engine, var!(0)) // jump to body
+    exec_again_end(engine, "AGAINENDBRK", true)
 }
 
-// (continuation - ), continuation.savelist[0] = c[0], c[0] = continuation
-pub(super) fn execute_atexit(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("ATEXIT"))?;
-    fetch_stack(engine, 1)?;
-    swap(engine, var!(0), ctrl!(0))?;
-    swap(engine, var!(0), savelist!(ctrl!(0), 0))
+// (integer_repeat_count body_continuation - )
+pub(super) fn execute_repeat(engine: &mut Engine) -> Status {
+    exec_repeat(engine, "REPEAT", false)
 }
 
-// (continuation - ), continuation.savelist[1] = c[1], c[1] = continuation
-pub(super) fn execute_atexitalt(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("ATEXITALT"))?;
-    fetch_stack(engine, 1)?;
-    swap(engine, var!(0), ctrl!(1))?;
-    swap(engine, var!(0), savelist!(ctrl!(1), 1))
+pub(super) fn execute_repeat_break(engine: &mut Engine) -> Status {
+    exec_repeat(engine, "REPEATBRK", true)
 }
 
-// (slice - continuation)
-pub(super) fn execute_bless(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("BLESS"))?;
-    setcont(engine, 0, true)
+// (integer_repeat_count - )
+pub(super) fn execute_repeatend(engine: &mut Engine) -> Status {
+    exec_repeat_end(engine, "REPEATEND", false)
 }
 
-// (x1 ... xR slice - continuation), continuation.stack.push(x1 ... xR)
-pub(super) fn execute_blessargs(engine: &mut Engine) -> Status {
+pub(super) fn execute_repeatend_break(engine: &mut Engine) -> Status {
+    exec_repeat_end(engine, "REPEATENDBRK", true)
+}
+
+// (body - )
+pub(super) fn execute_until(engine: &mut Engine) -> Status {
+    exec_until(engine, "UNTIL", false)
+}
+
+pub(super) fn execute_until_break(engine: &mut Engine) -> Status {
+    exec_until(engine, "UNTILBRK", true)
+}
+
+// cc is body
+pub(super) fn execute_untilend(engine: &mut Engine) -> Status {
+    exec_until_end(engine, "UNTILEND", false)
+}
+
+pub(super) fn execute_untilend_break(engine: &mut Engine) -> Status {
+    exec_until_end(engine, "UNTILENDBRK", true)
+}
+
+// (condition body - )
+pub(super) fn execute_while(engine: &mut Engine) -> Status {
+    exec_while(engine, "WHILE", false)
+}
+
+pub(super) fn execute_while_break(engine: &mut Engine) -> Status {
+    exec_while(engine, "WHILEBRK", true)
+}
+
+// cc is body, (condition - )
+pub(super) fn execute_whileend(engine: &mut Engine) -> Status {
+    exec_while_end(engine, "WHILEEND", false)
+}
+
+pub(super) fn execute_whileend_break(engine: &mut Engine) -> Status {
+    exec_while_end(engine, "WHILEENDBRK", true)
+}
+
+// Jumps and calls ************************************************************
+
+// (continuation - ), simple call
+pub(super) fn execute_callx(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("CALLX"))?;
+    let cont = pop_cont(engine)?;
+    call(engine, cont)
+}
+
+// (continuation - ), call with p,r (0xDA) or p,-1 (0xDB0p)
+pub(super) fn execute_callxargs(engine: &mut Engine) -> Status {
+    let cmd = engine.last_cmd();
+    engine.load_instruction(Instruction::new("CALLXARGS").set_opts(if cmd == 0xDA {
+        InstructionOptions::ArgumentAndReturnConstraints
+    } else {
+        InstructionOptions::Pargs(0..16)
+    }))?;
+    let pass_args = engine.cmd.pargs() as isize;
+    let ret_args = if cmd == 0xDA { engine.cmd.rargs() as isize } else { -1 };
+    let cont = pop_cont(engine)?;
+    call_args(engine, cont, pass_args, ret_args)
+}
+
+// (continuation p r - )
+pub(super) fn execute_callxva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("CALLXVARARGS"))?;
+    check_underflow(engine, 3)?;
+    let ret_args = pop_smallint_range(engine, 254, -1)?;
+    let pass_args = pop_smallint_range(engine, 254, -1)?;
+    let cont = pop_cont(engine)?;
+    call_args(engine, cont, pass_args, ret_args)
+}
+
+// (continuation - )
+pub(super) fn execute_jmpx(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("JMPX"))?;
+    let cont = pop_cont(engine)?;
+    jump(engine, cont)
+}
+
+// (continuation - ), jump passing p items
+pub(super) fn execute_jmpxargs(engine: &mut Engine) -> Status {
     engine.load_instruction(
-        Instruction::new("BLESSARGS").set_opts(InstructionOptions::ArgumentConstraints),
+        Instruction::new("JMPXARGS").set_opts(InstructionOptions::Pargs(0..16)),
     )?;
-    setcont(engine, 0, true)
+    let pass_args = engine.cmd.pargs() as isize;
+    let cont = pop_cont(engine)?;
+    jump_args(engine, cont, pass_args)
 }
 
-// (x1 ... xR slice R N - continuation), continuation.stack.push(x1 ... xR)
-pub(super) fn execute_blessva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("BLESSVARARGS"))?;
-    setcont(engine, 2, true)
+// (continuation p - )
+pub(super) fn execute_jmpxva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("JMPXVARARGS"))?;
+    check_underflow(engine, 2)?;
+    let pass_args = pop_smallint_range(engine, 254, -1)?;
+    check_underflow(engine, (pass_args + 1) as usize)?;
+    let cont = pop_cont(engine)?;
+    jump_args(engine, cont, pass_args)
 }
 
-//(c - )
-// c'= continuation {PUSHINT -1}, c'[0] = cc
-// c''= continuation {PUSHINT 0}, c''[0] = cc
-//c[0] = c', c[1] = c''
-//execute c
+// (continuation - ), cc pushed for the callee
+pub(super) fn execute_callcc(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("CALLCC"))?;
+    let cont = pop_cont(engine)?;
+    let cc = extract_cc(engine, 3, -1, -1)?;
+    engine.cc.stack.push_cont(cc);
+    jump(engine, cont)
+}
+
+// (continuation - ), cc capturing all but p items, returning r
+pub(super) fn execute_callccargs(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("CALLCCARGS").set_opts(InstructionOptions::ArgumentConstraints),
+    )?;
+    let pass_args = engine.cmd.pargs() as isize;
+    let ret_args = engine.cmd.nargs();
+    check_underflow(engine, (pass_args + 1) as usize)?;
+    let cont = pop_cont(engine)?;
+    let cc = extract_cc(engine, 3, pass_args, ret_args)?;
+    engine.cc.stack.push_cont(cc);
+    jump(engine, cont)
+}
+
+// (continuation p r - )
+pub(super) fn execute_callccva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("CALLCCVARARGS"))?;
+    check_underflow(engine, 3)?;
+    let ret_args = pop_smallint_range(engine, 254, -1)?;
+    let pass_args = pop_smallint_range(engine, 254, -1)?;
+    check_underflow(engine, (pass_args + 1) as usize)?;
+    let cont = pop_cont(engine)?;
+    let cc = extract_cc(engine, 3, pass_args, ret_args)?;
+    engine.cc.stack.push_cont(cc);
+    jump(engine, cont)
+}
+
+// equivalent to PUSHREFCONT; CALLX
+pub(super) fn execute_callref(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("CALLREF"))?;
+    let cont = ref_cont(engine)?;
+    call(engine, cont)
+}
+
+pub(super) fn execute_jmpref(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("JMPREF"))?;
+    let cont = ref_cont(engine)?;
+    jump(engine, cont)
+}
+
+pub(super) fn execute_jmprefdata(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("JMPREFDATA"))?;
+    let cont = ref_cont(engine)?;
+    push_code(engine);
+    jump(engine, cont)
+}
+
+// (continuation - code), jump with the rest of the current code on the stack
+pub(super) fn execute_jmpxdata(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("JMPXDATA"))?;
+    let cont = pop_cont(engine)?;
+    push_code(engine);
+    jump(engine, cont)
+}
+
+// return to c[0]
+pub(super) fn execute_ret(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RET"))?;
+    ret(engine)
+}
+
+// return to c[1]
+pub(super) fn execute_retalt(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RETALT"))?;
+    ret_alt(engine)
+}
+
+// return to c[0] with p items
+pub(super) fn execute_retargs(engine: &mut Engine) -> Status {
+    engine
+        .load_instruction(Instruction::new("RETARGS").set_opts(InstructionOptions::Pargs(0..16)))?;
+    let count = engine.cmd.pargs() as isize;
+    ret_args(engine, count)
+}
+
+// (r - ) return to c[0] with r items
+pub(super) fn execute_retva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RETVARARGS"))?;
+    let count = pop_smallint_range(engine, 254, -1)?;
+    ret_args(engine, count)
+}
+
+// (condition - ), if condition != 0 then RET else RETALT
+pub(super) fn execute_retbool(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RETBOOL"))?;
+    if pop_bool(engine)? {
+        ret(engine)
+    } else {
+        ret_alt(engine)
+    }
+}
+
+// ( - code), return with the rest of the current code on the stack
+pub(super) fn execute_retdata(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RETDATA"))?;
+    push_code(engine);
+    ret(engine)
+}
+
+//(c - ), c0 = PushInt(-1, cc), c1 = PushInt(0, cc), jump to c
 pub(super) fn execute_booleval(engine: &mut Engine) -> Status {
-    let mut old_cc_idx = ctrl!(0);
     engine.load_instruction(Instruction::new("BOOLEVAL"))?;
-    fetch_stack(engine, 1)?;
-    engine.cmd.var(0).as_continuation()?;
-    let cont = ContinuationData::with_type(ContinuationType::PushInt(-1));
-    engine.cmd.push_var(StackItem::continuation(cont));
-    let cont = ContinuationData::with_type(ContinuationType::PushInt(0));
-    engine.cmd.push_var(StackItem::continuation(cont));
-    callx(engine, 0, false)?;
-    let has_save_c0 = !engine.cc.can_put_to_savelist_once(0);
-    if has_save_c0 {
-        old_cc_idx = var!(0)
-    };
-    copy_to_var(engine, old_cc_idx)?;
-    swap(engine, savelist!(var!(1), 0), old_cc_idx)?;
-    swap(engine, savelist!(var!(2), 0), var!(3))?;
-    swap(engine, ctrl!(0), var!(1))?;
-    swap(engine, ctrl!(1), var!(2))
+    let cont = pop_cont(engine)?;
+    let cc = Arc::new(extract_cc(engine, 3, -1, -1)?);
+    set_ctrl_cont(
+        engine,
+        0,
+        ContinuationData::with_type(ContinuationType::PushInt(-1, cc.clone())),
+    );
+    set_ctrl_cont(engine, 1, ContinuationData::with_type(ContinuationType::PushInt(0, cc)));
+    jump(engine, cont)
 }
 
 // n ( - n), calls the continuation in c3
-// approximately equivalent to PUSHINT n; PUSH c3; EXECUTE
 fn execute_call(engine: &mut Engine, name: &'static str, range: Range<isize>, how: u8) -> Status {
     engine.load_instruction(Instruction::new(name).set_opts(InstructionOptions::Integer(range)))?;
     let n = engine.cmd.integer();
-    if how == PREPARE {
-        copy_to_var(engine, ctrl!(3))?;
-        engine.cc.stack.push(int!(n));
-        engine.cc.stack.push(engine.cmd.pop_var()?);
-        Ok(())
-    } else {
-        engine.cc.stack.push(int!(n));
-        copy_to_var(engine, ctrl!(3))?;
-        match how {
-            SWITCH => switch(engine, var!(0)),
-            CALLX => callx(engine, 0, false),
-            _ => fail!("how: 0x{:X}", how),
+    engine.cc.stack.push(int!(n));
+    match how {
+        PREPARE => {
+            copy_to_var(engine, ctrl!(3))?;
+            engine.cc.stack.push(engine.cmd.pop_var()?);
+            Ok(())
         }
+        SWITCH => {
+            let c3 = ctrl_cont(engine, 3)?;
+            jump(engine, c3)
+        }
+        CALLX => {
+            let c3 = ctrl_cont(engine, 3)?;
+            call(engine, c3)
+        }
+        _ => fail!("how: 0x{:X}", how),
     }
 }
 
@@ -472,97 +1135,7 @@ pub(super) fn execute_prepare(engine: &mut Engine) -> Status {
     execute_call(engine, "PREPARE", 0..16384, PREPARE)
 }
 
-// (continuation - ), callcc pattern
-pub(super) fn execute_callcc(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("CALLCC"))?;
-    callcc(engine, 0)
-}
-
-// (continuation - ), callcc pattern
-pub(super) fn execute_callccargs(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("CALLCCARGS").set_opts(InstructionOptions::ArgumentConstraints),
-    )?;
-    callcc(engine, 0)
-}
-
-// (continuation pargs rargs - ), callcc pattern
-pub(super) fn execute_callccva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("CALLCCVARARGS"))?;
-    fetch_stack(engine, 3)?;
-    fetch_nargs_pargs(engine, -1..=255, -1..=255)?;
-    callcc(engine, 2)
-}
-
-// equivalent to PUSHREFCONT; CALLX
-// e.g. remove first reference from CC and then call it
-pub(super) fn execute_callref(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("CALLREF"))?;
-    fetch_reference(engine, CC)?;
-    convert(engine, var!(0), CONTINUATION, CELL)?;
-    callx(engine, 0, false)
-}
-
-// (continuation - ), callx pattern
-pub(super) fn execute_callx(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("CALLX"))?;
-    callx(engine, 0, false)
-}
-
-// (continuation - ), callx pattern
-pub(super) fn execute_callxargs(engine: &mut Engine) -> Status {
-    let cmd = engine.last_cmd();
-    engine.load_instruction(Instruction::new("CALLXARGS").set_opts(if cmd == 0xDA {
-        InstructionOptions::ArgumentAndReturnConstraints
-    } else {
-        InstructionOptions::Pargs(0..16)
-    }))?;
-    callx(engine, 0, false)
-}
-
-// (continuation pargs rargs - ), callx pattern
-pub(super) fn execute_callxva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("CALLXVARARGS"))?;
-    fetch_stack(engine, 3)?;
-    fetch_nargs_pargs(engine, -1..=254, -1..=254)?;
-    callx(engine, 2, false)
-}
-
-// (continuation1 continuation2 - continuation1), continuation1.savelist[0] = continuation2
-pub(super) fn execute_compos(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("COMPOS"))?;
-    fetch_stack(engine, 2)?;
-    engine.cmd.var(0).as_continuation()?;
-    engine.cmd.var(1).as_continuation()?;
-    swap(engine, var!(0), savelist!(var!(1), 0))?;
-    engine.cc.stack.push(engine.cmd.pop_var()?);
-    Ok(())
-}
-
-// (continuation1 continuation2 - continuation1), continuation1.savelist[1] = continuation2
-pub(super) fn execute_composalt(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("COMPOSALT"))?;
-    fetch_stack(engine, 2)?;
-    engine.cmd.var(0).as_continuation()?;
-    engine.cmd.var(1).as_continuation()?;
-    swap(engine, var!(0), savelist!(var!(1), 1))?;
-    engine.cc.stack.push(engine.cmd.pop_var()?);
-    Ok(())
-}
-
-// (continuation1 continuation2 - continuation1),
-// continuation1.savelist[0] = continuation2, continuation1.savelist[1] = continuation2
-pub(super) fn execute_composboth(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("COMPOSBOTH"))?;
-    fetch_stack(engine, 2)?;
-    engine.cmd.var(0).as_continuation()?;
-    engine.cmd.var(1).as_continuation()?;
-    copy_to_var(engine, var!(0))?;
-    swap(engine, var!(0), savelist!(var!(1), 0))?;
-    swap(engine, var!(2), savelist!(var!(1), 1))?;
-    engine.cc.stack.push(engine.cmd.vars.remove(1));
-    Ok(())
-}
+// Conditional jumps **********************************************************
 
 // (f x y - ), x f != 0 else y
 pub(super) fn execute_condsel(engine: &mut Engine) -> Status {
@@ -642,7 +1215,7 @@ fn execute_if_mask(engine: &mut Engine, name: &'static str, how: u8) -> Status {
             callx(engine, 0, how.bit(REF))
         }
         true if how.bit(JMP) => jmpx(engine, how.bit(REF)),
-        true if how.bit(ALT) => retalt(engine),
+        true if how.bit(ALT) => ret_alt(engine),
         true if how.bit(RET) => ret(engine),
         true => callx(engine, 0, how.bit(REF)),
     }
@@ -728,32 +1301,6 @@ pub(super) fn execute_ifnotretalt(engine: &mut Engine) -> Status {
     execute_if_mask(engine, "IFNOTRETALT", RET | ALT | INV)
 }
 
-// c[0] <-> c[1]
-pub(super) fn execute_invert(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("INVERT"))?;
-    swap(engine, ctrl!(0), ctrl!(1))
-}
-
-pub(super) fn execute_jmpref(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("JMPREF"))?;
-    fetch_reference(engine, CC)?;
-    jmpx(engine, true)
-}
-
-pub(super) fn execute_jmprefdata(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("JMPREFDATA"))?;
-    fetch_reference(engine, CC)?;
-    convert(engine, var!(0), CONTINUATION, CELL)?;
-    jmpxdata(engine)
-}
-
-// (continuation - ), switch pattern
-pub(super) fn execute_jmpx(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("JMPX"))?;
-    fetch_stack(engine, 1)?;
-    jmpx(engine, false)
-}
-
 fn execute_ifbit_mask(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     engine.load_instruction(Instruction::new(name).set_opts(InstructionOptions::Integer(0..32)))?;
     if how.bit(REF) {
@@ -798,335 +1345,34 @@ pub(super) fn execute_ifnbitjmpref(engine: &mut Engine) -> Status {
     execute_ifbit_mask(engine, "IFNBITJMPREF", REF | INV)
 }
 
-// (continuation - ), continuation.nargs = cmd.pargs, then switch pattern
-pub(super) fn execute_jmpxargs(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("JMPXARGS").set_opts(InstructionOptions::Pargs(0..16)),
-    )?;
-    fetch_stack(engine, 1)?;
-    switch(engine, var!(0))
-}
+// Continuation changes *******************************************************
 
-// (continuation p - ), continuation.nargs = cmd.pargs, then switch pattern
-pub(super) fn execute_jmpxva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("JMPXVARARGS"))?;
-    fetch_stack(engine, 2)?;
-    fetch_pargs(engine, 0, -1..=254)?;
-    switch(engine, var!(1))
-}
-
-// (integer_repeat_count body_continuation - )
-// body.savelist[0] = cc
-// cc.savelist[0] = c[0]
-pub(super) fn execute_repeat(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("REPEAT"))?;
-    fetch_stack(engine, 2)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let counter = engine.cmd.var(1).as_integer_value(-0x80000000..=0x7FFFFFFF)?;
-    if counter <= 0 {
-        Ok(())
-    } else {
-        let cont = ContinuationData::with_type(ContinuationType::RepeatLoopBody(body, counter));
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-        copy_to_var(engine, CC)?;
-        swap(engine, savelist!(var!(2), 0), var!(3))?; // ec_repeat.savelist[0] = cc
-        swap(engine, savelist!(var!(0), 0), var!(2))?; // body.savelist[0] = ec_repeat
-        switch(engine, var!(0))
-    }
-}
-
-// (integer_repeat_count body_continuation - )
-// cc.savelist[0] = c[0]
-// ec_repeat.savelist[0] = cc
-// body.savelist[0] = ec_repeat
-// body.savelist[1] = cc
-pub(super) fn execute_repeat_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("REPEATBRK"))?;
-    fetch_stack(engine, 2)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let counter = engine.cmd.var(1).as_integer_value(-0x80000000..=0x7FFFFFFF)?;
-    if counter <= 0 {
-        Ok(())
-    } else {
-        let cont = ContinuationData::with_type(ContinuationType::RepeatLoopBody(body, counter));
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-        swap(engine, savelist!(CC, 1), ctrl!(1))?; // cc.savelist[1] = c[1]
-        copy_to_var(engine, CC)?;
-        copy_to_var(engine, var!(3))?;
-        swap(engine, savelist!(var!(2), 0), var!(3))?; // ec_repeat.savelist[0] = cc
-        swap(engine, savelist!(var!(0), 0), var!(2))?; // body.savelist[0] = ec_repeat
-        swap(engine, savelist!(var!(0), 1), var!(4))?; // body.savelist[1] = cc
-        switch(engine, var!(0)) // jump to body
-    }
-}
-
-// (integer_repeat_count - )
-// body.savelist[0] = cc
-// cc.savelist[0] = c[0]
-pub(super) fn execute_repeatend(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("REPEATEND"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cc.code().clone();
-    let counter = engine.cmd.var(0).as_integer_value(-0x80000000..=0x7FFFFFFF)?;
-    if counter <= 0 {
-        ret(engine)
-    } else {
-        let cont = ContinuationData::with_code(body.clone());
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        let cont = ContinuationData::with_type(ContinuationType::RepeatLoopBody(body, counter));
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        swap(engine, savelist!(var!(2), 0), ctrl!(0))?; // ec_repeat.savelist[0] = c[0]
-        swap(engine, savelist!(var!(1), 0), var!(2))?; // body.savelist[0] = ec_repeat
-        switch(engine, var!(1))
-    }
-}
-
-// (integer_repeat_count - )
-// ec_repeat.savelist[0] = c[0]
-// body.savelist[0] = ec_repeat
-// body.savelist[1] = c[0]
-pub(super) fn execute_repeatend_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("REPEATENDBRK"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cc.code().clone();
-    let counter = engine.cmd.var(0).as_integer_value(-0x80000000..=0x7FFFFFFF)?;
-    if counter <= 0 {
-        ret(engine)
-    } else {
-        let cont = ContinuationData::with_code(body.clone());
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        let cont = ContinuationData::with_type(ContinuationType::RepeatLoopBody(body, counter));
-        engine.cmd.vars.push(StackItem::continuation(cont));
-        copy_to_var(engine, ctrl!(0))?;
-        swap(engine, savelist!(var!(2), 0), ctrl!(0))?; // ec_repeat.savelist[0] = c[0]
-        swap(engine, savelist!(var!(1), 0), var!(2))?; // body.savelist[0] = ec_repeat
-        swap(engine, savelist!(var!(1), 1), var!(3))?; // body.savelist[1] = c[0]
-        switch(engine, var!(1))
-    }
-}
-
-// c[0].stack = cc.stack, cc.stack = ()
-// cc = continuation, c[2..] = cc.savelist[2..]
-// (continuation - ), var[0] = cc.stack.pop(), then jmpxdata pattern
-pub(super) fn execute_jmpxdata(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("JMPXDATA"))?;
-    fetch_stack(engine, 1)?;
-    jmpxdata(engine)
-}
-
-// switch to c[0]
-pub(super) fn execute_ret(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RET"))?;
-    ret(engine)
-}
-
-// switch to c[1]
-pub(super) fn execute_retalt(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RETALT"))?;
-    retalt(engine)
-}
-
-// switch to c[0] with pargs
-pub(super) fn execute_retargs(engine: &mut Engine) -> Status {
-    engine
-        .load_instruction(Instruction::new("RETARGS").set_opts(InstructionOptions::Pargs(0..16)))?;
-    switch(engine, ctrl!(0))
-}
-
-// (p - ) switch to c[0] with p params
-pub(super) fn execute_retva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RETVARARGS"))?;
-    fetch_stack(engine, 1)?;
-    fetch_pargs(engine, 0, -1..=254)?;
-    switch(engine, ctrl!(0))
-}
-
-// (condition - ), if condition != 0 then RET else RETALT
-pub(super) fn execute_retbool(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RETBOOL"))?;
-    fetch_stack(engine, 1)?;
-    match engine.cmd.var(0).as_bool()? {
-        false => retalt(engine),
-        _ => ret(engine),
-    }
-}
-
-// var[0] = c[0], then jmpxdata pattern
-pub(super) fn execute_retdata(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RETDATA"))?;
-    let cont = ContinuationData::with_type(ContinuationType::Quit(
-        ExceptionCode::NormalTermination as i32,
-    ));
-    engine.cmd.push_var(StackItem::continuation(cont));
-    swap(engine, ctrl!(0), var!(0))?;
-    jmpxdata(engine)
-}
-
-// (xN ... xN-p xN-p-1 ... x0 - xN-p-1 ... x0), c0.stack.push(xN ... xN-p)
-pub(super) fn execute_returnargs(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("RETURNARGS").set_opts(InstructionOptions::Rargs(0..16)),
-    )?;
-    if engine.cc.stack.depth() < engine.cmd.rargs() {
-        fail!(ExceptionCode::StackUnderflow)
-    } else {
-        let drop = engine.cmd.rargs()..engine.cc.stack.depth();
-        pop_range(engine, drop, ctrl!(0))
-    }
-}
-
-// (xN ... xN-p xN-p-1 ... x0 p - xN-p-1 ... x0), c0.stack.push(xN ... xN-p)
-pub(super) fn execute_returnva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("RETURNVARARGS"))?;
-    fetch_stack(engine, 1)?;
-    let rargs = engine.cmd.var(0).as_integer_value(0..=255)?;
-    if engine.cc.stack.depth() < rargs {
-        fail!(ExceptionCode::StackUnderflow)
-    } else {
-        let drop = rargs..engine.cc.stack.depth();
-        pop_range(engine, drop, ctrl!(0))
-    }
-}
-
-// ( - ), c[1] = c[0]
-pub(super) fn execute_samealt(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SAMEALT"))?;
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, ctrl!(1), var!(0))
-}
-
-// ( - ), c[0].savelist[1] = c[1], c[1] = c[0]
-pub(super) fn execute_samealt_save(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SAMEALTSAVE"))?;
-    swap(engine, savelist!(ctrl!(0), 1), ctrl!(1))?;
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, ctrl!(1), var!(0))
-}
-
-// ( - ), if c[0].savelist[i].is_none() { c[0].savelist[i] = c[i] }
-pub(super) fn execute_save(engine: &mut Engine) -> Status {
-    engine
-        .load_instruction(Instruction::new("SAVE").set_opts(InstructionOptions::ControlRegister))?;
-    save(engine, 0)
-}
-
-// ( - ), if c[1].savelist[i].is_none() { c[1].savelist[i] = c[i] }
-pub(super) fn execute_savealt(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("SAVEALT").set_opts(InstructionOptions::ControlRegister),
-    )?;
-    save(engine, 1)
-}
-
-// ( - ), if c[0].savelist[i].is_none() { c[0].savelist[i] = c[i] }
-// if c[1].savelist[i].is_none() { c[1].savelist[i] = c[i] }
-pub(super) fn execute_saveboth(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("SAVEBOTH").set_opts(InstructionOptions::ControlRegister),
-    )?;
-    let creg = engine.cmd.creg();
-    // Both destinations capture the original value, including when it is c0
-    // or c1 or when the two continuations share the same allocation.
-    let value = engine.ctrl(creg)?.clone();
-    for index in [0, 1] {
-        let cont = engine.ctrl_mut(index)?.as_continuation_mut()?;
-        if cont.savelist.get(creg).is_none() {
-            cont.put_to_savelist(creg, value.clone())?;
+/// `exec_setcontargs_common`: copies `copy` items into the continuation and sets `more`.
+fn setcontargs_common(engine: &mut Engine, copy: usize, more: isize) -> Status {
+    check_underflow(engine, copy + 1)?;
+    let mut cont = pop_cont(engine)?;
+    if copy > 0 || more >= 0 {
+        let cdata = cont.force_cdata();
+        if copy > 0 {
+            if cdata.nargs >= 0 && (cdata.nargs as usize) < copy {
+                fail!(
+                    ExceptionCode::StackOverflow,
+                    "too many arguments copied into a closure continuation"
+                )
+            }
+            move_from_stack(&mut cdata.stack, &mut engine.cc.stack, copy);
+            let captured = cdata.stack.depth();
+            if cdata.nargs >= 0 {
+                cdata.nargs -= copy as isize;
+            }
+            consume_stack_gas(engine, captured)?;
         }
-    }
-    Ok(())
-}
-
-// (x - ), c1.savelist[i] = x
-pub(super) fn execute_setaltctr(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("SETALTCTR").set_opts(InstructionOptions::ControlRegister),
-    )?;
-    fetch_stack(engine, 1)?;
-    let creg = engine.cmd.creg();
-    if let Some(c1) = engine.ctrls.get(1).and_then(|c1| c1.as_continuation().ok()) {
-        if is_filled_savelist_slot_for_v14(engine.block_version(), c1, creg) {
-            return Ok(());
-        }
-    }
-    swap(engine, var!(0), savelist!(ctrl!(1), creg))
-}
-
-// (x1 ... xR continuation - continuation), continuation.stack.push(x1 ... xR)
-pub(super) fn execute_setcontargs(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("SETCONTARGS").set_opts(InstructionOptions::ArgumentConstraints),
-    )?;
-    setcont(engine, 0, false)
-}
-
-// (x1 ... xR continuation R N - continuation), continuation.stack.push(x1 ... xR)
-pub(super) fn execute_setcontva(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SETCONTVARARGS"))?;
-    setcont(engine, 2, false)
-}
-
-// (continuation n - continuation)
-pub(super) fn execute_setnumvarargs(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SETNUMVARARGS"))?;
-    setcont(engine, 1, false)
-}
-
-// (x continuation - continuation), continuation.savelist[i] = x
-pub(super) fn execute_setcontctr(engine: &mut Engine) -> Status {
-    engine.load_instruction(
-        Instruction::new("SETCONTCTR").set_opts(InstructionOptions::ControlRegister),
-    )?;
-    fetch_stack(engine, 2)?;
-    let creg = engine.cmd.creg();
-    let skip = {
-        let cont = engine.cmd.var(0).as_continuation()?;
-        is_filled_savelist_slot_for_v14(engine.block_version(), cont, creg)
-    };
-    if skip {
-        engine.cc.stack.push(engine.cmd.vars.remove(0));
-        return Ok(());
-    }
-    swap(engine, var!(1), savelist!(var!(0), creg))?;
-    engine.cc.stack.push(engine.cmd.vars.remove(0));
-    Ok(())
-}
-
-// (x continuation i - continuation), continuation.savelist[i] = x
-pub(super) fn execute_setcontctrx(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SETCONTCTRX"))?;
-    fetch_stack(engine, 3)?;
-    let creg = engine.cmd.var(0).as_integer_value(0..=255)?;
-    if !SaveList::REGS.contains(&(creg as usize)) {
-        fail!(ExceptionCode::RangeCheckError)
-    }
-    let skip = {
-        let cont = engine.cmd.var(1).as_continuation()?;
-        is_filled_savelist_slot_for_v14(engine.block_version(), cont, creg as usize)
-    };
-    if skip {
-        engine.cc.stack.push(engine.cmd.vars.remove(1));
-        return Ok(());
-    }
-    swap(engine, var!(2), savelist!(var!(1), creg))?;
-    engine.cc.stack.push(engine.cmd.vars.remove(1));
-    Ok(())
-}
-
-fn setcontctrmany_helper(engine: &mut Engine, x: usize) -> Status {
-    if x & (1 << 6) != 0 {
-        fail!(ExceptionCode::RangeCheckError, "no control register for c6")
-    }
-    let mut cont = engine.cmd.last_var_mut()?.as_continuation_mut()?.withdraw();
-    for i in 0..8usize {
-        let mask = 1 << i;
-        if x & mask != 0 {
-            if let Some(var) = engine.ctrls.get(i).cloned() {
-                if !is_filled_savelist_slot_for_v14(engine.block_version(), &cont, i) {
-                    cont.put_to_savelist(i, var)?;
-                }
+        let cdata = cont.force_cdata();
+        if more >= 0 {
+            if cdata.nargs > more {
+                cdata.nargs = 0x40000000; // will throw an exception if run
+            } else if cdata.nargs < 0 {
+                cdata.nargs = more;
             }
         }
     }
@@ -1134,38 +1380,217 @@ fn setcontctrmany_helper(engine: &mut Engine, x: usize) -> Status {
     Ok(())
 }
 
-// (continuation - continuation), continuation.savelist[i] = c[i]
+// (x1 ... xR continuation - continuation)
+pub(super) fn execute_setcontargs(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("SETCONTARGS").set_opts(InstructionOptions::ArgumentConstraints),
+    )?;
+    let copy = engine.cmd.pargs();
+    let more = engine.cmd.nargs();
+    setcontargs_common(engine, copy, more)
+}
+
+// (x1 ... xR continuation R N - continuation)
+pub(super) fn execute_setcontva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SETCONTVARARGS"))?;
+    check_underflow(engine, 2)?;
+    let more = pop_smallint_range(engine, 255, -1)?;
+    let copy = pop_smallint_range(engine, 255, 0)?;
+    setcontargs_common(engine, copy as usize, more)
+}
+
+// (continuation n - continuation)
+pub(super) fn execute_setnumvarargs(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SETNUMVARARGS"))?;
+    check_underflow(engine, 2)?;
+    let more = pop_smallint_range(engine, 255, -1)?;
+    setcontargs_common(engine, 0, more)
+}
+
+/// `exec_return_args_common`: keeps the top `count` items, moves the rest into c0.
+fn return_args_common(engine: &mut Engine, count: usize) -> Status {
+    check_underflow(engine, count)?;
+    let depth = engine.cc.stack.depth();
+    if depth == count {
+        return Ok(());
+    }
+    let copy = depth - count;
+    let top = split_top(&mut engine.cc.stack, count);
+    let mut alt = mem::replace(&mut engine.cc.stack, top);
+    let mut cont = ctrl_cont(engine, 0)?;
+    let cdata = cont.force_cdata();
+    if cdata.nargs >= 0 && (cdata.nargs as usize) < copy {
+        fail!(ExceptionCode::StackOverflow, "too many arguments copied into a closure continuation")
+    }
+    move_from_stack(&mut cdata.stack, &mut alt, copy);
+    let captured = cdata.stack.depth();
+    if cdata.nargs >= 0 {
+        cdata.nargs -= copy as isize;
+    }
+    consume_stack_gas(engine, captured)?;
+    set_ctrl_cont(engine, 0, cont);
+    Ok(())
+}
+
+// (xN ... x0 - xR-1 ... x0), c0.stack.push(xN ... xR)
+pub(super) fn execute_returnargs(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("RETURNARGS").set_opts(InstructionOptions::Rargs(0..16)),
+    )?;
+    let count = engine.cmd.rargs();
+    return_args_common(engine, count)
+}
+
+// (xN ... x0 r - xR-1 ... x0)
+pub(super) fn execute_returnva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("RETURNVARARGS"))?;
+    let count = pop_smallint_range(engine, 255, 0)?;
+    return_args_common(engine, count as usize)
+}
+
+fn pop_cellslice(engine: &mut Engine) -> Result<rtos_block::SliceData> {
+    let item = engine.cc.stack.pop()?;
+    Ok(item.as_slice()?.clone())
+}
+
+// (slice - continuation)
+pub(super) fn execute_bless(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("BLESS"))?;
+    check_underflow(engine, 1)?;
+    let code = pop_cellslice(engine)?;
+    engine.cc.stack.push_cont(ContinuationData::with_code(code));
+    Ok(())
+}
+
+fn bless_args_common(engine: &mut Engine, copy: usize, more: isize) -> Status {
+    check_underflow(engine, copy + 1)?;
+    let code = pop_cellslice(engine)?;
+    let stack = split_top(&mut engine.cc.stack, copy);
+    consume_stack_gas(engine, copy)?;
+    let mut cont = ContinuationData::with_code_and_stack(code, stack);
+    cont.nargs = more;
+    engine.cc.stack.push_cont(cont);
+    Ok(())
+}
+
+// (x1 ... xR slice - continuation)
+pub(super) fn execute_blessargs(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("BLESSARGS").set_opts(InstructionOptions::ArgumentConstraints),
+    )?;
+    let copy = engine.cmd.pargs();
+    let more = engine.cmd.nargs();
+    bless_args_common(engine, copy, more)
+}
+
+// (x1 ... xR slice R N - continuation)
+pub(super) fn execute_blessva(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("BLESSVARARGS"))?;
+    check_underflow(engine, 2)?;
+    let more = pop_smallint_range(engine, 255, -1)?;
+    let copy = pop_smallint_range(engine, 255, 0)?;
+    bless_args_common(engine, copy as usize, more)
+}
+
+/// `ControlRegs::define(idx, value, silent_if_set)` on forced control data.
+fn define_reg(cont: &mut ContinuationData, index: usize, value: StackItem, silent: bool) -> bool {
+    let cdata = cont.force_cdata();
+    if !SaveList::REGS.contains(&index) || !SaveList::can_put(index, &value) {
+        return false;
+    }
+    if cdata.savelist.get(index).is_some() {
+        return index == 7 || silent;
+    }
+    cdata.define(index, value)
+}
+
+fn silent_if_set(engine: &Engine) -> bool {
+    engine.block_version() >= TVM_VERSION_14
+}
+
+fn get_reg(engine: &Engine, index: usize) -> StackItem {
+    engine.ctrls.get(index).cloned().unwrap_or_default()
+}
+
+fn type_check(ok: bool) -> Status {
+    if !ok {
+        fail!(ExceptionCode::TypeCheckError, "invalid value type for control register")
+    }
+    Ok(())
+}
+
+// (x continuation - continuation), continuation.savelist[i] = x
+pub(super) fn execute_setcontctr(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("SETCONTCTR").set_opts(InstructionOptions::ControlRegister),
+    )?;
+    let creg = engine.cmd.creg();
+    check_underflow(engine, 2)?;
+    let mut cont = pop_cont(engine)?;
+    let value = engine.cc.stack.pop()?;
+    let silent = silent_if_set(engine);
+    type_check(define_reg(&mut cont, creg, value, silent))?;
+    engine.cc.stack.push_cont(cont);
+    Ok(())
+}
+
+// (x continuation i - continuation), continuation.savelist[i] = x
+pub(super) fn execute_setcontctrx(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SETCONTCTRX"))?;
+    check_underflow(engine, 3)?;
+    let creg = pop_smallint_range(engine, 16, 0)? as usize;
+    if !SaveList::REGS.contains(&creg) {
+        fail!(ExceptionCode::RangeCheckError, "control register index out of range")
+    }
+    let mut cont = pop_cont(engine)?;
+    let value = engine.cc.stack.pop()?;
+    let silent = silent_if_set(engine);
+    type_check(define_reg(&mut cont, creg, value, silent))?;
+    engine.cc.stack.push_cont(cont);
+    Ok(())
+}
+
+fn setcontctrmany_common(engine: &mut Engine, mask: usize) -> Status {
+    if mask & (1 << 6) != 0 {
+        fail!(ExceptionCode::RangeCheckError, "no control register c6")
+    }
+    let mut cont = pop_cont(engine)?;
+    let silent = silent_if_set(engine);
+    for i in 0..8usize {
+        if mask & (1 << i) != 0 {
+            let value = get_reg(engine, i);
+            type_check(define_reg(&mut cont, i, value, silent))?;
+        }
+    }
+    engine.cc.stack.push_cont(cont);
+    Ok(())
+}
+
+// (continuation - continuation), continuation.savelist[i] = c[i] for the mask bits
 pub(super) fn execute_setcontctrmany(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("SETCONTCTRMANY").set_opts(InstructionOptions::Length(0..256)),
     )?;
-    if engine.cmd.length() & (1 << 6) != 0 {
-        fail!(ExceptionCode::RangeCheckError, "no control register for c6")
-    }
-    fetch_stack(engine, 1)?;
-    setcontctrmany_helper(engine, engine.cmd.length())
+    let mask = engine.cmd.length();
+    setcontctrmany_common(engine, mask)
 }
 
-// (continuation x - continuation), continuation.savelist[i] = c[i]
+// (continuation x - continuation)
 pub(super) fn execute_setcontctrmanyx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("SETCONTCTRMANYX"))?;
-    fetch_stack(engine, 2)?;
-    let x = engine.cmd.var(0).as_integer_value(0..=255)?;
-    setcontctrmany_helper(engine, x)
+    check_underflow(engine, 2)?;
+    let mask = pop_smallint_range(engine, 255, 0)? as usize;
+    setcontctrmany_common(engine, mask)
 }
 
-// (continuation - ), continuation.savelist[0] = c[0], continuation.savelist[1] = c[1],
-// c[1] = continuation
-pub(super) fn execute_setexitalt(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("SETEXITALT"))?;
-    fetch_stack(engine, 1)?;
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, var!(1), savelist!(var!(0), 0))?;
-    if engine.cc.savelist.get(1).is_some() {
-        copy_to_var(engine, ctrl!(1))?;
-        swap(engine, var!(2), savelist!(var!(0), 1))?;
-    }
-    swap(engine, var!(0), ctrl!(1))
+fn setctr_in_register(engine: &mut Engine, register: usize) -> Status {
+    let creg = engine.cmd.creg();
+    let mut cont = ctrl_cont(engine, register)?;
+    let value = engine.cc.stack.pop()?;
+    let silent = silent_if_set(engine);
+    type_check(define_reg(&mut cont, creg, value, silent))?;
+    set_ctrl_cont(engine, register, cont);
+    Ok(())
 }
 
 // (x - ), c0.savelist[i] = x
@@ -1173,193 +1598,211 @@ pub(super) fn execute_setretctr(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("SETRETCTR").set_opts(InstructionOptions::ControlRegister),
     )?;
-    fetch_stack(engine, 1)?;
+    setctr_in_register(engine, 0)
+}
+
+// (x - ), c1.savelist[i] = x
+pub(super) fn execute_setaltctr(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("SETALTCTR").set_opts(InstructionOptions::ControlRegister),
+    )?;
+    setctr_in_register(engine, 1)
+}
+
+fn save_in_register(engine: &mut Engine, register: usize) -> Status {
     let creg = engine.cmd.creg();
-    if let Some(c0) = engine.ctrls.get(0).and_then(|c0| c0.as_continuation().ok()) {
-        if is_filled_savelist_slot_for_v14(engine.block_version(), c0, creg) {
-            return Ok(());
-        }
+    let mut cont = ctrl_cont(engine, register)?;
+    let value = get_reg(engine, creg);
+    let silent = silent_if_set(engine);
+    type_check(define_reg(&mut cont, creg, value, silent))?;
+    set_ctrl_cont(engine, register, cont);
+    Ok(())
+}
+
+// ( - ), c[0].savelist[i] = c[i] if empty
+pub(super) fn execute_save(engine: &mut Engine) -> Status {
+    engine
+        .load_instruction(Instruction::new("SAVE").set_opts(InstructionOptions::ControlRegister))?;
+    save_in_register(engine, 0)
+}
+
+// ( - ), c[1].savelist[i] = c[i] if empty
+pub(super) fn execute_savealt(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("SAVEALT").set_opts(InstructionOptions::ControlRegister),
+    )?;
+    save_in_register(engine, 1)
+}
+
+// ( - ), c[0] and c[1] savelist[i] = c[i] where empty
+pub(super) fn execute_saveboth(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("SAVEBOTH").set_opts(InstructionOptions::ControlRegister),
+    )?;
+    let creg = engine.cmd.creg();
+    let mut c0 = ctrl_cont(engine, 0)?;
+    let mut c1 = ctrl_cont(engine, 1)?;
+    let value = get_reg(engine, creg);
+    define_reg(&mut c0, creg, value.clone(), false);
+    define_reg(&mut c1, creg, value, false);
+    set_ctrl_cont(engine, 0, c0);
+    set_ctrl_cont(engine, 1, c1);
+    Ok(())
+}
+
+// ( - ), c[1] = c[0]
+pub(super) fn execute_samealt(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SAMEALT"))?;
+    let c0 = ctrl_cont(engine, 0)?;
+    set_ctrl_cont(engine, 1, c0);
+    Ok(())
+}
+
+// ( - ), c[0].savelist[1] = c[1], c[1] = c[0]
+pub(super) fn execute_samealt_save(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SAMEALTSAVE"))?;
+    let mut c0 = ctrl_cont(engine, 0)?;
+    let c1 = engine.ctrls.get(1).cloned();
+    c0.force_cdata().define_opt(1, c1);
+    set_ctrl_cont(engine, 0, c0.clone());
+    set_ctrl_cont(engine, 1, c0);
+    Ok(())
+}
+
+fn compos(engine: &mut Engine, name: &'static str, mask: u8) -> Status {
+    engine.load_instruction(Instruction::new(name))?;
+    check_underflow(engine, 2)?;
+    let value = pop_cont(engine)?;
+    let mut cont = pop_cont(engine)?;
+    let cdata = cont.force_cdata();
+    let value = StackItem::continuation(value);
+    if mask & 1 != 0 {
+        cdata.define_opt(0, Some(value.clone()));
     }
-    swap(engine, var!(0), savelist!(ctrl!(0), creg))
+    if mask & 2 != 0 {
+        cdata.define_opt(1, Some(value));
+    }
+    engine.cc.stack.push_cont(cont);
+    Ok(())
+}
+
+// (continuation1 continuation2 - continuation1), continuation1.savelist[0] = continuation2
+pub(super) fn execute_compos(engine: &mut Engine) -> Status {
+    compos(engine, "COMPOS", 1)
+}
+
+// (continuation1 continuation2 - continuation1), continuation1.savelist[1] = continuation2
+pub(super) fn execute_composalt(engine: &mut Engine) -> Status {
+    compos(engine, "COMPOSALT", 2)
+}
+
+// (continuation1 continuation2 - continuation1), both slots
+pub(super) fn execute_composboth(engine: &mut Engine) -> Status {
+    compos(engine, "COMPOSBOTH", 3)
+}
+
+// (continuation - ), continuation.savelist[0] = c[0], c[0] = continuation
+pub(super) fn execute_atexit(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("ATEXIT"))?;
+    let mut cont = pop_cont(engine)?;
+    let c0 = engine.ctrls.get(0).cloned();
+    cont.force_cdata().define_opt(0, c0);
+    set_ctrl_cont(engine, 0, cont);
+    Ok(())
+}
+
+// (continuation - ), continuation.savelist[1] = c[1], c[1] = continuation
+pub(super) fn execute_atexitalt(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("ATEXITALT"))?;
+    let mut cont = pop_cont(engine)?;
+    let c1 = engine.ctrls.get(1).cloned();
+    cont.force_cdata().define_opt(1, c1);
+    set_ctrl_cont(engine, 1, cont);
+    Ok(())
+}
+
+// (continuation - ), continuation.savelist[0] = c[0], continuation.savelist[1] = c[1],
+// c[1] = continuation
+pub(super) fn execute_setexitalt(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("SETEXITALT"))?;
+    let mut cont = pop_cont(engine)?;
+    let c0 = engine.ctrls.get(0).cloned();
+    let c1 = engine.ctrls.get(1).cloned();
+    let cdata = cont.force_cdata();
+    cdata.define_opt(0, c0);
+    cdata.define_opt(1, c1);
+    set_ctrl_cont(engine, 1, cont);
+    Ok(())
 }
 
 // (continuation - continuation), continuation.savelist[0] = c[0]
 pub(super) fn execute_thenret(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("THENRET"))?;
-    fetch_stack(engine, 1)?;
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, savelist!(var!(0), 0), var!(1))?;
-    engine.cc.stack.push(engine.cmd.vars.remove(0));
+    let mut cont = pop_cont(engine)?;
+    let c0 = engine.ctrls.get(0).cloned();
+    cont.force_cdata().define_opt(0, c0);
+    engine.cc.stack.push_cont(cont);
     Ok(())
 }
 
 // (continuation - continuation), continuation.savelist[0] = c[1]
 pub(super) fn execute_thenretalt(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("THENRETALT"))?;
-    fetch_stack(engine, 1)?;
-    copy_to_var(engine, ctrl!(1))?;
-    swap(engine, savelist!(var!(0), 0), var!(1))?;
-    engine.cc.stack.push(engine.cmd.vars.remove(0));
+    let mut cont = pop_cont(engine)?;
+    let c1 = engine.ctrls.get(1).cloned();
+    cont.force_cdata().define_opt(0, c1);
+    engine.cc.stack.push_cont(cont);
     Ok(())
 }
 
-// (body - )
-// cc.savelist[0] = c[0]
-// condition.savelist[0] = cc
-// body.savelist[0] = condition
-// switch to body
-pub(super) fn execute_until(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("UNTIL"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::UntilLoopCondition(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    copy_to_var(engine, CC)?;
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // ec_until.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = ec_until
-    switch(engine, var!(0))
+// c[0] <-> c[1]
+pub(super) fn execute_invert(engine: &mut Engine) -> Status {
+    engine.load_instruction(Instruction::new("INVERT"))?;
+    swap(engine, ctrl!(0), ctrl!(1))
 }
 
-// (body - )
-// cc.savelist[0] = c[0]
-// ec_until.savelist[0] = cc
-// body.savelist[0] = ec_until
-// body.savelist[1] = cc
-// switch to body
-pub(super) fn execute_until_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("UNTILBRK"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::UntilLoopCondition(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    swap(engine, savelist!(CC, 1), ctrl!(1))?; // cc.savelist[1] = c[1]
-    copy_to_var(engine, CC)?;
-    copy_to_var(engine, var!(2))?;
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // ec_until.savelist[0] = cc
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = ec_until
-    swap(engine, savelist!(var!(0), 1), var!(3))?; // body.savelist[1] = cc
-    switch(engine, var!(0))
+/// POPSAVE c(i): the reference saves the old c(i) into a copy of c0 that is installed only
+/// for i != 0 (for i == 0 the new value replaces it).
+pub(in crate::executor) fn popsave(engine: &mut Engine, creg: usize) -> Status {
+    let value = engine.cc.stack.pop()?;
+    let mut c0 = ctrl_cont(engine, 0)?;
+    type_check(creg != 0 || value.as_continuation().is_ok())?;
+    let old = get_reg(engine, creg);
+    define_reg(&mut c0, creg, old, false);
+    if creg == 0 {
+        set_ctrl_cont(engine, 0, c0);
+        type_check(SaveList::can_put(0, &value))?;
+        engine.ctrls.put_opt(0, value);
+    } else {
+        type_check(SaveList::can_put(creg, &value))?;
+        engine.ctrls.put_opt(creg, value);
+        set_ctrl_cont(engine, 0, c0);
+    }
+    Ok(())
 }
 
-// cc is body
-// condition.savelist[0] = c[0]
-// body.savelist[0] = condition
-// switch to body
-pub(super) fn execute_untilend(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("UNTILEND"))?;
-    let body = engine.cc.code_mut().withdraw();
-    let cont = ContinuationData::with_code(body.clone());
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    let cont = ContinuationData::with_type(ContinuationType::UntilLoopCondition(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(var!(1), 0), ctrl!(0))?; // ec_until.savelist[0] = c[0]
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = ec_until
-    switch(engine, var!(0))
+// TRY ************************************************************************
+
+/// `exec_try`: the handler gets c2 = old c2 and c0 = cc where empty; c0 = cc, c2 = handler.
+pub(in crate::executor) fn try_catch(engine: &mut Engine, args: Option<(usize, usize)>) -> Status {
+    let need = args.map_or(2, |(params, _)| params + 2);
+    check_underflow(engine, need)?;
+    let mut handler = pop_cont(engine)?;
+    let cont = pop_cont(engine)?;
+    let old_c2 = engine.ctrls.get(2).cloned();
+    let cc = match args {
+        Some((params, retvals)) => extract_cc(engine, 7, params as isize, retvals as isize)?,
+        None => extract_cc(engine, 7, -1, -1)?,
+    };
+    let cdata = handler.force_cdata();
+    cdata.define_opt(2, old_c2);
+    cdata.define_opt(0, Some(StackItem::continuation(cc.clone())));
+    set_ctrl_cont(engine, 0, cc);
+    set_ctrl_cont(engine, 2, handler);
+    jump(engine, cont)
 }
 
-// cc is body
-// ec_until.savelist[0] = c[0]
-// body.savelist[0] = ec_until
-// body.savelist[1] = c[0]
-// switch to body
-pub(super) fn execute_untilend_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("UNTILENDBRK"))?;
-    let body = engine.cc.code_mut().withdraw();
-    let cont = ContinuationData::with_code(body.clone());
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    let cont = ContinuationData::with_type(ContinuationType::UntilLoopCondition(body));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, savelist!(var!(1), 0), ctrl!(0))?; // ec_until.savelist[0] = c[0]
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // body.savelist[0] = ec_until
-    swap(engine, savelist!(var!(0), 1), var!(2))?; // body.savelist[1] = c[0]
-    switch(engine, var!(0))
-}
-// .set(0x18, execute_while_break)
-// .set(0x19, execute_whileend_break)
-
-// (condition body - )
-// cc.savelist[0] = c[0]
-// ec_while.savelist[0] = cc
-// condition.savelist[0] = ec_while
-// switch to condition
-pub(super) fn execute_while(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("WHILE"))?;
-    fetch_stack(engine, 2)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cond = engine.cmd.var(1).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::WhileLoopCondition(body, cond));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    copy_to_var(engine, CC)?;
-    swap(engine, savelist!(var!(2), 0), var!(3))?; // ec_while.savelist[0] = cc
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // condition.savelist[0] = ec_while
-    switch(engine, var!(1))
-}
-
-// (condition body - )
-// cc.savelist[0] = c[0]
-// ec_while.savelist[0] = cc
-// condition.savelist[0] = ec_while
-// condition.savelist[1] = cc
-// switch to condition
-pub(super) fn execute_while_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("WHILEBRK"))?;
-    fetch_stack(engine, 2)?;
-    let body = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cond = engine.cmd.var(1).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::WhileLoopCondition(body, cond));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(CC, 0), ctrl!(0))?; // cc.savelist[0] = c[0]
-    swap(engine, savelist!(CC, 1), ctrl!(1))?; // cc.savelist[1] = c[1]
-    copy_to_var(engine, CC)?;
-    copy_to_var(engine, var!(3))?;
-    copy_to_var(engine, var!(3))?;
-    swap(engine, savelist!(var!(2), 0), var!(3))?; // ec_while.savelist[0] = cc
-    swap(engine, savelist!(var!(1), 0), var!(2))?; // condition.savelist[0] = ec_while
-    swap(engine, savelist!(var!(1), 1), var!(4))?; // condition.savelist[1] = cc
-    swap(engine, savelist!(var!(0), 1), var!(5))?; // body.savelist[1] = cc
-    switch(engine, var!(1))
-}
-
-// cc is body
-// (condition - )
-// condition.savelist[0] = c[0]
-// ec_while.savelist[0] = condition
-// switch to condition
-pub(super) fn execute_whileend(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("WHILEEND"))?;
-    fetch_stack(engine, 1)?;
-    let body = engine.cc.code_mut().withdraw();
-    let cond = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::WhileLoopCondition(body, cond));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    swap(engine, savelist!(var!(1), 0), ctrl!(0))?; // ec_while.savelist[0] = c[0]
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // condition.savelist[0] = ec_while
-    switch(engine, var!(0))
-}
-
-// cc is body
-// (condition - )
-// condition.savelist[0] = c[0]
-// ec_while.savelist[0] = condition
-// switch to condition
-pub(super) fn execute_whileend_break(engine: &mut Engine) -> Status {
-    engine.load_instruction(Instruction::new("WHILEENDBRK"))?;
-    fetch_stack(engine, 1)?;
-    pop_all(engine, var!(0))?; // move stack to cond check
-    let body = engine.cc.code_mut().withdraw();
-    let cond = engine.cmd.var(0).as_continuation()?.code().clone();
-    let cont = ContinuationData::with_type(ContinuationType::WhileLoopCondition(body, cond));
-    engine.cmd.vars.push(StackItem::continuation(cont));
-    copy_to_var(engine, ctrl!(0))?;
-    swap(engine, savelist!(var!(1), 0), ctrl!(0))?; // ec_while.savelist[0] = c[0]
-    swap(engine, savelist!(var!(0), 0), var!(1))?; // condition.savelist[0] = ec_while
-    swap(engine, savelist!(var!(0), 1), var!(2))?; // condition.savelist[1] = ec_while
-    switch(engine, var!(0))
-}
+// RUNVM **********************************************************************
 
 fn run_vm(engine: &mut Engine, mode: isize) -> Status {
     debug_assert!(engine.block_version() >= 4, "But block version is {}", engine.block_version());

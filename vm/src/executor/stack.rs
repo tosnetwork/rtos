@@ -1,5 +1,6 @@
 /*
  * RTOS project modifications (2026-10-10): project and crate naming.
+ * RTOS project modifications (2026-10-19): POPSAVE follows the reference register update.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -11,12 +12,13 @@
  */
 use crate::{
     executor::{
+        continuation::popsave,
         engine::{
             data::convert,
             storage::{copy_to_var, fetch_reference, fetch_stack, swap},
             Engine,
         },
-        microcode::{CC, CELL, CONTINUATION, CTRL, SAVELIST, SLICE, VAR},
+        microcode::{CC, CELL, CONTINUATION, CTRL, SLICE, VAR},
         types::{Instruction, InstructionOptions, WhereToGetParams},
     },
     stack::{
@@ -242,17 +244,8 @@ pub(super) fn execute_popsave(engine: &mut Engine) -> Status {
     engine.load_instruction(
         Instruction::new("POPSAVE").set_opts(InstructionOptions::ControlRegister),
     )?;
-    fetch_stack(engine, 1)?;
     let creg = engine.cmd.creg();
-    swap(engine, var!(0), ctrl!(creg))?;
-    if let Ok(c0) = engine.ctrl(0) {
-        if let Ok(c0) = c0.as_continuation() {
-            if c0.savelist.get(creg).is_some() {
-                return Ok(());
-            }
-        }
-    }
-    swap(engine, var!(0), savelist!(ctrl!(0), creg))
+    popsave(engine, creg)
 }
 
 // (x ... y ... z ... a - a... y ... z ... z y x)
