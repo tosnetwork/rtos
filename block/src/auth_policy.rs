@@ -10,6 +10,10 @@ use crate::{
 
 pub const AUTH_POLICY_PROFILE: &str = "TOS-AUTH-POLICY-v1;config=48;tag=a1;suite=1;retired=u16;sequence=u64;deadline=u32;network=bits256;monotonic";
 
+/// ConfigParam8 global version from which ConfigParam48 must be present; the
+/// network launches at this version, so every launched configuration carries it.
+pub const AUTH_POLICY_REQUIRED_VERSION: u32 = 16;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AuthPolicy {
     pub network: UInt256,
@@ -152,14 +156,14 @@ impl ConfigParams {
                 {
                     fail!("invalid AUTH governing version");
                 }
-                slice.get_next_u32()? >= 17
+                slice.get_next_u32()? >= AUTH_POLICY_REQUIRED_VERSION
             }
             None => false,
         };
         let policy = self.auth_policy()?;
         if policy.is_none() {
             if required {
-                fail!("AUTH policy is required from version 17");
+                fail!("AUTH policy is required from version {AUTH_POLICY_REQUIRED_VERSION}");
             }
             return Ok(());
         }

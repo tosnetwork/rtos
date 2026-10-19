@@ -112,7 +112,7 @@ fn auth_policy_reference_matrix() {
             outcome(cell.clone()),
         ));
     }
-    for version in [0, 14, 16, 17, 19] {
+    for version in [0, 14, 15, 16, 17, 19] {
         for mandatory in [false, true] {
             for critical in [false, true] {
                 for (i, cell) in
