@@ -19,7 +19,7 @@ use rtos_api::{
         rpc::engine::validator::ControlQuery,
         Bool,
     },
-    AnyBoxedSerialize, TLObject,
+    AnyBoxedSerialize, IntoBoxed, TLObject,
 };
 use rtos_block::{
     base64_decode, base64_encode, ed25519_create_private_key, error, fail, read_single_root_boc,
@@ -141,6 +141,15 @@ commands! {
         "delcustomoverlay <custom overlay name>\tdelete custom overlay"
     ShowCustomOverlays, "show_custom_overlays",
         "showcustomoverlays\tshow custom overlays"
+    SignShardOverlayCertificate, "sign-shard-overlay-cert",
+        "sign-shard-overlay-cert <wc>:<shard> <key> <expireat> <maxsize> <outfile>\tsign \
+        certificate for <key> in currently active shard overlay"
+    ImportShardOverlayCertificate, "import-shard-overlay-cert",
+        "import-shard-overlay-cert <wc>:<shard> <key> <certfile>\timport certificate for <key> \
+        in currently active shard overlay"
+    SetExtMessagesBroadcastDisabled, "set-ext-messages-broadcast-disabled",
+        "set-ext-messages-broadcast-disabled <value>\tdisable broadcasting and rebroadcasting \
+        ext messages; value is 0 or 1."
     // TODO: Simplex consensus commands (requires feature = "simplex")
     // GetSimplexStats, "getsimplexstats",
     //     "getsimplexstats\tget simplex consensus statistics"
@@ -680,6 +689,106 @@ impl<Q: ToString> SendReceive<Q> for ShowCustomOverlays {
         }
         let data = serialize_boxed(&overlays)?;
         Ok((description, data))
+    }
+}
+
+/// A shard token as the reference console reads it: a workchain followed by
+/// a signed 64-bit shard, or one `wc:hexshard` / `(wc,hexshard)` word.
+fn parse_shard<Q: ToString>(params: &mut impl Iterator<Item = Q>) -> Result<(i32, i64)> {
+    let word = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
+    if let Ok(workchain) = word.parse::<i32>() {
+        let shard = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
+        return Ok((workchain, shard.parse::<i64>().map_err(|e| error!("invalid shard: {e}"))?));
+    }
+    let text = word.strip_prefix('(').and_then(|w| w.strip_suffix(')')).unwrap_or(&word);
+    let separator =
+        text.find(':').or_else(|| text.find(',')).ok_or_else(|| error!("invalid shard {text}"))?;
+    if text.len() - separator - 1 != 16 {
+        fail!("invalid shard {text}");
+    }
+    let workchain = text[..separator].parse::<i32>().map_err(|e| error!("invalid shard: {e}"))?;
+    let shard = u64::from_str_radix(&text[separator + 1..], 16)
+        .map_err(|e| error!("invalid shard: {e}"))?;
+    Ok((workchain, shard as i64))
+}
+
+fn key_hash_boxed(key: UInt256) -> ton::engine::validator::KeyHash {
+    ton::engine::validator::keyhash::KeyHash { key_hash: key }.into_boxed()
+}
+
+impl<Q: ToString> SendReceive<Q> for SignShardOverlayCertificate {
+    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
+        let (workchain, shard) = parse_shard(params)?;
+        let key = parse_int256(params.next(), "key")?;
+        let expire_at = parse_int(params.next(), "expireat")?;
+        let max_size = parse_any(params.next(), "maxsize", |value| Ok(u32::from_str(value)?))?;
+        params.next().ok_or_else(|| error!("insufficient parameters"))?;
+        Ok(ton::rpc::engine::validator::SignShardOverlayCertificate {
+            workchain,
+            shard,
+            signed_key: key_hash_boxed(key),
+            expire_at,
+            // The wire field is signed; the size keeps its bit pattern.
+            max_size: max_size as i32,
+        }
+        .into_tl_object())
+    }
+    /// Only a version-1 certificate is accepted, and the reply is saved to
+    /// the output file exactly as received.
+    fn receive(
+        answer: TLObject,
+        params: &mut impl Iterator<Item = Q>,
+    ) -> Result<(String, Vec<u8>)> {
+        parse_shard(params)?;
+        let out_file = params.nth(3).ok_or_else(|| error!("insufficient parameters"))?.to_string();
+        let data = serialize_boxed(&answer)?;
+        match downcast::<ton::overlay::Certificate>(answer) {
+            Ok(ton::overlay::Certificate::Overlay_Certificate(_)) => {}
+            _ => fail!("received incorrect cert"),
+        }
+        std::fs::write(&out_file, &data)
+            .map_err(|e| error!("Failed to write certificate to file: {e}"))?;
+        Ok(("saved certificate".to_string(), data))
+    }
+}
+
+impl<Q: ToString> SendReceive<Q> for ImportShardOverlayCertificate {
+    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
+        let (workchain, shard) = parse_shard(params)?;
+        let key = parse_int256(params.next(), "key")?;
+        let in_file = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
+        let data = std::fs::read(&in_file)?;
+        let cert = rtos_api::deserialize_boxed(&data)
+            .map_err(|e| error!("incorrect certificate: {e}"))?
+            .downcast::<ton::overlay::Certificate>()
+            .map_err(|object| error!("incorrect certificate: {object:?}"))?;
+        Ok(ton::rpc::engine::validator::ImportShardOverlayCertificate {
+            workchain,
+            shard,
+            signed_key: key_hash_boxed(key),
+            cert,
+        }
+        .into_tl_object())
+    }
+    fn receive(
+        answer: TLObject,
+        _params: &mut impl Iterator<Item = Q>,
+    ) -> Result<(String, Vec<u8>)> {
+        downcast::<rtos_api::ton::engine::validator::Success>(answer)?;
+        Ok(("successfully sent certificate to overlay manager".to_string(), vec![]))
+    }
+}
+
+impl<Q: ToString> SendReceive<Q> for SetExtMessagesBroadcastDisabled {
+    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
+        let value = parse_int(params.next(), "value")?;
+        let disabled = match value {
+            0 => Bool::BoolFalse,
+            1 => Bool::BoolTrue,
+            _ => fail!("value should be 0 or 1"),
+        };
+        Ok(ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled { disabled }
+            .into_tl_object())
     }
 }
 
@@ -2398,5 +2507,138 @@ mod test {
         }
         assert_eq!(count, counter.load(Ordering::Relaxed));
         done_test(server, client, engine).await;
+    }
+}
+
+#[cfg(test)]
+mod certificate_command_tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        shell_words::split(line).unwrap()
+    }
+
+    fn v1_certificate() -> ton::overlay::Certificate {
+        ton::overlay::certificate::Certificate {
+            issued_by: ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
+                key: UInt256::from([7; 32]),
+            }),
+            expire_at: 1_700_000_000,
+            max_size: 1 << 24,
+            signature: vec![9; 64].into(),
+        }
+        .into_boxed()
+    }
+
+    #[test]
+    fn shards_parse_in_every_reference_form() {
+        for (line, expected) in [
+            ("0 -9223372036854775808", (0, i64::MIN)),
+            ("-1 -9223372036854775808", (-1, i64::MIN)),
+            ("0:8000000000000000", (0, i64::MIN)),
+            ("(0,4000000000000000)", (0, 0x4000000000000000)),
+            ("-1,8000000000000000", (-1, i64::MIN)),
+        ] {
+            assert_eq!(parse_shard(&mut words(line).into_iter()).unwrap(), expected, "{line}");
+        }
+        for bad in ["0:80", "x:8000000000000000", "0 x", ""] {
+            assert!(parse_shard(&mut words(bad).into_iter()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sign_sends_wire_integers_and_saves_the_reply_byte_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cert.bin");
+        let key = "11".repeat(32);
+        let line = format!("0:8000000000000000 {key} -5 4294967295 {}", out.display());
+        let query = command_send("sign-shard-overlay-cert", &mut words(&line).into_iter())
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::SignShardOverlayCertificate>()
+            .unwrap();
+        assert_eq!((query.workchain, query.shard), (0, i64::MIN));
+        assert_eq!((query.expire_at, query.max_size), (-5, -1));
+        assert_eq!(query.signed_key.key_hash(), &UInt256::from([0x11; 32]));
+        // The output file holds the reply bytes exactly.
+        let reply = v1_certificate();
+        let expected = serialize_boxed(&reply).unwrap();
+        let (message, data) = command_receive(
+            "sign-shard-overlay-cert",
+            reply.into_tl_object(),
+            &mut words(&line).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(message, "saved certificate");
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        assert_eq!(data, expected);
+        // The two-word shard form finds the same output file.
+        let out2 = dir.path().join("cert2.bin");
+        let line2 = format!("0 -9223372036854775808 {key} 10 768 {}", out2.display());
+        command_receive(
+            "sign-shard-overlay-cert",
+            v1_certificate().into_tl_object(),
+            &mut words(&line2).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out2).unwrap(), expected);
+        // Only a version-1 certificate is accepted.
+        let v2: ton::overlay::Certificate = ton::overlay::certificate::CertificateV2 {
+            issued_by: ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
+                key: UInt256::from([7; 32]),
+            }),
+            expire_at: 1,
+            max_size: 1,
+            flags: 1,
+            signature: vec![9; 64].into(),
+        }
+        .into_boxed();
+        let out3 = dir.path().join("cert3.bin");
+        let line3 = format!("0:8000000000000000 {key} 1 1 {}", out3.display());
+        let error = command_receive(
+            "sign-shard-overlay-cert",
+            v2.into_tl_object(),
+            &mut words(&line3).into_iter(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("received incorrect cert"));
+        assert!(!out3.exists());
+        // The console reads the size as an unsigned token.
+        let bad = format!("0:8000000000000000 {key} 1 -1 {}", out3.display());
+        assert!(command_send("sign-shard-overlay-cert", &mut words(&bad).into_iter()).is_err());
+    }
+
+    #[test]
+    fn import_reads_any_certificate_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cert.bin");
+        std::fs::write(&file, serialize_boxed(&v1_certificate()).unwrap()).unwrap();
+        let line = format!("-1:8000000000000000 {} {}", "22".repeat(32), file.display());
+        let query = command_send("import-shard-overlay-cert", &mut words(&line).into_iter())
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::ImportShardOverlayCertificate>()
+            .unwrap();
+        assert_eq!((query.workchain, query.shard), (-1, i64::MIN));
+        assert_eq!(query.cert, v1_certificate());
+        std::fs::write(&file, b"junk").unwrap();
+        assert!(command_send("import-shard-overlay-cert", &mut words(&line).into_iter())
+            .unwrap_err()
+            .to_string()
+            .contains("incorrect certificate"));
+    }
+
+    #[test]
+    fn ext_messages_value_is_zero_or_one() {
+        for (value, expected) in [("0", Bool::BoolFalse), ("1", Bool::BoolTrue)] {
+            let query =
+                command_send("set-ext-messages-broadcast-disabled", &mut words(value).into_iter())
+                    .unwrap()
+                    .downcast::<ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled>()
+                    .unwrap();
+            assert_eq!(query.disabled, expected);
+        }
+        let error =
+            command_send("set-ext-messages-broadcast-disabled", &mut words("2").into_iter())
+                .unwrap_err();
+        assert!(error.to_string().contains("value should be 0 or 1"));
     }
 }

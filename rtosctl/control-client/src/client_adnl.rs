@@ -10,12 +10,13 @@
 use crate::client_api::{
     Account, AddAdnlAddressRq, AddValidatorAdnlAddrRq, AddValidatorPermKeyRq,
     AddValidatorTempKeyRq, BlockchainConfigInfo, ClientAPI, EngineValidatorConfig,
-    ShardAccountState, Shutdown, SignRq,
+    ImportShardOverlayCertificateRq, ShardAccountState, Shutdown, SignRq,
+    SignShardOverlayCertificateRq,
 };
 use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
 use anyhow::Context;
 use rtos_api::{
-    AnyBoxedSerialize, TLObject, serialize_boxed,
+    AnyBoxedSerialize, IntoBoxed, TLObject, serialize_boxed,
     ton::{
         self, engine::validator::ControlQueryError as TonControlQueryError,
         raw::ShardAccountState as TonShardAccountState,
@@ -310,6 +311,79 @@ impl ToFromTL for SendBocRqRs {
     }
 }
 
+fn key_hash_boxed(key_hash: &[u8]) -> anyhow::Result<ton::engine::validator::KeyHash> {
+    let key_hash: [u8; 32] =
+        key_hash.try_into().map_err(|_| anyhow::anyhow!("key hash must be 32 bytes"))?;
+    Ok(ton::engine::validator::keyhash::KeyHash { key_hash: UInt256::from(key_hash) }.into_boxed())
+}
+
+struct SignShardOverlayCertificateRqRs {}
+
+impl ToFromTL for SignShardOverlayCertificateRqRs {
+    type Rq = SignShardOverlayCertificateRq;
+    type Rs = Vec<u8>;
+
+    fn serialize(rq: &Self::Rq) -> anyhow::Result<TLObject> {
+        let ret = ton::rpc::engine::validator::SignShardOverlayCertificate {
+            workchain: rq.workchain,
+            shard: rq.shard,
+            signed_key: key_hash_boxed(&rq.key_hash)?,
+            expire_at: rq.expire_at,
+            // The wire field is signed; the size keeps its bit pattern.
+            max_size: rq.max_size as i32,
+        };
+        Ok(ret.into_tl_object())
+    }
+
+    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
+        let certificate = downcast::<ton::overlay::Certificate>(rs)?;
+        serialize_boxed(&certificate)
+    }
+}
+
+struct ImportShardOverlayCertificateRqRs {}
+
+impl ToFromTL for ImportShardOverlayCertificateRqRs {
+    type Rq = ImportShardOverlayCertificateRq;
+    type Rs = ();
+
+    fn serialize(rq: &Self::Rq) -> anyhow::Result<TLObject> {
+        let cert = rtos_api::deserialize_boxed(&rq.certificate)?
+            .downcast::<ton::overlay::Certificate>()
+            .map_err(|object| anyhow::anyhow!("incorrect certificate: {object:?}"))?;
+        let ret = ton::rpc::engine::validator::ImportShardOverlayCertificate {
+            workchain: rq.workchain,
+            shard: rq.shard,
+            signed_key: key_hash_boxed(&rq.key_hash)?,
+            cert,
+        };
+        Ok(ret.into_tl_object())
+    }
+
+    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
+        downcast::<ton::engine::validator::Success>(rs)?;
+        Ok(())
+    }
+}
+
+struct SetExtMessagesBroadcastDisabledRqRs {}
+
+impl ToFromTL for SetExtMessagesBroadcastDisabledRqRs {
+    type Rq = bool;
+    type Rs = ();
+
+    fn serialize(disabled: &Self::Rq) -> anyhow::Result<TLObject> {
+        let disabled = if *disabled { ton::Bool::BoolTrue } else { ton::Bool::BoolFalse };
+        Ok(ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled { disabled }
+            .into_tl_object())
+    }
+
+    fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
+        downcast::<ton::engine::validator::Success>(rs)?;
+        Ok(())
+    }
+}
+
 pub struct ControlClientAdnl {
     config: AdnlClientConfig,
     adnl: Option<AdnlClient>,
@@ -473,6 +547,24 @@ impl ClientAPI for ControlClientAdnl {
     async fn send_boc(&mut self, boc: &[u8]) -> anyhow::Result<()> {
         self.do_rq::<SendBocRqRs>(&boc.to_vec()).await
     }
+
+    async fn sign_shard_overlay_certificate(
+        &mut self,
+        rq: &SignShardOverlayCertificateRq,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.do_rq::<SignShardOverlayCertificateRqRs>(rq).await
+    }
+
+    async fn import_shard_overlay_certificate(
+        &mut self,
+        rq: &ImportShardOverlayCertificateRq,
+    ) -> anyhow::Result<()> {
+        self.do_rq::<ImportShardOverlayCertificateRqRs>(rq).await
+    }
+
+    async fn set_ext_messages_broadcast_disabled(&mut self, disabled: bool) -> anyhow::Result<()> {
+        self.do_rq::<SetExtMessagesBroadcastDisabledRqRs>(&disabled).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -545,5 +637,60 @@ mod tests {
             connect_elapsed >= Duration::from_millis(700),
             "connect returned in {connect_elapsed:?}, expected ~800ms timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+
+    fn certificate() -> ton::overlay::Certificate {
+        ton::overlay::certificate::Certificate {
+            issued_by: ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
+                key: UInt256::from([7; 32]),
+            }),
+            expire_at: 5,
+            max_size: -1,
+            signature: vec![9; 64].into(),
+        }
+        .into_boxed()
+    }
+
+    #[test]
+    fn certificate_requests_keep_wire_bit_patterns_and_bytes() {
+        let rq = SignShardOverlayCertificateRq {
+            workchain: 0,
+            shard: i64::MIN,
+            key_hash: vec![1; 32],
+            expire_at: -5,
+            max_size: u32::MAX,
+        };
+        let query = SignShardOverlayCertificateRqRs::serialize(&rq)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::SignShardOverlayCertificate>()
+            .unwrap();
+        assert_eq!((query.shard, query.expire_at, query.max_size), (i64::MIN, -5, -1));
+        let bytes = serialize_boxed(&certificate()).unwrap();
+        let reply =
+            SignShardOverlayCertificateRqRs::deserialize(certificate().into_tl_object()).unwrap();
+        assert_eq!(reply, bytes, "the reply is returned byte for byte");
+        let import = ImportShardOverlayCertificateRq {
+            workchain: -1,
+            shard: i64::MIN,
+            key_hash: vec![2; 32],
+            certificate: bytes,
+        };
+        let query = ImportShardOverlayCertificateRqRs::serialize(&import)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::ImportShardOverlayCertificate>()
+            .unwrap();
+        assert_eq!(query.cert, certificate());
+        let short = SignShardOverlayCertificateRq { key_hash: vec![1; 31], ..rq };
+        assert!(SignShardOverlayCertificateRqRs::serialize(&short).is_err());
+        let query = SetExtMessagesBroadcastDisabledRqRs::serialize(&true)
+            .unwrap()
+            .downcast::<ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled>()
+            .unwrap();
+        assert_eq!(query.disabled, ton::Bool::BoolTrue);
     }
 }

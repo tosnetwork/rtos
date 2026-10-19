@@ -152,6 +152,41 @@ pub trait ClientAPI: Send + Sync {
     async fn add_validator_adnl_addr(&mut self, rq: &AddValidatorAdnlAddrRq) -> anyhow::Result<()>;
 
     async fn send_boc(&mut self, boc: &[u8]) -> anyhow::Result<()>;
+
+    /// Sign a shard overlay certificate for a key; returns the boxed wire
+    /// certificate exactly as the node replied.
+    async fn sign_shard_overlay_certificate(
+        &mut self,
+        rq: &SignShardOverlayCertificateRq,
+    ) -> anyhow::Result<Vec<u8>>;
+    /// Import a boxed wire certificate for a key in a shard overlay.
+    async fn import_shard_overlay_certificate(
+        &mut self,
+        rq: &ImportShardOverlayCertificateRq,
+    ) -> anyhow::Result<()>;
+    /// Stop (or resume) broadcasting and rebroadcasting external messages.
+    async fn set_ext_messages_broadcast_disabled(&mut self, disabled: bool) -> anyhow::Result<()>;
+}
+
+/// A shard is named by its workchain and tagged prefix as a signed integer.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SignShardOverlayCertificateRq {
+    pub workchain: i32,
+    pub shard: i64,
+    #[serde(with = "serde_utils::hex_string")]
+    pub key_hash: Vec<u8>,
+    pub expire_at: i32,
+    pub max_size: u32,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ImportShardOverlayCertificateRq {
+    pub workchain: i32,
+    pub shard: i64,
+    #[serde(with = "serde_utils::hex_string")]
+    pub key_hash: Vec<u8>,
+    #[serde(with = "serde_utils::hex_string")]
+    pub certificate: Vec<u8>,
 }
 
 #[async_trait::async_trait]
