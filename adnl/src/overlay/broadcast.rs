@@ -47,8 +47,25 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Half-width of the accepted broadcast date window (C++ `OverlayImpl::check_date`).
+pub(crate) const BROADCAST_DATE_WINDOW_SEC: f64 = 20.0;
+
+/// C++ `OverlayImpl::check_date`: the wire date is read as an unsigned 32-bit value
+/// and compared with the fractional system clock; a broadcast dated more than 20 s
+/// before or after `now` is dropped without delivery or relay.
+pub(crate) fn broadcast_date_admissible(date: i32, now: f64) -> bool {
+    let date = f64::from(date as u32);
+    !(date < now - BROADCAST_DATE_WINDOW_SEC) && !(date > now + BROADCAST_DATE_WINDOW_SEC)
+}
+
+/// Fractional seconds of the system clock, as C++ `td::Clocks::system()`. A clock
+/// before the epoch reads as zero, which refuses every dated broadcast.
+fn system_clock_secs() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
 
 pub(crate) struct BroadcastCheckInfo {
     bcast_id: BroadcastId,
@@ -326,6 +343,16 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
 
     async fn recv<'a>(&mut self, bcast: T, mut ctx: BroadcastRecvContext<'a>) -> Result<()> {
         let bcast_type = Self::broadcast_type();
+        if !broadcast_date_admissible(bcast.date(), system_clock_secs()) {
+            log::warn!(
+                target: TARGET,
+                "{bcast_type} broadcast dated {} outside the accepted window from {} in overlay {}",
+                bcast.date() as u32,
+                ctx.peers.other(),
+                ctx.overlay.overlay_id
+            );
+            return Ok(());
+        }
         let now = Version::get();
         #[cfg(feature = "xp25")]
         let flags = bcast.flags();
@@ -546,6 +573,10 @@ pub(crate) trait FecBroadcastParsed: BroadcastParsed {
 
 #[async_trait::async_trait]
 trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> {
+    /// Two-step FEC re-checks the date after its precheck, where reception can
+    /// suspend, before a part reaches the decoder (C++ broadcast-twostep.cpp).
+    const RECHECK_DATE_BEFORE_DECODE: bool = false;
+
     fn build_broadcast_part(
         data: Vec<u8>,
         transfer: &SendTransferFec,
@@ -867,6 +898,19 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                 "Broadcast {} part {} dropped by history filter in overlay {}",
                 base64_encode(bcast_id),
                 bcast.seqno(),
+                ctx.overlay.overlay_id
+            );
+            return Ok((None, false));
+        }
+        if Self::RECHECK_DATE_BEFORE_DECODE
+            && !broadcast_date_admissible(bcast.date(), system_clock_secs())
+        {
+            log::warn!(
+                target: TARGET,
+                "Broadcast {} part {} dated {} left the accepted window in overlay {}",
+                base64_encode(bcast_id),
+                bcast.seqno(),
+                bcast.date() as u32,
                 ctx.overlay.overlay_id
             );
             return Ok((None, false));
@@ -1918,6 +1962,8 @@ impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
 }
 
 impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
+    const RECHECK_DATE_BEFORE_DECODE: bool = true;
+
     fn build_broadcast_part(
         data: Vec<u8>,
         transfer: &SendTransferFec,
@@ -2150,3 +2196,7 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "broadcast_date_tests.rs"]
+mod date_tests;
