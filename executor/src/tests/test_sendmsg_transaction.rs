@@ -652,3 +652,100 @@ fn credit_overflow_complete_transactions() {
         &[],
     );
 }
+
+/// The basechain config with its gas prices changed by `change`.
+fn gas_config(
+    version: u32,
+    addr: &MsgAddressInt,
+    change: impl Fn(&mut rtos_block::GasLimitsPrices),
+) -> BlockchainConfig {
+    let mut raw = config(version, false, addr).raw_config().clone();
+    let mut gas = raw.gas_prices(false).unwrap();
+    change(&mut gas);
+    raw.set_config(ConfigParamEnum::ConfigParam21(gas)).unwrap();
+    BlockchainConfig::with_config(raw).unwrap()
+}
+
+// Complete transactions for the compute phase gas fields. The gas bought for a
+// balance is not clamped: a gas limit above the VarUInteger 7 maximum
+// (2^48 - 1) or an external gas credit above the VarUInteger 3 maximum (65535)
+// leaves the transaction unserializable. The gas threshold is rounded up, so
+// with a gas price that is not a multiple of 2^16 a value one below it buys
+// less than the whole limit. data/gas-width.tsv holds the reference roots.
+#[test]
+fn gas_width_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let none = rtos_block::ExtraCurrencyCollection::default;
+    let base_price = 400u64 << 16;
+    let mut rows = Vec::new();
+    for version in [11u32, 16] {
+        // Internal messages: gas limit width and threshold rounding.
+        for (tag, gas_limit, gas_price) in [
+            ("gl48m1", (1u64 << 48) - 1, base_price),
+            ("gl48", 1 << 48, base_price),
+            ("gl50", 1 << 50, base_price),
+            ("th", 1_000_000, base_price + 12345),
+        ] {
+            let cfg = gas_config(version, &addr, |g| {
+                g.gas_limit = gas_limit;
+                g.gas_price = gas_price;
+            });
+            let g = cfg.get_gas_config(false).clone();
+            let (fp, fl, price) =
+                (g.flat_gas_price as u128, g.flat_gas_limit as u128, gas_price as u128);
+            let product = price * (gas_limit as u128 - fl);
+            let floor = fp + (product >> 16);
+            let ceil = fp + product.div_ceil(1 << 16);
+            // The least value buying `gas` units below the threshold.
+            let buys = |gas: u128| fp + ((gas - fl) * price).div_ceil(1 << 16);
+            let values = [
+                ("v1e9", 1_000_000_000u128),
+                ("buy48m1", buys((1 << 48) - 1)),
+                ("buy48", buys(1 << 48)),
+                ("floor", floor),
+                ("ceilm1", ceil - 1),
+                ("ceil", ceil),
+                ("v2e110", 1 << 110),
+            ];
+            for (contract, code) in [("accept", "ACCEPT"), ("noaccept", "NOP")] {
+                for (acc_tag, balance) in [("rich", 1u128 << 100), ("poor", 1_000_000_000)] {
+                    let account = account_cell(&addr, &cfg, balance, none(), code, Cell::default());
+                    for (value_tag, value) in values {
+                        run_cells(
+                            &format!("a246-{tag}-{contract}-{acc_tag}-{value_tag}-v{version}"),
+                            cfg.clone(),
+                            account.clone(),
+                            inbound_cell(&src, &addr, &Inbound::value(value)),
+                            &addr,
+                            &mut rows,
+                        );
+                    }
+                }
+            }
+        }
+        // External messages: gas credit width, including 2^32 (which a 32-bit
+        // truncation would turn into no credit).
+        for credit in [65535u64, 65536, 70000, 1 << 32] {
+            let cfg = gas_config(version, &addr, |g| {
+                g.gas_limit = (1 << 48) - 1;
+                g.gas_price = base_price;
+                g.gas_credit = credit;
+            });
+            for (contract, code) in [("accept", "ACCEPT"), ("noaccept", "NOP")] {
+                for (acc_tag, balance) in [("rich", 1u128 << 100), ("poor", 1_000_000_000)] {
+                    run_cells(
+                        &format!("a246-credit{credit}-{contract}-{acc_tag}-v{version}"),
+                        cfg.clone(),
+                        account_cell(&addr, &cfg, balance, none(), code, Cell::default()),
+                        external_message_cell(&addr, (0, 0)),
+                        &addr,
+                        &mut rows,
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(rows.len(), 2 * (4 * 2 * 2 * 7 + 4 * 2 * 2));
+    check_reference_rows(&rows, include_str!("data/gas-width.tsv"), "RTOS_GAS_WIDTH_EXPORT", &[]);
+}

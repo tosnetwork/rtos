@@ -1749,12 +1749,14 @@ impl GasLimitsPrices {
         (self.flat_gas_limit + res as u64).min(crate::VarUInteger7::MAX.as_u64())
     }
 
-    /// Calculate max gas threshold
+    /// Calculate max gas threshold: the flat price plus the price of the gas
+    /// above the flat limit, rounded up (a value below it buys less than
+    /// `gas_limit`). Both factors are below 2^64, so the product fits u128.
     pub fn calc_max_gas_threshold(&self, gas_limit: u64) -> u128 {
         let mut result = self.flat_gas_price as u128;
         if gas_limit > self.flat_gas_limit {
-            result +=
-                ((self.gas_price as u128) * ((gas_limit - self.flat_gas_limit) as u128)) >> 16;
+            let price = (self.gas_price as u128) * ((gas_limit - self.flat_gas_limit) as u128);
+            result += price.div_ceil(1 << 16);
         }
         result
     }

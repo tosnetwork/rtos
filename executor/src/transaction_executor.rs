@@ -22,13 +22,12 @@ use rtos_block::{
     NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
     Serializable, SimpleLib, SizeLimitsConfig, SliceData, StateInit, StorageUsageCalc,
     TrActionPhase, TrBouncePhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase, TrStoragePhase,
-    Transaction, UInt256, VarUInteger16, VarUInteger3, VarUInteger32, WorkchainFormat,
-    BASE_WORKCHAIN_ID, CHANGE_SET_LIB_BOUNCE_IF_FAIL, MASTERCHAIN_ID, MAX_MERKLE_DEPTH,
-    MAX_MSG_MERKLE_DEPTH, RESERVE_ALL_BUT, RESERVE_BOUNCE_IF_FAIL, RESERVE_IGNORE_ERROR,
-    RESERVE_PLUS_ORIG, RESERVE_REVERSE, RESERVE_VALID_MODES, SENDMSG_ALL_BALANCE,
-    SENDMSG_BOUNCE_IF_FAIL, SENDMSG_DELETE_IF_EMPTY, SENDMSG_IGNORE_ERROR,
-    SENDMSG_PAY_FEE_SEPARATELY, SENDMSG_REMAINING_MSG_BALANCE, SENDMSG_VALID_FLAGS,
-    SET_LIB_CODE_ADD_PUBLIC,
+    Transaction, UInt256, VarUInteger16, VarUInteger32, WorkchainFormat, BASE_WORKCHAIN_ID,
+    CHANGE_SET_LIB_BOUNCE_IF_FAIL, MASTERCHAIN_ID, MAX_MERKLE_DEPTH, MAX_MSG_MERKLE_DEPTH,
+    RESERVE_ALL_BUT, RESERVE_BOUNCE_IF_FAIL, RESERVE_IGNORE_ERROR, RESERVE_PLUS_ORIG,
+    RESERVE_REVERSE, RESERVE_VALID_MODES, SENDMSG_ALL_BALANCE, SENDMSG_BOUNCE_IF_FAIL,
+    SENDMSG_DELETE_IF_EMPTY, SENDMSG_IGNORE_ERROR, SENDMSG_PAY_FEE_SEPARATELY,
+    SENDMSG_REMAINING_MSG_BALANCE, SENDMSG_VALID_FLAGS, SET_LIB_CODE_ADD_PUBLIC,
 };
 use rtos_vm::{
     error::tvm_exception_full,
@@ -395,7 +394,7 @@ pub trait TransactionExecutor {
             is_ordinary,
             self.config().block_version(),
             gas_config,
-        );
+        )?;
         if gas.get_gas_limit() == 0 && gas.get_gas_credit() == 0 {
             log::debug!(target: "executor", "skip computing phase no gas");
             return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None, None));
@@ -439,11 +438,16 @@ pub trait TransactionExecutor {
             }
         }
 
-        vm_phase.gas_credit = match gas.get_gas_credit() as u32 {
-            0 => None,
-            value => Some(value.try_into()?),
+        // The initial limit and credit are the compute phase fields; a value
+        // wider than its field leaves the transaction unserializable.
+        vm_phase.gas_credit = match u32::try_from(gas.get_gas_credit()) {
+            Ok(0) => None,
+            Ok(value) => Some(value.try_into()?),
+            Err(_) => fail!("gas credit {} does not fit VarUInteger 3", gas.get_gas_credit()),
         };
-        vm_phase.gas_limit = (gas.get_gas_limit() as u64).try_into()?;
+        vm_phase.gas_limit = u64::try_from(gas.get_gas_limit())
+            .map_err(|_| error!("gas limit {} does not fit VarUInteger 7", gas.get_gas_limit()))?
+            .try_into()?;
 
         let code = if let Some(code) = result_acc.get_code() {
             code
@@ -560,7 +564,7 @@ pub trait TransactionExecutor {
 
         // calc gas fees
         let gas = vm.get_gas();
-        let credit = gas.get_gas_credit() as u32;
+        let credit = gas.get_gas_credit();
         //for external messages gas will not be exacted if VM throws the exception and gas_credit != 0
         if let Some(precompiled) = precompiled.as_ref() {
             vm_phase.gas_used = precompiled.gas_usage.try_into()?;
@@ -2142,7 +2146,7 @@ fn init_gas(
     is_ordinary: bool,
     version: u32,
     gas_info: &GasLimitsPrices,
-) -> Gas {
+) -> Result<Gas> {
     let (gas_limit, max_gas_threshold) = if let Some(gas_limit) = override_gas(acc, now) {
         (gas_limit, gas_info.calc_max_gas_threshold(gas_limit))
     } else {
@@ -2151,29 +2155,62 @@ fn init_gas(
     let gas_max = if is_special {
         gas_info.special_gas_limit
     } else {
-        gas_info.calc_gas(acc_balance, gas_limit, max_gas_threshold).min(gas_limit)
+        gas_bought_for(gas_info, acc_balance, gas_limit, max_gas_threshold)?
     };
     let gas_limit = if !is_ordinary || (is_special && version >= 5) {
         gas_max
     } else {
-        gas_max.min(gas_info.calc_gas(msg_balance, gas_limit, max_gas_threshold))
+        gas_max.min(gas_bought_for(gas_info, msg_balance, gas_limit, max_gas_threshold)?)
     };
-    let gas_credit = if is_external {
-        gas_info.gas_credit.min(gas_max).min(VarUInteger3::MAX.as_u64())
-    } else {
-        0
-    };
+    // Not clamped: a credit wider than its serialized field (VarUInteger 3)
+    // leaves the transaction unserializable, as in the reference.
+    let gas_credit = if is_external { gas_info.gas_credit.min(gas_max) } else { 0 };
     log::debug!(
         target: "executor",
         "gas before: gm: {}, gl: {}, gc: {}, price: {}",
         gas_max, gas_limit, gas_credit, gas_info.get_real_gas_price()
     );
-    Gas::new(
+    Ok(Gas::new(
         gas_limit as i64,
         gas_credit as i64,
         gas_max as i64,
         gas_info.get_real_gas_price() as i64,
-    )
+    ))
+}
+
+/// The gas `value` nanocoins buy under `gas_limit` and its threshold: the
+/// whole limit at or above the threshold, nothing below the flat price, else
+/// `((value - flat_gas_price) << 16) / gas_price + flat_gas_limit`. The result
+/// is not clamped to any serialized width; the compute phase fields are checked
+/// when they are stored.
+fn gas_bought_for(
+    gas_info: &GasLimitsPrices,
+    value: u128,
+    gas_limit: u64,
+    max_gas_threshold: u128,
+) -> Result<u64> {
+    if value >= max_gas_threshold {
+        return Ok(gas_limit);
+    }
+    let flat_price = u128::from(gas_info.flat_gas_price);
+    if value < flat_price {
+        return Ok(0);
+    }
+    let price = u128::from(gas_info.gas_price);
+    if price == 0 {
+        fail!("gas price is zero")
+    }
+    // (rest << 16) / price without a 2^16-times wider intermediate: below
+    // the threshold the quotient stays under the gas limit.
+    let rest = value - flat_price;
+    let shifted = (rest / price)
+        .checked_mul(1 << 16)
+        .and_then(|q| q.checked_add(((rest % price) << 16) / price))
+        .ok_or_else(|| error!("gas bought for {value} does not fit"))?;
+    u64::try_from(shifted)
+        .ok()
+        .and_then(|gas| gas.checked_add(gas_info.flat_gas_limit))
+        .ok_or_else(|| error!("gas bought for {value} does not fit"))
 }
 
 fn check_deploy_state_init(
