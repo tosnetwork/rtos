@@ -713,3 +713,126 @@ fn add_with_transient_coins_keeps_balance_above_serialized_maximum() {
     assert!(acc.add_with_transient_coins(&CurrencyCollection::default()).unwrap());
     assert_eq!(acc.coins.inner(), max);
 }
+
+/// An `ExtraCurrencyCollection` cell (Maybe ^dict) with raw leaves.
+fn extra_currency_cell(entries: &[(u32, BuilderData)]) -> Cell {
+    let mut dict = HashmapE::with_bit_len(32);
+    for (key, leaf) in entries {
+        dict.set_builder(SliceData::load_builder(key.write_to_new_cell().unwrap()).unwrap(), leaf)
+            .unwrap();
+    }
+    let mut b = BuilderData::new();
+    dict.write_hashmap_data(&mut b).unwrap();
+    b.into_cell().unwrap()
+}
+
+fn extra_leaf(bytes: &[u8], trailing_bit: bool, extra_ref: bool) -> BuilderData {
+    let mut b = BuilderData::new();
+    b.append_bits(bytes.len(), 5).unwrap();
+    b.append_raw(bytes, bytes.len() * 8).unwrap();
+    if trailing_bit {
+        b.append_bit_one().unwrap();
+    }
+    if extra_ref {
+        b.checked_append_reference(Cell::default()).unwrap();
+    }
+    b
+}
+
+/// Extra-currency dictionaries for the reference handwritten (strict) and
+/// generated (structural) validators: value encodings, leaf exactness, node
+/// shapes and the 1024-cell visit budget.
+fn extra_currency_codec_rows() -> Vec<(String, Cell)> {
+    let mut padded = vec![0u8; 31];
+    padded[30] = 100;
+    let mut rows: Vec<(String, Cell)> = vec![
+        ("empty".to_string(), extra_currency_cell(&[])),
+        ("min100".to_string(), extra_currency_cell(&[(7, extra_leaf(&[100], false, false))])),
+        ("lead100".to_string(), extra_currency_cell(&[(7, extra_leaf(&[0, 100], false, false))])),
+        ("len31v100".to_string(), extra_currency_cell(&[(7, extra_leaf(&padded, false, false))])),
+        ("len0".to_string(), extra_currency_cell(&[(7, extra_leaf(&[], false, false))])),
+        ("zero1".to_string(), extra_currency_cell(&[(7, extra_leaf(&[0], false, false))])),
+        ("max31".to_string(), extra_currency_cell(&[(7, extra_leaf(&[0xff; 31], false, false))])),
+        ("trail".to_string(), extra_currency_cell(&[(7, extra_leaf(&[100], true, false))])),
+        ("extra-ref".to_string(), extra_currency_cell(&[(7, extra_leaf(&[100], false, true))])),
+        (
+            "two-one-lead".to_string(),
+            extra_currency_cell(&[
+                (7, extra_leaf(&[100], false, false)),
+                (9, extra_leaf(&[0, 5], false, false)),
+            ]),
+        ),
+        (
+            "two-min".to_string(),
+            extra_currency_cell(&[
+                (7, extra_leaf(&[100], false, false)),
+                (1 << 31, extra_leaf(&[1, 2, 3], false, false)),
+            ]),
+        ),
+    ];
+    // A short leaf: the length promises more bytes than the leaf holds.
+    let mut short = BuilderData::new();
+    short.append_bits(3, 5).unwrap();
+    short.append_raw(&[1, 2], 16).unwrap();
+    rows.push(("short".to_string(), extra_currency_cell(&[(7, short)])));
+    // A fork node with a trailing bit after its two references.
+    let two = extra_currency_cell(&[
+        (7, extra_leaf(&[100], false, false)),
+        (9, extra_leaf(&[5], false, false)),
+    ]);
+    let root = two.reference(0).unwrap();
+    let mut fork = BuilderData::from_cell(&root).unwrap();
+    fork.append_bit_one().unwrap();
+    let mut b = BuilderData::new();
+    b.append_bit_one().unwrap();
+    b.checked_append_reference(fork.into_cell().unwrap()).unwrap();
+    rows.push(("fork-trailing-bit".to_string(), b.into_cell().unwrap()));
+    // The visit budget: k entries take 2k - 1 dictionary cells.
+    for count in [512u32, 513] {
+        let entries: Vec<_> =
+            (0..count).map(|key| (key * 7 + 1, extra_leaf(&[1], false, false))).collect();
+        rows.push((format!("entries{count}"), extra_currency_cell(&entries)));
+    }
+    rows
+}
+
+#[test]
+fn extra_currency_values_match_reference_validators() {
+    let rows = extra_currency_codec_rows();
+    if let Ok(path) = std::env::var("RTOS_EXTRA_CURRENCY_CODEC_EXPORT") {
+        let text: String = rows
+            .iter()
+            .map(|(id, cell)| {
+                format!("{id}\tecc\t{}\n", hex::encode(crate::write_boc(cell).unwrap()))
+            })
+            .collect();
+        std::fs::write(path, text).unwrap();
+        return;
+    }
+    let fixture =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/extra-currency-codec.tsv"));
+    assert!(fixture
+        .lines()
+        .next()
+        .unwrap()
+        .contains("reference_commit=881240331ee48a291b96d73f8b8b93bae005ace0"));
+    let expected: std::collections::HashMap<_, _> = fixture
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            (f[0], (f[2] == "1", f[3] == "1"))
+        })
+        .collect();
+    assert_eq!(expected.len(), rows.len());
+    for (id, cell) in &rows {
+        let extras = ExtraCurrencyCollection::construct_from_cell(cell.clone()).unwrap();
+        let (strict, structural) = expected[id.as_str()];
+        assert_eq!(extras.values_are_valid(ExtraCurrencyEncoding::Strict, 1024), strict, "{id}");
+        assert_eq!(
+            extras.values_are_valid(ExtraCurrencyEncoding::Structural, 1024),
+            structural,
+            "{id}"
+        );
+    }
+}

@@ -1250,6 +1250,49 @@ impl CurrencyCollection {
     }
 }
 
+/// Which encodings of an extra-currency value a consumer accepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtraCurrencyEncoding {
+    /// `VarUInteger 32`: a 5-bit length and that many bytes, any length.
+    Structural,
+    /// `VarUIntegerPos 32`: as structural, with a nonzero length and a nonzero
+    /// first byte (the minimal encoding of a positive amount).
+    Strict,
+}
+
+impl ExtraCurrencyCollection {
+    /// Checks the dictionary and every value the way the reference validator
+    /// of a `HashmapE 32` of `encoding` values does: ordinary cells only, a
+    /// fork node holds exactly its label and two references, every leaf is
+    /// consumed exactly, and the dictionary cells (2k - 1 for k entries) fit
+    /// in `budget` cell visits. This checks the extra currencies only; the
+    /// lazily read value accessors stay lenient.
+    pub fn values_are_valid(&self, encoding: ExtraCurrencyEncoding, budget: usize) -> bool {
+        let Some(root) = self.root() else {
+            return true;
+        };
+        let Some(leaves) =
+            crate::config_params::config_param_schema::dictionary_leaves(root.clone(), 32)
+        else {
+            return false;
+        };
+        if leaves.len().saturating_mul(2).saturating_sub(1) > budget {
+            return false;
+        }
+        leaves.into_iter().all(|(_, mut leaf)| {
+            let Ok(len) = leaf.get_next_int(5) else {
+                return false;
+            };
+            if encoding == ExtraCurrencyEncoding::Strict
+                && (len == 0 || leaf.get_int(8).map_or(true, |first| first == 0))
+            {
+                return false;
+            }
+            leaf.move_by(len as usize * 8).is_ok() && leaf.is_empty_cell()
+        })
+    }
+}
+
 impl Serializable for CurrencyCollection {
     fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
         self.coins.write_to(cell)?;

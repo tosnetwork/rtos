@@ -94,6 +94,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         #[cfg(feature = "timings")]
         let mut now = Instant::now();
 
+        crate::check_account_extra_currencies(account)?;
         let in_msg_cell =
             in_msg_cell.ok_or_else(|| error!("Ordinary transaction must have input message"))?;
         let in_msg_hash = in_msg_cell.repr_hash();
@@ -107,6 +108,13 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             CommonMsgInfo::ExtOutMsgInfo(_) => fail!(ExecutorError::InvalidExtMessage),
             CommonMsgInfo::IntMsgInfo(hdr) => {
                 log::debug!(target: "executor", "internal message, bounce: {}", hdr.bounce);
+                // The committed transaction holds the inbound message, whose
+                // extra currencies must be minimal positive amounts.
+                if !crate::extra_currencies_are_canonical(&hdr.value) {
+                    fail!(ExecutorError::TrExecutorError(
+                        "inbound message value has invalid extra currencies".to_string()
+                    ))
+                }
                 msg_balance = hdr.value.clone();
                 let extra_flags = hdr.extra_flags.inner();
                 if self.config.block_version() >= 12 {

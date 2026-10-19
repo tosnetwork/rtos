@@ -918,28 +918,20 @@ fn build_acc_for_all_balance_test(
 }
 
 #[test]
-fn test_sendmsg_all_balance_strips_zero_extras() {
+fn test_sendmsg_all_balance_refuses_zero_extras() {
     // out_msg.value.other has a zero-valued extra (ec2:0) along with ec1:50.
-    // After SENDMSG_ALL_BALANCE the outgoing message must keep only the non-zero extras.
-    let mut acc =
-        build_acc_for_all_balance_test(&[(11111111, 50), (22222222, 0)], &[(11111111, 100)]);
+    // The suggested value is validated with minimal positive extra currencies
+    // before SENDMSG_ALL_BALANCE replaces it, so the action fails with 34
+    // (the rule a244-sendall-zero-one-* in data/extra-currency-values.tsv pins).
+    let acc = build_acc_for_all_balance_test(&[(11111111, 50), (22222222, 0)], &[(11111111, 100)]);
     let in_msg = create_msg_currency(
         SENDER_ACCOUNT.clone(),
         &CurrencyCollection::with_coins(1_000_000_000),
         false,
     );
 
-    let trans = execute(&in_msg, &mut acc, BLOCK_LT + 1).unwrap();
-    let descr = get_tr_descr(&trans);
-    assert!(descr.action.as_ref().unwrap().success, "action phase must succeed");
-    assert_eq!(descr.action.as_ref().unwrap().msgs_created, 1);
-
-    let out_msg = trans.get_out_msg(0).unwrap().expect("outgoing message expected");
-    let value = out_msg.get_value().expect("internal outgoing message");
-    assert_eq!(value.other.len().unwrap(), 1, "zero extra must be stripped");
-    let kept = value.other.get(&11111111u32).unwrap().unwrap();
-    assert_eq!(kept, VarUInteger32::from(50u32));
-    assert!(value.other.get(&22222222u32).unwrap().is_none(), "zero extra must not survive");
+    execute_acc_with_message(acc, &in_msg)
+        .expect_action_failed(crate::RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
 }
 
 #[test]
@@ -960,9 +952,11 @@ fn test_sendmsg_all_balance_too_many_extras() {
 }
 
 #[test]
-fn test_sendmsg_all_balance_total_extras_count_includes_zeros() {
+fn test_sendmsg_all_balance_zero_extras_refused_before_count() {
     // out_msg.value.other has 2 zero-valued + 1 non-zero extra (3 total) while
-    // max_msg_extra_currencies = 2. Currencies count is checked before removing zeroes
+    // max_msg_extra_currencies = 2. The value validation (minimal positive
+    // extra currencies) precedes the count limit, so the action fails with 34
+    // (the rule a244-sendall-zero-two-* in data/extra-currency-values.tsv pins).
     let acc = build_acc_for_all_balance_test(
         &[(11111111, 0), (22222222, 0), (33333333, 50)],
         &[(33333333, 100)],
@@ -973,7 +967,8 @@ fn test_sendmsg_all_balance_total_extras_count_includes_zeros() {
         false,
     );
 
-    execute_acc_with_message(acc, &in_msg).expect_action_failed(RESULT_CODE_TOO_MANY_EXTRA);
+    execute_acc_with_message(acc, &in_msg)
+        .expect_action_failed(crate::RESULT_CODE_UNKNOWN_OR_INVALID_ACTION);
 }
 
 #[test]

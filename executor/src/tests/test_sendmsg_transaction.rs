@@ -808,3 +808,245 @@ fn bounce_size_complete_transactions() {
         &[],
     );
 }
+
+/// A tick or tock transaction of a special masterchain account, exported in
+/// the reference row format (no message; a "-tock-" id marks a tock).
+fn run_tick_tock_cells(
+    name: &str,
+    config: BlockchainConfig,
+    account_cell: Cell,
+    address: &MsgAddressInt,
+    tock: bool,
+    rows: &mut Vec<String>,
+) {
+    let input = format!(
+        "{name}\t200\t2000000001\t{}\t{}\t-\t-\t1\t{}\t{}",
+        boc(config.raw_config().serialize().unwrap()),
+        boc(account_cell.clone()),
+        address.workchain_id(),
+        hex_bytes(address.address().get_bytestring(0).as_ref())
+    );
+    let outcome =
+        (|| -> rtos_block::Result<(String, String)> {
+            let mut account = Account::construct_from_cell(account_cell)?;
+            let old = account.hash()?;
+            let params = ExecuteParams {
+                block_unixtime: 200,
+                block_lt: 2_000_000_000,
+                last_tr_lt: 2_000_000_001,
+                ..Default::default()
+            };
+            let kind = if tock {
+                rtos_block::TransactionTickTock::Tock
+            } else {
+                rtos_block::TransactionTickTock::Tick
+            };
+            let mut tx = crate::TickTockTransactionExecutor::new(config, kind)
+                .execute_with_params(None, &mut account, params)?;
+            tx.write_state_update(&HashUpdate::with_hashes(old, account.hash()?))?;
+            Ok((format!("{:x}", tx.hash()?), format!("{:x}", account.hash()?)))
+        })();
+    let (th, ah) = outcome.unwrap_or_else(|_| ("ERROR".to_string(), "ERROR".to_string()));
+    rows.push(format!("{input}\t{th}\t{ah}"));
+}
+
+/// An extra-currency dictionary with key 7 holding `leaf` as its raw value.
+fn extras_with_leaf(leaf: &BuilderData) -> rtos_block::ExtraCurrencyCollection {
+    let mut dict = rtos_block::HashmapE::with_bit_len(32);
+    dict.set_builder(SliceData::load_builder(7u32.write_to_new_cell().unwrap()).unwrap(), leaf)
+        .unwrap();
+    let mut b = BuilderData::new();
+    rtos_block::HashmapType::write_hashmap_data(&dict, &mut b).unwrap();
+    rtos_block::ExtraCurrencyCollection::construct_from(&mut SliceData::load_builder(b).unwrap())
+        .unwrap()
+}
+
+/// Encodings of an extra-currency value: minimal, with a leading zero byte,
+/// padded to 31 bytes, zero as length 0, zero as one byte, the maximum, and
+/// the minimal one followed by a trailing bit in the leaf.
+fn extra_value_encodings() -> Vec<(&'static str, rtos_block::ExtraCurrencyCollection)> {
+    let leaf = |bytes: &[u8], trailing: bool| {
+        let mut b = BuilderData::new();
+        b.append_bits(bytes.len(), 5).unwrap();
+        b.append_raw(bytes, bytes.len() * 8).unwrap();
+        if trailing {
+            b.append_bit_one().unwrap();
+        }
+        extras_with_leaf(&b)
+    };
+    let mut padded = vec![0u8; 31];
+    padded[30] = 100;
+    vec![
+        ("min100", leaf(&[100], false)),
+        ("lead100", leaf(&[0, 100], false)),
+        ("len31v100", leaf(&padded, false)),
+        ("len0", leaf(&[], false)),
+        ("zero1", leaf(&[0], false)),
+        ("max31", leaf(&[0xff; 31], false)),
+        ("trail", leaf(&[100], true)),
+    ]
+}
+
+/// The reference reasons a row of `position` may fail with: validation of
+/// the account state, the inbound value at serialization, or (for a bounce)
+/// packing that value into the bounced message; none for other positions.
+fn extra_currency_error_reasons(position: &str) -> &'static [&'static str] {
+    match position {
+        "acconly" | "getextra" | "send128" | "tick" | "tock" => &["account-invalid"],
+        "msgonly" | "send64" => &["serialize"],
+        "bounce" => &["serialize", "other:-669"],
+        _ => &[],
+    }
+}
+
+// Complete transactions with an extra-currency value in each encoding at each
+// position: the account balance (ordinary and tick/tock), the inbound value,
+// a contract-built outbound value (modes 0, +2, +16) and a reserve currency.
+// The account and inbound consumers require minimal positive amounts (no
+// transaction otherwise); the action list check takes any encoding with
+// exact leaves (result 34 and an invalid action list otherwise); the send
+// consumer requires minimal positive amounts (result 34 with a valid action
+// list, not skippable). Values read by the VM stay lenient.
+// data/extra-currency-values.tsv holds the reference roots and reasons.
+#[test]
+fn extra_currency_values_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let mc_addr = MsgAddressInt::standard(-1, [0x63; 32]);
+    let none = rtos_block::ExtraCurrencyCollection::default;
+    let mut canonical = rtos_block::ExtraCurrencyCollection::default();
+    canonical.set(&7u32, &1000u32.into()).unwrap();
+    let mut rows = Vec::new();
+    for version in [11u32, 12, 16] {
+        let cfg = config(version, false, &addr);
+        let mc_cfg = config(version, true, &mc_addr);
+        for (enc, extras) in extra_value_encodings() {
+            let reply = |other| data_with_refs(&[outbound_cell(&addr, &src, 0, other)]);
+            let mut add = |position: &str, account: Cell, inbound: Inbound| {
+                run_cells(
+                    &format!("a244-{position}-{enc}-v{version}"),
+                    cfg.clone(),
+                    account,
+                    inbound_cell(&src, &addr, &inbound),
+                    &addr,
+                    &mut rows,
+                )
+            };
+            let plain = || Inbound::value(1_000_000_000);
+            let with_extras = || Inbound { other: extras.clone(), ..plain() };
+            let rich = |other, code: &str, data| {
+                account_cell(&addr, &cfg, 10_000_000_000, other, code, data)
+            };
+            add("acconly", rich(extras.clone(), "ACCEPT", Cell::default()), plain());
+            add("msgonly", rich(none(), "ACCEPT", Cell::default()), with_extras());
+            add(
+                "bounce",
+                rich(none(), "THROW 100", Cell::default()),
+                Inbound { bounce: true, ..with_extras() },
+            );
+            add("send64", rich(none(), &send_code(64), reply(none())), with_extras());
+            add(
+                "getextra",
+                rich(
+                    extras.clone(),
+                    "PUSHINT 7 GETEXTRABALANCE NEWC STVARUINT32 ENDC POPROOT",
+                    Cell::default(),
+                ),
+                plain(),
+            );
+            add("send128", rich(extras.clone(), &send_code(128), reply(none())), plain());
+            for mode in [0u8, 2, 16] {
+                let out = outbound_cell(&addr, &src, 1_000_000, extras.clone());
+                add(
+                    &format!("sendout{mode}"),
+                    rich(canonical.clone(), &send_code(mode), data_with_refs(&[out])),
+                    Inbound { bounce: true, ..plain() },
+                );
+            }
+            let dict = data_with_refs(&[extras.root().cloned().unwrap()]);
+            add(
+                "reservex",
+                rich(
+                    canonical.clone(),
+                    "PUSHINT 1000 PUSHROOT CTOS LDREF DROP PUSHINT 0 RAWRESERVEX",
+                    dict,
+                ),
+                plain(),
+            );
+            for (position, tock) in [("tick", false), ("tock", true)] {
+                let mut init = StateInit::default();
+                init.set_code(rtos_assembler::compile_code_to_cell("NOP").unwrap());
+                init.set_data(Cell::default());
+                init.set_special(rtos_block::TickTock::with_values(true, true));
+                let account = Account::active(
+                    mc_addr.clone(),
+                    CurrencyCollection {
+                        coins: rtos_block::Coins::from(10_000_000_000u64),
+                        other: extras.clone(),
+                    },
+                    0,
+                    0,
+                    init,
+                    mc_cfg.size_limits_config().acc_state_cells_for_storage_dict,
+                )
+                .unwrap()
+                .serialize()
+                .unwrap();
+                run_tick_tock_cells(
+                    &format!("a244-{position}-{enc}-v{version}"),
+                    mc_cfg.clone(),
+                    account,
+                    &mc_addr,
+                    tock,
+                    &mut rows,
+                );
+            }
+        }
+        // Mode 128 with zero-valued extras in the suggested message: the
+        // value is validated before the whole balance replaces it.
+        for (tag, out_extras) in [
+            ("zero-one", &[(11111111u32, 50u32), (22222222, 0)][..]),
+            ("zero-two", &[(11111111, 0), (22222222, 0), (33333333, 50)][..]),
+        ] {
+            let mut other = rtos_block::ExtraCurrencyCollection::default();
+            for (key, value) in out_extras {
+                other.set(key, &(*value).into()).unwrap();
+            }
+            let mut balance = rtos_block::ExtraCurrencyCollection::default();
+            balance.set(&11111111u32, &100u32.into()).unwrap();
+            balance.set(&33333333u32, &100u32.into()).unwrap();
+            run_cells(
+                &format!("a244-sendall-{tag}-v{version}"),
+                cfg.clone(),
+                account_cell(
+                    &addr,
+                    &cfg,
+                    2_000_000_000,
+                    balance,
+                    &format!("ACCEPT {}", send_code(128)),
+                    data_with_refs(&[outbound_cell(&addr, &src, 1_000_000_000, other)]),
+                ),
+                inbound_cell(&src, &addr, &Inbound::value(1_000_000_000)),
+                &addr,
+                &mut rows,
+            );
+        }
+    }
+    assert_eq!(rows.len(), 3 * (7 * 12 + 2));
+    check_reference_rows(
+        &rows,
+        include_str!("data/extra-currency-values.tsv"),
+        "RTOS_EXTRA_CURRENCY_EXPORT",
+        &[],
+    );
+    if std::env::var_os("RTOS_EXTRA_CURRENCY_EXPORT").is_none() {
+        // Every reference refusal is the validation of the position's consumer.
+        for line in include_str!("data/extra-currency-values.tsv").lines().skip(1) {
+            let f: Vec<_> = line.split('\t').collect();
+            let position = f[0].split('-').nth(1).unwrap();
+            if f[1] == "error" {
+                assert!(extra_currency_error_reasons(position).contains(&f[3]), "{}", f[0]);
+            }
+        }
+    }
+}

@@ -17,12 +17,13 @@ use crate::{blockchain_config::BlockchainConfig, error::ExecutorError};
 use rtos_block::{
     error, fail, time_checker, unpack_out_action_slices, AccStatusChange, Account, AccountId,
     AccountStatus, AddSub, BlockError, BouncedByPhase, Cell, ChildCell, Coins, ComputeSkipReason,
-    CurrencyCollection, Deserializable, ExceptionCode, GasLimitsPrices, GetRepresentationHash,
-    GlobalCapabilities, HashmapE, HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt,
-    NewBounceBody, NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result,
-    Serializable, SimpleLib, SizeLimitsConfig, SliceData, StateInit, StorageUsageCalc,
-    TrActionPhase, TrBouncePhase, TrComputePhase, TrComputePhaseVm, TrCreditPhase, TrStoragePhase,
-    Transaction, UInt256, VarUInteger16, VarUInteger32, WorkchainFormat, BASE_WORKCHAIN_ID,
+    CurrencyCollection, Deserializable, ExceptionCode, ExtraCurrencyCollection,
+    ExtraCurrencyEncoding, GasLimitsPrices, GetRepresentationHash, GlobalCapabilities, HashmapE,
+    HashmapFilterResult, IBitstring, Mask, Message, MsgAddressInt, NewBounceBody,
+    NewBounceComputePhaseInfo, NewBounceOriginalInfo, OutAction, Result, Serializable, SimpleLib,
+    SizeLimitsConfig, SliceData, StateInit, StorageUsageCalc, TrActionPhase, TrBouncePhase,
+    TrComputePhase, TrComputePhaseVm, TrCreditPhase, TrStoragePhase, Transaction, UInt256,
+    VarUInteger16, VarUInteger32, WorkchainFormat, BASE_WORKCHAIN_ID,
     CHANGE_SET_LIB_BOUNCE_IF_FAIL, MASTERCHAIN_ID, MAX_MERKLE_DEPTH, MAX_MSG_MERKLE_DEPTH,
     RESERVE_ALL_BUT, RESERVE_BOUNCE_IF_FAIL, RESERVE_IGNORE_ERROR, RESERVE_PLUS_ORIG,
     RESERVE_REVERSE, RESERVE_VALID_MODES, SENDMSG_ALL_BALANCE, SENDMSG_BOUNCE_IF_FAIL,
@@ -131,6 +132,61 @@ fn decode_action(slice: &mut SliceData, version: u32) -> Result<OutAction> {
 }
 
 pub(crate) const MAX_ACTIONS: usize = 255;
+
+/// Cell visits of a reference validation of one currency value or action.
+const CURRENCY_VALIDATION_BUDGET: usize = 1024;
+
+/// Whether the extra currencies of `value` are minimal positive amounts in a
+/// well-formed dictionary. The account and inbound-message consumers check
+/// them as part of a larger structure whose shared visit budget is not
+/// modelled here, so no budget applies.
+pub(crate) fn extra_currencies_are_canonical(value: &CurrencyCollection) -> bool {
+    value.other.values_are_valid(ExtraCurrencyEncoding::Strict, usize::MAX)
+}
+
+/// Refuses an account whose stored balance has invalid extra currencies: the
+/// reference refuses such an account state before any transaction.
+pub(crate) fn check_account_extra_currencies(account: &Account) -> Result<()> {
+    if account.balance().is_some_and(|balance| !extra_currencies_are_canonical(balance)) {
+        fail!(ExecutorError::TrExecutorError(
+            "account balance has invalid extra currencies".to_string()
+        ))
+    }
+    Ok(())
+}
+
+/// The value of a send-message action or the currency of a reserve action,
+/// read only to check its extra currencies, with the cells the action schema
+/// check visits before its dictionary (the action cell, and for a send the
+/// message cell; a StateInit in its own cell is visited later and is not
+/// counted). None for other actions and for external outbound messages.
+fn action_currency(slice: &SliceData) -> Result<Option<(ExtraCurrencyCollection, usize)>> {
+    // The coins are any VarUInteger 16 encoding here (the action schema).
+    fn extras_after_coins(slice: &mut SliceData) -> Result<ExtraCurrencyCollection> {
+        let len = slice.get_next_int(4)? as usize;
+        slice.move_by(len * 8)?;
+        ExtraCurrencyCollection::construct_from(slice)
+    }
+    let mut action = slice.clone();
+    match action.get_next_u32()? {
+        rtos_block::ACTION_SEND_MSG => {
+            action.get_next_byte()?;
+            let mut message = SliceData::load_cell(action.checked_drain_reference()?)?;
+            if message.get_next_bit()? {
+                return Ok(None);
+            }
+            message.get_next_int(3)?;
+            rtos_block::MsgAddressIntOrNone::skip(&mut message)?;
+            MsgAddressInt::skip(&mut message)?;
+            Ok(Some((extras_after_coins(&mut message)?, 2)))
+        }
+        rtos_block::ACTION_RESERVE => {
+            action.get_next_byte()?;
+            Ok(Some((extras_after_coins(&mut action)?, 1)))
+        }
+        _ => Ok(None),
+    }
+}
 
 static SPECIAL_LIMIT_ACCOUNTS: LazyLock<HashMap<MsgAddressInt, (u32, u64)>> = LazyLock::new(|| {
     let limits = [
@@ -704,11 +760,20 @@ pub trait TransactionExecutor {
                         fail!("Outbound action contains an inbound external message");
                     }
                 }
-                if remainder.is_empty_cell() {
-                    Ok(())
-                } else {
+                if !remainder.is_empty_cell() {
                     fail!("Trailing data in action")
                 }
+                // The action schema check covers the extra-currency dictionary
+                // of a send or reserve value (any value encoding, exact leaves)
+                // within the visit budget of the action, which has already
+                // visited the action cell and, for a send, the message cell.
+                if let Some((extras, visited)) = action_currency(&slice)? {
+                    let budget = CURRENCY_VALIDATION_BUDGET.saturating_sub(visited);
+                    if !extras.values_are_valid(ExtraCurrencyEncoding::Structural, budget) {
+                        fail!("Invalid extra currencies in action")
+                    }
+                }
+                Ok(())
             });
             if let Err(err) = parsed {
                 log::debug!(
@@ -1632,6 +1697,15 @@ fn outmsg_action_handler(
     }
     // Flags are evaluated before address rewriting in the action consumer.
     if let Some(int_header) = msg.int_header() {
+        // The value is validated with minimal positive extra currencies before
+        // its flags; a failure is not skippable with +2.
+        if !int_header
+            .value
+            .other
+            .values_are_valid(ExtraCurrencyEncoding::Strict, CURRENCY_VALIDATION_BUDGET)
+        {
+            return Err(RESULT_CODE_UNSUPPORTED);
+        }
         if config.block_version() >= 12
             && int_header.extra_flags.inner() > SUPPORTED_EXTRA_FLAGS as u128
         {
@@ -2034,6 +2108,11 @@ fn reserve_action_handler(
     }
     log::debug!(target: "executor", "Reserve with mode = {} value = {}", mode, balance_to_string(Some(val)));
 
+    // The reserve currency is validated with minimal positive extra
+    // currencies first; any extra currency is refused after that.
+    if !val.other.values_are_valid(ExtraCurrencyEncoding::Strict, CURRENCY_VALIDATION_BUDGET) {
+        return Err(RESULT_CODE_UNSUPPORTED);
+    }
     if !val.other.is_empty() {
         return Err(RESULT_CODE_UNSUPPORTED);
     }
