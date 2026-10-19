@@ -755,6 +755,8 @@ pub struct BlockHandleStorage {
     state_cache: lockfree::map::Map<String, Arc<BlockIdExt>>,
     tables: HandleTables,
     serializer: Arc<WriteSerializer>,
+    // First failure of the ordered writer, shared with direct durable writes.
+    writer_failure: Arc<std::sync::Mutex<Option<String>>>,
     storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
     writer: Option<WriterCompletion>,
     #[cfg(test)]
@@ -779,6 +781,13 @@ impl BlockHandleStorage {
             validator_state: validator_state_db.clone(),
         };
         let serializer = Arc::new(WriteSerializer::default());
+        let writer_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+        let shared_failure = writer_failure.clone();
+        let record_failure = move |reason: &str| {
+            if let Ok(mut slot) = shared_failure.lock() {
+                slot.get_or_insert_with(|| reason.to_owned());
+            }
+        };
         let mut ret = Self {
             handle_db: handle_db.clone(),
             handle_cache: Arc::new(lockfree::map::Map::new()),
@@ -788,6 +797,7 @@ impl BlockHandleStorage {
             state_cache: lockfree::map::Map::new(),
             tables: tables.clone(),
             serializer: serializer.clone(),
+            writer_failure,
             storer: sender,
             writer: None,
             #[cfg(test)]
@@ -835,6 +845,7 @@ impl BlockHandleStorage {
                         };
                         if let Err(error) = &result {
                             failed.get_or_insert_with(|| error.to_string());
+                            record_failure(&error.to_string());
                         }
                         let _ = reply.send(result);
                         continue;
@@ -880,6 +891,7 @@ impl BlockHandleStorage {
                     if let Some(error) = error {
                         log::error!(target: TARGET, "Handle storage commit failed: {error}");
                         failed.get_or_insert_with(|| error.to_string());
+                        record_failure(&error.to_string());
                     }
                     committed
                 };
@@ -1106,14 +1118,31 @@ impl BlockHandleStorage {
         )
     }
 
-    /// Saves the handle as it is now and returns after that write and every
-    /// earlier queued write are durable.
+    /// Writes the handle as it is now with one synchronized write and returns
+    /// once that record is durable. The write is serialized with the ordered
+    /// writer, so no older queued snapshot of this handle can overwrite it,
+    /// and its synchronization also covers everything written earlier to the
+    /// same WAL. It does not wait for unrelated queued work or for writer
+    /// callbacks. It is refused once the ordered writer has failed.
     pub async fn save_handle_durable(&self, handle: &Arc<BlockHandle>) -> Result<()> {
-        if self.no_cache {
-            return self.save_handle(handle, None);
+        if let Some(reason) = self
+            .writer_failure
+            .lock()
+            .map_err(|_| error!("Handle writer failure record poisoned"))?
+            .as_ref()
+        {
+            fail!("Handle storage has an unacknowledged write failure: {reason}");
         }
-        let op = self.handle_op(handle)?;
-        self.enqueue_durable(StoreJob::SaveHandle(handle.clone()), vec![op]).await
+        let key = handle.id().root_hash().as_slice().to_vec();
+        let value = handle.serialize().to_vec();
+        let tables = self.tables.clone();
+        let serializer = self.serializer.clone();
+        let synced = !self.no_cache;
+        tokio::task::spawn_blocking(move || {
+            tables.write_direct(&serializer, &[(Target::Handles, &key, Some(&value))], synced)
+        })
+        .await
+        .map_err(|e| error!("Durable handle write task failed: {e}"))?
     }
 
     fn state_job(

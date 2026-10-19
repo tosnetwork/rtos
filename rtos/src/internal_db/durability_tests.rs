@@ -127,26 +127,8 @@ async fn archive_gc_refuses_after_a_failed_write() -> Result<()> {
     Ok(())
 }
 
-/// A durable applied flag is in the database when the call returns.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn durable_applied_flag_is_stored_on_return() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = open_db(dir.path()).await?;
-    let handle = db.create_test_block_handle(&mc(9))?;
-    let held = hold_writer(&db).await?;
-    let applied = {
-        let db = &db;
-        let handle = handle.clone();
-        async move { db.store_block_applied_durable(&handle).await }
-    };
-    tokio::pin!(applied);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(300), &mut applied).await.is_err(),
-        "durable applied flag acknowledged while the writer was held"
-    );
-    held.release.notify_one();
-    assert!(applied.await?);
-    // Read the stored record, not the cached handle.
+/// Reads the stored handle record, bypassing every in-memory cache.
+fn stored_handle(db: &InternalDb, id: &BlockIdExt) -> Result<Option<Arc<BlockHandle>>> {
     let node_db = db.recovery_node_db.clone();
     let mut reader = BlockHandleStorage::with_dbs(
         Arc::new(BlockHandleDb::with_db(node_db.clone(), BLOCK_HANDLE_DB_NAME, false)?),
@@ -161,39 +143,59 @@ async fn durable_applied_flag_is_stored_on_return() -> Result<()> {
         db.allocated.storage.clone(),
     );
     reader.set_no_cache();
-    let stored = reader.load_handle_by_id(&mc(9))?;
-    assert!(stored.is_some_and(|handle| handle.is_applied()));
+    reader.load_handle_by_id(id)
+}
+
+/// A durable applied flag is in the database when the call returns, even
+/// while the ordered writer is held in a callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_applied_flag_is_stored_on_return() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = open_db(dir.path()).await?;
+    let handle = db.create_test_block_handle(&mc(9))?;
+    db.block_handle_storage.sync_pending().await?;
+    let held = hold_writer(&db).await?;
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        db.store_block_applied_durable(&handle),
+    )
+    .await;
+    let stored = stored_handle(&db, &mc(9))?;
+    held.release.notify_one();
+    assert!(applied.map_err(|_| error!("durable applied write did not return"))??);
+    assert!(stored.is_some_and(|handle| handle.is_applied()), "applied flag not stored on return");
     db.stop_states_db().await?;
     Ok(())
 }
 
-/// Archival mode: the saved-state notification fires only after the separate
-/// archival state database was synchronized and the saved flag is durable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn archival_state_is_durable_before_it_is_reported_saved() -> Result<()> {
-    struct Observed {
-        states: Arc<storage::archive_shardstate_db::ArchiveShardStateDb>,
-        synced_at_report: std::sync::Mutex<Option<Option<u64>>>,
-        reported: tokio::sync::Notify,
-    }
-    #[async_trait::async_trait]
-    impl storage::shardstate_db_async::Callback for Observed {
-        async fn invoke(&self, _job: storage::shardstate_db_async::Job) {
-            *self.synced_at_report.lock().unwrap() = Some(self.states.wal_synced_count());
-            self.reported.notify_one();
+/// A notification that reports a state saved, with what was stored when it
+/// fired.
+struct ReportProbe {
+    db: Arc<InternalDb>,
+    id: BlockIdExt,
+    archival_syncs: std::sync::Mutex<Option<Option<u64>>>,
+    stored_saved: std::sync::Mutex<Option<bool>>,
+    reported: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl storage::shardstate_db_async::Callback for ReportProbe {
+    async fn invoke(&self, _job: storage::shardstate_db_async::Job) {
+        if let StateDb::Archive(states) = &self.db.state_db {
+            *self.archival_syncs.lock().unwrap() = Some(states.wal_synced_count());
         }
+        let saved = stored_handle(&self.db, &self.id)
+            .ok()
+            .flatten()
+            .is_some_and(|handle| handle.has_saved_state());
+        *self.stored_saved.lock().unwrap() = Some(saved);
+        self.reported.notify_one();
     }
-    let dir = tempfile::tempdir()?;
-    let db = open_db_with(
-        &dir.path().join("node_db"),
-        Some(storage::archives::epoch::ArchivalModeConfig {
-            epoch_size: 20_000,
-            new_epochs_path: dir.path().join("epochs"),
-            existing_epochs: vec![],
-        }),
-    )
-    .await?;
-    let StateDb::Archive(states) = &db.state_db else { fail!("archival state DB expected") };
+}
+
+/// Stores the fixture state with a report probe while the ordered writer is
+/// held, and returns the probe after the report.
+async fn report_saved_state(db: Arc<InternalDb>) -> Result<Arc<ReportProbe>> {
     let block = crate::block::BlockStuff::read_block_from_file("src/tests/static/b571525")?;
     let state = crate::shard_state::ShardStateStuff::read_from_file(
         block.id().clone(),
@@ -207,33 +209,55 @@ async fn archival_state_is_durable_before_it_is_reported_saved() -> Result<()> {
         .await?
         .to_updated()
         .ok_or_else(|| error!("block data not stored"))?;
-    let observed = Arc::new(Observed {
-        states: states.clone(),
-        synced_at_report: Default::default(),
+    db.block_handle_storage.sync_pending().await?;
+    let probe = Arc::new(ReportProbe {
+        db: db.clone(),
+        id: block.id().clone(),
+        archival_syncs: Default::default(),
+        stored_saved: Default::default(),
         reported: Default::default(),
     });
-    let synced_before = states.wal_synced_count().unwrap_or_default();
     let held = hold_writer(&db).await?;
-    let store = {
-        let db = &db;
-        let handle = handle.clone();
-        let state = state.clone();
-        let callback = observed.clone() as Arc<dyn storage::shardstate_db_async::Callback>;
-        async move { db.store_shard_state_dynamic(&handle, &state, None, Some(callback), false).await }
-    };
-    tokio::pin!(store);
-    let reported_while_held =
-        tokio::time::timeout(std::time::Duration::from_millis(500), &mut store).await.is_ok()
-            || observed.synced_at_report.lock().unwrap().is_some();
+    let reported = probe.reported.notified();
+    db.store_shard_state_dynamic(
+        &handle,
+        &state,
+        None,
+        Some(probe.clone() as Arc<dyn storage::shardstate_db_async::Callback>),
+        false,
+    )
+    .await?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), reported).await;
     held.release.notify_one();
-    store.await?;
-    assert!(!reported_while_held, "state reported saved before its flag was durable");
-    let synced_at_report = observed.synced_at_report.lock().unwrap().flatten().unwrap_or_default();
+    result.map_err(|_| error!("saved state never reported"))?;
+    Ok(probe)
+}
+
+/// Archival mode: when the state is reported saved, the separate archival
+/// state database has been synchronized and the saved flag is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archival_state_is_durable_before_it_is_reported_saved() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(
+        open_db_with(
+            &dir.path().join("node_db"),
+            Some(storage::archives::epoch::ArchivalModeConfig {
+                epoch_size: 20_000,
+                new_epochs_path: dir.path().join("epochs"),
+                existing_epochs: vec![],
+            }),
+        )
+        .await?,
+    );
+    let StateDb::Archive(states) = &db.state_db else { fail!("archival state DB expected") };
+    let synced_before = states.wal_synced_count().unwrap_or_default();
+    let probe = report_saved_state(db.clone()).await?;
+    let synced_at_report = probe.archival_syncs.lock().unwrap().flatten().unwrap_or_default();
     assert!(
         synced_at_report > synced_before,
         "archival state DB was not synchronized before the state was reported saved"
     );
-    assert!(handle.has_saved_state());
+    assert_eq!(*probe.stored_saved.lock().unwrap(), Some(true), "saved flag not stored at report");
     db.stop_states_db().await?;
     Ok(())
 }
@@ -261,6 +285,19 @@ async fn interrupted_recovery_keeps_its_beacon_and_is_repeated() -> Result<()> {
     assert!(beacon.exists(), "recovery beacon lost across restart");
     restore::check_db(&db, 0, true, false, &|| Ok(()), None).await?;
     assert!(!beacon.exists(), "repeated recovery did not complete");
+    db.stop_states_db().await?;
+    Ok(())
+}
+
+/// Dynamic mode: when the state is reported saved, the saved flag is stored;
+/// its synchronized write also covers the state written before it on the
+/// same WAL. The report does not wait for a writer callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_state_is_reported_saved_only_after_durable_flag() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(open_db(dir.path()).await?);
+    let probe = report_saved_state(db.clone()).await?;
+    assert_eq!(*probe.stored_saved.lock().unwrap(), Some(true), "saved flag not stored at report");
     db.stop_states_db().await?;
     Ok(())
 }

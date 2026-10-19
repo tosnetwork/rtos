@@ -350,6 +350,11 @@ async fn failed_commit_refuses_later_durable_acks() {
     assert!(storage.sync_pending().await.is_err());
     let later = storage.save_full_node_state_durable("after".to_owned(), &block_id(3)).await;
     assert!(later.is_err(), "write after a failed commit was acknowledged durable");
+    let handle = handle.unwrap().unwrap();
+    assert!(
+        storage.save_handle_durable(&handle).await.is_err(),
+        "direct durable handle write accepted after a failed commit"
+    );
     let states = NodeStateDb::with_db(main.clone(), "full_node_states", false).unwrap();
     assert!(states.try_get_raw(b"after").unwrap().is_none(), "poisoned writer kept writing");
     assert!(states.try_get_raw(b"before").unwrap().is_some());
@@ -387,6 +392,44 @@ async fn direct_write_supersedes_older_queued_write() {
     storage.sync_pending().await.unwrap();
     assert_eq!(storage.load_validator_state_raw("Rotation").unwrap(), Some(value));
     assert_eq!(storage.load_validator_state("Rotation").unwrap().unwrap().seq_no(), 7);
+}
+
+/// A durable handle write returns without waiting for a held writer
+/// callback, and an older queued snapshot of the same handle that commits
+/// later does not overwrite it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_handle_write_wins_over_older_queued_snapshot() {
+    struct Hold {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl crate::block_handle_db::Callback for Hold {
+        async fn invoke(&self, _job: crate::block_handle_db::StoreJob, _ok: bool) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (storage, main, _catchain) = open_storage(dir.path());
+    let hold = Arc::new(Hold { entered: Default::default(), release: Default::default() });
+    let blocker = storage.create_handle(block_id(9), BlockMeta::default(), None).unwrap().unwrap();
+    storage.save_handle(&blocker, Some(hold.clone())).unwrap();
+    hold.entered.notified().await;
+    // Queued behind the held callback: the handle without any flag.
+    let handle = storage.create_handle(block_id(20), BlockMeta::default(), None).unwrap().unwrap();
+    handle.set_data();
+    tokio::time::timeout(std::time::Duration::from_secs(10), storage.save_handle_durable(&handle))
+        .await
+        .expect("durable handle write waited for a writer callback")
+        .unwrap();
+    let handles = BlockHandleDb::with_db(main.clone(), "block_handles", false).unwrap();
+    let durable =
+        handles.try_get_raw(block_id(20).root_hash().as_slice()).unwrap().unwrap().to_vec();
+    hold.release.notify_one();
+    storage.sync_pending().await.unwrap();
+    let after = handles.try_get_raw(block_id(20).root_hash().as_slice()).unwrap().unwrap().to_vec();
+    assert_eq!(after, durable, "older queued snapshot overwrote the durable handle record");
 }
 
 /// Durable acknowledgement latency with an idle writer and behind a backlog

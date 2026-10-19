@@ -43,8 +43,18 @@ struct GcProgress {
 }
 
 impl AllowStateGcSmartResolver {
+    /// Moves the masterchain boundary as if that progress had been committed
+    /// after a durability barrier.
     #[cfg(test)]
     pub(crate) fn test_advance_expired_mc_boundary(&self, min: u32) {
+        self.test_advance_live_mc_boundary(min);
+        self.committed.write().min_ref_mc_block = min;
+    }
+
+    /// Moves only the live boundary; a gated resolver ignores it until a GC
+    /// cycle commits it.
+    #[cfg(test)]
+    pub(crate) fn test_advance_live_mc_boundary(&self, min: u32) {
         self.min_ref_mc_block.store(min, Ordering::Release);
         self.test_expired.store(true, Ordering::Release);
     }
@@ -304,7 +314,7 @@ mod durable_progress_tests {
     #[test]
     fn gated_resolver_uses_only_committed_progress() {
         let resolver = AllowStateGcSmartResolver::new(0);
-        resolver.test_advance_expired_mc_boundary(10);
+        resolver.test_advance_live_mc_boundary(10);
         assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
         resolver.require_durable_progress();
         assert!(
@@ -312,7 +322,7 @@ mod durable_progress_tests {
             "live progress must not authorize deletion once gated"
         );
         let ticket = resolver.stage_gc_progress().unwrap();
-        resolver.test_advance_expired_mc_boundary(20);
+        resolver.test_advance_live_mc_boundary(20);
         resolver.commit_gc_progress(ticket);
         assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
         assert!(
@@ -335,7 +345,7 @@ mod durable_progress_tests {
     fn ungated_resolver_keeps_live_decisions() {
         let resolver = AllowStateGcSmartResolver::new(0);
         assert_eq!(resolver.stage_gc_progress(), None);
-        resolver.test_advance_expired_mc_boundary(10);
+        resolver.test_advance_live_mc_boundary(10);
         assert!(AllowStateGcResolver::allow_state_gc(&resolver, &mc(5), 0, 0).unwrap());
     }
 }
