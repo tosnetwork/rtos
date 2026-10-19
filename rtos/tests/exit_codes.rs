@@ -159,6 +159,57 @@ fn a_created_configuration_grants_the_console_client_every_permission() {
 }
 
 #[test]
+fn shard_overlay_certificate_options_repeat_like_the_reference_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("config.json"), "{}").unwrap();
+    let (a, b, c) = ("aa".repeat(32), "0b".repeat(32), "cc".repeat(32));
+    let (status, text) = run_configs(
+        dir.path(),
+        &[
+            "--auto-sign",
+            &a,
+            "--auto-sign",
+            &b,
+            "--auto-sign",
+            &a,
+            "--accept-certs-from",
+            &c,
+            "--accept-certs-from",
+            "*",
+            "--accept-certs-from",
+            &c,
+            "--process-conf-and-exit",
+        ],
+    );
+    assert_eq!(status.code(), Some(0), "{text}");
+    let lines: Vec<_> =
+        text.lines().filter(|line| line.contains("shard overlay certificates")).collect();
+    assert_eq!(
+        lines,
+        vec![
+            format!("configured auto-sign shard overlay certificates for adnl={b}"),
+            format!("configured auto-sign shard overlay certificates for adnl={a}"),
+            "configured accepting shard overlay certificates from any validator".to_string(),
+            format!("configured accepting shard overlay certificates from adnl={c}"),
+        ],
+        "duplicates collapse, targets in id order, the wildcard is kept: {text}"
+    );
+    // The options are for this run only.
+    assert_eq!(fs::read_to_string(dir.path().join("config.json")).unwrap(), "{}");
+    for (option, value) in [
+        ("--auto-sign", "zz".to_string()),
+        ("--auto-sign", "00".repeat(32)),
+        ("--auto-sign", "*".to_string()),
+        ("--accept-certs-from", "aa".repeat(31)),
+        ("--accept-certs-from", "00".repeat(32)),
+    ] {
+        let (status, text) = run_configs(dir.path(), &[option, &value, "--process-conf-and-exit"]);
+        assert_eq!(status.code(), Some(2), "{option} {value}: {text}");
+        assert!(text.contains(option), "{text}");
+    }
+}
+
+#[test]
 fn a_held_configuration_lock_exits_2_and_its_release_admits_the_node() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("config.json"), "{}").unwrap();

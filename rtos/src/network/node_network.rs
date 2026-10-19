@@ -12,7 +12,9 @@
 use crate::{
     config::{ConfigEvent, NodeConfigHandler, NodeConfigSubscriber, TonNodeConfig},
     engine_traits::{EngineAlloc, PrivateOverlayOperations, ValidatorListOutcome},
-    network::catchain_client::CatchainClient,
+    network::{
+        catchain_client::CatchainClient, shard_overlay_certificates::ShardCertificateEndpoint,
+    },
 };
 #[cfg(feature = "telemetry")]
 use crate::{engine_traits::EngineTelemetry, network::telemetry::FullNodeNetworkTelemetry};
@@ -125,6 +127,7 @@ pub struct NodeNetwork {
     config_handler: Arc<NodeConfigHandler>,
     default_rldp_roundtrip: Option<u32>,
     cancellation_token: tokio_util::sync::CancellationToken,
+    shard_certificate_endpoint: Arc<ShardCertificateEndpoint>,
 }
 
 declare_counted!(
@@ -288,6 +291,10 @@ impl NodeNetwork {
         let (config_handler, config_handler_context) =
             NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
 
+        let shard_certificate_endpoint = Arc::new(ShardCertificateEndpoint::new(
+            config_handler.shard_overlay_certificate_policy().clone(),
+            overlay_key.id().clone(),
+        ));
         let stack = Arc::new(NetworkStack { adnl, dht, overlay, rldp, quic });
 
         //TODO: remove CatchainClient and configure overlay manager to track private peers
@@ -335,6 +342,7 @@ impl NodeNetwork {
             config_handler,
             default_rldp_roundtrip,
             cancellation_token,
+            shard_certificate_endpoint,
         };
         let node_network = Arc::new(node_network);
 
@@ -452,7 +460,18 @@ impl NodeNetwork {
             self.network_context.stack.adnl.ip_address_adnl(),
             self.network_context.stack.adnl.key_by_tag(Self::TAG_OVERLAY_KEY)?.id()
         );
-        self.network_context.stack.start_over_udp_tcp().await?;
+        // The transport subscribers of the stack, then the receiver of pushed
+        // shard overlay certificates on the full-node identity.
+        let stack = &self.network_context.stack;
+        stack
+            .adnl
+            .start_over_udp_tcp(vec![
+                stack.dht.clone(),
+                stack.overlay.clone(),
+                stack.rldp.clone(),
+                self.shard_certificate_endpoint.clone(),
+            ])
+            .await?;
         log::info!(
             "network started; TCP support {}",
             if self.network_context.stack.is_tcp_available() { "ON" } else { "OFF" }
@@ -490,6 +509,12 @@ impl NodeNetwork {
 
     pub fn config_handler(&self) -> Arc<NodeConfigHandler> {
         self.config_handler.clone()
+    }
+
+    /// Receiver of pushed shard overlay certificates and route of the
+    /// certificate control queries to the full node.
+    pub fn shard_certificate_endpoint(&self) -> &Arc<ShardCertificateEndpoint> {
+        &self.shard_certificate_endpoint
     }
 
     pub async fn stop_adnl(&self) -> Result<()> {

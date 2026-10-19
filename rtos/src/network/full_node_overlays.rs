@@ -35,7 +35,10 @@ use crate::{
         node_network::NodeNetwork,
         overlay_client::OverlayClient,
         pack_block_signatures,
-        shard_overlay_certificates::{OverlayInstall, ShardOverlayCertificates},
+        shard_overlay_certificates::{
+            overlay_certificate_shards, OverlayInstall, ShardOverlayCertificatePolicy,
+            ShardOverlayCertificates, WireShard,
+        },
     },
     types::{
         awaiters_pool::AwaitersPool, owned_tasks::OwnedTasks, top_block_descr::TopBlockDescrStuff,
@@ -45,10 +48,10 @@ use crate::{
 #[cfg(feature = "xp25")]
 use adnl::OverlayNode;
 use adnl::{
-    common::{add_unbound_object_to_map_with_update, TaggedByteSlice},
+    common::{add_unbound_object_to_map_with_update, AdnlPeers, TaggedByteSlice},
     node::AdnlSendMethod,
-    DhtSearchPolicy, OverlayPrivacyRules, OverlayUtils, BROADCAST_FLAG_ANY_SENDER,
-    BROADCAST_FLAG_FIXED_NEIGHBOURS, MAX_SIMPLE_BROADCAST_SIZE,
+    AddressSearchContext, DhtSearchPolicy, OverlayPrivacyRules, OverlayUtils,
+    BROADCAST_FLAG_ANY_SENDER, BROADCAST_FLAG_FIXED_NEIGHBOURS, MAX_SIMPLE_BROADCAST_SIZE,
 };
 #[cfg(feature = "telemetry")]
 use rtos_api::{
@@ -218,7 +221,12 @@ impl FullNodeOverlaysRouter {
             engine.engine_allocated().clone(),
         );
         let actual_monitor_min_split = AtomicU8::new(engine.get_monitor_min_split());
-        Ok(Arc::new(Self {
+        // The live setting is owned by the configuration, which orders every
+        // change of it with its persistence.
+        let ext_messages_broadcast_disabled =
+            network.config_handler().ext_messages_broadcast_disabled_flag();
+        let endpoint = network.shard_certificate_endpoint().clone();
+        let router = Arc::new(Self {
             tasks,
             #[cfg(test)]
             init_gate: std::sync::Mutex::new(None),
@@ -247,17 +255,29 @@ impl FullNodeOverlaysRouter {
             shard_certificates: Arc::new(ShardOverlayCertificates::new()),
             certificate_refresh_started: AtomicBool::new(false),
             ext_messages: Default::default(),
-            ext_messages_broadcast_disabled: Arc::new(AtomicBool::new(false)),
-        }))
+            ext_messages_broadcast_disabled,
+        });
+        endpoint.bind(&router)?;
+        Ok(router)
     }
 
+    /// Once the masterchain and basechain overlays exist the full node
+    /// serves certificate requests, and an issuer starts its pushes.
     pub async fn initialize(self: &Arc<Self>) -> Result<()> {
         let _admission = self.tasks.enter()?;
         futures::try_join!(
             self.overlay_client(&ShardIdent::MASTERCHAIN),
             self.overlay_client(&ShardIdent::BASE_WORKCHAIN)
         )?;
+        self.shard_certificates.set_serving(true);
+        self.start_certificate_issuer()?;
         Ok(())
+    }
+
+    /// Whether certificate control queries and pushes are served: after
+    /// initialization and until the full node stops.
+    pub(crate) fn certificate_service_ready(&self) -> bool {
+        self.shard_certificates.is_serving() && self.tasks.enter().is_ok()
     }
 
     #[cfg(test)]
@@ -1276,9 +1296,17 @@ impl FullNodeOverlaysRouter {
             .clone())
     }
 
+    /// Whether external messages are no longer broadcast or rebroadcast.
+    #[cfg(test)]
+    pub(crate) fn ext_messages_broadcast_disabled(&self) -> bool {
+        self.ext_messages_broadcast_disabled.load(Ordering::Acquire)
+    }
+
     /// Stop (or resume) rebroadcasting external messages; received ones are
-    /// still processed locally.
-    pub fn set_ext_messages_broadcast_disabled(&self, disabled: bool) {
+    /// still processed locally. Operators change it through the
+    /// configuration, which also persists it.
+    #[cfg(test)]
+    pub(crate) fn set_ext_messages_broadcast_disabled(&self, disabled: bool) {
         self.ext_messages_broadcast_disabled.store(disabled, Ordering::Release);
     }
 
@@ -1445,13 +1473,13 @@ impl FullNodeOverlaysRouter {
     }
 
     /// Console import of a certificate for one of this node's shard sources.
-    pub fn import_shard_overlay_certificate(
+    pub fn import_shard_overlay_certificate_wire(
         &self,
-        shard: &ShardIdent,
+        shard: WireShard,
         signed_key: &Arc<KeyId>,
         certificate: &rtos_api::ton::overlay::Certificate,
     ) -> Result<()> {
-        let install = self.shard_certificates.import_certificate(
+        let install = self.shard_certificates.import_certificate_wire(
             shard,
             signed_key,
             certificate,
@@ -1462,14 +1490,40 @@ impl FullNodeOverlaysRouter {
     }
 
     /// Console signing of a certificate for `subject` in `shard`.
-    pub fn sign_shard_overlay_certificate(
+    pub fn sign_shard_overlay_certificate_wire(
         &self,
-        shard: &ShardIdent,
+        shard: WireShard,
         subject: &Arc<KeyId>,
         expire_at: i32,
         max_size: u32,
     ) -> Result<rtos_api::ton::overlay::Certificate> {
-        self.shard_certificates.sign_overlay_certificate(shard, subject, expire_at, max_size)
+        self.shard_certificates.sign_overlay_certificate_wire(shard, subject, expire_at, max_size)
+    }
+
+    /// A certificate pushed by `sender` for this node's full-node identity.
+    pub(crate) fn import_pushed_shard_overlay_certificate(
+        &self,
+        shard: WireShard,
+        sender: &Arc<KeyId>,
+        policy: &ShardOverlayCertificatePolicy,
+        signed_key: &Arc<KeyId>,
+        certificate: &rtos_api::ton::overlay::Certificate,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| error!("system clock before the epoch: {e}"))?
+            .as_secs_f64();
+        let install = self.shard_certificates.import_pushed_certificate(
+            shard,
+            sender,
+            policy,
+            self.full_node_adnl_key()?.id(),
+            signed_key,
+            certificate,
+            now,
+        )?;
+        self.apply_installs(&[install]);
+        Ok(())
     }
 
     /// The full-node ADNL identity changed: drop its certificates only.
@@ -1479,20 +1533,171 @@ impl FullNodeOverlaysRouter {
         Ok(())
     }
 
-    /// Issuer loop step over this node's public shard overlays.
-    pub fn issue_shard_overlay_certificates(
-        &self,
-        targets: &[Arc<KeyId>],
-    ) -> Result<
-        Vec<(Arc<KeyId>, rtos_api::ton::rpc::engine::validator::ImportShardOverlayCertificate)>,
-    > {
-        let mut shards: Vec<_> = self.public_overlays.iter().map(|g| g.key().clone()).collect();
-        shards.sort();
-        self.shard_certificates.issue_shard_overlay_certificates(
-            targets,
-            &shards,
-            rtos_block::UnixTime::now() as i32,
+    /// The issuer: an immediate scan, then one every minute, while the full
+    /// node runs. Without `--auto-sign` targets no task is started.
+    fn start_certificate_issuer(self: &Arc<Self>) -> Result<()> {
+        if self.network.shard_certificate_endpoint().policy().auto_sign().is_empty() {
+            return Ok(());
+        }
+        if !self.shard_certificates.claim_issuer() {
+            return Ok(());
+        }
+        let router = Arc::downgrade(self);
+        let spawned = self.tasks.spawn_cancelable("shard overlay certificate issuer", async move {
+            loop {
+                let Some(router) = router.upgrade() else {
+                    break;
+                };
+                if let Err(error) = router.issue_certificates_once().await {
+                    log::warn!("shard overlay cert issue scan failed: {error}");
+                }
+                drop(router);
+                tokio::time::sleep(crate::network::shard_overlay_certificates::ISSUE_INTERVAL)
+                    .await;
+            }
+        });
+        if let Err(error) = spawned {
+            self.shard_certificates.release_issuer();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// One issuer scan. The issuer is chosen afresh from the applied state's
+    /// transport roots and this node's currently held transport identities;
+    /// every target is attempted, each pair failing on its own. Returns the
+    /// number of certificates sent.
+    pub(crate) async fn issue_certificates_once(&self) -> Result<usize> {
+        let endpoint = self.network.shard_certificate_endpoint().clone();
+        let targets = endpoint.policy().auto_sign();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let source = self.full_node_adnl_key()?.id().clone();
+        let state = match self.engine.load_last_applied_mc_state().await {
+            Ok(state) => state,
+            Err(error) => {
+                log::info!("shard overlay cert issue skipped reason=no-state error={error}");
+                return Ok(0);
+            }
+        };
+        let config = state.config_params()?;
+        let mut all = Vec::new();
+        for set in
+            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?]
+        {
+            all.extend_from_slice(set.list());
+        }
+        let (roots, _) = fast_sync_transport_authority(
+            &all,
+            self.network.context().stack.overlay.wire_profile(),
+        )?;
+        let Some(signer) = self.local_transport_signer(&roots).await? else {
+            log::info!(
+                "shard overlay cert issue skipped reason=no-local-validator targets={}",
+                targets.len()
+            );
+            return Ok(0);
+        };
+        let shards =
+            overlay_certificate_shards(state.shards()?, config, state.state()?.gen_time())?;
+        if shards.is_empty() {
+            log::info!(
+                "shard overlay cert issue skipped reason=no-shards targets={}",
+                targets.len()
+            );
+            return Ok(0);
+        }
+        let expire_at = (rtos_block::UnixTime::now() as i32).saturating_add(
+            crate::network::shard_overlay_certificates::ISSUED_CERTIFICATE_LIFETIME_SEC,
+        );
+        log::info!(
+            "shard overlay cert issue scan issuer={} targets={} shards={} expire_at={expire_at}",
+            signer.id(),
+            targets.len(),
+            shards.len()
+        );
+        let issued = self
+            .shard_certificates
+            .issue_shard_overlay_certificates(&signer, targets, &shards, expire_at)?;
+        let mut by_target: Vec<(Arc<KeyId>, Vec<Vec<u8>>)> = Vec::new();
+        for item in issued {
+            let message = match item.message.and_then(|message| rtos_api::serialize_boxed(&message))
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!(
+                        "shard overlay cert issue failed target={} shard={} issuer={} error={error}",
+                        item.target,
+                        item.shard,
+                        signer.id()
+                    );
+                    continue;
+                }
+            };
+            match by_target.iter_mut().find(|(target, _)| target == &item.target) {
+                Some((_, messages)) => messages.push(message),
+                None => by_target.push((item.target, vec![message])),
+            }
+        }
+        let sent = futures::future::join_all(
+            by_target
+                .into_iter()
+                .map(|(target, messages)| self.push_certificates(&source, target, messages)),
         )
+        .await;
+        Ok(sent.into_iter().sum())
+    }
+
+    /// Send pushed certificates to one target, looking its address up once
+    /// when ADNL cannot reach it yet. Returns the number sent.
+    async fn push_certificates(
+        &self,
+        source: &Arc<KeyId>,
+        target: Arc<KeyId>,
+        messages: Vec<Vec<u8>>,
+    ) -> usize {
+        const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let stack = &self.network.context().stack;
+        let peers = AdnlPeers::with_keys(source.clone(), target.clone());
+        let mut resolved = false;
+        let mut sent = 0;
+        for message in messages {
+            let data = TaggedByteSlice {
+                object: &message,
+                #[cfg(feature = "telemetry")]
+                tag: crate::network::shard_overlay_certificates::push_constructor(),
+            };
+            let mut result = stack.adnl.send_custom(&data, &peers).await;
+            if result.is_err() && !resolved {
+                resolved = true;
+                let lookup = async {
+                    let found = stack
+                        .dht
+                        .find_address(&mut AddressSearchContext::with_params(
+                            &target,
+                            DhtSearchPolicy::default(),
+                        )?)
+                        .await?;
+                    let (address, quic, key) =
+                        found.ok_or_else(|| error!("address of {target} not found"))?;
+                    stack.adnl.add_peer(source, &address, quic.as_ref(), &key)?;
+                    Ok::<_, rtos_block::Error>(())
+                };
+                result = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
+                    Ok(Ok(())) => stack.adnl.send_custom(&data, &peers).await,
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(error!("address lookup of {target} timed out")),
+                };
+            }
+            match result {
+                Ok(()) => sent += 1,
+                Err(error) => {
+                    log::warn!("shard overlay cert push failed target={target} error={error}");
+                }
+            }
+        }
+        sent
     }
 
     #[cfg(test)]
@@ -1821,6 +2026,7 @@ impl FullNodeOverlaysRouter {
     }
 
     pub fn stop(&self) {
+        self.shard_certificates.set_serving(false);
         self.tasks.stop();
         self.delete_overlays();
     }
@@ -2066,3 +2272,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/test_fast_sync_snapshot.rs"]
 mod snapshot_tests;
+
+#[cfg(test)]
+#[path = "tests/test_shard_certificate_push.rs"]
+mod certificate_push_tests;

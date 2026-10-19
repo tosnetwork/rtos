@@ -213,6 +213,9 @@ fn served_queries_require_the_reference_bits() {
         (GetSelectedStats::default().into_tl_object(), VEP_DEFAULT),
         (GetBundle::default().into_tl_object(), VEP_MODIFY),
         (GetFutureBundle::default().into_tl_object(), VEP_MODIFY),
+        (SignShardOverlayCertificate::default().into_tl_object(), VEP_MODIFY),
+        (ImportShardOverlayCertificate::default().into_tl_object(), VEP_MODIFY),
+        (SetExtMessagesBroadcastDisabled::default().into_tl_object(), VEP_MODIFY),
     ];
     for (query, bits) in expected {
         assert_eq!(required_permission(&query), Some(bits), "{query:?}");
@@ -435,4 +438,49 @@ async fn each_server_authorizes_from_its_own_table() {
     assert_eq!(refusal(ask(&mut connection, GenerateKeyPair::default()).await), forbidden());
     first.shutdown().await;
     second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn certificate_and_broadcast_queries_need_modify_then_a_serving_full_node() {
+    let key_ring = CountingKeyRing::new();
+    let reader = client();
+    let operator = client();
+    let server = start(
+        serde_json::json!({ "list": [
+            listed(&reader, Some(1.into())),
+            listed(&operator, Some(2.into())),
+        ]}),
+        key_ring.clone(),
+    )
+    .await;
+    let mut connection = connect(&server, &reader).await;
+    assert_eq!(
+        refusal(ask(&mut connection, SignShardOverlayCertificate::default()).await),
+        not_authorized()
+    );
+    assert_eq!(
+        refusal(ask(&mut connection, ImportShardOverlayCertificate::default()).await),
+        not_authorized()
+    );
+    assert_eq!(
+        refusal(ask(&mut connection, SetExtMessagesBroadcastDisabled::default()).await),
+        not_authorized()
+    );
+    // Without a serving full node each is refused as not ready, with the
+    // reference code rather than the generic handler failure.
+    let not_started = Some((651, "not started".to_string()));
+    let mut connection = connect(&server, &operator).await;
+    assert_eq!(
+        refusal(ask(&mut connection, SignShardOverlayCertificate::default()).await),
+        not_started
+    );
+    assert_eq!(
+        refusal(ask(&mut connection, ImportShardOverlayCertificate::default()).await),
+        not_started
+    );
+    assert_eq!(
+        refusal(ask(&mut connection, SetExtMessagesBroadcastDisabled::default()).await),
+        not_started
+    );
+    server.shutdown().await;
 }

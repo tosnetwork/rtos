@@ -14,7 +14,10 @@ use crate::{
     config::{KeyRing, NodeConfigHandler},
     engine::Engine,
     engine_traits::{EngineOperations, Stoppable},
-    network::node_network::NodeNetwork,
+    network::{
+        node_network::NodeNetwork,
+        shard_overlay_certificates::{error_code, ShardCertificateEndpoint, WireShard},
+    },
     shard_states_keeper::PinnedShardStateGuard,
     validating_utils::{supported_capabilities, supported_version},
 };
@@ -49,7 +52,8 @@ use rtos_api::{
                 AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
                 AddValidatorTempKey, ControlQuery, DelCustomOverlay, ExportPublicKey,
                 GenerateKeyPair, GetBundle, GetConfig, GetFutureBundle, GetSelectedStats, GetStats,
-                ImportPrivateKey, ShowCustomOverlays, Sign,
+                ImportPrivateKey, ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled,
+                ShowCustomOverlays, Sign, SignShardOverlayCertificate,
             },
             lite_server::{
                 GetBlock, GetConfigAll, GetConfigParams, Query as LiteServerQuery, SendMessage,
@@ -78,6 +82,7 @@ pub(crate) const VEP_UNSAFE: u32 = 4;
 /// Reference engine error codes used in control replies.
 const ERROR_CODE_ERROR: i32 = 602;
 const ERROR_CODE_PROTOVIOLATION: i32 = 621;
+const ERROR_CODE_NOTREADY: i32 = 651;
 
 /// The permission bits a served control query needs. Zero means that being a
 /// listed client is enough, as for lite-server queries on the control port.
@@ -114,6 +119,9 @@ pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
         GetSelectedStats => VEP_DEFAULT,
         GetBundle => VEP_MODIFY,
         GetFutureBundle => VEP_MODIFY,
+        SignShardOverlayCertificate => VEP_MODIFY,
+        ImportShardOverlayCertificate => VEP_MODIFY,
+        SetExtMessagesBroadcastDisabled => VEP_MODIFY,
     );
     None
 }
@@ -205,6 +213,7 @@ struct ControlQuerySubscriber {
     key_ring: Arc<dyn KeyRing>,
     config: Arc<NodeConfigHandler>,
     public_overlay_adnl_id: Option<Arc<KeyId>>,
+    certificates: Option<Arc<ShardCertificateEndpoint>>,
     permissions: Arc<ClientPermissions>,
 }
 
@@ -221,8 +230,15 @@ impl ControlQuerySubscriber {
         } else {
             None
         };
-        let ret =
-            Self { data_source, key_ring, config, public_overlay_adnl_id: key_id, permissions };
+        let certificates = network.map(|network| network.shard_certificate_endpoint().clone());
+        let ret = Self {
+            data_source,
+            key_ring,
+            config,
+            public_overlay_adnl_id: key_id,
+            certificates,
+            permissions,
+        };
         Ok(ret)
     }
 
@@ -771,6 +787,83 @@ impl ControlQuerySubscriber {
         Ok(Success::Engine_Validator_Success)
     }
 
+    /// The full node, when it serves requests. The key ring the reference
+    /// engine also waits for exists before this server does, so only the
+    /// full node can be not ready.
+    fn certificate_router(
+        &self,
+    ) -> Option<Arc<crate::network::full_node_overlays::FullNodeOverlaysRouter>> {
+        if !matches!(self.data_source, DataSource::Engine(_)) {
+            return None;
+        }
+        self.certificates.as_ref()?.serving_router().ok()
+    }
+
+    /// Integer fields keep the wire bit patterns: the unsigned size is the
+    /// signed wire value reinterpreted, as the reference engine does.
+    fn sign_shard_overlay_certificate(
+        &self,
+        query: SignShardOverlayCertificate,
+    ) -> Result<QueryResult> {
+        let Some(router) = self.certificate_router() else {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        };
+        let subject = KeyId::from_data(query.signed_key.key_hash().clone().inner());
+        match router.sign_shard_overlay_certificate_wire(
+            WireShard { workchain: query.workchain, shard: query.shard },
+            &subject,
+            query.expire_at,
+            query.max_size as u32,
+        ) {
+            Ok(certificate) => QueryResult::consume_boxed(
+                certificate,
+                #[cfg(feature = "telemetry")]
+                None,
+            ),
+            Err(error) => {
+                control_error(error_code(&error), format!("failed to import cert: {error}"))
+            }
+        }
+    }
+
+    fn import_shard_overlay_certificate(
+        &self,
+        query: ImportShardOverlayCertificate,
+    ) -> Result<QueryResult> {
+        let Some(router) = self.certificate_router() else {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        };
+        let signed_key = KeyId::from_data(query.signed_key.key_hash().clone().inner());
+        match router.import_shard_overlay_certificate_wire(
+            WireShard { workchain: query.workchain, shard: query.shard },
+            &signed_key,
+            &query.cert,
+        ) {
+            Ok(()) => QueryResult::consume_boxed(
+                Success::Engine_Validator_Success,
+                #[cfg(feature = "telemetry")]
+                None,
+            ),
+            Err(error) => {
+                control_error(error_code(&error), format!("failed to import cert: {error}"))
+            }
+        }
+    }
+
+    async fn set_ext_messages_broadcast_disabled(&self, disabled: bool) -> Result<QueryResult> {
+        if self.certificate_router().is_none() {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        }
+        match self.config.set_ext_messages_broadcast_disabled(disabled).await {
+            Ok(()) => QueryResult::consume_boxed(
+                Success::Engine_Validator_Success,
+                #[cfg(feature = "telemetry")]
+                None,
+            ),
+            Err(error) => control_error(error_code(&error), error.to_string()),
+        }
+    }
+
     async fn redirect_external_message(&self, message_data: &[u8]) -> Result<Success> {
         let engine = self.engine()?;
         engine.redirect_external_message(message_data).await?;
@@ -1067,6 +1160,23 @@ impl ControlQuerySubscriber {
                     #[cfg(feature = "telemetry")]
                     None,
                 );
+            }
+            Err(query) => query,
+        };
+
+        let query = match query.downcast::<SignShardOverlayCertificate>() {
+            Ok(query) => return self.sign_shard_overlay_certificate(query),
+            Err(query) => query,
+        };
+
+        let query = match query.downcast::<ImportShardOverlayCertificate>() {
+            Ok(query) => return self.import_shard_overlay_certificate(query),
+            Err(query) => query,
+        };
+
+        let query = match query.downcast::<SetExtMessagesBroadcastDisabled>() {
+            Ok(query) => {
+                return self.set_ext_messages_broadcast_disabled((&query.disabled).into()).await
             }
             Err(query) => query,
         };

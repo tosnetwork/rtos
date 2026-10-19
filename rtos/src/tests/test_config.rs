@@ -20,6 +20,8 @@ fn make_test_config_handler() -> NodeConfigHandler {
         key_ring: Arc::new(lockfree::map::Map::new()),
         validator_keys: Arc::new(ValidatorKeys::new()),
         consensus_transport_bindings: Vec::new(),
+        shard_overlay_certificate_policy: Default::default(),
+        ext_messages: Arc::default(),
     }
 }
 
@@ -1042,5 +1044,112 @@ fn durable_config_replacement_preserves_old_file_on_failure() -> Result<()> {
     assert!(write_config_durable(&blocked, br#"{"version":4}"#).is_err());
     assert_eq!(std::fs::read(blocked.join("sentinel"))?, b"retained");
     assert!(std::fs::read_dir(dir.path())?.all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    Ok(())
+}
+
+async fn ext_messages_handler(
+    dir: &std::path::Path,
+) -> Result<(Arc<NodeConfigHandler>, std::path::PathBuf)> {
+    let path = dir.join("config.json");
+    if !path.exists() {
+        std::fs::write(&path, r#"{"validator_keys": [], "validator_key_ring": {}}"#)?;
+    }
+    let config = TonNodeConfig::from_file(
+        dir.to_str().expect("temporary path must be UTF-8"),
+        "config.json",
+        None,
+        "default_config.json",
+        None,
+    )
+    .await?;
+    let (handler, context) = NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
+    handler.clone().start_sheduler(context, vec![])?;
+    Ok((handler, path))
+}
+
+fn stored_ext_messages_flag(path: &std::path::Path) -> Result<Option<bool>> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    Ok(json.get("ext_messages_broadcast_disabled").and_then(serde_json::Value::as_bool))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ext_messages_setting_is_one_ordered_persisted_transition() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (handler, path) = ext_messages_handler(dir.path()).await?;
+    let live = handler.ext_messages_broadcast_disabled_flag();
+    assert!(!live.load(atomic::Ordering::Acquire));
+    // An unchanged value succeeds without writing.
+    let before = std::fs::read(&path)?;
+    handler.set_ext_messages_broadcast_disabled(false).await?;
+    assert_eq!(std::fs::read(&path)?, before);
+    handler.set_ext_messages_broadcast_disabled(true).await?;
+    assert!(live.load(atomic::Ordering::Acquire));
+    assert_eq!(stored_ext_messages_flag(&path)?, Some(true));
+    // A failed write is reported with the change already in force; the same
+    // value then succeeds without another write.
+    handler.fail_next_ext_messages_save();
+    let error = handler.set_ext_messages_broadcast_disabled(false).await.unwrap_err();
+    assert_eq!(
+        crate::network::shard_overlay_certificates::error_code(&error),
+        libc::EIO,
+        "an operating-system failure keeps its errno"
+    );
+    assert!(!live.load(atomic::Ordering::Acquire));
+    let stale = std::fs::read(&path)?;
+    handler.set_ext_messages_broadcast_disabled(false).await?;
+    assert_eq!(std::fs::read(&path)?, stale, "equal-value retry must not write");
+    assert_eq!(stored_ext_messages_flag(&path)?, Some(true));
+    // Concurrent opposite requests leave live state, memory and disk agreeing.
+    let mut requests = Vec::new();
+    for i in 0..16 {
+        let handler = handler.clone();
+        requests.push(tokio::spawn(async move {
+            handler.set_ext_messages_broadcast_disabled(i % 2 == 0).await
+        }));
+    }
+    for request in requests {
+        request.await??;
+    }
+    handler.stop_and_wait().await?;
+    let final_live = live.load(atomic::Ordering::Acquire);
+    assert_eq!(stored_ext_messages_flag(&path)?.unwrap_or(false), final_live);
+    // A restart reads the last successful write.
+    let (reloaded, _) = ext_messages_handler(dir.path()).await?;
+    assert_eq!(
+        reloaded.ext_messages_broadcast_disabled_flag().load(atomic::Ordering::Acquire),
+        final_live
+    );
+    reloaded.stop_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ext_messages_restart_reads_the_last_successful_write() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (handler, path) = ext_messages_handler(dir.path()).await?;
+    handler.set_ext_messages_broadcast_disabled(true).await?;
+    handler.fail_next_ext_messages_save();
+    assert!(handler.set_ext_messages_broadcast_disabled(false).await.is_err());
+    handler.stop_and_wait().await?;
+    assert_eq!(stored_ext_messages_flag(&path)?, Some(true));
+    let (reloaded, _) = ext_messages_handler(dir.path()).await?;
+    assert!(reloaded.ext_messages_broadcast_disabled_flag().load(atomic::Ordering::Acquire));
+    reloaded.stop_and_wait().await?;
+    Ok(())
+}
+
+#[test]
+fn shard_overlay_certificate_policy_is_never_written() -> Result<()> {
+    let mut config: TonNodeConfig = serde_json::from_value(serde_json::json!({}))?;
+    let mut policy =
+        crate::network::shard_overlay_certificates::ShardOverlayCertificatePolicy::default();
+    policy.add_auto_sign(&"11".repeat(32))?;
+    policy.add_accept_certs_from("*")?;
+    config.set_shard_overlay_certificate_policy(policy);
+    let json = serde_json::to_value(&config)?;
+    let text = json.to_string();
+    assert!(!text.contains("auto_sign") && !text.contains("accept") && !text.contains("1111"));
+    assert!(json.get("ext_messages_broadcast_disabled").is_none(), "false is not written");
+    assert!(!config.ext_messages_broadcast_disabled());
     Ok(())
 }

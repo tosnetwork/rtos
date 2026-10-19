@@ -63,6 +63,7 @@ use crate::{
     config::{SecretsVaultConfig, TonNodeConfig},
     engine::{Engine, EngineFlags, Stopper},
     internal_db::restore::set_graceful_termination,
+    network::shard_overlay_certificates::ShardOverlayCertificatePolicy,
     validating_utils::supported_version,
 };
 use rtos_block::Result;
@@ -480,6 +481,23 @@ fn build_command() -> clap::Command {
                 .long("truncate-db")
                 .value_name("truncate_db")
                 .help("truncate the database at the specified masterchain block sequence number"),
+        )
+        .arg(
+            clap::Arg::new("auto_sign")
+                .long("auto-sign")
+                .value_name("adnl")
+                .action(clap::ArgAction::Append)
+                .help("ADNL id (hex) to receive automatically issued shard overlay certificates"),
+        )
+        .arg(
+            clap::Arg::new("accept_certs_from")
+                .long("accept-certs-from")
+                .value_name("adnl")
+                .action(clap::ArgAction::Append)
+                .help(
+                    "accept shard overlay certificates from sender ADNL id (hex), or \"*\" for \
+                     any validator issuer",
+                ),
         );
 
     #[cfg(feature = "mirrornet")]
@@ -490,6 +508,40 @@ fn build_command() -> clap::Command {
             .help("shift the node's time by the specified number of seconds (can be negative) for testing purposes"),
     );
     app
+}
+
+/// The shard overlay certificate options of this run, in the order given:
+/// repeated values accumulate, and `*` accepts from any sender for good.
+fn shard_overlay_certificate_policy(
+    matches: &clap::ArgMatches,
+) -> std::result::Result<ShardOverlayCertificatePolicy, String> {
+    let mut policy = ShardOverlayCertificatePolicy::default();
+    for value in matches.get_many::<String>("auto_sign").into_iter().flatten() {
+        policy.add_auto_sign(value).map_err(|e| format!("--auto-sign {value}: {e}"))?;
+    }
+    for value in matches.get_many::<String>("accept_certs_from").into_iter().flatten() {
+        policy
+            .add_accept_certs_from(value)
+            .map_err(|e| format!("--accept-certs-from {value}: {e}"))?;
+    }
+    for target in policy.auto_sign() {
+        println!(
+            "configured auto-sign shard overlay certificates for adnl={}",
+            hex::encode(target.data())
+        );
+    }
+    if policy.accepts_from_any() {
+        println!("configured accepting shard overlay certificates from any validator");
+    }
+    let mut senders: Vec<_> = policy.accepted_senders().iter().collect();
+    senders.sort_by(|left, right| left.data().cmp(right.data()));
+    for sender in senders {
+        println!(
+            "configured accepting shard overlay certificates from adnl={}",
+            hex::encode(sender.data())
+        );
+    }
+    Ok(policy)
 }
 
 fn build_runtime(name: &str) -> std::result::Result<tokio::runtime::Runtime, i32> {
@@ -604,6 +656,14 @@ fn run_node() -> i32 {
         }
     };
 
+    let certificate_policy = match shard_overlay_certificate_policy(&matches) {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_CONFIG;
+        }
+    };
+
     let flags = EngineFlags {
         initial_sync_disabled: matches.get_flag("initial_sync_disabled"),
         force_check_db: matches.get_flag("force_check_db"),
@@ -664,6 +724,8 @@ fn run_node() -> i32 {
             return EXIT_CONFIG;
         }
     };
+
+    config.set_shard_overlay_certificate_policy(certificate_policy);
 
     if created {
         let path = std::path::Path::new(config_dir_path).join(CONFIG_NAME);

@@ -59,6 +59,7 @@ fn write_config_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 use crate::network::{
     liteserver::{LiteServerConfig, LiteServerConfigJson},
     node_network::NodeNetwork,
+    shard_overlay_certificates::ShardOverlayCertificatePolicy,
 };
 use adnl::{
     client::AdnlClientConfigJson,
@@ -565,6 +566,14 @@ pub struct TonNodeConfig {
     pss_cells_cache_max_count: usize,
     #[serde(default = "TonNodeConfig::default_pss_prev_part_max_size")]
     pss_prev_part_max_size: usize,
+    /// Neither broadcast nor rebroadcast external messages; set at run time
+    /// by the control query and kept here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ext_messages_broadcast_disabled: bool,
+    /// From the `--auto-sign` and `--accept-certs-from` options of this run;
+    /// never written to the file.
+    #[serde(skip)]
+    shard_overlay_certificate_policy: ShardOverlayCertificatePolicy,
 }
 
 pub struct TonNodeGlobalConfig(TonNodeGlobalConfigJson);
@@ -953,6 +962,13 @@ impl TonNodeConfig {
 
     pub fn extensions(&self) -> &NodeExtensions {
         &self.extensions
+    }
+    #[cfg(test)]
+    pub fn ext_messages_broadcast_disabled(&self) -> bool {
+        self.ext_messages_broadcast_disabled
+    }
+    pub fn set_shard_overlay_certificate_policy(&mut self, policy: ShardOverlayCertificatePolicy) {
+        self.shard_overlay_certificate_policy = policy;
     }
     pub fn restore_db(&self) -> bool {
         self.restore_db
@@ -1534,6 +1550,7 @@ enum Task {
     AddCustomOverlay(CustomOverlay),
     DelCustomOverlay(String),
     GetCustomOverlays,
+    SetExtMessagesBroadcastDisabled(bool),
 }
 
 #[derive(Debug)]
@@ -1544,6 +1561,16 @@ enum Answer {
     Result(Result<()>),
     AdnlKeys(Vec<(String, usize)>),
     CustomOverlays(Result<CustomOverlaysConfigBoxed>),
+}
+
+impl ExtMessagesSetting {
+    async fn save(&self, config: &TonNodeConfig, name: &str) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_save.swap(false, atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        config.save_to_file(name).await
+    }
 }
 
 #[path = "config_scheduler.rs"]
@@ -1564,6 +1591,17 @@ pub struct NodeConfigHandler {
     key_ring: Arc<lockfree::map::Map<String, Arc<dyn KeyOption>>>,
     validator_keys: Arc<ValidatorKeys>,
     consensus_transport_bindings: Vec<ConsensusTransportBinding>,
+    shard_overlay_certificate_policy: ShardOverlayCertificatePolicy,
+    ext_messages: Arc<ExtMessagesSetting>,
+}
+
+/// The live external-message broadcast setting. Only the configuration
+/// actor changes it, in the same step as the configuration it persists.
+#[derive(Default)]
+struct ExtMessagesSetting {
+    live: Arc<atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_next_save: atomic::AtomicBool,
 }
 
 impl NodeConfigHandler {
@@ -1623,6 +1661,12 @@ impl NodeConfigHandler {
             key_ring: Arc::new(lockfree::map::Map::new()),
             validator_keys: Arc::new(ValidatorKeys::new()),
             consensus_transport_bindings: bindings,
+            shard_overlay_certificate_policy: config.shard_overlay_certificate_policy.clone(),
+            ext_messages: Arc::new(ExtMessagesSetting {
+                live: Arc::new(atomic::AtomicBool::new(config.ext_messages_broadcast_disabled)),
+                #[cfg(test)]
+                fail_next_save: atomic::AtomicBool::new(false),
+            }),
         });
 
         Ok((config_handler, NodeConfigHandlerContext { reader, config }))
@@ -1853,6 +1897,40 @@ impl NodeConfigHandler {
             Some(Some(_)) => fail!("Bad answer (Result needed)!"),
             None => fail!("Waiting returned an internal error!"),
         }
+    }
+
+    /// The startup policy of shard overlay certificate pushes.
+    pub fn shard_overlay_certificate_policy(&self) -> &ShardOverlayCertificatePolicy {
+        &self.shard_overlay_certificate_policy
+    }
+
+    /// The live external-message broadcast setting the full node reads.
+    pub fn ext_messages_broadcast_disabled_flag(&self) -> Arc<atomic::AtomicBool> {
+        self.ext_messages.live.clone()
+    }
+
+    /// Change the external-message broadcast setting: an unchanged value
+    /// succeeds without a write; otherwise the configuration and the live
+    /// setting change first and the file is written after, so a failed write
+    /// is reported with the change already in force.
+    pub async fn set_ext_messages_broadcast_disabled(&self, disabled: bool) -> Result<()> {
+        let (wait, mut queue_reader) = Wait::new();
+        let pushed_task = (wait.clone(), Task::SetExtMessagesBroadcastDisabled(disabled));
+        wait.request();
+        if let Err(e) = self.send_task(pushed_task) {
+            fail!("Error set_ext_messages_broadcast_disabled: {}", e);
+        }
+        match wait.wait(&mut queue_reader, true).await {
+            Some(None) => fail!("Answer was not set!"),
+            Some(Some(Answer::Result(result))) => result,
+            Some(Some(_)) => fail!("Bad answer (SetExtMessagesBroadcastDisabled)!"),
+            None => fail!("Waiting returned an internal error!"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_ext_messages_save(&self) {
+        self.ext_messages.fail_next_save.store(true, atomic::Ordering::SeqCst);
     }
 
     pub async fn show_custom_overlays(&self) -> Result<CustomOverlaysConfigBoxed> {
@@ -2282,6 +2360,7 @@ impl NodeConfigHandler {
         let mut reader = scheduler::ConfigInbox(config_handler_context.reader);
         let key_ring = self.key_ring.clone();
         let validator_keys = self.validator_keys.clone();
+        let ext_messages = self.ext_messages.clone();
         let scheduler = self.scheduler.clone();
         let mut admission = scheduler.admission.lock().unwrap();
         if !admission.open || admission.started {
@@ -2394,6 +2473,16 @@ impl NodeConfigHandler {
                     }
                     Task::GetCustomOverlays => {
                         Answer::CustomOverlays(Ok(actual_config.custom_overlays.clone()))
+                    }
+                    Task::SetExtMessagesBroadcastDisabled(disabled) => {
+                        let result = if actual_config.ext_messages_broadcast_disabled == disabled {
+                            Ok(())
+                        } else {
+                            actual_config.ext_messages_broadcast_disabled = disabled;
+                            ext_messages.live.store(disabled, atomic::Ordering::Release);
+                            ext_messages.save(&actual_config, &name).await
+                        };
+                        Answer::Result(result)
                     }
                 };
                 response.respond(answer);
