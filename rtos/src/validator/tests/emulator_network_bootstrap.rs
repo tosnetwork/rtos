@@ -259,7 +259,15 @@ fn make_config_params(
         proto_version: 0,
         catchain_max_blocks_coeff: 0,
     };
-    let simplex_config = SimplexConfig::default();
+    // Fixtures pin genesis ids built with a 2400 ms target rate; keep it explicit
+    // rather than following the protocol default.
+    let simplex_config = SimplexConfig {
+        noncritical_params: rtos_block::NoncriticalParams {
+            target_rate_ms: 2400,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let block_limits = make_block_limits()?;
     let mut workchain_descr = WorkchainDescr::default();
     workchain_descr.format =

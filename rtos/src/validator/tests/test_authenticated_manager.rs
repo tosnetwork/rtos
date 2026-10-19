@@ -32,7 +32,12 @@ fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) ->
     bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam32(rtos_block::ConfigParam32 {
         prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, vec![previous])?,
     }))?;
-    let v2 = SimplexConfig { protocol_version: 2, ..Default::default() };
+    // The signed manager history pins the genesis built with a 2400 ms target rate.
+    let v2 = SimplexConfig {
+        protocol_version: 2,
+        noncritical_params: rtos_block::NoncriticalParams { target_rate_ms: 2400, ..Default::default() },
+        ..Default::default()
+    };
     bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
         mc: Some(v2.clone()), shard: Some(v2),
     }))?;
