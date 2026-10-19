@@ -4,7 +4,7 @@ use crate::{
     ConsensusKeyStore, Error, KeyWindow,
 };
 use rtos_block::{UInt256, ValidatorDescr, ValidatorKey};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct HeldKey {
@@ -21,29 +21,48 @@ impl PqConsensusCustody {
     /// Load an entire configured binding before exposing it. Any live seed or
     /// derived-ID error rejects startup; it is never downgraded to an observer.
     pub fn load(validator: UInt256, config: &[ConfiguredKey], now: u32) -> Result<Self, Error> {
+        Self::load_with_key_ids(validator, config, now).map(|(custody, _)| custody)
+    }
+    /// The startup order of the reference node: plan the load before reading any
+    /// seed, load every unexpired seed, check the schedule over the identities the
+    /// seeds derive (the same seed under two paths is refused only here), install
+    /// every loaded key, and only then record the windows of expired keys that
+    /// were not loaded. Also returns the derived key identity of each loaded file.
+    pub fn load_with_key_ids(
+        validator: UInt256,
+        config: &[ConfiguredKey],
+        now: u32,
+    ) -> Result<(Self, BTreeMap<PathBuf, [u8; 32]>), Error> {
         if validator == UInt256::default() {
             return Err(Error::InvalidValidator);
         }
         let to_load = plan_key_load(config, now)?;
-        let mut result = Self::default();
-        for (i, entry) in config.iter().enumerate() {
-            if !to_load.contains(&i) {
-                result.record_unloaded(validator.clone(), entry.valid_from, entry.expire_at)?;
-                continue;
-            }
+        let mut loaded = Vec::with_capacity(to_load.len());
+        let mut schedule = Vec::with_capacity(to_load.len());
+        let mut key_ids_by_file = BTreeMap::new();
+        for &index in &to_load {
+            let entry = &config[index];
             let store = Arc::new(load_consensus_key(&entry.key_file, entry.expire_at)?);
-            let id = store.consensus_key().key_id.as_array();
-            // install supports updating an existing held window; loading a
-            // configuration must instead reject the same seed under two paths.
-            if result.held.get(&validator).is_some_and(|keys| keys.contains_key(id)) {
-                return Err(Error::InvalidSchedule("duplicate seed-derived key identity"));
+            let id = *store.consensus_key().key_id.as_array();
+            schedule.push(KeyWindow {
+                key_id: Some(id),
+                valid_from: entry.valid_from,
+                expire_at: entry.expire_at,
+            });
+            key_ids_by_file.insert(entry.key_file.clone(), id);
+            loaded.push((store, entry.valid_from, entry.expire_at));
+        }
+        validate_schedule(&schedule)?;
+        let mut result = Self::default();
+        for (store, valid_from, expire_at) in loaded {
+            result.install(validator.clone(), store, valid_from, expire_at)?;
+        }
+        for (index, entry) in config.iter().enumerate() {
+            if !to_load.contains(&index) {
+                result.record_unloaded(validator.clone(), entry.valid_from, entry.expire_at)?;
             }
-            result.install(validator.clone(), store, entry.valid_from, entry.expire_at)?;
         }
-        if result.usable_key_ids(&validator, now).is_empty() {
-            return Err(Error::InvalidSchedule("no configured consensus key is usable"));
-        }
-        Ok(result)
+        Ok((result, key_ids_by_file))
     }
     pub fn install(
         &mut self,

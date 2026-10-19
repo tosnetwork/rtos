@@ -21,16 +21,23 @@ impl KeyWindow {
     }
 }
 pub fn validate_windows(keys: &[KeyWindow]) -> Result<(), Error> {
-    if keys.is_empty() || keys.len() > MAX_HELD_KEYS {
-        return Err(Error::InvalidSchedule("between one and eight keys are required"));
+    if keys.is_empty() {
+        return Err(Error::InvalidSchedule("no consensus key is configured"));
+    }
+    if keys.len() > MAX_HELD_KEYS {
+        return Err(Error::InvalidSchedule("at most 8 consensus keys may be held at once"));
     }
     let mut starts = BTreeSet::new();
     for key in keys {
         if key.expire_at != 0 && key.expire_at <= key.valid_from {
-            return Err(Error::InvalidSchedule("expiry must follow the election window start"));
+            return Err(Error::InvalidSchedule(
+                "a consensus key expires not after its window opens",
+            ));
         }
         if !starts.insert(key.valid_from) {
-            return Err(Error::InvalidSchedule("duplicate election window start"));
+            return Err(Error::InvalidSchedule(
+                "two consensus keys are valid from the same election date",
+            ));
         }
     }
     Ok(())
@@ -41,34 +48,39 @@ pub fn validate_schedule(keys: &[KeyWindow]) -> Result<(), Error> {
     for key in keys {
         if let Some(id) = key.key_id {
             if !identities.insert(id) {
-                return Err(Error::InvalidSchedule("duplicate seed-derived key identity"));
+                return Err(Error::InvalidSchedule("a consensus key is configured twice"));
             }
         }
     }
     Ok(())
 }
+/// Decided before any seed is read. File paths are refused first, key by key,
+/// and only then the windows, so the first refusal reported for a configuration
+/// is the same one the reference node reports.
 pub fn plan_key_load(keys: &[ConfiguredKey], now: u32) -> Result<Vec<usize>, Error> {
-    let windows: Vec<_> = keys
-        .iter()
-        .map(|key| KeyWindow { key_id: None, valid_from: key.valid_from, expire_at: key.expire_at })
-        .collect();
-    validate_windows(&windows)?;
     let mut paths = BTreeSet::new();
+    let mut windows = Vec::with_capacity(keys.len());
     for key in keys {
         if key.key_file.as_os_str().is_empty() {
-            return Err(Error::InvalidSchedule("empty seed file path"));
+            return Err(Error::InvalidSchedule("a consensus key is configured with no key file"));
         }
         if !paths.insert(&key.key_file) {
-            return Err(Error::InvalidSchedule("duplicate seed file path"));
+            return Err(Error::InvalidSchedule("a consensus key file is configured twice"));
         }
+        windows.push(KeyWindow {
+            key_id: None,
+            valid_from: key.valid_from,
+            expire_at: key.expire_at,
+        });
     }
+    validate_windows(&windows)?;
     let load: Vec<_> = windows
         .iter()
         .enumerate()
         .filter_map(|(i, key)| (!key.expired(now)).then_some(i))
         .collect();
     if load.is_empty() {
-        return Err(Error::InvalidSchedule("every configured key has expired"));
+        return Err(Error::InvalidSchedule("every configured consensus key has expired"));
     }
     Ok(load)
 }

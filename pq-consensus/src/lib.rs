@@ -1,17 +1,22 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Local consensus signing material, isolated from wallet and ADNL keyrings.
 //!
-//! This foundation does not authorize production signing. A durable coordinator
-//! must enforce replay, equivocation and publication rules before using a store.
+//! A store signs nothing by itself being held: a durable session coordinator
+//! enforces replay, equivocation and publication rules before using one.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod custody;
 mod key_file;
+mod membership;
 mod schedule;
 mod store;
 
 pub use custody::{HeldKey, PqConsensusCustody};
 pub use key_file::{load_consensus_key, KeyFileError};
+pub use membership::{
+    local_consensus_descriptor, local_consensus_member, node_validator_membership,
+    pq_signer_for_set, PqSetSigner,
+};
 pub use rtos_pq_crypto::SIMPLEX_CONTEXT;
 pub use schedule::{
     plan_key_load, select_stake_key, validate_schedule, validate_windows, ConfiguredKey, KeyWindow,
@@ -36,6 +41,8 @@ pub enum Error {
     UnavailableScheduledKey,
     DeadlineMismatch,
     InvalidValidator,
+    NotSetValidator,
+    UnheldSetKey([u8; 32]),
     KeyFile(KeyFileError),
 }
 impl std::fmt::Display for Error {
@@ -59,6 +66,14 @@ impl std::fmt::Display for Error {
                 f.write_str("store signing deadline differs from custody window")
             }
             Self::InvalidValidator => f.write_str("validator identity must not be zero"),
+            Self::NotSetValidator => f.write_str("not a validator of the set"),
+            Self::UnheldSetKey(key_id) => {
+                f.write_str("the set records consensus key ")?;
+                for byte in key_id {
+                    write!(f, "{byte:02x}")?;
+                }
+                f.write_str(" for this validator, which this node does not hold unexpired")
+            }
             Self::KeyFile(error) => write!(f, "consensus seed file refused: {error}"),
         }
     }

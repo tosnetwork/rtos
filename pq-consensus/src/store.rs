@@ -128,7 +128,7 @@ impl ConsensusKeyStore {
     pub fn expired_now(&self) -> bool {
         self.expired_with_clock(system_clock)
     }
-    fn expired_with_clock(&self, clock: impl FnOnce() -> Option<u64>) -> bool {
+    pub(crate) fn expired_with_clock(&self, clock: impl FnOnce() -> Option<u64>) -> bool {
         if self.retired() {
             return true;
         }
@@ -152,7 +152,7 @@ impl ConsensusKeyStore {
     pub fn sign_consensus(&self, message: &[u8]) -> Result<ConsensusSignature, Error> {
         self.sign_consensus_with(message, system_clock, native_sign)
     }
-    fn sign_consensus_with(
+    pub(crate) fn sign_consensus_with(
         &self,
         message: &[u8],
         clock: impl Fn() -> Option<u64>,
