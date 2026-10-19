@@ -12,6 +12,11 @@
 //! Tests multi-instance consensus with in-process and ADNL overlays.
 //! Similar structure to `validator-session/tests/test_accelerated_consensus_session.rs`
 
+// These suites run post-quantum custody sessions, whose validator namespaces
+// are provisioned through the integration-test-support feature:
+//   cargo test -p simplex --features integration-test-support
+#![cfg(feature = "integration-test-support")]
+
 use colored::Colorize;
 use consensus_common::{
     node_test_network::NodeTestNetwork, ConsensusCommonFactory, ConsensusOverlayManagerPtr,
@@ -59,24 +64,25 @@ const RESOLVER_PROBE_MAX_REQUESTS: u32 = 256;
 
 include!("../../../common/src/info.rs");
 
+mod pq_support;
+
 fn session_start_args(
     shard: &ShardIdent,
     initial_block_seqno: u32,
 ) -> (Vec<BlockIdExt>, BlockIdExt) {
-    (
-        vec![BlockIdExt::with_params(
+    // The masterchain start anchor is the pinned zerostate; a masterchain
+    // session starting at seqno 1 builds on that zerostate itself.
+    let prev = if shard.is_masterchain() && initial_block_seqno <= 1 {
+        pq_support::zerostate()
+    } else {
+        BlockIdExt::with_params(
             shard.clone(),
             initial_block_seqno.saturating_sub(1),
             UInt256::default(),
             UInt256::default(),
-        )],
-        BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            0,
-            UInt256::default(),
-            UInt256::default(),
-        ),
-    )
+        )
+    };
+    (vec![prev], pq_support::zerostate())
 }
 
 /*
@@ -640,16 +646,12 @@ impl SessionListener for SessionInstance {
             self.source_index
         );
 
-        // Generate random root_hash (represents block content hash)
-        let mut root_hash_bytes = [0; 32];
-        for byte in &mut root_hash_bytes {
-            *byte = rng.gen_range(0..255);
-        }
-        let root_hash = UInt256::with_array(root_hash_bytes);
-
         // Create block data with slot (using seqno as proxy), seqno, and source for validation tracking
         let collated_data_payload = DummyCollatedData::new(slot_for_data, seqno, self.source_index);
         let data_bytes = collated_data_payload.to_bytes();
+        // Durable source finality checks that the block id names its body: the
+        // root hash is the body's root cell hash and the file hash its digest.
+        let root_hash = rtos_block::read_single_root_boc(&data_bytes).unwrap().repr_hash().clone();
         let collated_bytes = vec![]; // Empty collated data
 
         // Compute file_hash and collated_file_hash from SHA256 of actual data
@@ -709,7 +711,7 @@ impl SessionListener for SessionInstance {
             "on_block_finalized: round must be SIMPLEX_ROUNDLESS in roundless mode"
         );
         let slot = match &signatures {
-            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(s)) => {
                 s.slot
             }
             _ => 0,
@@ -847,7 +849,7 @@ impl SessionListener for SessionInstanceListener {
         let data_bytes = data.data();
         let is_empty = data_bytes.is_empty();
         let slot = match &signatures {
-            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(s)) => {
                 s.slot
             }
             _ => 0,
@@ -1059,8 +1061,7 @@ where
 
             // Create single shared overlay manager
             let overlay_threads_count = config.node_count;
-            let overlay_manager =
-                SessionFactory::create_in_process_overlay_manager(overlay_threads_count);
+            let overlay_manager = pq_support::in_process_overlay_manager(overlay_threads_count);
             let overlay_managers = vec![overlay_manager; config.node_count];
 
             (nodes, overlay_managers, None)
@@ -1128,6 +1129,9 @@ where
     } else {
         overlay_managers
     };
+    // Authenticated sessions start authenticated overlays over these transports.
+    let overlay_managers: Vec<ConsensusOverlayManagerPtr> =
+        overlay_managers.into_iter().map(pq_support::authenticated).collect();
 
     // Generate session ID and paths
     // Note: Each node needs its own unique db_path because they all run in the same process
@@ -1138,11 +1142,18 @@ where
         .map(char::from)
         .collect();
     let db_path_base = format!("{}/simplex_test_{}_{}", DB_PATH, config.test_name, rand_name);
-    let mut rng = rand::thread_rng();
-    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
 
     // Session options
     let slots_per_window = config.slots_per_leader_window.unwrap_or(1);
+    // Every node is a post-quantum committee member with custodied consensus
+    // keys; the session identity is the one the authenticated runtime derives.
+    let committee = Arc::new(pq_support::PqCommittee::new(
+        &config.test_name,
+        nodes.iter().map(|node| node.public_key.clone()).collect(),
+        config.shard.clone(),
+        slots_per_window,
+    ));
+    let session_id: UInt256 = committee.runtime(0).session_id().clone();
     let mut session_opts = SessionOptions {
         proto_version: 0,
         target_rate: config.target_rate,
@@ -1161,6 +1172,7 @@ where
     if let Some(st) = config.standstill_timeout {
         session_opts.standstill_timeout = st;
     }
+    let session_opts = committee.options(&session_opts);
 
     let finalized_blocks: FinalizedBlocksMap = Arc::new(Mutex::new(HashSet::new()));
 
@@ -1185,19 +1197,16 @@ where
         let overlay_manager = overlay_managers[i].clone();
         let db_path = format!("{}_node{}", db_path_base, i);
 
-        let session = SessionFactory::create_session(
-            &session_opts,
-            &session_id,
-            &shard,
-            nodes.clone(),
-            &local_key,
-            db_path,
-            overlay_manager,
-            Arc::downgrade(&session_listener),
-            None,
-            0,
-        )
-        .unwrap();
+        let _ = &local_key;
+        let session = committee
+            .create_session(
+                i,
+                &session_opts,
+                db_path,
+                overlay_manager,
+                Arc::downgrade(&session_listener),
+            )
+            .unwrap();
         let (prev_blocks, min_masterchain_block_id) =
             session_start_args(&shard, initial_block_seqno);
         session.start(prev_blocks, min_masterchain_block_id);
@@ -1350,25 +1359,24 @@ where
     #[derive(Clone)]
     struct SessionCreationContext {
         db_path: String,
-        nodes: Arc<Vec<SessionNode>>,
+        committee: Arc<pq_support::PqCommittee>,
+        index: usize,
         local_key: PrivateKey,
         overlay_manager: ConsensusOverlayManagerPtr,
         session_opts: SessionOptions,
-        session_id: UInt256,
         shard: ShardIdent,
         initial_block_seqno: u32,
     }
 
     // Capture session creation contexts for potential restarts.
-    let nodes_arc = Arc::new(nodes.clone());
     let session_contexts: Vec<SessionCreationContext> = (0..config.node_count)
         .map(|i| SessionCreationContext {
             db_path: format!("{}_node{}", db_path_base, i),
-            nodes: nodes_arc.clone(),
+            committee: committee.clone(),
+            index: i,
             local_key: nodes[i].public_key.clone(),
             overlay_manager: overlay_managers[i].clone(),
             session_opts: session_opts.clone(),
-            session_id: session_id.clone(),
             shard: config.shard.clone(),
             initial_block_seqno: 1,
         })
@@ -1525,17 +1533,12 @@ where
                         let session_listener: Arc<dyn SessionListener + Send + Sync> =
                             new_listener.clone();
 
-                        let new_session = SessionFactory::create_session(
+                        let new_session = ctx.committee.create_session(
+                            ctx.index,
                             &ctx.session_opts,
-                            &ctx.session_id,
-                            &ctx.shard,
-                            ctx.nodes.as_ref().clone(),
-                            &ctx.local_key,
                             ctx.db_path.clone(),
                             ctx.overlay_manager.clone(),
                             Arc::downgrade(&session_listener),
-                            None,
-                            0,
                         );
 
                         match new_session {
@@ -1892,7 +1895,6 @@ where
 
 /// Basic consensus test - runs to completion with finalization (in-process overlay)
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_basic() {
     run_simplex_consensus_test(
         TestConfig {
@@ -1947,7 +1949,6 @@ fn test_simplex_consensus_basic() {
 
 /// Consensus test with simulated failures
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_with_failures() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2015,7 +2016,6 @@ fn test_simplex_consensus_with_failures() {
 /// Recovery: the node eventually receives the finalization certificate from peers
 /// and the finalized block is delivered via `on_block_finalized`.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_finalcert_recovery() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2092,7 +2092,6 @@ fn test_simplex_consensus_finalcert_recovery() {
 /// Tests shard session behavior with periodic masterchain finalization notifications.
 /// This triggers empty block generation when MC finalization lags behind shard seqno.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_shard_with_mc_notifications() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2152,7 +2151,6 @@ fn test_simplex_consensus_shard_with_mc_notifications() {
 /// This test uses the real ADNL network stack instead of the in-process overlay,
 /// testing the full network path including message serialization and routing.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_adnl_overlay() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2209,7 +2207,6 @@ fn test_simplex_consensus_adnl_overlay() {
 ///
 /// Temporarily disables overlay networking for random nodes while consensus is running.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_adnl_net_gremlin() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2273,7 +2270,6 @@ fn test_simplex_consensus_adnl_net_gremlin() {
 /// after being stopped and restarted. Mirrors C++ `run_gremlin` in test-consensus.cpp.
 ///
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_restart_gremlin() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2415,7 +2411,6 @@ fn test_collated_file_hash_consistency() {
 /// the FSM's `first_block_timeout` would fire before the overlay had established
 /// peer connections, permanently stalling finalization.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_start_gate() {
     let _test_lock = SIMPLEX_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -2438,7 +2433,8 @@ fn test_simplex_start_gate() {
         nodes.push(SessionNode { public_key: key, adnl_id, weight: 1 });
     }
 
-    let overlay_manager = SessionFactory::create_in_process_overlay_manager(node_count);
+    let overlay_manager =
+        pq_support::authenticated(pq_support::in_process_overlay_manager(node_count));
 
     let rand_name: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -2446,10 +2442,14 @@ fn test_simplex_start_gate() {
         .map(char::from)
         .collect();
     let db_path_base = format!("{}/simplex_start_gate_{}", DB_PATH, rand_name);
-    let mut rng = rand::thread_rng();
-    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
+    let committee = pq_support::PqCommittee::new(
+        "simplex_start_gate",
+        nodes.iter().map(|node| node.public_key.clone()).collect(),
+        shard.clone(),
+        1,
+    );
 
-    let session_opts = SessionOptions {
+    let session_opts = committee.options(&SessionOptions {
         proto_version: 0,
         target_rate: Duration::from_millis(200),
         first_block_timeout: Duration::from_millis(1000),
@@ -2457,7 +2457,7 @@ fn test_simplex_start_gate() {
         wait_for_db_init: true,
         max_leader_window_desync: 10_000,
         ..Default::default()
-    };
+    });
 
     let finalized_blocks: FinalizedBlocksMap = Arc::new(Mutex::new(HashSet::new()));
     let finalized_counters: Vec<Arc<AtomicU32>> =
@@ -2502,19 +2502,16 @@ fn test_simplex_start_gate() {
         });
         let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
 
-        let session = SessionFactory::create_session(
-            &session_opts,
-            &session_id,
-            &shard,
-            nodes.clone(),
-            &local_key,
-            db_path,
-            overlay_manager.clone(),
-            Arc::downgrade(&session_listener),
-            None,
-            0,
-        )
-        .expect("Failed to create session");
+        let _ = &local_key;
+        let session = committee
+            .create_session(
+                i,
+                &session_opts,
+                db_path,
+                overlay_manager.clone(),
+                Arc::downgrade(&session_listener),
+            )
+            .expect("Failed to create session");
         let simplex_session = session.clone() as Arc<dyn SimplexSession + Send + Sync>;
 
         let session_instance = Arc::new(SpinMutex::new(SessionInstance {
@@ -2632,7 +2629,6 @@ fn test_simplex_start_gate() {
 /// Acceptance: the test reaches the commit threshold (at least 30% of rounds
 /// committed), proving that chained candidates are notarized and finalized.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_candidate_chaining() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2688,7 +2684,6 @@ fn test_simplex_consensus_candidate_chaining() {
 /// Candidate chaining in multi-slot windows should remain live under moderate
 /// packet loss, validating in-window publication parity behavior.
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_candidate_chaining_with_lossy_overlay() {
     run_simplex_consensus_test(
         TestConfig {
@@ -2751,7 +2746,6 @@ fn test_simplex_consensus_candidate_chaining_with_lossy_overlay() {
 /// `SessionListener::on_candidate_observed` to emulate validator-side resolver
 /// demand (`ensure_candidate_available(include_parent_chain=true)`).
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_simplex_consensus_ghost_parent_resolver_probe() {
     run_simplex_consensus_test(
         TestConfig {

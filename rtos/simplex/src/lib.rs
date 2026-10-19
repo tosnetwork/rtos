@@ -1375,3 +1375,14 @@ pub(crate) mod authenticated_fixture;
 /// Explicit offline provisioning and recovery for isolated consensus builds.
 #[cfg(feature = "isolated-consensus-signing")]
 pub mod isolated_signing;
+
+/// Explicit provisioning of a fresh validator namespace for integration tests.
+/// A validator namespace is never created implicitly by a session; this is
+/// the test fixture's trusted provisioning step. It refuses an existing path.
+#[cfg(feature = "integration-test-support")]
+pub fn provision_test_validator_namespace(
+    runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+    directory: &std::path::Path,
+) -> Result<()> {
+    runtime_manifest::RuntimeManifest::provision_test_validator(runtime, directory)
+}

@@ -20,6 +20,11 @@
 //! NOTE: These tests intentionally avoid crate-private symbols. Deeper byte-level
 //! assertions belong to `rtos/simplex/src/tests/test_restart.rs`.
 
+// These suites run post-quantum custody sessions, whose validator namespaces
+// are provisioned through the integration-test-support feature:
+//   cargo test -p simplex --features integration-test-support
+#![cfg(feature = "integration-test-support")]
+
 use colored::Colorize;
 use rand::Rng;
 use rtos_block::{
@@ -42,24 +47,25 @@ use std::{
 
 include!("../../../common/src/info.rs");
 
+mod pq_support;
+
 fn session_start_args(
     shard: &ShardIdent,
     initial_block_seqno: u32,
 ) -> (Vec<BlockIdExt>, BlockIdExt) {
-    (
-        vec![BlockIdExt::with_params(
+    // The masterchain start anchor is the pinned zerostate; a masterchain
+    // session starting at seqno 1 builds on that zerostate itself.
+    let prev = if shard.is_masterchain() && initial_block_seqno <= 1 {
+        pq_support::zerostate()
+    } else {
+        BlockIdExt::with_params(
             shard.clone(),
             initial_block_seqno.saturating_sub(1),
             UInt256::default(),
             UInt256::default(),
-        )],
-        BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            0,
-            UInt256::default(),
-            UInt256::default(),
-        ),
-    )
+        )
+    };
+    (vec![prev], pq_support::zerostate())
 }
 
 /*
@@ -226,8 +232,9 @@ impl SessionListener for RestartSingleSessionListener {
         let file_hash = UInt256::from_slice(&sha256_digest(&block_data));
         let collated_file_hash = UInt256::from_slice(&sha256_digest(&collated_data));
 
-        // root_hash can be arbitrary but must be consistent across the system
-        let root_hash = file_hash.clone();
+        // Durable source finality checks that the block id names its body: the
+        // root hash is the body's root cell hash and the file hash its digest.
+        let root_hash = rtos_block::read_single_root_boc(&block_data).unwrap().repr_hash().clone();
 
         let candidate = Arc::new(ValidatorBlockCandidate {
             public_key: self.public_key.clone(),
@@ -273,11 +280,11 @@ impl SessionListener for RestartSingleSessionListener {
         _approve_signatures: Vec<(PublicKeyHash, BlockPayloadPtr)>,
     ) {
         let slot = match &signatures {
-            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::Simplex(s)) => {
+            consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(s)) => {
                 s.slot
             }
             _ => unreachable!(
-                "Non-Simplex BlockSignaturesVariant encountered in Simplex restart integration test"
+                "Non-post-quantum Simplex finality encountered in Simplex restart integration test"
             ),
         };
         self.last_slot_seen.fetch_max(slot, Ordering::SeqCst);
@@ -428,11 +435,15 @@ fn run_single_node_restart_test(test_name: &str) {
     let adnl_id = private_key.id().clone();
     let public_key = private_key.clone();
 
-    let node = SessionNode { adnl_id, public_key: private_key.clone(), weight: 1 };
-    let nodes = vec![node];
+    let _ = adnl_id;
+    // The node is a post-quantum committee member with a custodied consensus
+    // key; its transport key stays the one generated above.
+    let shard = ShardIdent::masterchain();
+    let committee =
+        pq_support::PqCommittee::new(test_name, vec![private_key.clone()], shard.clone(), 1);
 
     // Create overlay manager with 1 thread
-    let overlay_manager = SessionFactory::create_in_process_overlay_manager(1);
+    let overlay_manager = pq_support::authenticated(pq_support::in_process_overlay_manager(1));
 
     // Generate session ID and DB path (must be stable across restart)
     let rand_name: String = rand::thread_rng()
@@ -441,23 +452,20 @@ fn run_single_node_restart_test(test_name: &str) {
         .map(char::from)
         .collect();
     let db_path = format!("{}/{}_{}", DB_PATH, test_name, rand_name);
-    let mut rng = rand::thread_rng();
-    let session_id: UInt256 = UInt256::from(rng.gen::<[u8; 32]>());
 
     // Session options: fast timings for test speed and deterministic init
     // Keep timings relaxed enough to avoid debug-mode skip storms, which can
     // produce sparse finalized snapshots and make restart behavior flaky.
-    let session_opts = SessionOptions {
+    let session_opts = committee.options(&SessionOptions {
         proto_version: 0,
         target_rate: Duration::from_millis(100),
         first_block_timeout: Duration::from_millis(900),
         slots_per_leader_window: 1,
         wait_for_db_init: true,
         ..Default::default()
-    };
+    });
 
     // Phase 1: run initial session to build some persisted state
-    let shard = ShardIdent::masterchain();
     let initial_block_seqno = 1u32; // seqno 0 is zerostate
 
     let listener =
@@ -465,19 +473,15 @@ fn run_single_node_restart_test(test_name: &str) {
     let session_listener: Arc<dyn SessionListener + Send + Sync> = listener.clone();
     log::info!("Starting session phase 1: finalized-driven, db_path={}", db_path);
 
-    let session_1 = SessionFactory::create_session(
-        &session_opts,
-        &session_id,
-        &shard,
-        nodes.clone(),
-        &private_key,
-        db_path.clone(),
-        overlay_manager.clone(),
-        Arc::downgrade(&session_listener),
-        None,
-        0,
-    )
-    .expect("Failed to create session (phase 1)");
+    let session_1 = committee
+        .create_session(
+            0,
+            &session_opts,
+            db_path.clone(),
+            overlay_manager.clone(),
+            Arc::downgrade(&session_listener),
+        )
+        .expect("Failed to create session (phase 1)");
     let (prev_blocks_1, min_masterchain_block_id_1) =
         session_start_args(&shard, initial_block_seqno);
     session_1.start(prev_blocks_1, min_masterchain_block_id_1);
@@ -513,8 +517,23 @@ fn run_single_node_restart_test(test_name: &str) {
     let last_finalized_slot_before = listener.last_finalized_slot();
     let collation_before = listener.collation_count();
 
-    // Stop session 1 and give some time for DB handles to close
-    session_1.stop();
+    // Stop session 1 and wait until its workers have released the namespace:
+    // the restarted session reopens the same database, journal and owner.
+    session_1.stop_checked().expect("checked stop of session 1");
+    let drain_deadline = Instant::now() + Duration::from_secs(10);
+    while !(session_1.threads_drained() && session_1.namespace_drained())
+        && Instant::now() < drain_deadline
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        session_1.threads_drained() && session_1.namespace_drained(),
+        "session 1 workers and namespace must be released before the restart \
+         (threads_drained={}, namespace_drained={})",
+        session_1.threads_drained(),
+        session_1.namespace_drained()
+    );
+    drop(session_1);
     thread::sleep(Duration::from_millis(200));
 
     // Phase 2: restart with same DB path and updated initial_block_seqno
@@ -527,21 +546,21 @@ fn run_single_node_restart_test(test_name: &str) {
         restart_initial_seqno={restart_initial_seqno}, db_path={db_path}"
     );
 
-    let session_2 = SessionFactory::create_session(
-        &session_opts,
-        &session_id,
-        &shard,
-        nodes,
-        &private_key,
-        db_path,
-        overlay_manager,
-        Arc::downgrade(&session_listener),
-        None,
-        0,
-    )
-    .expect("Failed to create session (phase 2)");
+    let session_2 = committee
+        .create_session(
+            0,
+            &session_opts,
+            db_path,
+            overlay_manager,
+            Arc::downgrade(&session_listener),
+        )
+        .expect("Failed to create session (phase 2)");
+    // An authenticated session's start context is durable: a restart starts
+    // from the same parents and anchor, and progress is recovered from the
+    // session's own database and journal rather than re-seeded by the caller.
+    let _ = restart_initial_seqno;
     let (prev_blocks_2, min_masterchain_block_id_2) =
-        session_start_args(&shard, restart_initial_seqno);
+        session_start_args(&shard, initial_block_seqno);
     session_2.start(prev_blocks_2, min_masterchain_block_id_2);
 
     // Wait for first post-restart slot generation (proof that current slot was seeded)
@@ -628,7 +647,6 @@ fn run_single_node_restart_test(test_name: &str) {
 */
 
 #[test]
-#[ignore = "classical sessions no longer sign own votes (no classical fallback); needs a post-quantum custody session port"]
 fn test_single_session_restart_round_monotonicity_first_commit_after_finalized() {
     run_single_node_restart_test("simplex_restart_single_first_commit");
 }
