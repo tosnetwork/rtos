@@ -10,7 +10,6 @@
 use rtos_assembler::{compile_code, compile_code_to_cell, CompileError};
 use rtos_block::{ExceptionCode, SliceData};
 use rtos_vm::{
-    executor::{FixGasPrefix, FIX_GAS},
     int,
     stack::{continuation::ContinuationData, integer::IntegerData, Stack, StackItem},
 };
@@ -2724,34 +2723,13 @@ mod runvm {
     }
 }
 
-#[test]
-fn test_cont_invalid_opcode() {
-    for (bits, fix_gas) in FIX_GAS.into_iter().enumerate() {
-        let bits = bits + 1;
-        for (prefix, gas) in fix_gas {
-            let prefix = match prefix {
-                FixGasPrefix::Number(prefix) => prefix,
-                FixGasPrefix::Range(start, ..) => start,
-            };
-
-            log::info!(target: "tvm", "Testing prefix 0x{prefix:X} with bits {bits} and gas {gas}\n");
-            let data = (*prefix as u32) << (32 - bits) | (1 << (32 - bits - 1));
-            let data = data.to_be_bytes();
-            assert_eq!(data[3], 0);
-            let code = SliceData::new(data.to_vec()).into_cell().unwrap();
-            test_case_with_bytecode(code)
-                .expect_steps(2)
-                .expect_failure(ExceptionCode::InvalidOpcode)
-                .expect_gas_used(*gas as i64 + 50);
-        }
-    }
-}
-
 /// Number of rows in `data/short-code.tsv`; a regenerated fixture must update it explicitly.
-const SHORT_CODE_ROWS: usize = 2096;
+const SHORT_CODE_ROWS: usize = 5506;
 
 /// Truncated and fragment-terminated code compared with results frozen from the reference VM:
-/// exit code, consumed gas and executed steps for every row.
+/// exit code, consumed gas and executed steps for every row. The `table-*` rows cover every
+/// boundary point of the 1..15-bit truncated-code tables as they stood before the merged-entry
+/// removal, at versions 15 and 16, as explicit inputs independent of the live tables.
 #[test]
 fn short_code_matches_reference() {
     use rtos_block::BuilderData;
