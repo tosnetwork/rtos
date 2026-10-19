@@ -2724,7 +2724,7 @@ mod runvm {
 }
 
 /// Number of rows in `data/short-code.tsv`; a regenerated fixture must update it explicitly.
-const SHORT_CODE_ROWS: usize = 5506;
+const SHORT_CODE_ROWS: usize = 8738;
 
 /// Truncated and fragment-terminated code compared with results frozen from the reference VM:
 /// exit code, consumed gas and executed steps for every row. The `table-*` rows cover every

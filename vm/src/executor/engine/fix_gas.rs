@@ -961,7 +961,7 @@ static FIX_GAS15: [(FixGasPrefix, u8); 228] = [
     (FixGasPrefix::Range(0x7D85, 0x7EFF), 10),
     (FixGasPrefix::Range(0x7F00, 0x7FFF), 26),
 ];
-static FIX_GAS16: [(FixGasPrefix, u8); 25] = [
+static FIX_GAS16: [(FixGasPrefix, u8); 33] = [
     (FixGasPrefix::Range(0x1000, 0x1011), 26),
     (FixGasPrefix::Range(0x1020, 0x1022), 26),
     (FixGasPrefix::Range(0x1030, 0x1033), 26),
@@ -986,9 +986,154 @@ static FIX_GAS16: [(FixGasPrefix, u8); 25] = [
     (FixGasPrefix::Range(0xA9B0, 0xA9BF), 34),
     (FixGasPrefix::Range(0xA9D0, 0xA9DF), 34),
     (FixGasPrefix::Range(0xA9E0, 0xA9FF), 10),
+    (FixGasPrefix::Range(0xB7A9, 0xB7AB), 34),
+    (FixGasPrefix::Range(0xB7B4, 0xB7B5), 34),
     // Registered quiet Ristretto prefixes are handled before this fallback.
     // Padding an incomplete b7f9 prefix into an unregistered slot costs 10.
     (FixGasPrefix::Number(0xB7F9), 10),
+    (FixGasPrefix::Range(0xCF08, 0xCF0F), 34),
+    (FixGasPrefix::Number(0xCF38), 34),
+    (FixGasPrefix::Number(0xCF3C), 34),
+    (FixGasPrefix::Range(0xD708, 0xD70F), 34),
+    (FixGasPrefix::Range(0xD71C, 0xD71F), 34),
+    (FixGasPrefix::Number(0xDB36), 34),
+];
+
+// Exact 17..23-bit codes whose charge depends on bits past the first 16 (the reference pads the
+// truncated code with zeros before the instruction lookup). Consulted before FIX_GAS16.
+static FIX_GAS_EXACT: [&[(FixGasPrefix, u8)]; 7] = [
+    &FIX_GAS17_EXACT,
+    &FIX_GAS18_EXACT,
+    &FIX_GAS19_EXACT,
+    &FIX_GAS20_EXACT,
+    &FIX_GAS21_EXACT,
+    &FIX_GAS22_EXACT,
+    &FIX_GAS23_EXACT,
+];
+static FIX_GAS17_EXACT: [(FixGasPrefix, u8); 9] = [
+    (FixGasPrefix::Range(0x16F52, 0x16F57), 34),
+    (FixGasPrefix::Range(0x16F68, 0x16F6B), 34),
+    (FixGasPrefix::Number(0x16F6D), 10),
+    (FixGasPrefix::Range(0x19E10, 0x19E1F), 34),
+    (FixGasPrefix::Range(0x19E70, 0x19E71), 34),
+    (FixGasPrefix::Range(0x19E78, 0x19E79), 34),
+    (FixGasPrefix::Range(0x1AE10, 0x1AE1F), 34),
+    (FixGasPrefix::Range(0x1AE38, 0x1AE3F), 34),
+    (FixGasPrefix::Range(0x1B66C, 0x1B66D), 34),
+];
+static FIX_GAS18_EXACT: [(FixGasPrefix, u8); 11] = [
+    (FixGasPrefix::Number(0x2DEA4), 34),
+    (FixGasPrefix::Number(0x2DEA5), 10),
+    (FixGasPrefix::Range(0x2DEA6, 0x2DEAF), 34),
+    (FixGasPrefix::Range(0x2DED0, 0x2DED7), 34),
+    (FixGasPrefix::Range(0x2DED9, 0x2DEDB), 10),
+    (FixGasPrefix::Range(0x33C20, 0x33C3F), 34),
+    (FixGasPrefix::Range(0x33CE0, 0x33CE3), 34),
+    (FixGasPrefix::Range(0x33CF0, 0x33CF3), 34),
+    (FixGasPrefix::Range(0x35C20, 0x35C3F), 34),
+    (FixGasPrefix::Range(0x35C70, 0x35C7F), 34),
+    (FixGasPrefix::Range(0x36CD8, 0x36CDB), 34),
+];
+static FIX_GAS19_EXACT: [(FixGasPrefix, u8); 13] = [
+    (FixGasPrefix::Range(0x5BD48, 0x5BD49), 34),
+    (FixGasPrefix::Range(0x5BD4A, 0x5BD4B), 10),
+    (FixGasPrefix::Range(0x5BD4C, 0x5BD4E), 34),
+    (FixGasPrefix::Number(0x5BD4F), 10),
+    (FixGasPrefix::Range(0x5BD50, 0x5BD5F), 34),
+    (FixGasPrefix::Range(0x5BDA0, 0x5BDAF), 34),
+    (FixGasPrefix::Range(0x5BDB1, 0x5BDB7), 10),
+    (FixGasPrefix::Range(0x67840, 0x6787F), 34),
+    (FixGasPrefix::Range(0x679C0, 0x679C7), 34),
+    (FixGasPrefix::Range(0x679E0, 0x679E7), 34),
+    (FixGasPrefix::Range(0x6B840, 0x6B87F), 34),
+    (FixGasPrefix::Range(0x6B8E0, 0x6B8FF), 34),
+    (FixGasPrefix::Range(0x6D9B0, 0x6D9B7), 34),
+];
+static FIX_GAS20_EXACT: [(FixGasPrefix, u8); 19] = [
+    (FixGasPrefix::Number(0xB7A90), 34),
+    (FixGasPrefix::Number(0xB7A91), 10),
+    (FixGasPrefix::Number(0xB7A92), 34),
+    (FixGasPrefix::Range(0xB7A93, 0xB7A97), 10),
+    (FixGasPrefix::Number(0xB7A98), 34),
+    (FixGasPrefix::Number(0xB7A99), 10),
+    (FixGasPrefix::Number(0xB7A9A), 34),
+    (FixGasPrefix::Number(0xB7A9B), 10),
+    (FixGasPrefix::Number(0xB7A9C), 34),
+    (FixGasPrefix::Range(0xB7A9D, 0xB7A9F), 10),
+    (FixGasPrefix::Range(0xB7AA0, 0xB7ABF), 34),
+    (FixGasPrefix::Range(0xB7B40, 0xB7B5F), 34),
+    (FixGasPrefix::Range(0xB7B61, 0xB7B6F), 10),
+    (FixGasPrefix::Range(0xCF080, 0xCF0FF), 34),
+    (FixGasPrefix::Range(0xCF380, 0xCF38F), 34),
+    (FixGasPrefix::Range(0xCF3C0, 0xCF3CF), 34),
+    (FixGasPrefix::Range(0xD7080, 0xD70FF), 34),
+    (FixGasPrefix::Range(0xD71C0, 0xD71FF), 34),
+    (FixGasPrefix::Range(0xDB360, 0xDB36F), 34),
+];
+static FIX_GAS21_EXACT: [(FixGasPrefix, u8); 19] = [
+    (FixGasPrefix::Range(0x16F520, 0x16F521), 34),
+    (FixGasPrefix::Range(0x16F522, 0x16F523), 10),
+    (FixGasPrefix::Range(0x16F524, 0x16F525), 34),
+    (FixGasPrefix::Range(0x16F526, 0x16F52F), 10),
+    (FixGasPrefix::Range(0x16F530, 0x16F531), 34),
+    (FixGasPrefix::Range(0x16F532, 0x16F533), 10),
+    (FixGasPrefix::Range(0x16F534, 0x16F535), 34),
+    (FixGasPrefix::Range(0x16F536, 0x16F537), 10),
+    (FixGasPrefix::Range(0x16F538, 0x16F539), 34),
+    (FixGasPrefix::Range(0x16F53A, 0x16F53F), 10),
+    (FixGasPrefix::Range(0x16F540, 0x16F57F), 34),
+    (FixGasPrefix::Range(0x16F680, 0x16F6BF), 34),
+    (FixGasPrefix::Range(0x16F6C2, 0x16F6DF), 10),
+    (FixGasPrefix::Range(0x19E100, 0x19E1FF), 34),
+    (FixGasPrefix::Range(0x19E700, 0x19E71F), 34),
+    (FixGasPrefix::Range(0x19E780, 0x19E79F), 34),
+    (FixGasPrefix::Range(0x1AE100, 0x1AE1FF), 34),
+    (FixGasPrefix::Range(0x1AE380, 0x1AE3FF), 34),
+    (FixGasPrefix::Range(0x1B66C0, 0x1B66DF), 34),
+];
+static FIX_GAS22_EXACT: [(FixGasPrefix, u8); 20] = [
+    (FixGasPrefix::Range(0x2DEA40, 0x2DEA43), 34),
+    (FixGasPrefix::Range(0x2DEA44, 0x2DEA47), 10),
+    (FixGasPrefix::Range(0x2DEA48, 0x2DEA4B), 34),
+    (FixGasPrefix::Range(0x2DEA4C, 0x2DEA5F), 10),
+    (FixGasPrefix::Range(0x2DEA60, 0x2DEA63), 34),
+    (FixGasPrefix::Range(0x2DEA64, 0x2DEA67), 10),
+    (FixGasPrefix::Range(0x2DEA68, 0x2DEA6B), 34),
+    (FixGasPrefix::Range(0x2DEA6C, 0x2DEA6F), 10),
+    (FixGasPrefix::Range(0x2DEA70, 0x2DEA73), 34),
+    (FixGasPrefix::Range(0x2DEA74, 0x2DEA7F), 10),
+    (FixGasPrefix::Range(0x2DEA80, 0x2DEAFF), 34),
+    (FixGasPrefix::Range(0x2DED00, 0x2DED7F), 34),
+    (FixGasPrefix::Number(0x2DED81), 10),
+    (FixGasPrefix::Range(0x2DED83, 0x2DEDBF), 10),
+    (FixGasPrefix::Range(0x33C200, 0x33C3FF), 34),
+    (FixGasPrefix::Range(0x33CE00, 0x33CE3F), 34),
+    (FixGasPrefix::Range(0x33CF00, 0x33CF3F), 34),
+    (FixGasPrefix::Range(0x35C200, 0x35C3FF), 34),
+    (FixGasPrefix::Range(0x35C700, 0x35C7FF), 34),
+    (FixGasPrefix::Range(0x36CD80, 0x36CDBF), 34),
+];
+static FIX_GAS23_EXACT: [(FixGasPrefix, u8); 20] = [
+    (FixGasPrefix::Range(0x5BD480, 0x5BD487), 34),
+    (FixGasPrefix::Range(0x5BD488, 0x5BD48F), 10),
+    (FixGasPrefix::Range(0x5BD490, 0x5BD497), 34),
+    (FixGasPrefix::Range(0x5BD498, 0x5BD4BF), 10),
+    (FixGasPrefix::Range(0x5BD4C0, 0x5BD4C7), 34),
+    (FixGasPrefix::Range(0x5BD4C8, 0x5BD4CF), 10),
+    (FixGasPrefix::Range(0x5BD4D0, 0x5BD4D7), 34),
+    (FixGasPrefix::Range(0x5BD4D8, 0x5BD4DF), 10),
+    (FixGasPrefix::Range(0x5BD4E0, 0x5BD4E7), 34),
+    (FixGasPrefix::Range(0x5BD4E8, 0x5BD4FF), 10),
+    (FixGasPrefix::Range(0x5BD500, 0x5BD5FF), 34),
+    (FixGasPrefix::Range(0x5BDA00, 0x5BDAFF), 34),
+    (FixGasPrefix::Range(0x5BDB02, 0x5BDB03), 10),
+    (FixGasPrefix::Range(0x5BDB06, 0x5BDB7F), 10),
+    (FixGasPrefix::Range(0x678400, 0x6787FF), 34),
+    (FixGasPrefix::Range(0x679C00, 0x679C7F), 34),
+    (FixGasPrefix::Range(0x679E00, 0x679E7F), 34),
+    (FixGasPrefix::Range(0x6B8400, 0x6B87FF), 34),
+    (FixGasPrefix::Range(0x6B8E00, 0x6B8FFF), 34),
+    (FixGasPrefix::Range(0x6D9B00, 0x6D9B7F), 34),
 ];
 
 static FIX_GAS24: [(FixGasPrefix, u8); 10] = [
@@ -1006,6 +1151,12 @@ static FIX_GAS24: [(FixGasPrefix, u8); 10] = [
 
 pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u32, u8, u8)>> {
     let mut bits = code.remaining_bits();
+    if (17..24).contains(&bits) {
+        let cmd = code.get_int(bits)? as u32;
+        if let Some(gas) = lookup(FIX_GAS_EXACT[bits - 17], cmd) {
+            return Ok(Some((cmd, bits as u8, gas)));
+        }
+    }
     let fix_gas = match bits {
         0 => return Ok(None),
         1..16 => FIX_GAS[bits - 1],
@@ -1019,7 +1170,10 @@ pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u32, u8, u8)>> {
         }
     };
     let cmd = code.get_int(bits)? as u32;
-    // println!("cmd: {cmd:#X}, bits: {bits}");
+    Ok(lookup(fix_gas, cmd).map(|gas| (cmd, bits as u8, gas)))
+}
+
+fn lookup(fix_gas: &[(FixGasPrefix, u8)], cmd: u32) -> Option<u8> {
     let result = fix_gas.binary_search_by(|(prefix, _)| match prefix {
         FixGasPrefix::Number(n) => n.cmp(&cmd),
         FixGasPrefix::Range(start, end) => {
@@ -1032,10 +1186,5 @@ pub fn check_too_short_code(code: &SliceData) -> Result<Option<(u32, u8, u8)>> {
             Ordering::Equal
         }
     });
-    if let Ok(index) = result {
-        let (_, gas) = fix_gas[index];
-        Ok(Some((cmd, bits as u8, gas)))
-    } else {
-        Ok(None)
-    }
+    result.ok().and_then(|index| fix_gas.get(index)).map(|(_, gas)| *gas)
 }
