@@ -409,18 +409,18 @@ fn get_block_limits(some_val: u32, extra_limits: bool) -> BlockLimits {
 fn get_config_param_39() -> ConfigParam39 {
     let mut cp = ConfigParam39::default();
     let vstk = ValidatorSignedTempKey::construct_from_base64(
-        "te6ccgEBAgEAlAABgwRQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB\
-         AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKAEAmgMDAwMDAwMDAwMD\
-         AwMDAwMDAwMDAwMDAwMDAwMDAwMDA46BJ4rNcGUgnAwuWyQw+RaHbPRm6ub11x\
-         lYhzyXOQiirgIdZgABiJRdJFss",
+        "te6ccgEBAgEAkwABgkUBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ\
+         ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAQCZMDAwMDAwMDAwMDAw\
+         MDAwMDAwMDAwMDAwMDAwMDAwMDA46BJ4rNcGUgnAwuWyQw+RaHbPRm6ub11xlY\
+         hzyXOQiirgIdZgABiJRdJFssg=",
     )
     .unwrap();
     cp.insert(&UInt256::from([1; 32]), &vstk).unwrap();
     let vstk = ValidatorSignedTempKey::construct_from_base64(
-        "te6ccgEBAgEAlAABgwRQYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYG\
-          BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBweAEAmgMICAgICAgICAgI\
-          CAgICAgICAgICAgICAgICAgICAgICI6BJ4obim1cCeb6yST1ojiep2h7raTYuN\
-          UkJEbwlPIjN4qOLAAHoYRdJF8U",
+        "te6ccgEBAgEAkwABgkUGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBg\
+         cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHAQCZMICAgICAgICAgICA\
+         gICAgICAgICAgICAgICAgICAgICI6BJ4obim1cCeb6yST1ojiep2h7raTYuNUk\
+         JEbwlPIjN4qOLAAHoYRdJF8Ug=",
     )
     .unwrap();
     cp.insert(&UInt256::from([1; 32]), &vstk).unwrap();
