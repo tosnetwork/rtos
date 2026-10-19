@@ -749,3 +749,62 @@ fn gas_width_complete_transactions() {
     assert_eq!(rows.len(), 2 * (4 * 2 * 2 * 7 + 4 * 2 * 2));
     check_reference_rows(&rows, include_str!("data/gas-width.tsv"), "RTOS_GAS_WIDTH_EXPORT", &[]);
 }
+
+// Complete transactions bouncing an inbound message with extra currencies.
+// With the version-2 extra-currency rules (from version 10) the bounced
+// message size leaves the extra-currency dictionary out from version 13, which
+// changes its forwarding fee. data/bounce-size.tsv holds the reference roots.
+#[test]
+fn bounce_size_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let mut rows = Vec::new();
+    let extras = |entries: &[(u32, u128)]| {
+        let mut other = rtos_block::ExtraCurrencyCollection::default();
+        for (key, value) in entries {
+            other.set(key, &(*value).into()).unwrap();
+        }
+        other
+    };
+    let currencies = [
+        ("none", extras(&[])),
+        ("one", extras(&[(7, 100)])),
+        ("three", extras(&[(7, 100), (9, 1 << 100), (1000, 5)])),
+    ];
+    for version in [10u32, 12, 13, 16] {
+        let cfg = config(version, false, &addr);
+        let account = account_cell(
+            &addr,
+            &cfg,
+            10_000_000_000,
+            Default::default(),
+            "THROW 100",
+            Cell::default(),
+        );
+        for (tag, other) in &currencies {
+            for (flags_tag, extra_flags) in [("f0", 0u128), ("f1", 1)] {
+                if extra_flags != 0 && version < 12 {
+                    continue;
+                }
+                for value in [1_000_000_000u128, 1_000_000] {
+                    let m = Inbound { other: other.clone(), extra_flags, bounce: true, value };
+                    run_cells(
+                        &format!("a248-{tag}-{flags_tag}-{value}-v{version}"),
+                        cfg.clone(),
+                        account.clone(),
+                        inbound_cell(&src, &addr, &m),
+                        &addr,
+                        &mut rows,
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(rows.len(), 3 * 2 + 3 * 3 * 2 * 2);
+    check_reference_rows(
+        &rows,
+        include_str!("data/bounce-size.tsv"),
+        "RTOS_BOUNCE_SIZE_EXPORT",
+        &[],
+    );
+}

@@ -1068,9 +1068,16 @@ pub trait TransactionExecutor {
         };
         int_header.extra_flags = VarUInteger16::from(extra_flags as u64);
 
+        // The bounced message size counts the extra-currency dictionary only
+        // without the version-2 extra-currency rules (from version 10) or
+        // before version 13. The rules are not configurable separately.
+        let version = self.config().block_version();
+        let extra_currency_v2 = version >= 10;
         let mut calc = StorageUsageCalc::with_limits(0, 0);
-        if let Some(root) = int_header.value.other.root() {
-            calc.append_cell(root, true, &mut 0)?;
+        if !extra_currency_v2 || version < 13 {
+            if let Some(root) = int_header.value.other.root() {
+                calc.append_cell(root, true, &mut 0)?;
+            }
         }
         let body = if extra_flags.bit(EXTRA_FLAG_NEW_BOUNCE_FORMAT) {
             let original_body = if let Some(body) = msg.body() {
