@@ -1,7 +1,114 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use crate::config_read_budget::{self as signature_budget, ConfigReadBudget};
 
+/// Key width of the signature dictionaries (`HashmapE 16`).
+const SIGNATURE_DICTIONARY_KEY_BITS: usize = 16;
+
+/// Builds the canonical `HashmapE 16` root holding keys `0..count`, the cell the
+/// dictionary serializer writes for those entries, bottom-up: every node takes
+/// the shortest label form for its key bits, and the tree has exactly
+/// `2 * count - 1` cells. `leaf` appends the value of entry `index`. Each new
+/// cell is admitted (one step and one cell allocation) before it is built.
+fn canonical_index_dictionary_bounded(
+    count: usize,
+    budget: &dyn ConfigReadBudget,
+    leaf: &mut dyn FnMut(usize, &mut BuilderData) -> Result<()>,
+) -> Result<Option<Cell>> {
+    if count == 0 {
+        return Ok(None);
+    }
+    if count > 1 << SIGNATURE_DICTIONARY_KEY_BITS {
+        fail!("signature dictionary: {} entries exceed the 16-bit key space", count)
+    }
+    canonical_index_subtree_bounded(0, count, 0, budget, leaf).map(Some)
+}
+
+/// The subtree holding keys `low..high`, which agree on their first
+/// `consumed` key bits; those bits are spelled by the labels above it.
+fn canonical_index_subtree_bounded(
+    low: usize,
+    high: usize,
+    consumed: usize,
+    budget: &dyn ConfigReadBudget,
+    leaf: &mut dyn FnMut(usize, &mut BuilderData) -> Result<()>,
+) -> Result<Cell> {
+    budget.step()?;
+    budget.workspace(crate::merkle_apply_budget::NEW_CELL_ALLOCATION)?;
+    let remaining = SIGNATURE_DICTIONARY_KEY_BITS
+        .checked_sub(consumed)
+        .ok_or_else(|| crate::error!("signature dictionary: key depth overflow"))?;
+    let last = high
+        .checked_sub(1)
+        .filter(|last| *last >= low)
+        .ok_or_else(|| crate::error!("signature dictionary: empty subtree"))?;
+    // The label is the common prefix of the range below the consumed bits:
+    // up to the first bit where its smallest and largest keys differ.
+    let label_len = if low == last {
+        remaining
+    } else {
+        let differing = u16::try_from(low ^ last)?;
+        (differing.leading_zeros() as usize)
+            .checked_sub(consumed)
+            .ok_or_else(|| crate::error!("signature dictionary: subtree prefix mismatch"))?
+    };
+    let below = remaining
+        .checked_sub(label_len)
+        .ok_or_else(|| crate::error!("signature dictionary: label overflow"))?;
+    let mut key = BuilderData::new();
+    key.append_bits((low >> below) & ((1usize << label_len) - 1), label_len)?;
+    let mut node = hm_label(&SliceData::load_bitstring(key)?, remaining)?;
+    if below == 0 {
+        leaf(low, &mut node)?;
+    } else {
+        // The fork bit is the first bit below the label; the right subtree
+        // starts at the smallest key of the range with that bit set.
+        let fork = 1usize << (below - 1);
+        let middle = (low | fork) & !(fork - 1);
+        let next = consumed + label_len + 1;
+        let left = canonical_index_subtree_bounded(low, middle, next, budget, leaf)?;
+        let right = canonical_index_subtree_bounded(middle, high, next, budget, leaf)?;
+        node.checked_append_reference(left)?;
+        node.checked_append_reference(right)?;
+    }
+    node.into_cell()
+}
+
 impl BlockSignaturesPure {
+    /// Bounded counterpart of `read_from`: the same entry, order, count and
+    /// canonical-encoding rules, with the parse and the canonical rebuild
+    /// charged to `budget`.
+    pub fn construct_bounded(cell: &mut SliceData, budget: &dyn ConfigReadBudget) -> Result<Self> {
+        let sig_count = u32::construct_from(cell)?;
+        let sig_weight = u64::construct_from(cell)?;
+        let mut signatures = CryptoSignaturePairDict::default();
+        signatures.read_from(cell)?;
+        // Refusing an entry beyond the declared count early keeps the admitted
+        // vector exact; the count rule refuses such a set in any case.
+        let capacity = (sig_count as usize).min(MAX_CLASSICAL_SIGNATURES);
+        let mut pairs = signature_budget::vector::<CryptoSignaturePair>(budget, capacity)?;
+        signatures.0.iterate_slices_bounded(budget, |mut key, mut value| {
+            let index = pairs.len();
+            let pair = read_classical_signature_entry(&mut key, &mut value, index)?;
+            if index >= capacity {
+                check_classical_signature_count(index + 1, sig_count)?;
+            }
+            pairs.push(pair);
+            Ok(true)
+        })?;
+        let canonical =
+            canonical_index_dictionary_bounded(pairs.len(), budget, &mut |index, b| {
+                pairs
+                    .get(index)
+                    .ok_or_else(|| crate::error!("signatures dict: missing entry {}", index))?
+                    .write_to(b)
+            })?;
+        if !is_canonical_dictionary_root(signatures.0.data(), canonical.as_ref()) {
+            fail!("signatures dict: noncanonical dictionary encoding")
+        }
+        check_classical_signature_count(pairs.len(), sig_count)?;
+        Ok(Self { sig_count, sig_weight, signatures })
+    }
+
     pub fn signatures_count_bounded(&self, budget: &dyn ConfigReadBudget) -> Result<usize> {
         let mut count = 0usize;
         self.signatures().iterate_slices_bounded(budget, |_, _| {
@@ -185,6 +292,7 @@ impl BlockSignaturesSimplexPq {
         dictionary.read_from(&mut cell)?;
         let mut signatures =
             signature_budget::vector::<PqBlockSignaturePair>(budget, sig_count as usize)?;
+        let mut signature_cells = signature_budget::vector::<Cell>(budget, sig_count as usize)?;
         dictionary.0.iterate_slices_bounded(budget, |mut key, mut value| {
             if key.get_next_int(16)? as usize != signatures.len() {
                 return pq_reject(PqBlockSignatureReasonCode::DictionaryIndex, "dictionary index");
@@ -203,8 +311,9 @@ impl BlockSignaturesSimplexPq {
                     "unsupported algorithm",
                 );
             }
+            let signature_cell = value.checked_drain_reference()?;
             let signature = crate::pq_bytes::unpack_pq_bytes_bounded(
-                &value.checked_drain_reference()?,
+                &signature_cell,
                 PQ_SIGNATURE_BYTES,
                 budget,
             )?;
@@ -218,12 +327,35 @@ impl BlockSignaturesSimplexPq {
                 );
             }
             signatures.push(PqBlockSignaturePair { validator_id, algorithm_id, signature });
+            signature_cells.push(signature_cell);
             Ok(true)
         })?;
         if signatures.len() != sig_count as usize {
             return pq_reject(
                 PqBlockSignatureReasonCode::DictionaryMissingEntry,
                 "dictionary missing entry",
+            );
+        }
+        // Every entry is canonical on its own: fixed-width fields, and strict
+        // PQBytes, whose only accepted tree is the one the packer writes, so
+        // the decoded signature cell stands for its repacked form. What is
+        // left is the shape of the dictionary itself.
+        let canonical =
+            canonical_index_dictionary_bounded(signatures.len(), budget, &mut |index, b| {
+                let (Some(pair), Some(signature_cell)) =
+                    (signatures.get(index), signature_cells.get(index))
+                else {
+                    fail!("pq signatures: missing entry {}", index)
+                };
+                pair.validator_id.write_to(b)?;
+                pair.algorithm_id.write_to(b)?;
+                b.checked_append_reference(signature_cell.clone())?;
+                Ok(())
+            })?;
+        if !is_canonical_dictionary_root(dictionary.0.data(), canonical.as_ref()) {
+            return pq_reject(
+                PqBlockSignatureReasonCode::NoncanonicalDictionary,
+                "noncanonical dictionary",
             );
         }
         let session_id = UInt256::construct_from(&mut cell)?;
@@ -395,18 +527,52 @@ impl BlockProof {
             crate::merkle_apply_budget::require_materialized(&signature_root)?;
             let mut value = SliceData::load_cell_ref(&signature_root)?;
             let tag = value.clone().get_next_byte()?;
-            Some(if tag == BLOCK_SIGNATURES_SIMPLEX_PQ_TAG {
-                BlockSignaturesVariant::SimplexPq(BlockSignaturesSimplexPq::construct_bounded(
-                    signature_root,
-                    budget,
-                )?)
-            } else {
-                BlockSignaturesVariant::construct_from(&mut value)?
+            Some(match tag {
+                BLOCK_SIGNATURES_SIMPLEX_PQ_TAG => BlockSignaturesVariant::SimplexPq(
+                    BlockSignaturesSimplexPq::construct_bounded(signature_root, budget)?,
+                ),
+                BLOCK_SIGNATURES_TAG | BLOCK_SIGNATURES_SIMPLEX_TAG => {
+                    BlockSignaturesVariant::construct_classical_bounded(&mut value, budget)?
+                }
+                _ => BlockSignaturesVariant::construct_from(&mut value)?,
             })
         } else {
             None
         };
         Ok(Self { proof_for, root, signatures })
+    }
+}
+
+impl BlockSignaturesVariant {
+    /// Bounded counterpart of `read_from` for the classical `#11` and `#12`
+    /// carriers; the signature dictionary is read by
+    /// `BlockSignaturesPure::construct_bounded`.
+    pub fn construct_classical_bounded(
+        cell: &mut SliceData,
+        budget: &dyn ConfigReadBudget,
+    ) -> Result<Self> {
+        budget.step()?;
+        let tag = cell.get_next_byte()?;
+        if tag != BLOCK_SIGNATURES_TAG && tag != BLOCK_SIGNATURES_SIMPLEX_TAG {
+            fail!(BlockSignatures::invalid_tag(tag as u32))
+        }
+        let validator_info = ValidatorBaseInfo::construct_from(cell)?;
+        let pure_signatures = BlockSignaturesPure::construct_bounded(cell, budget)?;
+        if tag == BLOCK_SIGNATURES_TAG {
+            return Ok(Self::Ordinary(BlockSignatures { validator_info, pure_signatures }));
+        }
+        let mut session_id_bytes = [0u8; 32];
+        cell.get_next_bytes_to_slice(&mut session_id_bytes)?;
+        let slot = cell.get_next_u32()?;
+        let candidate_data = cell.checked_drain_reference()?;
+        // See BlockSignaturesSimplex::read_from: only final sets are serialized.
+        Ok(Self::Simplex(BlockSignaturesSimplex::new_finalize(
+            validator_info,
+            pure_signatures,
+            UInt256::from(session_id_bytes),
+            slot,
+            candidate_data,
+        )))
     }
 }
 

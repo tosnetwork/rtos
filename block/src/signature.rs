@@ -12,7 +12,7 @@ use crate::{
     blocks::BlockIdExt,
     define_HashmapE,
     error::BlockError,
-    fail,
+    fail, hm_label,
     pq_bytes::{pack_pq_bytes, unpack_pq_bytes},
     read_single_root_boc,
     validators::{ValidatorBaseInfo, ValidatorDescr, MLDSA44_ALGORITHM_ID},
@@ -329,12 +329,76 @@ impl Serializable for BlockSignaturesPure {
     }
 }
 
+/// Most entries a classical (`#11`/`#12`) signature dictionary may hold.
+pub const MAX_CLASSICAL_SIGNATURES: usize = 1024;
+/// An entry is exactly `node_id_short:bits256`, the `ed25519_signature#5`
+/// tag and `R:bits256 s:bits256`, with no references.
+const CRYPTO_SIGNATURE_PAIR_BITS: usize = 256 + 4 + 256 + 256;
+
+/// A signature dictionary has one encoding: the cell the serializer writes for
+/// the parsed entries. A reader accepts any edge-label form (short, long,
+/// same) that spells the same key bits, so the received root is compared with
+/// a dictionary rebuilt from the decoded entries. An empty dictionary has no
+/// root on either side.
+fn is_canonical_dictionary_root(received: Option<&Cell>, canonical: Option<&Cell>) -> bool {
+    match (received, canonical) {
+        (None, None) => true,
+        (Some(received), Some(canonical)) => received.repr_hash() == canonical.repr_hash(),
+        _ => false,
+    }
+}
+
+/// Decodes the classical dictionary entry at position `index`: its key must be
+/// that position, and its value exactly one `CryptoSignaturePair`.
+fn read_classical_signature_entry(
+    key: &mut SliceData,
+    value: &mut SliceData,
+    index: usize,
+) -> Result<CryptoSignaturePair> {
+    if index >= MAX_CLASSICAL_SIGNATURES {
+        fail!("signatures dict: more than {} entries", MAX_CLASSICAL_SIGNATURES)
+    }
+    let key = key.get_next_int(16)? as usize;
+    if key != index {
+        fail!("signatures dict: key {} where index {} was expected", key, index)
+    }
+    if value.remaining_bits() != CRYPTO_SIGNATURE_PAIR_BITS || value.remaining_references() != 0 {
+        fail!(
+            "signatures dict: entry {} has {} bits and {} references, expected exactly {} bits",
+            index,
+            value.remaining_bits(),
+            value.remaining_references(),
+            CRYPTO_SIGNATURE_PAIR_BITS
+        )
+    }
+    CryptoSignaturePair::construct_from(value)
+}
+
+fn check_classical_signature_count(entries: usize, sig_count: u32) -> Result<()> {
+    if entries != sig_count as usize {
+        fail!("signatures dict: {} entries, declared sig_count {}", entries, sig_count)
+    }
+    Ok(())
+}
+
 impl Deserializable for BlockSignaturesPure {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
         self.sig_count.read_from(cell)?;
         self.sig_weight.read_from(cell)?;
         self.signatures.read_from(cell)?;
-        Ok(())
+        let mut canonical = CryptoSignaturePairDict::default();
+        let mut entries = 0usize;
+        self.signatures.iterate_slices_with_keys(|mut key, mut value| {
+            let pair = read_classical_signature_entry(&mut key, &mut value, entries)?;
+            // `entries` is below MAX_CLASSICAL_SIGNATURES, so it fits the key.
+            canonical.set(&(entries as u16), &pair)?;
+            entries += 1;
+            Ok(true)
+        })?;
+        if !is_canonical_dictionary_root(self.signatures.0.data(), canonical.0.data()) {
+            fail!("signatures dict: noncanonical dictionary encoding")
+        }
+        check_classical_signature_count(entries, self.sig_count)
     }
 }
 
@@ -628,6 +692,7 @@ pub enum PqBlockSignatureReasonCode {
     DictionaryIndex,
     DictionaryMissingEntry,
     DictionaryExtraEntry,
+    NoncanonicalDictionary,
     CandidateOversize,
     CandidateNoncanonicalChunk,
     CandidateNonByteAligned,
@@ -653,6 +718,7 @@ impl PqBlockSignatureReasonCode {
             Self::DictionaryIndex => "dictionary_index",
             Self::DictionaryMissingEntry => "dictionary_missing_entry",
             Self::DictionaryExtraEntry => "dictionary_extra_entry",
+            Self::NoncanonicalDictionary => "noncanonical_dictionary",
             Self::CandidateOversize => "candidate_oversize",
             Self::CandidateNoncanonicalChunk => "candidate_noncanonical_chunk",
             Self::CandidateNonByteAligned => "candidate_non_byte_aligned",
@@ -1090,6 +1156,19 @@ impl Deserializable for BlockSignaturesSimplexPq {
                 "dictionary extra entry",
             );
         }
+        // Every entry is canonical on its own (fixed-width fields, strict
+        // PQBytes); what is left is the shape of the dictionary itself.
+        let mut canonical = PqBlockSignaturePairDict::default();
+        for (index, signature) in self.signatures.iter().enumerate() {
+            // `index` is below PQ_SIGNATURE_MAX_SIGNERS, so it fits the key.
+            canonical.set(&(index as u16), signature)?;
+        }
+        if !is_canonical_dictionary_root(dictionary.0.data(), canonical.0.data()) {
+            return pq_reject(
+                PqBlockSignatureReasonCode::NoncanonicalDictionary,
+                "noncanonical dictionary",
+            );
+        }
         self.session_id.read_from(cell)?;
         self.slot.read_from(cell)?;
         self.candidate_data = cell.checked_drain_reference()?;
@@ -1378,3 +1457,7 @@ include!("signature_bounded.rs");
 #[cfg(test)]
 #[path = "tests/test_signature_bounded.rs"]
 mod bounded_tests;
+
+#[cfg(test)]
+#[path = "tests/test_signature_dictionary_canonical.rs"]
+mod dictionary_canonical_tests;
