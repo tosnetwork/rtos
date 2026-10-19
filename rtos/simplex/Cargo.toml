@@ -33,6 +33,9 @@ chrono = '0.4'
 colored = '2.0'
 env_logger = '0.11'
 consensus-common = { path = '../consensus-common', features = ['test-utils'] }
+# The multi-node integration suites provision test validator namespaces; enable
+# that support for every test build so they never compile to nothing.
+simplex = { path = '.', features = ['integration-test-support'] }
 
 [features]
 default = []
