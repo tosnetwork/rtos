@@ -392,11 +392,25 @@ fn nonminimal_coins_complete_transactions() {
         }
     }
     assert_eq!(rows.len(), 3 * 28);
-    if let Ok(path) = std::env::var("RTOS_NONMINIMAL_TRANSACTION_EXPORT") {
+    check_reference_rows(
+        &rows,
+        include_str!("data/nonminimal-coins.tsv"),
+        "RTOS_NONMINIMAL_TRANSACTION_EXPORT",
+        &[],
+    );
+}
+
+/// Compares exported rows (transaction and account roots in columns 10 and 11)
+/// with a reference fixture (id, transaction root, account root, ...). When
+/// `export_var` is set the rows are written to that path instead. Rows listed
+/// in `known` are open findings: they must still differ, so the list cannot go
+/// stale silently.
+fn check_reference_rows(rows: &[String], fixture: &str, export_var: &str, known: &[&str]) {
+    if let Ok(path) = std::env::var(export_var) {
         std::fs::write(path, rows.join("\n") + "\n").unwrap();
         return;
     }
-    let expected: std::collections::HashMap<_, _> = include_str!("data/nonminimal-coins.tsv")
+    let expected: std::collections::HashMap<_, _> = fixture
         .lines()
         .filter(|line| !line.starts_with('#'))
         .map(|line| {
@@ -405,21 +419,181 @@ fn nonminimal_coins_complete_transactions() {
         })
         .collect();
     assert_eq!(expected.len(), rows.len());
-    // Before version 12 the reference credits extra_flags as the legacy IHR
-    // fee to the message balance, which the executor does not do; the minimal
-    // flags=1 row at version 11 is tracked as a separate executor finding.
-    const KNOWN_DIFFERENCES: [&str; 1] = ["int-flags-1-min-v11"];
-    for row in &rows {
+    for row in rows {
         let f: Vec<_> = row.split('\t').collect();
-        if KNOWN_DIFFERENCES.contains(&f[0]) {
-            continue;
+        let (th, ah) = expected.get(f[0]).unwrap_or_else(|| panic!("{} not in fixture", f[0]));
+        let actual = (f[10].to_lowercase(), f[11].to_lowercase());
+        if known.contains(&f[0]) {
+            assert_ne!(actual, (th.clone(), ah.clone()), "{} no longer differs", f[0]);
+        } else {
+            assert_eq!(actual, (th.clone(), ah.clone()), "{}", f[0]);
         }
-        let (th, ah) = &expected[f[0]];
-        assert_eq!(
-            (f[10].to_lowercase(), f[11].to_lowercase()),
-            (th.clone(), ah.clone()),
-            "{}",
-            f[0]
-        );
     }
+}
+
+/// `value` as a Coins payload in its minimal encoding.
+fn coins_min(builder: &mut BuilderData, value: u128) {
+    coins_bits(builder, value, minimal_len(value));
+}
+
+struct Inbound {
+    value: u128,
+    other: rtos_block::ExtraCurrencyCollection,
+    extra_flags: u128,
+    bounce: bool,
+}
+
+impl Inbound {
+    fn value(value: u128) -> Self {
+        Self { value, other: Default::default(), extra_flags: 0, bounce: false }
+    }
+}
+
+/// An internal message with minimal encodings and the given value, extra
+/// currencies, extra_flags and bounce flag.
+fn inbound_cell(src: &MsgAddressInt, dst: &MsgAddressInt, m: &Inbound) -> Cell {
+    let mut b = BuilderData::new();
+    b.append_bit_zero().unwrap(); // int_msg_info$0
+    b.append_bit_one().unwrap(); // ihr_disabled
+    if m.bounce {
+        b.append_bit_one().unwrap();
+    } else {
+        b.append_bit_zero().unwrap();
+    }
+    b.append_bit_zero().unwrap(); // bounced
+    src.write_to(&mut b).unwrap();
+    dst.write_to(&mut b).unwrap();
+    coins_min(&mut b, m.value);
+    m.other.write_to(&mut b).unwrap();
+    coins_min(&mut b, m.extra_flags);
+    coins_min(&mut b, 0); // fwd_fee
+    b.append_u64(1000).unwrap(); // created_lt
+    b.append_u32(0).unwrap(); // created_at
+    b.append_bit_zero().unwrap(); // no init
+    b.append_bit_zero().unwrap(); // inline empty body
+    b.into_cell().unwrap()
+}
+
+/// An active account cell with the given balance, code and data.
+fn account_cell(
+    addr: &MsgAddressInt,
+    cfg: &BlockchainConfig,
+    coins: u128,
+    other: rtos_block::ExtraCurrencyCollection,
+    code: &str,
+    data: Cell,
+) -> Cell {
+    let mut init = StateInit::default();
+    init.set_code(rtos_assembler::compile_code_to_cell(code).unwrap());
+    init.set_data(data);
+    Account::active(
+        addr.clone(),
+        CurrencyCollection { coins: rtos_block::Coins::try_from(coins).unwrap(), other },
+        0,
+        100,
+        init,
+        cfg.size_limits_config().acc_state_cells_for_storage_dict,
+    )
+    .unwrap()
+    .serialize()
+    .unwrap()
+}
+
+/// Contract code sending the message kept as the first reference of its data.
+fn send_code(mode: u8) -> String {
+    format!("PUSHROOT CTOS LDREF DROP PUSHINT {mode} SENDRAWMSG")
+}
+
+fn data_with_refs(refs: &[Cell]) -> Cell {
+    let mut b = BuilderData::new();
+    for r in refs {
+        b.checked_append_reference(r.clone()).unwrap();
+    }
+    b.into_cell().unwrap()
+}
+
+/// An outbound internal message to `dst` without bounce.
+fn outbound_cell(
+    src: &MsgAddressInt,
+    dst: &MsgAddressInt,
+    value: u128,
+    other: rtos_block::ExtraCurrencyCollection,
+) -> Cell {
+    let mut hdr = InternalMessageHeader::with_addresses(
+        src.clone(),
+        dst.clone(),
+        CurrencyCollection { coins: rtos_block::Coins::try_from(value).unwrap(), other },
+    );
+    hdr.ihr_disabled = true;
+    hdr.bounce = false;
+    Message::with_int_header(hdr).serialize().unwrap()
+}
+
+// Complete transactions for the inbound extra_flags field. From version 12 it
+// carries flags and reserved bits refuse the message; before version 12 it is
+// the legacy IHR fee, credited with the message value (to the credit phase, the
+// gas limit, the stack and c7 values, mode 64 and the bounce), and a bounce
+// carries no flags. data/inbound-extra-flags.tsv holds the reference roots.
+#[test]
+fn inbound_extra_flags_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let max = (1u128 << 120) - 1;
+    let mut rows = Vec::new();
+    for version in [11u32, 12, 16] {
+        let cfg = config(version, false, &addr);
+        let none = rtos_block::ExtraCurrencyCollection::default;
+        let reply = || data_with_refs(&[outbound_cell(&addr, &src, 0, none())]);
+        let contracts = [
+            ("accept", "ACCEPT".to_string(), Cell::default(), false, 1_000_000_000),
+            ("bounce", "THROW 100".to_string(), Cell::default(), true, 1_000_000_000),
+            ("send64", send_code(64), reply(), false, 1_000_000_000),
+            ("zerovalue", "PUSHINT 0 NEWC STU 8 ENDC POPROOT".to_string(), Cell::default(), false, 0),
+            ("maxvalue", "ACCEPT".to_string(), Cell::default(), false, max),
+            ("stack", "DROP DROP DROP NEWC STVARUINT16 ENDC POPROOT".to_string(), Cell::default(), false, 1_000_000_000),
+            ("incoming", "INCOMINGVALUE FIRST NEWC STVARUINT16 ENDC POPROOT".to_string(), Cell::default(), false, 1_000_000_000),
+            (
+                "inmsgparams",
+                "PUSHCTR c7 FIRST PUSHINT 17 INDEXVAR PUSHINT 7 INDEXVAR NEWC STVARUINT16 ENDC POPROOT"
+                    .to_string(),
+                Cell::default(),
+                false,
+                1_000_000_000,
+            ),
+        ];
+        for (tag, code, data, bounce, value) in contracts {
+            let account = account_cell(&addr, &cfg, 10_000_000_000, none(), &code, data);
+            for flags in [0u128, 1, 2, 3, 4, 1000, 1 << 100, max] {
+                let m = Inbound { extra_flags: flags, bounce, ..Inbound::value(value) };
+                run_cells(
+                    &format!("a245-{tag}-f{flags}-v{version}"),
+                    cfg.clone(),
+                    account.clone(),
+                    inbound_cell(&src, &addr, &m),
+                    &addr,
+                    &mut rows,
+                );
+            }
+        }
+    }
+    assert_eq!(rows.len(), 192);
+    check_reference_rows(
+        &rows,
+        include_str!("data/inbound-extra-flags.tsv"),
+        "RTOS_INBOUND_EXTRA_FLAGS_EXPORT",
+        // The credited account balance exceeds the serialized maximum; the
+        // reference keeps it transiently (credit overflow, a separate finding).
+        &[
+            "a245-zerovalue-f1329227995784915872903807060280344575-v11",
+            "a245-maxvalue-f0-v11",
+            "a245-maxvalue-f0-v12",
+            "a245-maxvalue-f1-v12",
+            "a245-maxvalue-f2-v12",
+            "a245-maxvalue-f3-v12",
+            "a245-maxvalue-f0-v16",
+            "a245-maxvalue-f1-v16",
+            "a245-maxvalue-f2-v16",
+            "a245-maxvalue-f3-v16",
+        ],
+    );
 }

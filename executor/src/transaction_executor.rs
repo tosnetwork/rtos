@@ -1048,7 +1048,13 @@ pub trait TransactionExecutor {
         int_header.ihr_disabled = true;
         int_header.bounce = false;
         int_header.bounced = true;
-        let extra_flags = int_header.extra_flags.inner() as u8 & SUPPORTED_EXTRA_FLAGS;
+        // Before version 12 the inbound field is the legacy IHR fee, not flags: the bounce
+        // carries no flags and keeps the old format.
+        let extra_flags = if self.config().block_version() >= 12 {
+            (int_header.extra_flags.inner() & SUPPORTED_EXTRA_FLAGS as u128) as u8
+        } else {
+            0
+        };
         int_header.extra_flags = VarUInteger16::from(extra_flags as u64);
 
         let mut calc = StorageUsageCalc::with_limits(0, 0);

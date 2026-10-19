@@ -108,6 +108,25 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
             CommonMsgInfo::IntMsgInfo(hdr) => {
                 log::debug!(target: "executor", "internal message, bounce: {}", hdr.bounce);
                 msg_balance = hdr.value.clone();
+                let extra_flags = hdr.extra_flags.inner();
+                if self.config.block_version() >= 12 {
+                    // From version 12 the field carries flags; reserved bits refuse the message.
+                    if extra_flags > crate::SUPPORTED_EXTRA_FLAGS as u128 {
+                        fail!(ExecutorError::TrExecutorError(format!(
+                            "inbound message has reserved extra_flags bits set: {extra_flags}"
+                        )))
+                    }
+                } else {
+                    // Before version 12 the field is the legacy IHR fee, which is credited
+                    // with the value of a message that is not delivered through IHR.
+                    let legacy_fee = Coins::try_from(extra_flags)?;
+                    if !msg_balance.coins.add(&legacy_fee)? {
+                        fail!(ExecutorError::TrExecutorError(
+                            "inbound value and legacy IHR fee exceed the representable amount"
+                                .to_string()
+                        ))
+                    }
+                }
                 (hdr.bounce, false, &hdr.dst)
             }
             CommonMsgInfo::ExtInMsgInfo(hdr) => {
