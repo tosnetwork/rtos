@@ -241,6 +241,27 @@ pub trait EngineOperations: Sync + Send {
         unimplemented!()
     }
 
+    /// The post-quantum consensus-key custody this node loaded at startup, if
+    /// it is configured with one. It is the only source of consensus membership
+    /// for a post-quantum set and of every consensus signer.
+    fn pq_consensus_custody(&self) -> Option<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+        None
+    }
+
+    /// The custody clock, read afresh at each decision point that depends on a
+    /// key's window: member selection, the creation-time recheck and the exact
+    /// signer lookup.
+    fn pq_custody_now(&self) -> u32 {
+        crate::pq_consensus_config::pq_custody_now()
+    }
+
+    /// Whether this node holds any local validator key at all: a classical
+    /// validator key or any custodied consensus key.
+    fn has_local_validator_keys(&self) -> bool {
+        self.pq_consensus_custody().is_some_and(|custody| !custody.is_empty())
+            || self.get_validator_status()
+    }
+
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
         unimplemented!()
     }

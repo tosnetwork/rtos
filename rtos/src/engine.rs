@@ -143,6 +143,9 @@ pub struct Engine {
     // next block is admitted, so the published head is the admitted predecessor
     // and never moves backwards.
     mc_head_publication: tokio::sync::Mutex<()>,
+    /// The consensus-key custody loaded before anything else started. Shared,
+    /// as one instance, with the validator manager and every group.
+    pq_custody: Option<Arc<crate::pq_consensus_config::PqCustodyShared>>,
     db: Arc<InternalDb>,
     candidate_db: CandidateDbPool,
     network: Arc<NodeNetwork>,
@@ -739,6 +742,16 @@ impl Engine {
 
         log::info!("Creating engine...");
 
+        // The consensus keys this host holds are loaded before the database, the
+        // network or any service starts: a key that cannot be loaded, an
+        // ambiguous schedule, or a binding that names no validator stops the
+        // node here instead of letting it come up as an observer.
+        let pq_custody = crate::pq_consensus_config::load_pq_consensus_from_dir(
+            &general_config.build_config_path(""),
+            crate::pq_consensus_config::pq_custody_now(),
+        )?
+        .map(|loaded| loaded.custody);
+
         #[cfg(feature = "telemetry")]
         let (metrics, engine_telemetry) = Self::create_telemetry();
         let storage_allocated = Arc::new(StorageAlloc::default());
@@ -959,6 +972,7 @@ impl Engine {
                     mc_head_publication: tokio::sync::Mutex::new(()),
                     #[cfg(test)]
                     overlay_init_test_gate: std::sync::Mutex::new(None),
+                    pq_custody,
                     db,
                     candidate_db,
                     shard_states_awaiters: AwaitersPool::new(
@@ -1462,6 +1476,10 @@ impl Engine {
 
     pub fn network(&self) -> &NodeNetwork {
         &self.network
+    }
+
+    pub fn pq_consensus_custody(&self) -> Option<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+        self.pq_custody.clone()
     }
 
     pub fn zerostate_id(&self) -> &BlockIdExt {

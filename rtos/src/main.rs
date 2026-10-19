@@ -28,6 +28,7 @@ mod internal_db;
 mod macros;
 mod network;
 mod network_db;
+mod pq_consensus_config;
 mod propagation_outbox;
 pub(crate) mod propagation_outbox_auth;
 pub(crate) mod publication_worker;

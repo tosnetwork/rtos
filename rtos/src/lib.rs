@@ -31,6 +31,7 @@ pub mod network;
 mod network_db;
 #[cfg(feature = "isolated-consensus-signing")]
 pub use network_db::DbNetworkBinding;
+pub mod pq_consensus_config;
 pub mod propagation_outbox;
 pub(crate) mod propagation_outbox_auth;
 pub(crate) mod publication_worker;

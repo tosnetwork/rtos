@@ -263,6 +263,10 @@ impl EngineOperations for Engine {
         self.network().config_handler().get_validator_status()
     }
 
+    fn pq_consensus_custody(&self) -> Option<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+        Engine::pq_consensus_custody(self)
+    }
+
     fn validator_network(&self) -> Arc<dyn PrivateOverlayOperations> {
         Engine::validator_network(self)
     }
