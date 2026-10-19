@@ -1197,6 +1197,11 @@ fn execute_if_mask(engine: &mut Engine, name: &'static str, how: u8) -> Status {
         fetch_reference(engine, CC)?
     }
     fetch_stack(engine, params)?;
+    // Continuations taken from the stack are type-checked before the condition, in stack order.
+    let first_stack_var = usize::from(how.bit(REF)) + usize::from(how.bit(REF2));
+    for index in first_stack_var..engine.cmd.var_count() - 1 {
+        engine.cmd.var(index).as_continuation()?;
+    }
     if how.bit(THROW) && engine.cmd.last_var()?.as_integer()?.is_nan() {
         fail!(ExceptionCode::IntegerOverflow)
     }

@@ -174,10 +174,10 @@ pub fn execute_xctos(engine: &mut Engine) -> Status {
 pub fn execute_xload(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("XLOAD"))?;
     fetch_stack(engine, 1)?;
-    // now it does nothing as Durov's code
     let cell = engine.cmd.var(0).as_cell()?.clone();
-    let slice = engine.load_cell(cell)?;
-    let cell = slice.into_cell()?;
+    // Before version 5 the cell is returned as it is, without loading it.
+    let cell =
+        if engine.block_version() >= 5 { engine.load_cell(cell)?.into_cell()? } else { cell };
     engine.cc.stack.push(StackItem::Cell(cell));
     Ok(())
 }
@@ -186,8 +186,13 @@ pub fn execute_xload(engine: &mut Engine) -> Status {
 pub fn execute_xloadq(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("XLOADQ"))?;
     fetch_stack(engine, 1)?;
-    // now it does nothing as Durov's code
     let cell = engine.cmd.var(0).as_cell()?.clone();
+    // Before version 5 the cell is returned as it is, without loading it.
+    if engine.block_version() < 5 {
+        engine.cc.stack.push(StackItem::Cell(cell));
+        engine.cc.stack.push(boolean!(true));
+        return Ok(());
+    }
     if let Ok(slice) = engine.load_cell(cell.clone()) {
         let cell = slice.into_cell()?;
         engine.cc.stack.push(StackItem::Cell(cell));

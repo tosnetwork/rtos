@@ -661,6 +661,21 @@ pub(super) fn execute_xchg(
     Ok(())
 }
 
+// XCHG s(i), s(j) with 1 <= i < j encoded in the next byte; other arguments are invalid
+fn execute_xchg_checked(engine: &mut Engine) -> Status {
+    engine.load_instruction(
+        Instruction::new("XCHG")
+            .set_opts(InstructionOptions::StackRegisterPair(WhereToGetParams::GetFromNextByte)),
+    )?;
+    let ra = engine.cmd.sregs().ra;
+    let rb = engine.cmd.sregs().rb;
+    if ra == 0 || ra >= rb {
+        fail!(ExceptionCode::InvalidOpcode, "invalid XCHG arguments")
+    }
+    engine.cc.stack.swap(ra, rb)?;
+    Ok(())
+}
+
 // SWAP
 pub(super) fn execute_swap(engine: &mut Engine) -> Status {
     execute_xchg(
@@ -681,11 +696,7 @@ pub(super) fn execute_xchg_simple(engine: &mut Engine) -> Status {
 
 // XCHG addressing via the next instruction byte
 pub(super) fn execute_xchg_std(engine: &mut Engine) -> Status {
-    execute_xchg(
-        engine,
-        "XCHG",
-        InstructionOptions::StackRegisterPair(WhereToGetParams::GetFromNextByte),
-    )
+    execute_xchg_checked(engine)
 }
 
 // XCHG addressing via the next instruction byte, long index

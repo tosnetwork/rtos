@@ -679,11 +679,9 @@ pub fn execute_stones(engine: &mut Engine) -> Status {
 pub fn execute_stsame(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("STSAME"))?;
     fetch_stack(engine, 3)?;
-    let x = engine.cmd.var(0).as_integer()?;
-    let n = engine.cmd.var(1).as_integer()?;
-    engine.cmd.var(2).as_builder()?;
-    let x = x.as_integer_value(0..=1)?;
-    let n = n.as_integer_value(0..=1023)?;
+    // Operands are checked in stack order, each completely (type and range).
+    let x = engine.cmd.var(0).as_integer_value(0..=1)?;
+    let n = engine.cmd.var(1).as_integer_value(0..=1023)?;
     let b = engine.cmd.var_mut(2).as_builder_mut()?;
     engine.cc.stack.push_builder(store_bits(b, n, x != 0)?);
     Ok(())

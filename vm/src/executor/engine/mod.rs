@@ -1,5 +1,6 @@
 /*
  * RTOS project modifications (2026-10-10): historical opcode activation gates.
+ * RTOS project modifications (2026-10-19): reference code page 0 dispatch table.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -10,14 +11,14 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 mod core;
+mod cp0_table;
 pub(in crate::executor) mod data;
-mod fix_gas;
 mod handlers;
-mod version_gates;
+mod opcode_table;
 #[macro_use]
 pub(in crate::executor) mod storage;
 
-pub use self::{core::*, fix_gas::*};
+pub use self::core::*;
 
 #[cfg(test)]
 #[path = "../../tests/test_microfunctions.rs"]

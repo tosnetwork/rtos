@@ -24,7 +24,7 @@ use num::{bigint::Sign, BigInt};
 use rtos_block::{
     fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, IBitstring, MsgAddressInt,
     MsgForwardPrices, Result, SizeLimitsConfig, SliceData, Status, ACTION_CHANGE_LIB,
-    ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE, CHANGE_SET_LIB_VALID_MODES,
+    ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE,
 };
 
 fn get_bigint(slice: &SliceData) -> BigInt {
@@ -58,14 +58,25 @@ fn add_action(
     Ok(())
 }
 
+/// The mode operand of SETLIBCODE and CHANGELIB: up to 2, optionally with flag 16, from
+/// version 4; at most 2 before.
+fn lib_mode(engine: &Engine, item: &StackItem) -> Result<u8> {
+    if engine.block_version() >= 4 {
+        let mode = item.as_integer_value(0..=31u8)?;
+        if mode & !16 > 2 {
+            fail!(ExceptionCode::RangeCheckError, "invalid library mode {mode}");
+        }
+        Ok(mode)
+    } else {
+        item.as_integer_value(0..=2u8)
+    }
+}
+
 /// CHANGELIB (h x - )
 pub(super) fn execute_changelib(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("CHANGELIB"))?;
     fetch_stack(engine, 2)?;
-    let x = engine.cmd.var(0).as_integer_value(0..=CHANGE_SET_LIB_VALID_MODES)?;
-    if x & !CHANGE_SET_LIB_VALID_MODES != 0 {
-        fail!(ExceptionCode::RangeCheckError, "invalid setlibcode mode {x}");
-    }
+    let x = lib_mode(engine, engine.cmd.var(0))?;
     let hash = engine.cmd.var(1).as_integer()?.as_u256()?;
     let mut suffix = BuilderData::with_raw(vec![x * 2], 8)?;
     suffix.append_raw(&hash, 256)?;
@@ -442,10 +453,7 @@ pub(super) fn execute_setcode(engine: &mut Engine) -> Status {
 pub(super) fn execute_setlibcode(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("SETLIBCODE"))?;
     fetch_stack(engine, 2)?;
-    let x = engine.cmd.var(0).as_integer_value(0..=CHANGE_SET_LIB_VALID_MODES)?;
-    if x & !CHANGE_SET_LIB_VALID_MODES != 0 {
-        fail!(ExceptionCode::RangeCheckError, "invalid setlibcode mode {x}");
-    }
+    let x = lib_mode(engine, engine.cmd.var(0))?;
     let cell = engine.cmd.var(1).as_cell()?.clone();
     let suffix = BuilderData::with_raw(vec![x * 2 + 1], 8)?;
     add_action(engine, ACTION_CHANGE_LIB, Some(cell), suffix)

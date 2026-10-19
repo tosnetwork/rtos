@@ -1,7 +1,8 @@
 /*
  * RTOS project modifications (2026-10-10): historical base gas, persistent exception handlers and OOG results.
  * RTOS project modifications (2026-10-19): exception dispatch and implicit returns go through the
- * common jump resolver; VM termination is recorded when a quit continuation is reached.
+ * common jump resolver; VM termination is recorded when a quit continuation is reached;
+ * instructions are decoded through the reference dispatch table stage.
  * Copyright (C) 2019-2024 EverX. All Rights Reserved.
  * Modifications Copyright (C) 2025-2026 RSquad Blockchain Lab.
  *
@@ -15,7 +16,7 @@ use crate::{
     error::{tvm_exception_code, tvm_exception_full, tvm_exception_or_custom_code, TvmError},
     executor::{
         continuation::{jump, ret},
-        engine::{fix_gas::check_too_short_code, handlers::Handlers},
+        engine::{handlers::Handlers, opcode_table},
         gas::gas_state::Gas,
         math::DivMode,
         storage::fetch_stack,
@@ -43,6 +44,20 @@ use std::{
 };
 
 pub(super) type ExecuteHandler = fn(&mut Engine) -> Status;
+
+/// Removes the completion tag of an inline bit string: the trailing zero bits and the one bit
+/// before them; a string of zero bits only becomes empty. References and the start offset stay.
+pub(super) fn remove_trailing(slice: &mut SliceData) {
+    let bits = slice.remaining_bits();
+    let mut keep = 0;
+    for offset in (0..bits).rev() {
+        if slice.get_bit_opt(offset) == Some(true) {
+            keep = offset;
+            break;
+        }
+    }
+    slice.shrink_data(..keep);
+}
 
 pub(super) struct SliceProto {
     data_window: Range<usize>,
@@ -125,6 +140,8 @@ pub struct Engine {
     /// Exception being dispatched; reported as is when the dispatch terminates the VM with its
     /// code (keeps the system/custom kind of the original exception).
     dispatched: Option<Exception>,
+    /// The dispatch stage has charged the current instruction's base gas.
+    base_charged: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +255,7 @@ impl Engine {
             block_version: 0,
             finished: None,
             dispatched: None,
+            base_charged: false,
         }
     }
 
@@ -592,57 +610,16 @@ impl Engine {
                 break result;
             }
             self.cmd_code = SliceProto::from(self.cc.code());
-            if let Some((minimum, width)) = super::version_gates::registration(self.cc.code())? {
-                if self.block_version < minimum {
-                    let err = self.reject_unavailable_instruction().unwrap_err();
-                    self.cmd.clear();
-                    self.raise_exception(err)?;
-                    continue;
-                }
-                if self.cc.code().remaining_bits() < width {
-                    self.step += 1;
-                    let gas = Gas::basic_gas_price(width, 0);
-                    let err = match self.try_use_gas(gas) {
-                        Err(err) => err,
-                        Ok(()) => error!(ExceptionCode::InvalidOpcode),
-                    };
-                    self.raise_exception(err)?;
-                    continue;
-                }
-            }
-            if let Some((prefix, bits, gas)) = check_too_short_code(self.cc.code())? {
-                self.cc.code_mut().move_by(bits as usize)?;
-                // Before v4, exception gas is charged before checking exhaustion.
-                let gas_result = if self.block_version >= 4 {
-                    self.try_use_gas(gas as i64)
-                } else {
-                    self.use_gas(gas as i64);
-                    Ok(())
-                };
-                let err = match gas_result {
-                    Err(err) => err,
-                    Ok(_) => error!(
-                        ExceptionCode::InvalidOpcode,
-                        "partial primitive with bits {bits} : 0x{prefix:X}",
-                    ),
-                };
-                self.step += 1;
+            if let Err(err) = self.dispatch_stage() {
+                self.cmd.clear();
                 self.raise_exception(err)?;
                 continue;
             }
             let execution_result = match HANDLERS_CP0.get_handler(self) {
                 Err(err) => {
+                    // The dispatch stage has charged the instruction gas.
                     self.step += 1;
-                    if self.block_version < 4 {
-                        let bits = 8 + self.cc.code().pos().saturating_sub(self.cmd_code.pos());
-                        self.use_gas(Gas::basic_gas_price(bits, 0));
-                        Some(err)
-                    } else {
-                        match self.basic_use_gas(8) {
-                            Err(err) => Some(err),
-                            Ok(_) => Some(err),
-                        }
-                    }
+                    Some(err)
                 }
                 Ok(Some(handler)) => {
                     match handler(self) {
@@ -655,8 +632,12 @@ impl Engine {
                         Ok(_) => self.gas.check_gas_remaining().err(),
                     }
                 }
-                Ok(None) => Some(self.reject_unavailable_instruction().unwrap_err()),
+                Ok(None) => {
+                    self.step += 1;
+                    Some(error!(ExceptionCode::InvalidOpcode, "no handler for a dispatched opcode"))
+                }
             };
+            self.base_charged = false;
             self.cmd.clear();
             if let Some(err) = execution_result {
                 self.raise_exception(err)?;
@@ -1097,6 +1078,7 @@ impl Engine {
             block_version: self.block_version,
             finished: None,
             dispatched: None,
+            base_charged: false,
         };
         if params.push_0 {
             child.cc.stack.push_int(0);
@@ -1209,9 +1191,38 @@ impl Engine {
 
     // Implementation *********************************************************
 
+    /// The generic dispatch stage of the reference decoder (see `opcode_table`): unassigned
+    /// ranges and instructions above the global version cost 10 gas, every other instruction
+    /// costs `10 + total bits` before its length is checked; any rejection is an invalid opcode.
+    /// The gas is consumed unchecked before version 4.
+    fn dispatch_stage(&mut self) -> Status {
+        let bits = self.cc.code().remaining_bits().min(24);
+        let opcode = (self.cc.code().get_int(bits)? as u32) << (24 - bits);
+        let (gas, run) = opcode_table::dispatch(opcode, bits, self.block_version);
+        let charged = if self.block_version >= 4 {
+            self.try_use_gas(gas)
+        } else {
+            self.use_gas(gas);
+            Ok(())
+        };
+        if let Err(err) = charged {
+            self.step += 1;
+            return Err(err);
+        }
+        if !run {
+            self.step += 1;
+            fail!(ExceptionCode::InvalidOpcode, "invalid or too short opcode {opcode:06x}");
+        }
+        self.base_charged = true;
+        Ok(())
+    }
+
     /// A version-disabled opcode still counts as an attempted instruction.
     pub(in crate::executor) fn reject_unavailable_instruction(&mut self) -> Status {
         self.step += 1;
+        if self.base_charged {
+            fail!(ExceptionCode::InvalidOpcode);
+        }
         // Since version 4, exhaustion precedes exception dispatch. Older
         // versions also charge the exception before detecting exhaustion.
         let gas = Gas::basic_gas_price(0, 0);
@@ -1300,7 +1311,12 @@ impl Engine {
         Ok(slice)
     }
 
+    /// Instruction base gas. The dispatch stage charges it for every dispatched instruction;
+    /// this only charges it for an instruction run outside that stage.
     fn basic_use_gas(&mut self, mut bits: usize) -> Result<()> {
+        if self.base_charged {
+            return Ok(());
+        }
         bits += self.cc.code().pos().saturating_sub(self.cmd_code.pos());
         let gas = Gas::basic_gas_price(bits, 0);
         if self.block_version >= 4 {
@@ -1354,6 +1370,10 @@ impl Engine {
                     self.cmd.params.push(InstructionParameter::Length(len))
                 }
                 self.basic_use_gas(0)?;
+                // The add forms (neither quotient nor remainder requested) exist from version 4.
+                if mode.flags & 0x0C == 0 && self.block_version < 4 {
+                    fail!(ExceptionCode::InvalidOpcode, "add form of a division before version 4")
+                }
                 self.cmd.proto.name = mode.command_name()?;
                 self.cmd.params.push(InstructionParameter::DivisionMode(mode));
             }
@@ -1558,7 +1578,9 @@ impl Engine {
                 }))
             }
             Some(InstructionOptions::Dictionary(offset, bits)) => {
-                self.use_gas(Gas::basic_gas_price(offset + 1 + bits, 0));
+                if !self.base_charged {
+                    self.use_gas(Gas::basic_gas_price(offset + 1 + bits, 0));
+                }
                 let mut code = self.cmd_code(offset)?;
                 let cell = code
                     .get_next_dictionary()
@@ -1570,7 +1592,9 @@ impl Engine {
                 self.cmd.params.push(InstructionParameter::Length(length))
             }
             Some(InstructionOptions::Bytestring(offset, r, x, bytes)) => {
-                self.use_gas(Gas::basic_gas_price(offset + r + x, 0));
+                if !self.base_charged {
+                    self.use_gas(Gas::basic_gas_price(offset + r + x, 0));
+                }
                 let slice = self.extract_slice(offset, r, x, 0, bytes)?;
                 if slice.remaining_bits() % 8 != 0 {
                     fail!(ExceptionCode::InvalidOpcode)
@@ -1578,9 +1602,11 @@ impl Engine {
                 self.cmd.params.push(InstructionParameter::Slice(slice))
             }
             Some(InstructionOptions::Bitstring(offset, r, x, refs)) => {
-                self.use_gas(Gas::basic_gas_price(offset + r + x, 0));
+                if !self.base_charged {
+                    self.use_gas(Gas::basic_gas_price(offset + r + x, 0));
+                }
                 let mut slice = self.extract_slice(offset, r, x, refs, 0)?;
-                slice.trim_right();
+                remove_trailing(&mut slice);
                 self.cmd.params.push(InstructionParameter::Slice(slice));
             }
             None => {

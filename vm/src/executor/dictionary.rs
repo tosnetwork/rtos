@@ -192,14 +192,23 @@ fn find(engine: &mut Engine, name: &'static str, how: u8) -> Status {
 // (value key slice nbits - slice -1|0)
 fn pfxdictset(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     engine.load_instruction(Instruction::new(name))?;
+    // Before version 9 the setting forms check for three operands only.
+    let params = if how.bit(DEL) || engine.block_version() < 9 { 3 } else { 4 };
+    if engine.cc.stack.depth() < params {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     let params = if how.bit(DEL) { 3 } else { 4 };
-    fetch_stack(engine, params)?;
+    let depth = engine.cc.stack.depth().min(params);
+    fetch_stack(engine, depth)?;
     let nbits = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let mut dict = PfxHashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
     let key = engine.cmd.var(2).as_slice()?.clone();
     let key_valid = if how.bit(DEL) {
         convert_dict_error(dict.lookup_delete_with_gas(&key, engine))?
     } else {
+        if engine.cmd.var_count() < 4 {
+            fail!(ExceptionCode::StackUnderflow)
+        }
         let value = engine.cmd.var(3).as_slice()?.as_builder()?;
         let mode = if how.bit(INV) {
             ADD

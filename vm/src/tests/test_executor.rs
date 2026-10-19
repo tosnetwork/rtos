@@ -175,6 +175,8 @@ where
     let code = div_generate_bytecode::<T>(mode, mul_shift as u8, div_shift as u8);
     let mut engine =
         Engine::with_capabilities(0).setup(code, None, Some(stack), None, vec![]).unwrap();
+    // The add forms (neither quotient nor remainder) exist from version 4.
+    engine.set_block_version(4);
 
     match engine.execute() {
         Err(e) => panic!("Execute error: {}", e),
