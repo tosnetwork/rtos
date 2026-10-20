@@ -1737,28 +1737,24 @@ impl GasLimitsPrices {
         self.gas_price >> 16
     }
 
-    /// Calculate gas by coins balance
-    pub fn calc_gas(&self, value: u128, gas_limit: u64, max_gas_threshold: u128) -> u64 {
-        if value >= max_gas_threshold {
-            return gas_limit;
-        }
-        if value < self.flat_gas_price as u128 {
-            return 0;
-        }
-        let res = ((value - self.flat_gas_price as u128) << 16) / (self.gas_price as u128);
-        (self.flat_gas_limit + res as u64).min(crate::VarUInteger7::MAX.as_u64())
-    }
-
     /// Calculate max gas threshold: the flat price plus the price of the gas
-    /// above the flat limit, rounded up (a value below it buys less than
-    /// `gas_limit`). Both factors are below 2^64, so the product fits u128.
+    /// above the flat limit, rounded toward positive infinity (a value below
+    /// it buys less than `gas_limit`). As in the reference, the gas above the
+    /// flat limit (an unsigned difference) and the flat price added to it are
+    /// taken as signed 64-bit integers, so either counts as negative from
+    /// 2^63, while the gas price stays unsigned; the product is exact in
+    /// i128. When the limit does not exceed the flat limit the threshold is
+    /// the unsigned flat price. A threshold at or below zero is returned as
+    /// zero, which every value reaches as well.
     pub fn calc_max_gas_threshold(&self, gas_limit: u64) -> u128 {
-        let mut result = self.flat_gas_price as u128;
-        if gas_limit > self.flat_gas_limit {
-            let price = (self.gas_price as u128) * ((gas_limit - self.flat_gas_limit) as u128);
-            result += price.div_ceil(1 << 16);
+        if gas_limit <= self.flat_gas_limit {
+            return u128::from(self.flat_gas_price);
         }
-        result
+        let above = i128::from((gas_limit - self.flat_gas_limit) as i64);
+        let product = i128::from(self.gas_price) * above;
+        let ceil = product.div_euclid(1 << 16) + i128::from(product.rem_euclid(1 << 16) != 0);
+        let threshold = ceil + i128::from(self.flat_gas_price as i64);
+        u128::try_from(threshold).unwrap_or(0)
     }
 }
 

@@ -1447,3 +1447,136 @@ fn failed_action_fine_is_capped_by_account_balance() {
     assert_eq!(inbound_balance.coins, Coins::from(13u64));
     assert!(result.messages.is_empty());
 }
+
+/// Gas prices around the signed 64-bit boundaries of the reference
+/// arithmetic: flat limit zero and nonzero with the gas above it at 2^63 - 1,
+/// 2^63 and 2^63 + 1, a limit of exactly 2^63, zero, small, 2^16-multiple,
+/// 2^63 and maximum gas prices, flat prices of 2^63 and more, and products
+/// that round toward positive infinity from below zero.
+fn gas_threshold_rows() -> Vec<(String, GasLimitsPrices, Vec<u128>)> {
+    let half = 1u64 << 63;
+    let mut rows = Vec::new();
+    let base = GasLimitsPrices {
+        gas_price: 400 << 16,
+        gas_limit: 1_000_000,
+        special_gas_limit: 1_000_000,
+        gas_credit: 10_000,
+        block_gas_limit: 10_000_000,
+        freeze_due_limit: 100_000_000,
+        delete_due_limit: 1_000_000_000,
+        flat_gas_limit: 100,
+        flat_gas_price: 40_000,
+        max_gas_threshold: 0,
+    };
+    for flat_gas_limit in [0u64, 100] {
+        for (tag, above) in
+            [("m1", half - 1), ("half", half), ("p1", half + 1), ("max", u64::MAX - flat_gas_limit)]
+        {
+            for gas_price in [0u64, 1, 65_535, 65_536, 400 << 16, half - 1, half, u64::MAX] {
+                rows.push((
+                    format!("fl{flat_gas_limit}-{tag}-p{gas_price}"),
+                    GasLimitsPrices {
+                        flat_gas_limit,
+                        gas_limit: flat_gas_limit.wrapping_add(above),
+                        gas_price,
+                        ..base.clone()
+                    },
+                ));
+            }
+        }
+        rows.push((
+            format!("fl{flat_gas_limit}-limit-half"),
+            GasLimitsPrices { flat_gas_limit, gas_limit: half, ..base.clone() },
+        ));
+        rows.push((
+            format!("fl{flat_gas_limit}-limit-below-flat"),
+            GasLimitsPrices { flat_gas_limit, gas_limit: 0, ..base.clone() },
+        ));
+    }
+    for flat_gas_price in [half - 1, half, u64::MAX] {
+        // A limit not above the flat limit keeps the unsigned flat price as
+        // the threshold, while values below it are still compared with the
+        // signed one.
+        for gas_limit in [0u64, 1_000_000, half + 100] {
+            rows.push((
+                format!("fp{flat_gas_price}-gl{gas_limit}"),
+                GasLimitsPrices { flat_gas_price, gas_limit, ..base.clone() },
+            ));
+        }
+        // A unit price makes the quotient below the threshold exceed 64 bits.
+        rows.push((
+            format!("fp{flat_gas_price}-gl0-p1"),
+            GasLimitsPrices { flat_gas_price, gas_limit: 0, gas_price: 1, ..base.clone() },
+        ));
+    }
+    rows.push(("normal".to_string(), base.clone()));
+    rows.into_iter()
+        .map(|(id, prices)| {
+            let threshold = prices.calc_max_gas_threshold(prices.gas_limit);
+            let fp = u128::from(prices.flat_gas_price);
+            let mut values = vec![0u128, 1, 1_000_000_000, 1 << 64, 1 << 100, (1 << 120) - 1];
+            values.extend([fp.saturating_sub(1), fp, fp + 1]);
+            values.extend([threshold.saturating_sub(1), threshold, threshold + 1]);
+            values.sort_unstable();
+            values.dedup();
+            (id, prices, values)
+        })
+        .collect()
+}
+
+// The gas threshold and the gas bought for a value, pinned against the
+// reference from the same ConfigParam 21 value cells
+// (data/gas-threshold.tsv). The threshold is kept as zero where the
+// reference one is zero or negative.
+#[test]
+fn gas_threshold_matches_reference() {
+    let rows = gas_threshold_rows();
+    if let Ok(path) = std::env::var("RTOS_GAS_THRESHOLD_EXPORT") {
+        let text: String = rows
+            .iter()
+            .map(|(id, prices, values)| {
+                let cell = prices.serialize().unwrap();
+                let values: Vec<_> = values.iter().map(|v| v.to_string()).collect();
+                format!(
+                    "{id}\t{}\t{}\n",
+                    rtos_block::write_boc(&cell)
+                        .unwrap()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    values.join(",")
+                )
+            })
+            .collect();
+        std::fs::write(path, text).unwrap();
+        return;
+    }
+    let fixture = include_str!("data/gas-threshold.tsv");
+    assert!(fixture
+        .lines()
+        .next()
+        .unwrap()
+        .contains("reference_commit=881240331ee48a291b96d73f8b8b93bae005ace0"));
+    let expected: std::collections::HashMap<_, _> = fixture
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            (f[0], f[1..].to_vec())
+        })
+        .collect();
+    assert_eq!(expected.len(), rows.len());
+    for (id, prices, values) in &rows {
+        let reference = &expected[id.as_str()];
+        assert_eq!(reference[0], "1", "{id}: the reference parses the prices");
+        // Read back as a configuration parameter, as the executor does.
+        let prices = GasLimitsPrices::construct_from_cell(prices.serialize().unwrap()).unwrap();
+        let threshold: i128 = reference[1].parse().unwrap();
+        assert_eq!(prices.max_gas_threshold, u128::try_from(threshold).unwrap_or(0), "{id}");
+        for (value, bought) in values.iter().zip(&reference[2..]) {
+            let ours = gas_bought_for(&prices, *value, prices.gas_limit, prices.max_gas_threshold)
+                .unwrap();
+            assert_eq!(ours.to_string(), *bought, "{id} value {value}");
+        }
+    }
+}

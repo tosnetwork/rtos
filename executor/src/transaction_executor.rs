@@ -2266,9 +2266,15 @@ fn init_gas(
 
 /// The gas `value` nanocoins buy under `gas_limit` and its threshold: the
 /// whole limit at or above the threshold, nothing below the flat price, else
-/// `((value - flat_gas_price) << 16) / gas_price + flat_gas_limit`. The result
-/// is not clamped to any serialized width; the compute phase fields are checked
-/// when they are stored.
+/// `floor(((value - flat_gas_price) << 16) / gas_price) + flat_gas_limit`.
+/// The result is not clamped to any serialized width; the compute phase
+/// fields are checked when they are stored. As in the reference, the flat
+/// price is compared and subtracted as a signed 64-bit integer, the quotient
+/// is narrowed to a signed 64-bit integer (the minimum when it does not fit)
+/// and the flat gas limit is added modulo 2^64; below the threshold this
+/// differs from exact arithmetic only for a flat price of 2^63 or more, where
+/// a limit not above the flat limit leaves the unsigned flat price as the
+/// threshold.
 fn gas_bought_for(
     gas_info: &GasLimitsPrices,
     value: u128,
@@ -2278,25 +2284,28 @@ fn gas_bought_for(
     if value >= max_gas_threshold {
         return Ok(gas_limit);
     }
-    let flat_price = u128::from(gas_info.flat_gas_price);
+    let value = i128::try_from(value).map_err(|_| error!("gas value {value} out of range"))?;
+    let flat_price = i128::from(gas_info.flat_gas_price as i64);
     if value < flat_price {
         return Ok(0);
     }
-    let price = u128::from(gas_info.gas_price);
+    let price = i128::from(gas_info.gas_price);
     if price == 0 {
+        // A zero price makes the threshold the flat price, decided above.
         fail!("gas price is zero")
     }
-    // (rest << 16) / price without a 2^16-times wider intermediate: below
-    // the threshold the quotient stays under the gas limit.
-    let rest = value - flat_price;
-    let shifted = (rest / price)
-        .checked_mul(1 << 16)
-        .and_then(|q| q.checked_add(((rest % price) << 16) / price))
-        .ok_or_else(|| error!("gas bought for {value} does not fit"))?;
-    u64::try_from(shifted)
-        .ok()
-        .and_then(|gas| gas.checked_add(gas_info.flat_gas_limit))
-        .ok_or_else(|| error!("gas bought for {value} does not fit"))
+    // The reference subtracts by adding the 64-bit negation of the signed
+    // flat price, which leaves -2^63 unchanged. Below the threshold the value
+    // is under 2^111, so the shift fits.
+    let rest = value + i128::from((gas_info.flat_gas_price as i64).wrapping_neg());
+    let shifted =
+        rest.checked_mul(1 << 16).ok_or_else(|| error!("gas bought for {value} does not fit"))?;
+    let mut quotient = shifted / price;
+    if shifted % price != 0 && (shifted < 0) != (price < 0) {
+        quotient -= 1;
+    }
+    let quotient = i64::try_from(quotient).unwrap_or(i64::MIN);
+    Ok((quotient as u64).wrapping_add(gas_info.flat_gas_limit))
 }
 
 fn check_deploy_state_init(

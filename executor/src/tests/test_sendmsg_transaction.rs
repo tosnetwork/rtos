@@ -268,11 +268,26 @@ fn run_cells(
     address: &MsgAddressInt,
     rows: &mut Vec<String>,
 ) {
+    run_cells_with(name, config, account_cell, msg_cell, address, false, rows)
+}
+
+/// As `run_cells`; `special` marks the account special for the reference
+/// (the executor derives it from the configuration).
+fn run_cells_with(
+    name: &str,
+    config: BlockchainConfig,
+    account_cell: Cell,
+    msg_cell: Cell,
+    address: &MsgAddressInt,
+    special: bool,
+    rows: &mut Vec<String>,
+) {
     let input = format!(
-        "{name}\t200\t2000000001\t{}\t{}\t{}\t-\t0\t{}\t{}",
+        "{name}\t200\t2000000001\t{}\t{}\t{}\t-\t{}\t{}\t{}",
         boc(config.raw_config().serialize().unwrap()),
         boc(account_cell.clone()),
         boc(msg_cell.clone()),
+        u8::from(special),
         address.workchain_id(),
         hex_bytes(address.address().get_bytestring(0).as_ref())
     );
@@ -1049,4 +1064,108 @@ fn extra_currency_values_complete_transactions() {
             }
         }
     }
+}
+
+// Complete transactions with gas configurations at the signed 64-bit
+// boundaries of the reference arithmetic (ConfigParam 21 for basechain
+// accounts, ConfigParam 20 for a special masterchain account): gas above the
+// flat limit of 2^63 - 1, 2^63 and 2^63 + 1, the maximum gas limit, and the
+// maximum gas price. Rows cover VM execution with and without ACCEPT, an
+// external message (gas credit), a message to an account without code
+// (compute skipped) and a special account. data/gas-extreme.tsv holds the
+// reference roots.
+#[test]
+fn gas_extreme_complete_transactions() {
+    let src = MsgAddressInt::with_standart(None, 0, [0x11; 32].into()).unwrap();
+    let addr = MsgAddressInt::standard(0, [0x62; 32]);
+    let mc_addr = MsgAddressInt::standard(-1, [0x63; 32]);
+    let none = rtos_block::ExtraCurrencyCollection::default;
+    let half = 1u64 << 63;
+    let mut rows = Vec::new();
+    for version in [11u32, 16] {
+        let flat = config(version, false, &addr).raw_config().gas_prices(false).unwrap();
+        let variants: [(&str, Box<dyn Fn(&mut rtos_block::GasLimitsPrices)>); 6] = [
+            ("m1", Box::new(move |g| g.gas_limit = g.flat_gas_limit + (half - 1))),
+            ("half", Box::new(move |g| g.gas_limit = g.flat_gas_limit + half)),
+            ("p1", Box::new(move |g| g.gas_limit = g.flat_gas_limit + half + 1)),
+            ("max", Box::new(|g| g.gas_limit = u64::MAX)),
+            ("pricemax", Box::new(|g| g.gas_price = u64::MAX)),
+            ("pricehalf", Box::new(move |g| g.gas_price = half)),
+        ];
+        assert!(flat.flat_gas_limit < half);
+        for (tag, change) in &variants {
+            let cfg = gas_config(version, &addr, |g| change(g));
+            for (acc_tag, balance) in
+                [("rich", 10_000_000_000u128), ("poor", 1_000_000), ("zero", 0)]
+            {
+                for (contract, code) in [("accept", "ACCEPT"), ("noaccept", "NOP")] {
+                    run_cells(
+                        &format!("a251-{tag}-{contract}-{acc_tag}-v{version}"),
+                        cfg.clone(),
+                        account_cell(&addr, &cfg, balance, none(), code, Cell::default()),
+                        inbound_cell(&src, &addr, &Inbound::value(1_000_000_000)),
+                        &addr,
+                        &mut rows,
+                    );
+                }
+                run_cells(
+                    &format!("a251-{tag}-external-{acc_tag}-v{version}"),
+                    cfg.clone(),
+                    account_cell(&addr, &cfg, balance, none(), "ACCEPT", Cell::default()),
+                    external_message_cell(&addr, (0, 0)),
+                    &addr,
+                    &mut rows,
+                );
+            }
+            // No account: the compute phase is skipped.
+            run_cells(
+                &format!("a251-{tag}-nostate-v{version}"),
+                cfg.clone(),
+                Account::default().serialize().unwrap(),
+                inbound_cell(&src, &addr, &Inbound::value(1_000_000_000)),
+                &addr,
+                &mut rows,
+            );
+        }
+        // A special masterchain account buys its special gas limit (ConfigParam 20).
+        for (tag, special_gas_limit) in [("specialhalf", half), ("specialmax", u64::MAX)] {
+            let mut raw = config(version, true, &mc_addr).raw_config().clone();
+            let mut gas = raw.gas_prices(true).unwrap();
+            gas.special_gas_limit = special_gas_limit;
+            raw.set_config(ConfigParamEnum::ConfigParam20(gas)).unwrap();
+            let cfg = BlockchainConfig::with_config(raw).unwrap();
+            for (contract, code) in [("accept", "ACCEPT"), ("noaccept", "NOP")] {
+                let mut init = StateInit::default();
+                init.set_code(rtos_assembler::compile_code_to_cell(code).unwrap());
+                init.set_data(Cell::default());
+                let account = Account::active(
+                    mc_addr.clone(),
+                    CurrencyCollection::with_coins(10_000_000_000u64),
+                    0,
+                    0,
+                    init,
+                    cfg.size_limits_config().acc_state_cells_for_storage_dict,
+                )
+                .unwrap()
+                .serialize()
+                .unwrap();
+                run_cells_with(
+                    &format!("a251-{tag}-{contract}-v{version}"),
+                    cfg.clone(),
+                    account,
+                    inbound_cell(&src, &mc_addr, &Inbound::value(1_000_000_000)),
+                    &mc_addr,
+                    true,
+                    &mut rows,
+                );
+            }
+        }
+    }
+    assert_eq!(rows.len(), 2 * (6 * (3 * 3 + 1) + 2 * 2));
+    check_reference_rows(
+        &rows,
+        include_str!("data/gas-extreme.tsv"),
+        "RTOS_GAS_EXTREME_EXPORT",
+        &[],
+    );
 }
