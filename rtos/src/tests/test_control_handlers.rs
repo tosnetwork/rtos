@@ -457,3 +457,106 @@ async fn get_stats_reports_the_reference_names_it_has() {
     node.server.shutdown().await;
     node.handler.stop_and_wait().await.unwrap();
 }
+
+/// An engine that records the custom overlays it is given.
+struct OverlayEngine {
+    allocated: Arc<crate::engine_traits::EngineAlloc>,
+    #[cfg(feature = "telemetry")]
+    telemetry: Arc<crate::engine_traits::EngineTelemetry>,
+    given: Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl EngineOperations for OverlayEngine {
+    fn engine_allocated(&self) -> &Arc<crate::engine_traits::EngineAlloc> {
+        &self.allocated
+    }
+    #[cfg(feature = "telemetry")]
+    fn engine_telemetry(&self) -> &Arc<crate::engine_traits::EngineTelemetry> {
+        &self.telemetry
+    }
+    async fn update_custom_overlays(
+        &self,
+        configs: Option<&[rtos_api::ton::engine::validator::customoverlay::CustomOverlay]>,
+    ) -> Result<()> {
+        let names = configs.unwrap_or_default().iter().map(|c| c.name.clone()).collect();
+        self.given.lock().unwrap().push(names);
+        Ok(())
+    }
+}
+
+/// The reference engine's answer to a recorded console command.
+fn reference_failure(command: &str) -> (i32, String) {
+    let table = std::fs::read_to_string(format!("{DATA}cpp-console.tsv")).unwrap();
+    let row = table.lines().find(|line| line.split('\t').next() == Some(command)).unwrap();
+    let output = row.split('\t').nth(2).unwrap();
+    let inner = output.split_once("[Error : ").unwrap().1;
+    let inner = inner.strip_suffix("]\\n").unwrap();
+    let (code, message) = inner.split_once(" : ").unwrap();
+    (code.parse().unwrap(), message.to_string())
+}
+
+fn overlay(
+    name: &str,
+    nodes: usize,
+) -> rtos_api::ton::engine::validator::customoverlay::CustomOverlay {
+    rtos_api::ton::engine::validator::customoverlay::CustomOverlay {
+        name: name.to_string(),
+        nodes: (0..nodes)
+            .map(|i| rtos_api::ton::engine::validator::customoverlaynode::CustomOverlayNode {
+                adnl_id: UInt256::from([i as u8 + 1; 32]),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    }
+}
+
+/// Custom overlays are added and removed as the reference engine adds and
+/// removes them: an empty node list, a name in use and an unknown name are
+/// refused with the reference messages, before start every request is not
+/// ready, and the engine gets each new list.
+#[tokio::test(flavor = "multi_thread")]
+async fn custom_overlays_change_as_in_the_reference_engine() {
+    use rtos_api::ton::rpc::engine::validator::{
+        AddCustomOverlay, DelCustomOverlay, ShowCustomOverlays,
+    };
+    let engine = Arc::new(OverlayEngine {
+        allocated: crate::collator_test_bundle::create_engine_allocated(),
+        #[cfg(feature = "telemetry")]
+        telemetry: crate::collator_test_bundle::create_engine_telemetry(),
+        given: Mutex::new(Vec::new()),
+    });
+    let node = Node::start_with_engine(engine.clone()).await;
+    let empty = AddCustomOverlay { overlay: overlay("ov2", 0) };
+    assert_eq!(
+        ask(&node, 15, empty).await,
+        Ok(Some(reference_failure("add-custom-overlay cases/console2/ov2.json")))
+    );
+    assert_eq!(ask(&node, 15, AddCustomOverlay { overlay: overlay("ov1", 2) }).await, Ok(None));
+    assert_eq!(
+        ask(&node, 15, AddCustomOverlay { overlay: overlay("ov1", 1) }).await,
+        Ok(Some((0, "duplicate custom overlay name \"ov1\"".to_string())))
+    );
+    assert_eq!(
+        ask(&node, 15, DelCustomOverlay { name: "nosuch".to_string() }).await,
+        Ok(Some(reference_failure("del-custom-overlay nosuch")))
+    );
+    let shown = ask_object(&node, 15, ShowCustomOverlays::default()).await.unwrap();
+    let shown =
+        shown.downcast::<rtos_api::ton::engine::validator::CustomOverlaysConfig>().unwrap().only();
+    assert_eq!(shown.overlays.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["ov1"]);
+    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".to_string() }).await, Ok(None));
+    assert_eq!(*engine.given.lock().unwrap(), vec![vec!["ov1".to_string()], vec![]]);
+    node.server.shutdown().await;
+    node.handler.stop_and_wait().await.unwrap();
+
+    let node = Node::start(false).await;
+    let not_started = Ok(Some((651, "not started".to_string())));
+    assert_eq!(ask(&node, 15, AddCustomOverlay { overlay: overlay("ov1", 1) }).await, not_started);
+    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".to_string() }).await, not_started);
+    assert_eq!(ask(&node, 15, ShowCustomOverlays::default()).await, not_started);
+    node.server.shutdown().await;
+    node.handler.stop_and_wait().await.unwrap();
+}

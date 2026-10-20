@@ -1078,16 +1078,45 @@ impl ControlQuerySubscriber {
         )
     }
 
-    pub async fn add_custom_overlay(&self, overlay: CustomOverlay) -> Result<Success> {
+    /// Adds a custom overlay as the reference engine does: refused before
+    /// the engine starts, with no nodes, or under a name already in use.
+    async fn add_custom_overlay(&self, overlay: CustomOverlay) -> Result<QueryResult> {
+        let DataSource::Engine(engine) = &self.data_source else {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        };
+        if overlay.nodes.is_empty() {
+            return control_error(0, "list of nodes is empty");
+        }
+        let current = self.config.show_custom_overlays().await?;
+        if current.overlays().iter().any(|known| known.name == overlay.name) {
+            return control_error(0, format!("duplicate custom overlay name \"{}\"", overlay.name));
+        }
         let config = self.config.add_custom_overlay(overlay).await?;
-        self.engine()?.update_custom_overlays(Some(&config.overlays()[..])).await?;
-        Ok(Success::Engine_Validator_Success)
+        engine.update_custom_overlays(Some(&config.overlays()[..])).await?;
+        Self::success()
     }
 
-    pub async fn del_custom_overlay(&self, name: String) -> Result<Success> {
+    /// Removes a custom overlay as the reference engine does: refused before
+    /// the engine starts or for a name it does not have.
+    async fn del_custom_overlay(&self, name: String) -> Result<QueryResult> {
+        let DataSource::Engine(engine) = &self.data_source else {
+            return control_error(ERROR_CODE_NOTREADY, "not started");
+        };
+        let current = self.config.show_custom_overlays().await?;
+        if !current.overlays().iter().any(|known| known.name == name) {
+            return control_error(0, format!("no such overlay \"{name}\""));
+        }
         let config = self.config.del_custom_overlay(name).await?;
-        self.engine()?.update_custom_overlays(Some(&config.overlays()[..])).await?;
-        Ok(Success::Engine_Validator_Success)
+        engine.update_custom_overlays(Some(&config.overlays()[..])).await?;
+        Self::success()
+    }
+
+    fn success() -> Result<QueryResult> {
+        QueryResult::consume_boxed(
+            Success::Engine_Validator_Success,
+            #[cfg(feature = "telemetry")]
+            None,
+        )
     }
 
     async fn process_generate_keypair(&self, key_type: i32) -> Result<KeyHash> {
@@ -1462,24 +1491,12 @@ impl ControlQuerySubscriber {
         };
 
         let query = match query.downcast::<AddCustomOverlay>() {
-            Ok(params) => {
-                return QueryResult::consume_boxed(
-                    self.add_custom_overlay(params.overlay).await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
+            Ok(params) => return self.add_custom_overlay(params.overlay).await,
             Err(query) => query,
         };
 
         let query = match query.downcast::<DelCustomOverlay>() {
-            Ok(params) => {
-                return QueryResult::consume_boxed(
-                    self.del_custom_overlay(params.name).await?,
-                    #[cfg(feature = "telemetry")]
-                    None,
-                );
-            }
+            Ok(params) => return self.del_custom_overlay(params.name).await,
             Err(query) => query,
         };
 
@@ -1502,6 +1519,9 @@ impl ControlQuerySubscriber {
 
         let query = match query.downcast::<ShowCustomOverlays>() {
             Ok(_) => {
+                if !matches!(self.data_source, DataSource::Engine(_)) {
+                    return control_error(ERROR_CODE_NOTREADY, "not started");
+                }
                 return QueryResult::consume_boxed(
                     self.config.show_custom_overlays().await?,
                     #[cfg(feature = "telemetry")]

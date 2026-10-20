@@ -1898,22 +1898,25 @@ impl FullNodeOverlaysRouter {
             #[cfg(feature = "telemetry")]
             tag: ExternalMessageBroadcast::constructor_const(),
         };
-        let mut skip_public = false;
-        for guard in self.custom_overlays.iter() {
-            let overlay = guard.val();
-            if overlay.sends_msgs_to(to) {
-                overlay.send_broadcast(&broadcast, 0).await?;
-                if overlay.skip_public_msg_send() {
-                    skip_public = true;
-                }
-            }
+        let senders: Vec<_> = self
+            .custom_overlays
+            .iter()
+            .map(|guard| guard.val().clone())
+            .filter(|overlay| overlay.sends_msgs_to(to))
+            .collect();
+        let disabled = self.ext_messages_broadcast_disabled.load(Ordering::Acquire);
+        let skips: Vec<bool> =
+            senders.iter().map(|overlay| overlay.skip_public_msg_send()).collect();
+        let (custom, public) = ext_message_routes(disabled, &skips);
+        for index in custom {
+            senders[index].send_broadcast(&broadcast, 0).await?;
         }
-        if !skip_public {
+        if public {
             let client = self.overlay_client(&to.shard_ident()?).await?;
             // A disabled switch or an already processed message sends nothing.
             let admitted = match client.ext_messages() {
                 Some(messages) => messages.admit_send(data)?,
-                None => true,
+                None => !disabled,
             };
             if admitted {
                 self.send_public_broadcast(
@@ -2250,6 +2253,19 @@ fn calc_new_shards(old_min_split: u8, new_min_split: u8) -> Result<HashSet<Shard
     Ok(new_shards)
 }
 
+/// Where an external message goes, given whether broadcasting is disabled
+/// and, for each custom overlay that sends to the message's shard, whether
+/// it replaces the public send: the indices of the custom overlays that
+/// send it, and whether the public overlay is asked to. As in the reference
+/// node, a disabled switch stops every custom send, while an overlay that
+/// replaces the public send still keeps the message from the public
+/// overlay; the public overlay applies the switch itself.
+fn ext_message_routes(disabled: bool, replaces_public: &[bool]) -> (Vec<usize>, bool) {
+    let custom = if disabled { Vec::new() } else { (0..replaces_public.len()).collect() };
+    let public = !replaces_public.iter().any(|replaces| *replaces);
+    (custom, public)
+}
+
 fn trim_shard(shard: &ShardIdent, min_split: u8) -> Result<ShardIdent> {
     if shard.is_masterchain() {
         Ok(ShardIdent::MASTERCHAIN)
@@ -2276,3 +2292,26 @@ mod snapshot_tests;
 #[cfg(test)]
 #[path = "tests/test_shard_certificate_push.rs"]
 mod certificate_push_tests;
+
+#[cfg(test)]
+mod ext_message_route_tests {
+    use super::ext_message_routes;
+
+    #[test]
+    fn custom_overlays_send_unless_broadcasting_is_disabled() {
+        assert_eq!(ext_message_routes(false, &[false, false]), (vec![0, 1], true));
+        assert_eq!(ext_message_routes(true, &[false, false]), (vec![], true));
+    }
+
+    #[test]
+    fn an_overlay_that_replaces_the_public_send_keeps_it_even_when_disabled() {
+        assert_eq!(ext_message_routes(false, &[false, true]), (vec![0, 1], false));
+        assert_eq!(ext_message_routes(true, &[true]), (vec![], false));
+    }
+
+    #[test]
+    fn with_no_custom_overlay_the_public_overlay_is_asked() {
+        assert_eq!(ext_message_routes(false, &[]), (vec![], true));
+        assert_eq!(ext_message_routes(true, &[]), (vec![], true));
+    }
+}
