@@ -8,6 +8,9 @@
 //
 // - decode-vectors.json: readable vectors per gap with the full expected result.
 // - decode-matrix*.json: CALLCCARGS with 0..4 stack items, every argument, five versions.
+//   Also the cell-typed entry without a cell that RUNVM returns before version 11 for a child
+//   that did not commit (c4, c5 or both; committed, uncommitted and abnormal children; every
+//   kind of consumer; versions 4 9 10 11 12 16).
 // - decode-sweep-*.json (ignored test, run explicitly): every code of every length 1..16 bits
 //   at versions 0 3 4 9 12 16; the first, second, middle and last opcode of every reference
 //   table interval and its neighbours cut to every length 1..24 bits at versions 0..17; complete

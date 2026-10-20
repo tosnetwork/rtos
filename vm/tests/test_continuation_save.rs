@@ -11,6 +11,7 @@ fn typed(item: &StackItem) -> String {
         StackItem::None => "null".into(),
         StackItem::Integer(n) => format!("int:{n}"),
         StackItem::Cell(cell) => format!("cell:{:x}", cell.repr_hash()),
+        StackItem::AbsentCell => "cell:none".into(),
         StackItem::Builder(builder) => format!("builder:{:x}", (**builder).clone().into_cell().unwrap().repr_hash()),
         StackItem::Slice(slice) => {
             let bits = (0..slice.remaining_bits()).map(|i| if slice.get_bit_opt(i).unwrap() {'1'} else {'0'}).collect::<String>();

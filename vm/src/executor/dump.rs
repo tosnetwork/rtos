@@ -47,6 +47,7 @@ fn dump_var_impl(item: &StackItem, how: u8, in_tuple: bool) -> String {
             StackItem::None => String::new(),
             StackItem::Builder(x) => format!("BC<{:X}>", Arc::as_ref(x)),
             StackItem::Cell(x) => format!("C<{:X}>", x),
+            StackItem::AbsentCell => "C<>".to_string(),
             StackItem::Continuation(x) => {
                 x.code().cell_opt().map_or(String::new(), |cell| format!("R<{:X}>", cell))
             }
@@ -61,6 +62,7 @@ fn dump_var_impl(item: &StackItem, how: u8, in_tuple: bool) -> String {
             StackItem::None => String::new(),
             StackItem::Builder(x) => format!("BC<{:b}>", Arc::as_ref(x)),
             StackItem::Cell(x) => format!("C<{:b}>", x),
+            StackItem::AbsentCell => "C<>".to_string(),
             StackItem::Continuation(x) => {
                 x.code().cell_opt().map_or(String::new(), |cell| format!("R<{:b}>", cell))
             }
@@ -75,6 +77,7 @@ fn dump_var_impl(item: &StackItem, how: u8, in_tuple: bool) -> String {
             StackItem::None => return String::new(),
             StackItem::Builder(x) => x.data().to_vec(),
             StackItem::Cell(x) => x.data().to_vec(),
+            StackItem::AbsentCell => Vec::new(),
             StackItem::Continuation(x) => x.code().get_bytestring(0).into_vec(),
             StackItem::Integer(x) => return format!("{}", Arc::as_ref(x)),
             StackItem::Slice(x) => x.get_bytestring(0).into_vec(),
@@ -89,6 +92,7 @@ fn dump_var_impl(item: &StackItem, how: u8, in_tuple: bool) -> String {
             StackItem::None => String::new(),
             StackItem::Builder(x) => format!("BC<{:X}>", Arc::as_ref(x)),
             StackItem::Cell(x) => format!("C<{:X}>", x),
+            StackItem::AbsentCell => "C<>".to_string(),
             StackItem::Continuation(x) => {
                 x.code().cell_opt().map_or(String::new(), |cell| format!("R<{:X}>", cell))
             }

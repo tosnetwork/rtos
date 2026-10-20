@@ -59,6 +59,7 @@ impl Renderer {
                 }
             }
             StackItem::Cell(cell) => format!("cell:{}", hex_hash(&cell.repr_hash())),
+            StackItem::AbsentCell => "cell:none".into(),
             StackItem::Builder(builder) => {
                 format!(
                     "builder:{}",

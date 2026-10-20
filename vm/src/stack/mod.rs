@@ -69,6 +69,11 @@ pub enum StackItem {
     None,
     Builder(Arc<BuilderData>),
     Cell(Cell),
+    /// A cell-typed entry holding no cell. Only RUNVM before version 11 produces it (the data
+    /// or actions of a child that did not commit). It is not null, has the cell type, can be
+    /// moved and copied like any value, and every operation that needs a cell rejects it with a
+    /// type check error.
+    AbsentCell,
     Continuation(Arc<ContinuationData>),
     Integer(Arc<IntegerData>),
     Slice(SliceData),
@@ -344,6 +349,15 @@ impl StackItem {
         matches!(self, StackItem::None)
     }
 
+    /// Type identity of stack values as the reference sees it: an absent cell has the cell type.
+    pub fn same_type(&self, other: &StackItem) -> bool {
+        let cell = |item: &StackItem| matches!(item, StackItem::Cell(_) | StackItem::AbsentCell);
+        if cell(self) || cell(other) {
+            return cell(self) && cell(other);
+        }
+        mem::discriminant(self) == mem::discriminant(other)
+    }
+
     pub fn is_zero(&self) -> bool {
         if let StackItem::Integer(data) = self {
             return data.is_zero();
@@ -380,6 +394,7 @@ impl StackItem {
             StackItem::None => "(null)".to_string(),
             StackItem::Integer(data) => data.clone().to_string(),
             StackItem::Cell(data) => format!("C{{{:X}}}", data.repr_hash()),
+            StackItem::AbsentCell => "C{}".to_string(),
             StackItem::Continuation(_data) => {
                 format!("Cont{{{}}}", "vmc_std")
             }
@@ -466,6 +481,7 @@ impl fmt::Display for StackItem {
             StackItem::None            => write!(f, "Null"),
             StackItem::Builder(x)      => write!(f, "Builder {}", Arc::as_ref(x)),
             StackItem::Cell(x)         => write!(f, "Cell x{:x} x{:x}", x.repr_hash(), x),
+            StackItem::AbsentCell      => write!(f, "Cell (absent)"),
             StackItem::Continuation(x) => write!(f, "Continuation x{:x}", x.code().repr_hash()),
             StackItem::Integer(x)      => write!(f, "{}", Arc::as_ref(x)),
             StackItem::Slice(x)        => write!(f, "Slice x{:x}", x),
@@ -762,6 +778,7 @@ impl Stack {
         match x {
             StackItem::Builder(x) => Stack::eq_builder(x, y),
             StackItem::Cell(x) => Stack::eq_cell(x, y),
+            StackItem::AbsentCell => y == &StackItem::AbsentCell,
             StackItem::Continuation(x) => Stack::eq_continuation(x, y),
             StackItem::Integer(x) => Stack::eq_integer(x, y),
             StackItem::Slice(x) => Stack::eq_slice(x, y),

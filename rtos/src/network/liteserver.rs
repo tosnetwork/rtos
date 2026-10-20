@@ -3409,6 +3409,9 @@ fn write_vm_stack_value(item: &StackItem, cb: &mut BuilderData) -> Result<()> {
         StackItem::Continuation(_) => {
             fail!("Cannot serialize continuation in liteserver response");
         }
+        StackItem::AbsentCell => {
+            fail!("Cannot serialize a cell-typed entry without a cell");
+        }
     }
     Ok(())
 }

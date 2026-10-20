@@ -1153,7 +1153,7 @@ pub(super) fn execute_condsel(engine: &mut Engine) -> Status {
 pub(super) fn execute_condselchk(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("CONDSELCHK"))?;
     fetch_stack(engine, 3)?;
-    if mem::discriminant(engine.cmd.var(0)) != mem::discriminant(engine.cmd.var(1)) {
+    if !engine.cmd.var(0).same_type(engine.cmd.var(1)) {
         fail!(ExceptionCode::TypeCheckError)
     }
     if !engine.cmd.var(2).as_bool()? {

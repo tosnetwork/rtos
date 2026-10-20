@@ -542,6 +542,7 @@ impl Engine {
                 StackItem::Cell(data) => {
                     format!("C{}-{}", data.bit_length(), data.references_count())
                 }
+                StackItem::AbsentCell => "C".to_string(),
                 StackItem::Continuation(data) => format!("T{}", data.code().remaining_bits() / 8),
                 StackItem::Builder(data) => {
                     format!("B{}-{}", data.length_in_bits(), data.references().len())
@@ -1154,7 +1155,6 @@ impl Engine {
         if !params.isolate_gas {
             self.visited_cells = child.visited_cells;
         }
-        debug_assert!(self.block_version >= 11 || (!params.return_data && !params.return_actions));
         // A child that did not commit returns null data and actions.
         match child.cstate.take() {
             Some((data, actions)) => {
@@ -1166,11 +1166,14 @@ impl Engine {
                 }
             }
             None => {
+                // Before version 11 the reference returns cell-typed entries without a cell.
+                let absent =
+                    if self.block_version >= 11 { StackItem::None } else { StackItem::AbsentCell };
                 if params.return_data {
-                    self.cc.stack.push(StackItem::None);
+                    self.cc.stack.push(absent.clone());
                 }
                 if params.return_actions {
-                    self.cc.stack.push(StackItem::None);
+                    self.cc.stack.push(absent);
                 }
             }
         }
