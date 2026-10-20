@@ -1089,12 +1089,12 @@ fn test_timeout_management() {
     // FSM is created with unarmed timeouts (skip_timestamp = None).
     // SessionProcessor::start() is responsible for calling reset_timeouts_on_start().
     assert!(state.get_next_timeout().is_none(), "FSM must start with unarmed timeouts");
-    assert_eq!(state.skip_slot, SlotIndex::new(0));
+    assert_eq!(state.timeout_slot, SlotIndex::new(0), "C++ timeout_slot_ starts at 0");
 
-    // Arm timeouts (simulating start())
+    // Arm timeouts (simulating start()): C++ timeout_slot_ = start_slot + 1.
     state.reset_timeouts_on_start(&desc);
     assert!(state.get_next_timeout().is_some(), "reset_timeouts_on_start must set skip_timestamp");
-    assert_eq!(state.skip_slot, SlotIndex::new(0));
+    assert_eq!(state.timeout_slot, SlotIndex::new(1));
 }
 
 #[test]
@@ -1176,13 +1176,12 @@ fn test_set_timeouts_anchors_skip_slot_to_progress_cursor_cpp_parity() {
         "precondition: advanced to window 1"
     );
 
-    // set_timeouts was called during window transition. skip_slot must be
-    // anchored to the progress cursor (slot 2), not re-calculated from
-    // a lower value.
-    assert!(
-        state.skip_slot >= SlotIndex::new(2),
-        "skip_slot must be anchored to progress cursor (slot 2), not window start, got {}",
-        state.skip_slot
+    // The window transition armed the timeout from the progress cursor
+    // (start_slot 2), so the C++ cursor is start_slot + 1.
+    assert_eq!(
+        state.timeout_slot,
+        SlotIndex::new(3),
+        "the cursor must be anchored to the progress cursor (slot 2), not the window start"
     );
 }
 
@@ -1208,13 +1207,16 @@ fn test_try_skip_window_preserves_pending_block_cpp_mode() {
         .and_then(|w| w.slots[0].pending_block.as_ref())
         .is_some();
 
-    // Fire skip for the entire window (simulates timeout -> try_skip_window)
-    state.try_skip_window_for_test(WindowIndex::new(0));
+    // Fire the alarm's skip over the entire window
+    state.skip_range_for_test(
+        SlotIndex::new(0),
+        SlotIndex::new(desc.opts().slots_per_leader_window),
+    );
 
     // voted_skip must be set
     let voted_skip =
         state.get_window(WindowIndex::new(0)).map(|w| w.slots[0].voted_skip).unwrap_or(false);
-    assert!(voted_skip, "slot 0 must have voted_skip after try_skip_window");
+    assert!(voted_skip, "slot 0 must have voted_skip after the alarm skip");
 
     // In C++ mode, pending_block must be PRESERVED (not cleared)
     let pending_after = state
@@ -3657,9 +3659,9 @@ fn test_notarized_parent_chain_advances_to_next_window_only_after_window_progres
         "notarized-parent chain mode must advance leader window on progress cursor progression"
     );
     assert_eq!(
-        state.skip_slot,
-        SlotIndex::new(2),
-        "timeouts must be scheduled from the new window start slot"
+        state.timeout_slot,
+        SlotIndex::new(3),
+        "timeouts must be scheduled from the new window start slot (C++ start_slot + 1)"
     );
 
     // slot2.available_base should be set from notarized slot1
@@ -6636,7 +6638,7 @@ fn test_set_timeouts_arms_timeout_base() {
         Some(t0 + first_block + target_rate),
         "skip_timestamp must be timeout_base + target_rate"
     );
-    assert_eq!(state.skip_slot, SlotIndex::new(0));
+    assert_eq!(state.timeout_slot, SlotIndex::new(1), "C++ timeout_slot_ = start_slot + 1");
 }
 
 #[test]
@@ -6673,11 +6675,11 @@ fn test_notarization_rearm_uses_fixed_base_not_sliding() {
     state.on_vote_test(&desc, ValidatorIndex::new(2), vote, vec![3]).unwrap();
     drain_events(&mut state);
 
-    // skip_slot should advance to 1 (watching slot 1 now)
+    // C++ timeout_slot_ = slot + 2: the alarm now watches slot 1.
     assert_eq!(
-        state.skip_slot,
-        SlotIndex::new(1),
-        "skip_slot must advance to 1 after notarization"
+        state.timeout_slot,
+        SlotIndex::new(2),
+        "the cursor must advance to 2 after notarization of slot 0"
     );
 
     // C++ formula: alarm = timeout_base + (timeout_slot - window_start) * target_rate
@@ -6753,7 +6755,7 @@ fn test_notarization_window_end_transitions_to_new_window() {
     // resets the timer. In Rust, advance_leader_window_on_progress_cursor →
     // set_timeouts re-arms with fresh timeout_base for the new window.
     //
-    // The guard `skip_slot <= slot` (C++ parity) prevents the per-notarization
+    // The guard `timeout_slot_ <= slot + 1` (C++ parity) prevents the per-notarization
     // timer update from overwriting the freshly set window 1 schedule.
     let desc = create_test_desc(4, 4);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
@@ -6805,7 +6807,7 @@ fn test_notarization_window_end_transitions_to_new_window() {
         Some(new_base + target_rate),
         "skip_timestamp must be base + target_rate for window 1"
     );
-    assert_eq!(state.skip_slot, SlotIndex::new(4), "skip_slot must be at window 1 start");
+    assert_eq!(state.timeout_slot, SlotIndex::new(5), "the cursor must be at window 1 start + 1");
 }
 
 #[test]
@@ -6822,11 +6824,11 @@ fn test_skip_cert_does_not_move_timer() {
     let first_block = desc.opts().first_block_timeout;
     let target_rate = desc.opts().target_rate;
 
-    let skip_slot_before = state.skip_slot;
+    let cursor_before = state.timeout_slot;
     let skip_ts_before = state.skip_timestamp;
     let base_before = state.timeout_base;
 
-    assert_eq!(skip_slot_before, SlotIndex::new(0));
+    assert_eq!(cursor_before, SlotIndex::new(1));
     assert_eq!(skip_ts_before, Some(t0 + first_block + target_rate));
 
     // Advance time and submit skip cert for slot 0 (3 out of 4)
@@ -6837,16 +6839,17 @@ fn test_skip_cert_does_not_move_timer() {
     state.on_vote_test(&desc, ValidatorIndex::new(2), skip, Vec::new()).unwrap();
     drain_events(&mut state);
 
-    // Timer state must be UNCHANGED (skip_slot, skip_timestamp, timeout_base)
-    assert_eq!(state.skip_slot, skip_slot_before, "skip_slot must NOT advance on skip cert");
+    // Timer state must be UNCHANGED (cursor, skip_timestamp, timeout_base)
+    assert_eq!(state.timeout_slot, cursor_before, "the cursor must NOT advance on skip cert");
     assert_eq!(state.skip_timestamp, skip_ts_before, "skip_timestamp must NOT change on skip cert");
     assert_eq!(state.timeout_base, base_before, "timeout_base must NOT change on skip cert");
 }
 
 #[test]
-fn test_window_skip_clears_timeout_base() {
-    // When process_timeouts fires the C++ window-skip, both skip_timestamp
-    // and timeout_base must be cleared (None).
+fn test_window_skip_keeps_timeout_base() {
+    // When the alarm fires (C++ alarm()), it is one-shot: skip_timestamp is
+    // cleared, the cursor moves to the window end, and timeout_base is kept
+    // because a later notarization re-arms from it.
     let desc = create_test_desc(4, 4);
     let mut state = SimplexState::new(&desc).expect("Failed to create state");
 
@@ -6862,12 +6865,16 @@ fn test_window_skip_clears_timeout_base() {
     drain_events(&mut state);
 
     assert!(state.skip_timestamp.is_none(), "skip_timestamp must be None after C++ window-skip");
-    assert!(state.timeout_base.is_none(), "timeout_base must be None after C++ window-skip");
-    // skip_slot should be at window end (4)
     assert_eq!(
-        state.skip_slot,
+        state.timeout_base,
+        Some(t0 + desc.opts().first_block_timeout),
+        "timeout_base must be kept after the alarm"
+    );
+    // C++ timeout_slot_ = window_end (4)
+    assert_eq!(
+        state.timeout_slot,
         SlotIndex::new(4),
-        "skip_slot must be at window end after C++ window-skip"
+        "the cursor must be at window end after C++ window-skip"
     );
 }
 
@@ -6890,7 +6897,7 @@ fn test_new_window_rearms_timeout_base() {
     desc.set_time(t0 + Duration::from_secs(10));
     state.check_all(&desc);
     drain_events(&mut state);
-    assert!(state.timeout_base.is_none(), "base cleared after window skip");
+    assert!(state.timeout_base.is_some(), "the base is kept after the alarm");
 
     // Now feed skip certs for all 4 slots (to let progress cursor cross window boundary)
     let t1 = t0 + Duration::from_secs(11);
@@ -6924,7 +6931,7 @@ fn test_new_window_rearms_timeout_base() {
         Some(t1 + backed_off_first_block + target_rate),
         "skip_timestamp must be armed for new window (with backoff)"
     );
-    assert_eq!(state.skip_slot, SlotIndex::new(4), "skip_slot must be at start of window 1");
+    assert_eq!(state.timeout_slot, SlotIndex::new(5), "the cursor must be at window 1 start + 1");
 }
 
 #[test]
@@ -6954,7 +6961,7 @@ fn test_adaptive_backoff_uses_first_block_timeout_noncritical_params() {
     desc.set_time(t0 + Duration::from_secs(10));
     state.check_all(&desc);
     drain_events(&mut state);
-    assert!(state.timeout_base.is_none(), "base cleared after window skip");
+    assert!(state.timeout_base.is_some(), "the base is kept after the alarm");
 
     // Feed skip certs for full window 0 so progress crosses boundary and re-arms timeout.
     let t1 = t0 + Duration::from_secs(11);
@@ -7366,7 +7373,11 @@ fn test_finality_behind_timeout_casts_no_skip_and_marks_nothing() {
     let window = state.get_window(WindowIndex::new(0)).unwrap();
     assert!(!window.slots[0].voted_skip && !window.slots[1].voted_skip);
     assert!(!window.had_timeouts, "no skip was cast, so the window had none");
-    assert!(state.skip_slot >= SlotIndex::new(2), "the alarm is still consumed to the window end");
+    assert_eq!(
+        state.timeout_slot,
+        SlotIndex::new(2),
+        "the alarm is still consumed to the window end"
+    );
     assert!(state.skip_timestamp.is_none(), "and not re-armed until the next window");
 }
 
@@ -7380,4 +7391,240 @@ fn test_finality_behind_suppresses_restart_skip_votes() {
         assert_eq!(queued, if behind { 0 } else { 2 }, "behind={behind}");
         assert_eq!(count_votes(&drain_events(&mut state), is_skip), queued as usize);
     }
+}
+
+/*
+    ========================================================================
+    Skip timeout cursor (C++ consensus.cpp timeout_slot_ / alarm())
+
+    Expected values come from the C++ reference harness
+    test-skip-after-finality-backlog at tos 8b6b935691 with its scratch
+    baseline-correction modes d1-*, d2-*, d3-* (memo evidence
+    2026-10-20-a142-rust/cpp-runs-isolated): W=4, first_block_timeout 0.3 s,
+    target_rate 0.4 s, finality never behind. These cases are 8812403
+    semantics; none of them involves the finalization backlog.
+    ========================================================================
+*/
+
+/// The C++ harness timing: four slots per window, 0.3 s first block, 0.4 s per slot.
+fn cpp_timer_desc() -> SessionDescription {
+    let opts = crate::SessionOptions {
+        first_block_timeout: Duration::from_millis(300),
+        target_rate: Duration::from_millis(400),
+        first_block_timeout_multiplier: 1.2,
+        ..Default::default()
+    };
+    create_test_desc_with_options(4, 4, opts)
+}
+
+/// The quorum of the three validators other than the node under test.
+fn peer_signers() -> Vec<ValidatorIndex> {
+    vec![ValidatorIndex::new(1), ValidatorIndex::new(2), ValidatorIndex::new(3)]
+}
+
+fn skip_slots(events: &[SimplexEvent]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SimplexEvent::BroadcastVote(Vote::Skip(skip)) => Some(skip.slot.value()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn install_notar_cert(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    slot: u32,
+    byte: u8,
+) -> rtos_block::Result<()> {
+    let hash = UInt256::from([byte; 32]);
+    let cert = create_test_notar_cert(desc, SlotIndex::new(slot), hash.clone(), &peer_signers());
+    state.set_notarize_certificate(desc, SlotIndex::new(slot), &hash, cert)?;
+    Ok(())
+}
+
+fn install_skip_cert(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    slot: u32,
+) -> rtos_block::Result<()> {
+    let cert = create_test_skip_cert(desc, SlotIndex::new(slot), &peer_signers());
+    state.set_skip_certificate(desc, SlotIndex::new(slot), cert)?;
+    Ok(())
+}
+
+fn t0() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+}
+
+/// Start the FSM at `t0` and return it with its description.
+fn started_cpp_timer_state() -> rtos_block::Result<(SessionDescription, SimplexState)> {
+    let desc = cpp_timer_desc();
+    desc.set_time(t0());
+    let mut state = SimplexState::new(&desc)?;
+    state.reset_timeouts_on_start(&desc);
+    Ok((desc, state))
+}
+
+/// Run the FSM just before and exactly at `deadline`; return the skips cast at the deadline.
+fn skips_at_deadline(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    deadline: SystemTime,
+) -> Vec<u32> {
+    desc.set_time(deadline - Duration::from_millis(1));
+    state.check_all(desc);
+    assert_eq!(skip_slots(&drain_events(state)), Vec::<u32>::new(), "nothing before the deadline");
+    desc.set_time(deadline);
+    state.check_all(desc);
+    skip_slots(&drain_events(state))
+}
+
+/// D1 (C++ d1-unvoted-range-start): peers notarize slot 0, which this node
+/// never voted for. The cursor moves to 2, due at base + 2 target rates
+/// (C++ rel 1.1 s), and the alarm skips slots 1-3 only; slot 0 and the next
+/// window are never skipped.
+#[test]
+fn test_alarm_skips_from_the_range_start_not_the_window_start() -> rtos_block::Result<()> {
+    let (desc, mut state) = started_cpp_timer_state()?;
+    desc.set_time(t0() + Duration::from_millis(10));
+    install_notar_cert(&mut state, &desc, 0, 0x30)?;
+    drain_events(&mut state);
+    assert_eq!(state.timeout_slot, SlotIndex::new(2), "C++ timeout_slot_ = slot + 2");
+
+    let skips = skips_at_deadline(&mut state, &desc, t0() + Duration::from_millis(1100));
+    assert_eq!(skips, vec![1, 2, 3], "C++ requests skips 1, 2, 3 and never slot 0");
+    assert_eq!(state.timeout_slot, SlotIndex::new(4), "the cursor moves to the window end");
+    assert!(state.skip_timestamp.is_none(), "the alarm is one-shot");
+
+    desc.set_time(t0() + Duration::from_secs(5));
+    state.check_all(&desc);
+    assert_eq!(skip_slots(&drain_events(&mut state)), Vec::<u32>::new(), "nothing of window 1");
+    Ok(())
+}
+
+/// D2 (C++ d2-range-start-voted): the range start already holds this
+/// node's skip from before a restart. The one alarm at the first deadline
+/// (C++ rel 0.7 s) skips slots 1-3 at once, not one target rate later.
+#[test]
+fn test_alarm_covers_the_whole_range_when_its_start_is_already_voted() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    desc.set_time(t0());
+    let mut state = SimplexState::new(&desc)?;
+    state.mark_slot_voted_on_restart(&desc, &Vote::Skip(SkipVote { slot: SlotIndex::new(0) }));
+    state.reset_timeouts_on_start(&desc);
+    drain_events(&mut state);
+
+    let skips = skips_at_deadline(&mut state, &desc, t0() + Duration::from_millis(700));
+    for slot in [1, 2, 3] {
+        assert_eq!(
+            skips.iter().filter(|s| **s == slot).count(),
+            1,
+            "slot {slot} is skipped once at the first deadline: {skips:?}"
+        );
+    }
+    assert!(skips.iter().all(|s| *s < 4), "nothing of window 1: {skips:?}");
+    Ok(())
+}
+
+/// D3 (C++ d3-last-slot-notarized): the window's last slot is notarized out
+/// of order before its deadline. The cursor moves to that slot + 1 = 4, due
+/// at base + 4 target rates (C++ rel 1.9 s), and the alarm skips slot 3
+/// alone; nothing of the next window is skipped.
+#[test]
+fn test_last_slot_notarization_arms_the_alarm_for_that_slot_alone() -> rtos_block::Result<()> {
+    let (desc, mut state) = started_cpp_timer_state()?;
+    desc.set_time(t0() + Duration::from_millis(10));
+    install_notar_cert(&mut state, &desc, 3, 0x33)?;
+    drain_events(&mut state);
+    assert_eq!(
+        state.timeout_slot,
+        SlotIndex::new(4),
+        "C++ timeout_slot_ = slot + 1 at a window end"
+    );
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(0), "window 0 has not progressed");
+
+    let skips = skips_at_deadline(&mut state, &desc, t0() + Duration::from_millis(1900));
+    assert_eq!(skips, vec![3], "C++ requests only the skip of slot 3");
+    assert_eq!(state.timeout_slot, SlotIndex::new(4), "the cursor stays at the window end");
+    assert_eq!(
+        state.timeout_base,
+        Some(t0() + Duration::from_millis(300)),
+        "the base is kept after the alarm"
+    );
+
+    desc.set_time(t0() + Duration::from_secs(5));
+    state.check_all(&desc);
+    assert_eq!(skip_slots(&drain_events(&mut state)), Vec::<u32>::new(), "nothing more fires");
+    Ok(())
+}
+
+/// D3, conditional window re-arm (C++ d3-notar-ahead-of-window): slot 4 is
+/// notarized before window 1 is observed, which moves the cursor to 6, due at
+/// the window-0 base + 6 target rates (C++ rel 2.7 s). Window 1 is then
+/// observed at start slot 5 (`timeout_slot_ 6 > 5`), which keeps the cursor,
+/// the base and the deadline; the alarm skips slots 5-7.
+#[test]
+fn test_window_observation_keeps_a_cursor_a_notarization_moved_ahead() -> rtos_block::Result<()> {
+    let (desc, mut state) = started_cpp_timer_state()?;
+    desc.set_time(t0() + Duration::from_millis(5));
+    install_notar_cert(&mut state, &desc, 4, 0x34)?;
+    drain_events(&mut state);
+    assert_eq!(state.timeout_slot, SlotIndex::new(6), "C++ timeout_slot_ = slot + 2");
+    let deadline = t0() + Duration::from_millis(2700);
+    assert_eq!(state.skip_timestamp, Some(deadline), "base + 6 target rates");
+
+    desc.set_time(t0() + Duration::from_millis(20));
+    for slot in 0..4 {
+        install_skip_cert(&mut state, &desc, slot)?;
+    }
+    drain_events(&mut state);
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1), "window 1 is observed");
+    assert_eq!(state.get_first_non_progressed_slot(), SlotIndex::new(5), "C++ start_slot=5");
+    assert_eq!(state.timeout_slot, SlotIndex::new(6), "the observation keeps the cursor");
+    assert_eq!(state.timeout_base, Some(t0() + Duration::from_millis(300)), "and the base");
+    assert_eq!(state.skip_timestamp, Some(deadline), "and the deadline");
+
+    let skips = skips_at_deadline(&mut state, &desc, deadline);
+    assert_eq!(skips, vec![5, 6, 7], "C++ requests skips 5, 6, 7");
+    Ok(())
+}
+
+/// The cursor invariant at every transition: arm (start_slot + 1), expiry
+/// (window end), notarization (slot + 2, or slot + 1 at a window end) and a
+/// window transition after the alarm (the window end equals the new start, so
+/// `timeout_slot_ <= start_slot` holds and the window re-arms at start + 1).
+#[test]
+fn test_timeout_cursor_follows_the_cpp_cursor_at_every_transition() -> rtos_block::Result<()> {
+    let (desc, mut state) = started_cpp_timer_state()?;
+    assert_eq!(state.timeout_slot, SlotIndex::new(1), "arm: start_slot + 1");
+
+    desc.set_time(t0() + Duration::from_millis(100));
+    install_notar_cert(&mut state, &desc, 0, 0x40)?;
+    assert_eq!(state.timeout_slot, SlotIndex::new(2), "notarization: slot + 2");
+    assert_eq!(state.skip_timestamp, Some(t0() + Duration::from_millis(1100)));
+
+    desc.set_time(t0() + Duration::from_millis(1100));
+    state.check_all(&desc);
+    assert_eq!(skip_slots(&drain_events(&mut state)), vec![1, 2, 3]);
+    assert_eq!(state.timeout_slot, SlotIndex::new(4), "expiry: window end");
+
+    // The last slot's notarization after the alarm: C++ `4 <= 3 + 1` re-arms
+    // the alarm at base + 4 target rates for slot 3, which is already skipped.
+    desc.set_time(t0() + Duration::from_millis(1200));
+    install_notar_cert(&mut state, &desc, 3, 0x43)?;
+    assert_eq!(state.timeout_slot, SlotIndex::new(4), "notarization at a window end: slot + 1");
+    assert_eq!(state.skip_timestamp, Some(t0() + Duration::from_millis(1900)));
+
+    let t1 = t0() + Duration::from_millis(1300);
+    desc.set_time(t1);
+    for slot in 1..3 {
+        install_skip_cert(&mut state, &desc, slot)?;
+    }
+    drain_events(&mut state);
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+    assert_eq!(state.timeout_slot, SlotIndex::new(5), "window transition: start_slot + 1");
+    assert_eq!(state.timeout_base, Some(t1 + state.first_block_timeout), "a fresh base");
+    Ok(())
 }

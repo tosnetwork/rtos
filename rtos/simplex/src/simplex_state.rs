@@ -18,7 +18,7 @@
 //! 1. `on_candidate()` stores and validates candidates, then attempts `try_notar()`.
 //! 2. `on_vote()` updates per-slot vote weights and calls `check_thresholds_and_trigger()`.
 //! 3. Threshold handling emits certificates/events and can trigger `try_final()`.
-//! 4. `check_all()` drives timeout handling via `process_timeouts()` / `try_skip_window()`.
+//! 4. `check_all()` drives timeout handling via `process_timeouts()` (the one-shot skip alarm).
 //! 5. Callers drain `SimplexEvent` via `pull_event()` and execute side effects.
 //!
 //! ## Usage
@@ -997,16 +997,21 @@ pub(crate) struct SimplexState {
     // ------------------------------------------------------------------
     // Timeout state
     // ------------------------------------------------------------------
-    /// Current skip slot (for timeout progression)
-    skip_slot: SlotIndex,
+    /// The skip timeout cursor, C++ `timeout_slot_` (consensus.cpp): by the
+    /// alarm deadline every slot below it should be notarized. When the alarm
+    /// fires it covers `[timeout_slot - 1, end of that slot's window)`, and the
+    /// cursor then moves to that window's end. Zero until the first arm.
+    timeout_slot: SlotIndex,
 
-    /// Timestamp when current skip_slot times out
+    /// The skip alarm deadline (C++ `alarm_timestamp()`); one-shot, `None`
+    /// once it fired until something arms it again.
     skip_timestamp: Option<SystemTime>,
 
     /// Fixed per-window base from which all slot deadlines are derived.
     /// C++ `timeout_base_` (consensus.cpp): set to `now + first_block_timeout`
-    /// when a new leader window starts, never modified within the window.
-    /// Slot at offset k has deadline `timeout_base + (k+1) * target_rate`.
+    /// when a leader window arms the timeout, never modified within the window
+    /// and kept after the alarm fires, because a notarization re-arms from it.
+    /// The alarm for cursor `t` is due at `timeout_base + (t - window_start) * target_rate`.
     timeout_base: Option<SystemTime>,
 
     /// First block timeout (adaptive)
@@ -1115,7 +1120,7 @@ impl SimplexState {
             candidate_ids: HashMap::new(),
             first_non_progressed_slot: SlotIndex(0),
             skip_intervals: BTreeSet::new(),
-            skip_slot: SlotIndex(0),
+            timeout_slot: SlotIndex(0),
             skip_timestamp: None,
             timeout_base: None,
             first_block_timeout,
@@ -2405,26 +2410,53 @@ impl SimplexState {
     ///     schedule event Timeout(i) at time clock()+Δtimeout+(i−s+1)·Δblock
     /// ```
     fn set_timeouts(&mut self, desc: &SessionDescription) {
-        let window_start = self.current_leader_window_idx * self.slots_per_leader_window;
+        let start_slot = self.observed_window_start_slot();
+        self.arm_window_timeout(desc, start_slot);
+    }
 
-        // C++ parity: timeout_slot_ is set from the actual progress cursor
-        // (start_slot from LeaderWindowObserved), which may be ahead of the
-        // window start when the progress cursor entered mid-window after
-        // skip/notarize catch-up.
-        self.skip_slot = self.first_non_progressed_slot.max(window_start);
-        // C++ consensus.cpp:
-        //   timeout_base_ = Timestamp::in(first_block_timeout_);          // base = now + first_block
-        //   alarm_timestamp() = Timestamp::in(target_rate, timeout_base_); // alarm = base + target_rate
-        // First alarm fires at: now + first_block_timeout + target_rate.
+    /// The slot a newly observed leader window starts at: the progress cursor
+    /// (C++ `LeaderWindowObserved::start_slot` is Pool's `now_`), which may be
+    /// ahead of the window start after skip or notarize catch-up.
+    fn observed_window_start_slot(&self) -> SlotIndex {
+        let window_start = self.current_leader_window_idx * self.slots_per_leader_window;
+        self.first_non_progressed_slot.max(window_start)
+    }
+
+    /// A leader window was observed (C++ `handle(LeaderWindowObserved)`): the
+    /// timeout is armed for it only if the cursor has not already moved past
+    /// its start (`timeout_slot_ <= start_slot`). A notarization that moved the
+    /// cursor ahead keeps its cursor, base and deadline.
+    fn observe_window_timeouts(&mut self, desc: &SessionDescription) {
+        let start_slot = self.observed_window_start_slot();
+        if self.timeout_slot <= start_slot {
+            self.arm_window_timeout(desc, start_slot);
+        } else {
+            log::debug!(
+                "SimplexState::observe_window_timeouts: ({}/{}) cursor {} is already ahead; \
+                 the timeout stays as it is",
+                self.current_leader_window_idx,
+                start_slot,
+                self.timeout_slot,
+            );
+        }
+    }
+
+    /// C++ consensus.cpp:
+    ///   timeout_slot_ = start_slot + 1;
+    ///   timeout_base_ = Timestamp::in(first_block_timeout_);
+    ///   alarm_timestamp() = Timestamp::in(target_rate, timeout_base_);
+    /// The first alarm fires at now + first_block_timeout + target_rate.
+    fn arm_window_timeout(&mut self, desc: &SessionDescription, start_slot: SlotIndex) {
+        self.timeout_slot = start_slot + 1;
         self.timeout_base = Some(desc.get_time() + self.first_block_timeout);
         let first_timeout = self.first_block_timeout + self.target_rate_timeout;
         self.skip_timestamp = Some(desc.get_time() + first_timeout);
 
         log::debug!(
-            "SimplexState::set_timeouts: ({}/{}) scheduling timeout in {:.3}s \
+            "SimplexState::arm_window_timeout: ({}/{}) scheduling timeout in {:.3}s \
             (first_block={:.3}s, target_rate={:.3}s)",
             self.current_leader_window_idx,
-            self.skip_slot,
+            start_slot,
             first_timeout.as_secs_f64(),
             self.first_block_timeout.as_secs_f64(),
             self.target_rate_timeout.as_secs_f64(),
@@ -2444,109 +2476,94 @@ impl SimplexState {
         );
     }
 
-    /// Process expired timeouts.
+    /// Fire the skip alarm once its deadline has passed.
     ///
     /// Rule mapping:
     /// - `Simplex.md` timeout-to-skip transition for the active leader window.
-    /// - C++ `consensus.cpp::alarm()` driving skip escalation.
+    /// - C++ `consensus.cpp::alarm()`: one alarm covers
+    ///   `[timeout_slot_ - 1, window_end)` at once, then moves the cursor to
+    ///   `window_end`. Nothing re-arms it here: the next arm comes from a
+    ///   notarization or from the next leader window. The base is kept.
     fn process_timeouts(&mut self, desc: &SessionDescription) {
-        // Check if we have a timeout pending
-        let Some(mut skip_timestamp) = self.skip_timestamp else {
+        let Some(skip_timestamp) = self.skip_timestamp else {
             log::trace!("SimplexState::process_timeouts: no timeout pending");
             return;
         };
+        if desc.is_in_future(skip_timestamp) {
+            return;
+        }
+        // The alarm is one-shot.
+        self.skip_timestamp = None;
 
-        // Process all elapsed timeouts (time <= current time means expired)
-        while !desc.is_in_future(skip_timestamp) {
-            let slot_id = self.skip_slot;
+        let Some(range_start) = self.timeout_slot.value().checked_sub(1).map(SlotIndex::new) else {
+            log::warn!("SimplexState::process_timeouts: the alarm fired with no cursor armed");
+            return;
+        };
+        let window_idx = range_start.window_index(self.slots_per_leader_window);
+        let window_end = (window_idx + 1).window_start(self.slots_per_leader_window);
 
-            log::trace!("SimplexState::process_timeouts: timeout for slot {}", slot_id);
+        log::trace!(
+            "SimplexState::process_timeouts: ({window_idx}/{range_start}) alarm covers \
+             [{range_start}, {window_end})"
+        );
 
-            // Advance to next slot's timeout
-            skip_timestamp = skip_timestamp + self.target_rate_timeout;
-            self.skip_timestamp = Some(skip_timestamp);
-            self.skip_slot += 1;
+        self.alarm_skip_range(range_start, window_end);
+        self.timeout_slot = window_end;
+    }
 
-            // Skip if slot is already finalized
-            if slot_id < self.first_non_finalized_slot {
-                log::trace!(
-                    "SimplexState::process_timeouts: slot {} is already finalized, skipping",
-                    slot_id
-                );
-                continue;
-            }
-
-            // Get slot state
-            let window_idx = desc.get_window_idx(slot_id);
-            let offset = desc.get_slot_offset_in_window(slot_id) as usize;
-
-            // Ensure window exists
-            self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
-
-            // C++ alarm() checks voted_final and fires once per window (one-shot alarm).
-            // Rust process_timeouts fires per-slot, so we must also check voted_skip to
-            // prevent repeated skip vote broadcasts for the same window.
-            // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
-            let should_skip_timeout = {
-                let window = self.get_window(window_idx);
-                if let Some(window) = window {
-                    // C++: voted_final or voted_skip blocks timeout.
-                    // C++ alarm is one-shot so only checks voted_final, but Rust fires
-                    // per-slot so we also check voted_skip to avoid re-broadcasting.
-                    window.slots[offset].voted_final || window.slots[offset].voted_skip
-                } else {
-                    continue;
-                }
-            };
-
-            // Skip if condition is met
-            if !should_skip_timeout {
-                // Get slot state for logging
-                let (is_voted, is_completed) = self
+    /// The slots of `[begin, end)` the alarm may act on: tracked, not finalized,
+    /// and not voted final (C++ `slot_at(i)` and `!voted_final`).
+    fn alarm_slots(&mut self, begin: SlotIndex, end: SlotIndex) -> Vec<SlotIndex> {
+        let mut slots = Vec::new();
+        let mut slot = begin;
+        while slot < end {
+            if slot >= self.first_non_finalized_slot {
+                let window_idx = slot.window_index(self.slots_per_leader_window);
+                self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
+                let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
+                let open = self
                     .get_window(window_idx)
-                    .map(|w| (w.slots[offset].is_voted, w.slots[offset].is_completed))
-                    .unwrap_or((false, false));
-
-                log::trace!(
-                    "SimplexState::process_timeouts: ({window_idx}/{slot_id}) timeout expired, \
-                    voted={is_voted}, is_completed={is_completed} -> skip window"
-                );
-
-                // Mark the window as having had a skip only when one was cast
-                // (C++ alarm() sets previous_window_had_skip_ per cast vote; none
-                // is cast while finality is behind).
-                if self.try_skip_window(window_idx) {
-                    if let Some(window) = self.get_window_mut(window_idx) {
-                        window.had_timeouts = true;
-                    }
+                    .and_then(|window| window.slots.get(offset))
+                    .is_some_and(|slot_state| !slot_state.voted_final);
+                if open {
+                    slots.push(slot);
                 }
+            }
+            slot += 1;
+        }
+        slots
+    }
 
-                // C++ behavior: skip entire remaining window at once, then STOP.
-                // Reference: C++ consensus.cpp alarm():
-                //   C++ fires alarm once and skips ALL remaining slots in the window,
-                //   then sets timeout_slot_ = window_end. Crucially, C++ does NOT
-                //   schedule a new alarm here — the next alarm is only armed when
-                //   LeaderWindowObserved fires for the next window (which applies
-                //   first_block_timeout). Without this, the skip timer races ahead
-                //   of actual window advancement, firing for future windows with
-                //   only target_rate delay instead of first_block_timeout + target_rate,
-                //   causing nodes to vote skip before leaders can produce blocks.
-                let window_end_slot = (window_idx + 1) * self.slots_per_leader_window;
-                if self.skip_slot < window_end_slot {
-                    log::debug!(
-                        "SimplexState::process_timeouts: C++ window skip: \
-                        advancing skip_slot {} -> {} (window_end)",
-                        self.skip_slot,
-                        window_end_slot
-                    );
-                    self.skip_slot = window_end_slot;
+    /// C++ 8812403 `alarm()` body: skip every slot of `[begin, end)` that is
+    /// not voted final, unless finality is behind.
+    fn alarm_skip_range(&mut self, begin: SlotIndex, end: SlotIndex) {
+        if self.finality_behind || !self.local_is_validator {
+            return;
+        }
+        let slots = self.alarm_slots(begin, end);
+        if slots.is_empty() {
+            return;
+        }
+        let slots_str: Vec<String> = slots.iter().map(|s| format!("{}", s)).collect();
+        log::warn!(
+            "SimplexState::process_timeouts: SKIP VOTING for {} slots: [{}]",
+            slots.len(),
+            slots_str.join(",")
+        );
+        for slot in slots {
+            self.broadcast_vote(Vote::Skip(SkipVote { slot }));
+            let window_idx = slot.window_index(self.slots_per_leader_window);
+            let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
+            if let Some(window) = self.get_window_mut(window_idx) {
+                // C++ previous_window_had_skip_ is set per cast skip.
+                window.had_timeouts = true;
+                if let Some(slot_state) = window.slots.get_mut(offset) {
+                    slot_state.is_voted = true;
+                    slot_state.voted_skip = true;
+                    slot_state.is_timeout_skipped = true;
+                    // C++ alarm() only sets voted_skip; the pending candidate is
+                    // kept and rules out a different one for the slot.
                 }
-                // Do NOT reschedule — let advance_leader_window_on_progress_cursor()
-                // re-arm via set_timeouts() with proper first_block_timeout when
-                // the next window actually starts.
-                self.skip_timestamp = None;
-                self.timeout_base = None;
-                break;
             }
         }
     }
@@ -3996,120 +4013,39 @@ impl SimplexState {
         );
         self.advance_leader_window_on_progress_cursor(desc);
 
-        // C++ compatibility: advance skip timer when NotarCert arrives.
-        // Reference: C++ consensus.cpp NotarizationObserved handler.
-        //
-        // C++ computes the deadline from a fixed per-window timeout_base_:
-        //   alarm = timeout_base_ + (timeout_slot_ - window_start) * target_rate
-        // This anchors all deadlines to the window start time, not to "now".
-        //
-        // Guard: C++ checks `timeout_slot_ <= event->id.slot + 1`.
-        // Since C++ timeout_slot_ = Rust skip_slot + 1, this maps to:
-        //   skip_slot + 1 <= slot + 1  →  skip_slot <= slot
-        // This prevents stale updates and also prevents overwriting a deadline
-        // that was freshly set by advance_leader_window_on_progress_cursor when
-        // notarization of the last window slot caused a window transition.
+        // C++ consensus.cpp process_notarization_observed: move the skip timeout
+        // to the slot after this one, with the deadline taken from the fixed
+        // per-window base:
+        //   if (timeout_slot_ <= slot + 1) {
+        //     timeout_slot_ = window end ? slot + 1 : slot + 2;
+        //     alarm = timeout_base_ + (timeout_slot_ - window_start) * target_rate;
+        //   }
+        // At a window end the alarm then covers that last slot alone. The guard
+        // also leaves a deadline freshly armed by a window transition alone.
+        // The base exists from the first arm on, and is kept after the alarm.
         let next_slot = slot + 1;
-        if self.skip_slot <= slot {
+        if self.timeout_slot <= next_slot {
             if let Some(base) = self.timeout_base {
                 let window_start =
                     self.current_leader_window_idx.window_start(self.slots_per_leader_window);
-
-                // C++ timeout_slot_ = slot+2 normally, slot+1 at window end.
-                // Rust skip_slot = C++ timeout_slot_ - 1.
                 let is_window_end = next_slot.value() % self.slots_per_leader_window == 0;
-                let cpp_timeout_slot =
-                    if is_window_end { next_slot.value() } else { next_slot.value() + 1 };
-
-                let offset = cpp_timeout_slot - window_start.value();
+                let new_cursor = if is_window_end { next_slot } else { next_slot + 1 };
+                let offset = new_cursor - window_start;
                 let new_deadline = base + self.target_rate_timeout * offset;
 
                 log::debug!(
                     "SimplexState::on_block_notarized: advancing skip timer: \
-                    skip_slot {} -> {next_slot}, deadline at base+{}*target_rate",
-                    self.skip_slot,
+                    cursor {} -> {new_cursor}, deadline at base+{}*target_rate",
+                    self.timeout_slot,
                     offset,
                 );
-                self.skip_slot = next_slot;
+                self.timeout_slot = new_cursor;
                 self.skip_timestamp = Some(new_deadline);
             }
         }
 
         // Attempt finalization after notarization update.
         self.try_final(desc, slot, &block_hash);
-    }
-
-    /// function trySkipWindow(s)
-    ///
-    /// Rule mapping:
-    /// - `Simplex.md` helper `trySkipWindow`.
-    /// - C++ `consensus.cpp::alarm()` skip broadcast loop.
-    ///
-    /// ```text
-    /// for k ∈ windowSlots(s) do
-    ///     if Voted ∉ state[k] then
-    ///         broadcast SkipVote(k)
-    ///         state[k] ← state[k] ∪ {Voted, TimeoutSkipped}
-    ///         pendingBlocks[k] ← ⊥
-    /// ```
-    ///
-    /// Returns whether any skip vote was cast. C++ `alarm()` casts none while
-    /// finality is behind (`!voted_final && !finality_behind_`), and only a cast
-    /// skip marks the window as having had one.
-    fn try_skip_window(&mut self, window_idx: WindowIndex) -> bool {
-        if !self.local_is_validator {
-            return false;
-        }
-        self.ensure_window_exists(window_idx, WindowAlloc::BoundedByHorizon);
-
-        let start_slot = window_idx * self.slots_per_leader_window;
-        let num_slots = self.slots_per_leader_window as usize;
-        // Collect slots to skip.
-        // C++ alarm() checks voted_final, not voted_notar:
-        // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
-        let mut slots_to_skip = Vec::new();
-        if let Some(window) = self.get_window(window_idx) {
-            for i in 0..num_slots {
-                // C++: if !voted_final — once this node votes final, it cannot
-                // vote skip. This prevents split-brain deadlocks where some
-                // nodes vote skip and others vote final.
-                // Reference: C++ consensus.cpp alarm(): if (!affected_slot->voted_final)
-                let should_skip = !window.slots[i].voted_final && !self.finality_behind;
-                if should_skip {
-                    slots_to_skip.push(start_slot + i as u32);
-                }
-            }
-        }
-
-        if slots_to_skip.is_empty() {
-            return false;
-        }
-
-        {
-            let slots_str: Vec<String> = slots_to_skip.iter().map(|s| format!("{}", s)).collect();
-            log::warn!(
-                "SimplexState::try_skip_window: ({}) SKIP VOTING for {} slots: [{}]",
-                window_idx,
-                slots_to_skip.len(),
-                slots_str.join(",")
-            );
-        }
-
-        // Skip each eligible slot.
-        for slot in slots_to_skip {
-            self.broadcast_vote(Vote::Skip(SkipVote { slot }));
-
-            let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-            if let Some(window) = self.get_window_mut(window_idx) {
-                window.slots[offset].is_voted = true;
-                window.slots[offset].voted_skip = true;
-                window.slots[offset].is_timeout_skipped = true;
-                // C++ alarm() only sets voted_skip — it does NOT clear pending_block.
-                // The pending candidate keeps a different one out of the slot, but it
-                // can no longer be notarized locally: try_notar refuses after a skip.
-            }
-        }
-        true
     }
 
     /// function checkPendingBlocks()
@@ -4632,9 +4568,10 @@ impl SimplexState {
             "SimplexState::advance_leader_window_on_progress_cursor",
         );
 
-        // Advance to new window and schedule timeouts
+        // Advance to new window; arm its timeout unless a notarization already
+        // moved the cursor past its start (C++ `timeout_slot_ <= start_slot`).
         self.current_leader_window_idx = now_window;
-        self.set_timeouts(desc);
+        self.observe_window_timeouts(desc);
 
         // C++ parity: populate new window's available_bases and first slot base.
         // In C++ this happens via LeaderWindowObserved -> consensus.cpp handler which
@@ -4653,10 +4590,10 @@ impl SimplexState {
         }
 
         log::trace!(
-            "SimplexState: advanced to window {}, base={}, scheduling timeouts from slot {}",
+            "SimplexState: advanced to window {}, base={}, timeout cursor at {}",
             now_window,
             Self::format_parent(base.as_ref()),
-            self.skip_slot
+            self.timeout_slot
         );
     }
 
@@ -4927,10 +4864,10 @@ impl SimplexState {
             // State info
             result.push_str(&format!(
                 "  - first_non_finalized: {}, first_non_progressed: {}, \
-                skip_slot: {}, pending_events: {}\n",
+                timeout_slot: {}, pending_events: {}\n",
                 self.first_non_finalized_slot,
                 self.first_non_progressed_slot,
-                self.skip_slot,
+                self.timeout_slot,
                 self.events.len()
             ));
             result.push_str(&format!(
@@ -5674,8 +5611,29 @@ impl SimplexState {
     /// Used in unit tests to satisfy SessionProcessor assertions when
     /// injecting events without running full FSM vote accumulation.
     #[cfg(test)]
-    pub fn try_skip_window_for_test(&mut self, window_idx: WindowIndex) {
-        self.try_skip_window(window_idx);
+    pub fn skip_range_for_test(&mut self, begin: SlotIndex, end: SlotIndex) {
+        self.alarm_skip_range(begin, end);
+    }
+
+    /// Skip every slot of `window_idx` that is not voted final, as an alarm
+    /// covering the whole window does.
+    #[cfg(test)]
+    pub fn try_skip_window(&mut self, window_idx: WindowIndex) {
+        let begin = window_idx.window_start(self.slots_per_leader_window);
+        let end = (window_idx + 1).window_start(self.slots_per_leader_window);
+        self.alarm_skip_range(begin, end);
+    }
+
+    /// The skip timeout cursor (C++ `timeout_slot_`).
+    #[cfg(test)]
+    pub fn timeout_slot_for_test(&self) -> SlotIndex {
+        self.timeout_slot
+    }
+
+    /// The fixed per-window base of the skip deadlines (C++ `timeout_base_`).
+    #[cfg(test)]
+    pub fn timeout_base_for_test(&self) -> Option<SystemTime> {
+        self.timeout_base
     }
 
     #[cfg(test)]
@@ -5821,9 +5779,9 @@ impl SimplexState {
                 "SimplexState::on_window_base_ready",
             );
 
-            // Advance to new window and schedule timeouts
+            // Advance to new window; arm its timeout as a window observation does.
             self.current_leader_window_idx = window_idx;
-            self.set_timeouts(desc);
+            self.observe_window_timeouts(desc);
         } else {
             log::trace!(
                 "SimplexState::on_window_base_ready: ({}/{}) not advancing window (current={})",
