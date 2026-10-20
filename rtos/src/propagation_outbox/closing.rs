@@ -7,6 +7,9 @@ use crate::{
 };
 const MAX_CLOSE_RECORDS: usize = 16_384;
 const MAX_CLOSE_BYTES: usize = 32 << 20;
+/// The largest stored close value: its binding plus fixed fields and header.
+pub(super) const MAX_CLOSE_VALUE_BYTES: usize =
+    crate::repair_lease_binding::MAX_REPAIR_BINDING_BYTES + 256;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClosingRecord {
     pub binding: RepairLeaseBinding,
@@ -223,11 +226,12 @@ impl PropagationOutbox {
         if state.snapshot.closing.len() >= MAX_CLOSE_RECORDS {
             fail!("Close history capacity exhausted");
         }
-        let mut next = state.snapshot.clone();
-        let generation = next.next_close_generation;
-        next.next_close_generation =
-            generation.checked_add(1).ok_or_else(|| error!("Close generation exhausted"))?;
-        self.commit(&mut state, next)?;
+        let generation = state.snapshot.next_close_generation;
+        let next = generation.checked_add(1).ok_or_else(|| error!("Close generation exhausted"))?;
+        let mut batch = Batch::default();
+        self.put_meta(&mut batch, state.snapshot.next_id, next)?;
+        self.commit(&mut state, batch)?;
+        state.snapshot.next_close_generation = next;
         Ok(generation)
     }
     pub(crate) fn begin_close_offer(
@@ -269,9 +273,17 @@ impl PropagationOutbox {
         {
             fail!("Close generation was not reserved or was reused");
         }
-        let mut next = state.snapshot.clone();
-        next.closing.push(record.clone());
-        self.commit(&mut state, next)?;
+        let quota = close_quota(&record)?;
+        let close_bytes =
+            state.close_bytes.checked_add(quota).ok_or_else(|| error!("Close bytes overflow"))?;
+        if close_bytes > MAX_CLOSE_BYTES || state.snapshot.closing.len() >= MAX_CLOSE_RECORDS {
+            fail!("Close history byte quota exhausted");
+        }
+        let mut batch = Batch::default();
+        self.put_close(&mut batch, &record)?;
+        self.commit(&mut state, batch)?;
+        state.close_bytes = close_bytes;
+        state.snapshot.closing.push(record.clone());
         Ok(record)
     }
     /// Require both private custody and the opaque source WAL confirmation.
@@ -324,12 +336,18 @@ impl PropagationOutbox {
             .ok_or_else(|| error!("Close offer lost canonical entry"))?;
         exact_completed(&state.snapshot, delivery, entry)?;
         check_binding(&expected.binding, entry, delivery)?;
-        let mut next = state.snapshot.clone();
-        next.closing[index].released = true;
-        next.entries.retain(|e| e.id.0 != expected.binding.record_id);
-        next.deliveries.retain(|d| d.delivery_id != expected.binding.delivery_id);
-        let result = next.closing[index].clone();
-        self.commit(&mut state, next)?;
+        let record_id = entry.id;
+        let mut result = state.snapshot.closing[index].clone();
+        result.released = true;
+        let mut batch = Batch::default();
+        self.put_close(&mut batch, &result)?;
+        batch.deletes.push(body_key(record_id));
+        batch.deletes.push(state_key(record_id));
+        self.commit(&mut state, batch)?;
+        state.snapshot.closing[index].released = true;
+        state.snapshot.entries.retain(|e| e.id != record_id);
+        state.snapshot.deliveries.retain(|d| d.delivery_id != expected.binding.delivery_id);
+        state.synced.remove(&record_id);
         Ok(result)
     }
 }
@@ -343,8 +361,13 @@ pub(super) fn reject_terminal_record(
     }
     Ok(())
 }
-fn validate_history(snapshot: &Snapshot, domain: &OutboxDomain) -> Result<()> {
+pub(super) fn validate_history(snapshot: &Snapshot, domain: &OutboxDomain) -> Result<()> {
     validate_history_with(snapshot, domain, delivery_id)
+}
+
+/// The bytes one close counts against the close history quota.
+pub(super) fn close_quota(close: &ClosingRecord) -> Result<usize> {
+    close.binding.encode()?.len().checked_add(45).ok_or_else(|| error!("Close bytes overflow"))
 }
 fn validate_history_with(
     snapshot: &Snapshot,
@@ -367,9 +390,7 @@ fn validate_history_with(
     let mut records = BTreeSet::new();
     let mut bytes = 0usize;
     for c in &snapshot.closing {
-        bytes = bytes
-            .checked_add(c.binding.encode()?.len() + 45)
-            .ok_or_else(|| error!("Close bytes overflow"))?;
+        bytes = bytes.checked_add(close_quota(c)?).ok_or_else(|| error!("Close bytes overflow"))?;
         if bytes > MAX_CLOSE_BYTES
             || c.lease_generation == 0
             || c.binding.close_generation >= snapshot.next_close_generation
@@ -412,58 +433,30 @@ fn validate_history_with(
     }
     Ok(())
 }
-pub(super) fn encode_closing(
-    snapshot: &Snapshot,
-    domain: &OutboxDomain,
-    _limits: &Limits,
-    out: &mut Encoder,
-) -> Result<()> {
-    validate_history(snapshot, domain)?;
-    out.u64(snapshot.next_close_generation)?;
-    out.u32(u32::try_from(snapshot.closing.len())?)?;
-    for c in &snapshot.closing {
-        out.blob(&c.binding.encode()?)?;
-        out.u64(c.lease_generation)?;
-        out.hash(&c.dependency_digest)?;
-        out.byte(u8::from(c.released))?;
-    }
-    Ok(())
+/// One stored close value, bound to the outbox domain.
+pub(super) fn encode_close(domain_digest: &UInt256, c: &ClosingRecord) -> Result<Vec<u8>> {
+    let mut out = value_encoder(CLOSE_MAGIC, domain_digest)?;
+    out.maximum = MAX_CLOSE_VALUE_BYTES;
+    out.blob(&c.binding.encode()?)?;
+    out.u64(c.lease_generation)?;
+    out.hash(&c.dependency_digest)?;
+    out.byte(u8::from(c.released))?;
+    Ok(seal(out))
 }
-pub(super) fn decode_closing(
-    input: &mut Decoder<'_>,
-    domain: &OutboxDomain,
-    _limits: &Limits,
-    next_id: u64,
-    entries: &[UnverifiedRecord],
-    deliveries: &[Delivery],
-) -> Result<(u64, Vec<ClosingRecord>)> {
-    let next_close_generation = input.u64()?;
-    let count = input.count(MAX_CLOSE_RECORDS)?;
-    let mut closing = Vec::new();
-    let mut bytes = 0usize;
-    for _ in 0..count {
-        let raw = input.blob(crate::repair_lease_binding::MAX_REPAIR_BINDING_BYTES)?;
-        bytes =
-            bytes.checked_add(raw.len() + 45).ok_or_else(|| error!("Close history overflow"))?;
-        if bytes > MAX_CLOSE_BYTES {
-            fail!("Close history byte quota exhausted");
-        }
-        closing.push(ClosingRecord {
-            binding: RepairLeaseBinding::decode(&raw)?,
-            lease_generation: input.u64()?,
-            dependency_digest: input.hash()?,
-            released: input.boolean()?,
-        });
+pub(super) fn decode_close(bytes: &[u8], domain_digest: &UInt256) -> Result<ClosingRecord> {
+    if bytes.len() > MAX_CLOSE_VALUE_BYTES {
+        fail!("Outbox close value too large");
     }
-    let snapshot = Snapshot {
-        next_close_generation,
-        closing,
-        next_id,
-        entries: entries.to_vec(),
-        deliveries: deliveries.to_vec(),
+    let mut input = open_value(bytes, CLOSE_MAGIC, domain_digest)?;
+    let raw = input.blob(crate::repair_lease_binding::MAX_REPAIR_BINDING_BYTES)?;
+    let close = ClosingRecord {
+        binding: RepairLeaseBinding::decode(&raw)?,
+        lease_generation: input.u64()?,
+        dependency_digest: input.hash()?,
+        released: input.boolean()?,
     };
-    validate_history(&snapshot, domain)?;
-    Ok((next_close_generation, snapshot.closing))
+    input.finish()?;
+    Ok(close)
 }
 
 /// Seeds synthetic Released bookkeeping for crash tests; bypasses authentication
@@ -483,46 +476,15 @@ pub(crate) fn seed_released_pair_for_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repair_lease_binding::RepairLeaseDomain;
+    use crate::{
+        propagation_outbox::test_stores::{DiskStore, MemoryStore as Disk},
+        repair_lease_binding::RepairLeaseDomain,
+    };
     use consensus_common::finality_delivery::{CanonicalFinalityRequest, FinalityDeliveryRole};
-    use std::sync::atomic::{AtomicU8, Ordering};
-    #[derive(Default)]
-    struct Disk {
-        bytes: Mutex<Option<Vec<u8>>>,
-        extra: Mutex<Vec<(String, Vec<u8>)>>,
-        fail: AtomicU8,
-    }
-    impl SnapshotStore for Disk {
-        fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-            let bytes = self.bytes.lock().unwrap().clone();
-            if bytes.as_ref().is_some_and(|b| b.len() > maximum) {
-                fail!("limit");
-            }
-            Ok(bytes)
-        }
-        fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
-            let failure = self.fail.load(Ordering::SeqCst);
-            if failure == 1 {
-                fail!("before");
-            }
-            *self.bytes.lock().unwrap() = Some(bytes.to_vec());
-            if failure == 2 {
-                fail!("after");
-            }
-            Ok(())
-        }
-        fn replace_sync_with(&self, bytes: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
-            let failure = self.fail.load(Ordering::SeqCst);
-            if failure == 1 {
-                fail!("before");
-            }
-            *self.bytes.lock().unwrap() = Some(bytes.to_vec());
-            self.extra.lock().unwrap().extend(extra.iter().cloned());
-            if failure == 2 {
-                fail!("after");
-            }
-            Ok(())
-        }
+    use std::sync::atomic::Ordering;
+    /// Whether the journal key was written beside the outbox rows.
+    fn journal_written(disk: &Disk) -> bool {
+        disk.rows.lock().unwrap().contains_key("journal")
     }
     fn id(seq: u32) -> BlockIdExt {
         BlockIdExt::with_params(
@@ -717,7 +679,7 @@ mod tests {
             assert!(store.lookup_close(&first.binding.delivery_id)?.is_some());
             assert!(store.lookup_close(&second.binding.delivery_id)?.is_some());
         }
-        assert!(disk.extra.lock().unwrap().is_empty(), "no journal without the removal");
+        assert!(!journal_written(&disk), "no journal without the removal");
         Ok(())
     }
     #[test]
@@ -731,7 +693,7 @@ mod tests {
         assert_eq!(store.mutation_epoch()?, Some(epoch + 1));
         assert!(store.lookup_close(&first.binding.delivery_id)?.is_none());
         assert_eq!(store.lookup_close(&second.binding.delivery_id)?, Some(second.clone()));
-        assert_eq!(*disk.extra.lock().unwrap(), journal);
+        assert_eq!(disk.rows.lock().unwrap().get("journal"), Some(&journal[0].1));
         drop(store);
         let store = open(disk);
         assert!(store.lookup_close(&first.binding.delivery_id)?.is_none(), "durable");
@@ -745,16 +707,16 @@ mod tests {
             let store = open(disk.clone());
             let journal = vec![("journal".to_string(), vec![1u8])];
             let (first, _) = released_pair(&store)?;
-            disk.fail.store(failure, Ordering::SeqCst);
+            disk.failure.store(failure, Ordering::SeqCst);
             assert!(store.remove_cleanup_closes(&[association(&first)?], &journal).is_err());
             assert!(store.lookup_close(&first.binding.delivery_id).is_err(), "fails closed");
             assert!(store.with_cleanup_lock(|_, _| Ok(())).is_err());
-            disk.fail.store(0, Ordering::SeqCst);
+            disk.failure.store(0, Ordering::SeqCst);
             drop(store);
             let store = open(disk.clone());
             let applied = failure == 2;
             assert_eq!(store.lookup_close(&first.binding.delivery_id)?.is_none(), applied);
-            assert_eq!(disk.extra.lock().unwrap().is_empty(), !applied, "one batch");
+            assert_eq!(journal_written(&disk), applied, "one batch");
         }
         Ok(())
     }
@@ -886,10 +848,10 @@ mod tests {
             let store = open(disk.clone());
             let (d, e, c) = setup(&store, 1)?;
             store.begin_close_offer_inner(c.clone(), &d, &e)?;
-            disk.fail.store(failure, Ordering::SeqCst);
+            disk.failure.store(failure, Ordering::SeqCst);
             assert!(store.confirm_close_inner(c.clone()).is_err());
             assert!(store.lookup_close(&d.delivery_id).is_err());
-            disk.fail.store(0, Ordering::SeqCst);
+            disk.failure.store(0, Ordering::SeqCst);
             drop(store);
             let store = open(disk);
             let closed = store.lookup_close(&d.delivery_id)?.unwrap();
@@ -923,26 +885,9 @@ mod tests {
     }
     #[test]
     fn close_real_snapshot_database_reopen_preserves_terminal() -> Result<()> {
-        use storage::{
-            block_handle_db::NodeStateDb,
-            db::rocksdb::{AccessType, RocksDb},
-        };
-        struct RealDisk(NodeStateDb);
-        impl SnapshotStore for RealDisk {
-            fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-                let value = self.0.try_get_raw(KEY.as_bytes())?;
-                if value.as_ref().is_some_and(|v| v.len() > maximum) {
-                    fail!("snapshot limit");
-                }
-                Ok(value.map(|v| v.to_vec()))
-            }
-            fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
-                self.0.put_raw_sync(KEY.as_bytes(), bytes)
-            }
-        }
+        use storage::db::rocksdb::AccessType;
         fn reopen(path: &std::path::Path) -> Result<PropagationOutbox> {
-            let db = RocksDb::new(path, "close-test", None, AccessType::ReadWrite)?;
-            let disk = Arc::new(RealDisk(NodeStateDb::with_db(db, "snapshot", true)?));
+            let disk = DiskStore::open(path, AccessType::ReadWrite)?;
             PropagationOutbox::load(disk, domain(), Limits::default(), None)
         }
         let dir = tempfile::tempdir()?;
@@ -965,37 +910,24 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn close_reserved_generation_uncertainty_and_schema_three_migration() -> Result<()> {
+    fn close_reserved_generation_uncertainty_burns_generations() -> Result<()> {
         let disk = Arc::new(Disk::default());
         let store = open(disk.clone());
         let (d, e, c) = setup(&store, 1)?;
-        // Existing schema 3 has the same entry/delivery payload, without v4's
-        // empty close allocator/table. Import it and reserve anew, never infer
-        // an offer or release from an older Completed tag.
-        let mut old = disk.load(1 << 20)?.unwrap();
-        old.drain(old.len() - DIGEST_BYTES - 12..old.len() - DIGEST_BYTES);
-        old[8..10].copy_from_slice(&3u16.to_le_bytes());
-        let n = old.len() - DIGEST_BYTES;
-        let hash = UInt256::calc_file_hash(&old[..n]);
-        old[n..].copy_from_slice(hash.as_slice());
-        *disk.bytes.lock().unwrap() = Some(old);
-        drop(store);
-        let store = open(disk.clone());
-        assert!(store.lookup_close(&d.delivery_id)?.is_none());
-        let first = store.reserve_close(&d, &e)?;
-        assert_eq!(first, 1);
-        disk.fail.store(2, Ordering::SeqCst);
+        assert_eq!(c.binding.close_generation, 1);
+        assert_eq!(store.reserve_close(&d, &e)?, 2);
+        disk.failure.store(2, Ordering::SeqCst);
         assert!(store.reserve_close(&d, &e).is_err());
         assert!(store.reserve_close(&d, &e).is_err());
-        disk.fail.store(0, Ordering::SeqCst);
+        disk.failure.store(0, Ordering::SeqCst);
         drop(store);
         let store = open(disk);
-        assert_eq!(store.reserve_close(&d, &e)?, 3);
+        assert!(store.lookup_close(&d.delivery_id)?.is_none());
+        assert_eq!(store.reserve_close(&d, &e)?, 4, "an uncertain reservation is burnt");
         // Supplied stale event changes are independently rejected.
         let mut changed = d.clone();
         changed.last_mc += 1;
         assert!(store.reserve_close(&changed, &e).is_err());
-        assert_eq!(c.binding.close_generation, 1);
         Ok(())
     }
     #[test]
@@ -1027,42 +959,29 @@ mod tests {
         snapshot.next_id = 1026;
         snapshot.next_close_generation = 1026;
         let limits = Limits { max_records: 1, ..Limits::default() };
-        let encoded = encode_snapshot(&snapshot, &domain(), &limits)?;
-        let decoded = decode_snapshot(&encoded, &domain(), &limits)?;
+        let rows = encode_snapshot_rows(&snapshot, &domain(), &limits)?;
+        let (decoded, _, _) = decode_rows(&rows, &domain(), &limits)?;
         assert_eq!(decoded.closing.len(), 1025);
         assert!(decoded.entries.is_empty());
         let mut bad = decoded.clone();
         bad.closing[0].binding.canonical.block_id = id(2000);
-        assert!(encode_snapshot(&bad, &domain(), &limits).is_err());
+        let rows = encode_snapshot_rows(&bad, &domain(), &limits)?;
+        assert!(decode_rows(&rows, &domain(), &limits).is_err());
         let mut bad = decoded;
         bad.closing.resize(MAX_CLOSE_RECORDS + 1, base);
-        assert!(encode_snapshot(&bad, &domain(), &limits).is_err());
+        assert!(validate_history(&bad, &domain()).is_err());
         Ok(())
     }
     #[test]
     fn close_real_compact_admission_capacity_preserves_snapshot_and_canonical() -> Result<()> {
-        use storage::{
-            block_handle_db::NodeStateDb,
-            db::rocksdb::{AccessType, RocksDb},
-        };
-        struct CapacityDisk(NodeStateDb);
-        impl SnapshotStore for CapacityDisk {
-            fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-                let value = self.0.try_get_raw(KEY.as_bytes())?;
-                if value.as_ref().is_some_and(|v| v.len() > maximum) {
-                    fail!("snapshot limit");
-                }
-                Ok(value.map(|v| v.to_vec()))
-            }
-            fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
-                self.0.put_raw_sync(KEY.as_bytes(), bytes)
-            }
-        }
+        use storage::db::rocksdb::AccessType;
         fn reopen(path: &std::path::Path) -> Result<PropagationOutbox> {
-            let db = RocksDb::new(path, "compact-capacity", None, AccessType::ReadWrite)?;
-            let disk = Arc::new(CapacityDisk(NodeStateDb::with_db(db, "snapshot", true)?));
+            let disk = DiskStore::open(path, AccessType::ReadWrite)?;
             PropagationOutbox::load(disk, domain(), Limits::default(), None)
         }
+        let rows = |store: &PropagationOutbox| {
+            read_rows(store.store.as_ref(), &Limits::default(), usize::MAX)
+        };
         let dir = tempfile::tempdir()?;
         let store = reopen(dir.path())?;
         let (d1, e1, first) = setup(&store, 1)?;
@@ -1124,20 +1043,16 @@ mod tests {
             snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS
                 || total + first_size + second_size > MAX_CLOSE_BYTES
         );
-        let seed = encode_snapshot(&snapshot, &domain(), &Limits::default())?;
-        store.store.replace_sync(&seed)?;
+        let seed = encode_snapshot_rows(&snapshot, &domain(), &Limits::default())?;
+        store.store.write_batch(&seed, &[])?;
         drop(store);
         let store = reopen(dir.path())?;
         store.begin_close_offer_inner(first.clone(), &d1, &e1)?;
-        let before = store.store.load(Limits::default().max_snapshot_bytes)?.unwrap();
+        let before = rows(&store)?;
         let error =
             store.begin_close_offer_inner(second.clone(), &d2, &e2).unwrap_err().to_string();
-        if snapshot.closing.len() + 1 == MAX_CLOSE_RECORDS {
-            assert!(error.contains("Invalid close history capacity/allocator"), "{error}");
-        } else {
-            assert!(error.contains("Invalid close history binding or quota"), "{error}");
-        }
-        assert_eq!(store.store.load(Limits::default().max_snapshot_bytes)?.unwrap(), before);
+        assert!(error.contains("Close history byte quota exhausted"), "{error}");
+        assert_eq!(rows(&store)?, before);
         assert!(store.delivery(&d1.delivery_id)?.is_some());
         assert!(store.delivery(&d2.delivery_id)?.is_some());
         assert_eq!(store.lookup_close(&d1.delivery_id)?, Some(first.clone()));
@@ -1149,7 +1064,7 @@ mod tests {
         );
         drop(store);
         let store = reopen(dir.path())?;
-        assert_eq!(store.store.load(Limits::default().max_snapshot_bytes)?.unwrap(), before);
+        assert_eq!(rows(&store)?, before);
         assert!(store.delivery(&d1.delivery_id)?.is_some());
         assert!(store.delivery(&d2.delivery_id)?.is_some());
         assert_eq!(store.lookup_close(&d1.delivery_id)?, Some(first));

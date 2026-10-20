@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Atomic outbox close removal plus journal update across executable recovery.
 use super::*;
-use crate::propagation_outbox::{inspect_closure_snapshot, Limits, OutboxDomain, PropagationOutbox};
+use crate::propagation_outbox::{inspect_exported_rows, Limits, OutboxDomain, PropagationOutbox};
 use consensus_common::validator_cleanup::{decode_record, encode_record, record_key, CleanupAssociation, CleanupJournal};
 use std::sync::Arc;
 
@@ -13,10 +13,12 @@ fn domain(db: &InternalDb) -> Result<OutboxDomain> {
 }
 fn rows(db: &InternalDb) -> Result<Vec<String>> {
     let (_, record) = validator_retirement_loss::journal_pair(&Fixture::node_recovery().id(3, false))?;
-    ["PropagationOutboxV1".to_owned(), record_key(&record.namespace)].iter().map(|key| {
-        db.load_validator_state_key_bounded(key, 64 << 20)?.map(hex::encode)
-            .ok_or_else(|| rtos_block::error!("Missing outbox cleanup row {key}"))
-    }).collect()
+    let key = record_key(&record.namespace);
+    let journal = db
+        .load_validator_state_key_bounded(&key, 64 << 20)?
+        .map(hex::encode)
+        .ok_or_else(|| rtos_block::error!("Missing outbox cleanup row {key}"))?;
+    Ok(vec![hex::encode(crate::propagation_outbox::export_rows(db)?), journal])
 }
 fn receipt(root: &Path) -> Result<serde_json::Value> {
     Ok(serde_json::from_slice(&fs::read(root.join("validator-outbox-ack.json"))?)?)
@@ -24,8 +26,8 @@ fn receipt(root: &Path) -> Result<serde_json::Value> {
 fn check_pair(db: &InternalDb, previous: &[String], expected: &[String]) -> Result<()> {
     assert_eq!(previous.len(), 2); assert_eq!(expected.len(), 2);
     let domain = domain(db)?;
-    let (entries, before) = inspect_closure_snapshot(&hex::decode(&previous[0])?, &domain)?;
-    let (after_entries, after) = inspect_closure_snapshot(&hex::decode(&expected[0])?, &domain)?;
+    let (entries, before) = inspect_exported_rows(&hex::decode(&previous[0])?, &domain)?;
+    let (after_entries, after) = inspect_exported_rows(&hex::decode(&expected[0])?, &domain)?;
     assert!(entries.is_empty() && after_entries.is_empty());
     assert_eq!(before.len(), 2); assert_eq!(after.len(), 1);
     assert!(before.iter().all(|c| c.released));

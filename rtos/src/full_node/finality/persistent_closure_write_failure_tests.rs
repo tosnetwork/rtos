@@ -3,7 +3,7 @@
 //! are application-visible storage boundary errors, not failed OS syscalls.
 use super::*;
 use crate::internal_db::OutboxSyncBoundary;
-use crate::propagation_outbox::inspect_closure_snapshot;
+use crate::propagation_outbox::inspect_closure_batch;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
@@ -49,10 +49,10 @@ async fn released_write_failure(boundary: OutboxSyncBoundary) {
             let attempts=arm_attempts.clone();
             let injections=arm_injections.clone();
             let domain=hook_domain.clone();
-            db.set_outbox_sync_observer(Some(Arc::new(move |point,bytes| {
+            db.set_outbox_sync_observer(Some(Arc::new(move |point,puts,_deletes| {
                 // Validate the exact serialized write, not a call-number guess:
                 // no reserve/offer/other event write may satisfy this fault.
-                let (entries,closed)=inspect_closure_snapshot(bytes,&domain)?;
+                let (entries,closed)=inspect_closure_batch(puts,&domain)?;
                 if !entries.is_empty() || closed.len()!=1 || !closed[0].released || closed[0].offer()!=offer {
                     rtos_block::fail!("Released fault intercepted unrelated storage transition");
                 }

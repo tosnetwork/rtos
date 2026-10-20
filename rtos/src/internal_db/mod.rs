@@ -277,8 +277,10 @@ pub(crate) enum OutboxSyncBoundary {
     BeforeWrite,
     AfterSuccessfulSync,
 }
+/// Observes one outbox write batch: its puts and its deletes.
 #[cfg(test)]
-type OutboxSyncObserver = dyn Fn(OutboxSyncBoundary, &[u8]) -> Result<()> + Send + Sync;
+type OutboxSyncObserver =
+    dyn Fn(OutboxSyncBoundary, &[(String, Vec<u8>)], &[String]) -> Result<()> + Send + Sync;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2328,40 +2330,26 @@ impl InternalDb {
         *self.outbox_sync_observer.lock().unwrap() = observer;
     }
     pub fn save_validator_state_raw_sync(&self, key: &'static str, data: &[u8]) -> Result<()> {
-        #[cfg(test)]
-        let observer = if key == "PropagationOutboxV1" {
-            self.outbox_sync_observer.lock().unwrap().clone()
-        } else {
-            None
-        };
-        #[cfg(test)]
-        if let Some(observer) = &observer {
-            observer(OutboxSyncBoundary::BeforeWrite, data)?;
-        }
-        self.block_handle_storage.save_validator_state_raw_sync(key, data)?;
-        #[cfg(test)]
-        if let Some(observer) = &observer {
-            observer(OutboxSyncBoundary::AfterSuccessfulSync, data)?;
-        }
-        Ok(())
+        self.block_handle_storage.save_validator_state_raw_sync(key, data)
     }
 
-    /// The outbox snapshot and further validator-state keys in one synced
-    /// batch, observed like a plain outbox write.
-    pub fn save_outbox_with_sync(&self, data: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
+    /// One propagation outbox write: its puts and deletes, with any further
+    /// validator-state keys among the puts, in one synced batch.
+    pub fn write_outbox_batch_sync(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        deletes: &[String],
+    ) -> Result<()> {
         #[cfg(test)]
         let observer = self.outbox_sync_observer.lock().unwrap().clone();
         #[cfg(test)]
         if let Some(observer) = &observer {
-            observer(OutboxSyncBoundary::BeforeWrite, data)?;
+            observer(OutboxSyncBoundary::BeforeWrite, puts, deletes)?;
         }
-        let mut puts = Vec::with_capacity(extra.len().saturating_add(1));
-        puts.push(("PropagationOutboxV1".to_owned(), data.to_vec()));
-        puts.extend(extra.iter().cloned());
-        self.block_handle_storage.write_validator_state_batch_sync(&puts, &[])?;
+        self.block_handle_storage.write_validator_state_batch_sync(puts, deletes)?;
         #[cfg(test)]
         if let Some(observer) = &observer {
-            observer(OutboxSyncBoundary::AfterSuccessfulSync, data)?;
+            observer(OutboxSyncBoundary::AfterSuccessfulSync, puts, deletes)?;
         }
         Ok(())
     }

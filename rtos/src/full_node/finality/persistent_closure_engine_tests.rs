@@ -341,13 +341,7 @@ async fn circulation_with_retry_turn(events: usize, close_demand: bool, single_r
                 "the test must actually complete publication effects"
             );
             if index == 0 {
-                let before = engine
-                    .db()
-                    .load_validator_state_raw_bounded(
-                        "PropagationOutboxV1",
-                        crate::propagation_outbox::Limits::default().max_snapshot_bytes,
-                    )
-                    .unwrap();
+                let before = crate::propagation_outbox::export_rows(engine.db()).unwrap();
                 let worker = engine.ensure_publication_worker().await.unwrap();
                 assert!(
                     worker
@@ -360,13 +354,7 @@ async fn circulation_with_retry_turn(events: usize, close_demand: bool, single_r
                         .is_err(),
                     "real compact Released record must not mint new history admission"
                 );
-                let after = engine
-                    .db()
-                    .load_validator_state_raw_bounded(
-                        "PropagationOutboxV1",
-                        crate::propagation_outbox::Limits::default().max_snapshot_bytes,
-                    )
-                    .unwrap();
+                let after = crate::propagation_outbox::export_rows(engine.db()).unwrap();
                 assert_eq!(after, before, "failed compact admission mutated durable outbox");
             }
             assert!(generations.insert(entry.lease_generation));

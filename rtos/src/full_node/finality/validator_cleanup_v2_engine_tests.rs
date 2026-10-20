@@ -712,7 +712,7 @@ async fn uncertain_b2(boundary: crate::internal_db::OutboxSyncBoundary, durable:
                     let _stop = Controls::stop_at(&retired.v2_ns, CleanupPoint::AfterB1Prime);
                     manager.tick().await;
                 }
-                engine.db().set_outbox_sync_observer(Some(Arc::new(move |at, _| {
+                engine.db().set_outbox_sync_observer(Some(Arc::new(move |at, _, _| {
                     if at == boundary {
                         rtos_block::fail!("injected outbox batch failure");
                     }

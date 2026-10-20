@@ -5,18 +5,42 @@
 //! and complete acceptance before marking it ready or sending. Neither the
 //! checksum nor a Ready tag grants that authority. All methods are synchronous;
 //! call them on an owned blocking worker, never while holding a network lock.
+//!
+//! Storage: one validator-state key per object, written in one synced batch per
+//! mutation that touches only the objects the mutation changes.
+//! - `PropagationOutboxV2/meta`: the identifier allocators;
+//! - `PropagationOutboxV2/b/<record>`: a record's immutable body, written once;
+//! - `PropagationOutboxV2/s/<record>`: its stage, frozen effects, remaining
+//!   effects and delivery identity;
+//! - `PropagationOutboxV2/c/<delivery>`: one close history record.
+//!
+//! Every value carries its kind, the schema, the network domain and its own key
+//! identity under a SHA-256 checksum. Loading checks every relationship between
+//! the values; the aggregate byte budget is checked before every commit, so an
+//! acknowledged state always reopens within the configured limits.
 use crate::internal_db::{InternalDb, PropagationOutboxWriterLease};
 use consensus_common::simplex_protocol::SimplexProtocol;
 use rtos_api::WireProfile;
 use rtos_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
-const KEY: &str = "PropagationOutboxV1";
-const MAGIC: &[u8; 8] = b"RTOSPBOX";
-pub const SCHEMA_VERSION: u16 = 4;
+/// The snapshot key of earlier development builds; its presence refuses open.
+const LEGACY_KEY: &str = "PropagationOutboxV1";
+pub(crate) const KEY_PREFIX: &str = "PropagationOutboxV2/";
+const META_KEY: &str = "PropagationOutboxV2/meta";
+const BODY_PREFIX: &str = "PropagationOutboxV2/b/";
+const STATE_PREFIX: &str = "PropagationOutboxV2/s/";
+const CLOSE_PREFIX: &str = "PropagationOutboxV2/c/";
+const META_MAGIC: &[u8; 8] = b"RTOSPBXM";
+const BODY_MAGIC: &[u8; 8] = b"RTOSPBXB";
+const STATE_MAGIC: &[u8; 8] = b"RTOSPBXS";
+const CLOSE_MAGIC: &[u8; 8] = b"RTOSPBXC";
+pub const SCHEMA_VERSION: u16 = 5;
+/// Keys read per page while loading; the writer lease is held throughout.
+const LOAD_PAGE_KEYS: usize = 256;
 pub(crate) mod closing;
 pub(crate) use closing::{canonical_intent_digest, effects_digest, ClosingRecord};
 const DIGEST_BYTES: usize = 32;
@@ -31,6 +55,7 @@ pub struct OutboxDomain {
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub max_records: usize,
+    /// The aggregate size of every stored key and value.
     pub max_snapshot_bytes: usize,
     pub max_block_bytes: usize,
     pub max_proof_bytes: usize,
@@ -138,8 +163,8 @@ impl PublicationRecord {
 }
 
 /// IDs are monotonically allocated and never reused, including across empty
-/// snapshots/restarts. A stale completion cannot erase a later re-enqueue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// outboxes/restarts. A stale completion cannot erase a later re-enqueue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecordId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,28 +182,45 @@ pub struct UnverifiedRecord {
     pub stage: PublicationStage,
     /// Shared immutable evidence, like the candidate reference retained by a
     /// resolver. A transport checkpoint changes only stage/pending, while old
-    /// readers keep the same retained input. Full snapshot sync is unchanged.
+    /// readers keep the same retained input.
     pub record: Arc<PublicationRecord>,
     pub pending: Vec<PublicationEffect>,
 }
 
-trait SnapshotStore: Send + Sync {
-    fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>>;
-    fn replace_sync(&self, bytes: &[u8]) -> Result<()>;
-    /// The snapshot plus further keys of the same database, one synced batch.
-    fn replace_sync_with(&self, _bytes: &[u8], _extra: &[(String, Vec<u8>)]) -> Result<()> {
-        fail!("Snapshot store cannot write further keys atomically")
-    }
+/// One page of a prefix scan: the rows read, the last key examined, and whether
+/// the prefix range was exhausted.
+type ScanPage = (Vec<(String, Vec<u8>)>, String, bool);
+
+/// The keyed storage an outbox writes through. Every write is one synced
+/// atomic batch.
+trait OutboxStore: Send + Sync {
+    fn write_batch(&self, puts: &[(String, Vec<u8>)], deletes: &[String]) -> Result<()>;
+    /// At most `max_keys` entries under `prefix` strictly after `after`; a value
+    /// larger than `max_value_bytes` is skipped, never copied.
+    fn scan(
+        &self,
+        prefix: &str,
+        after: &str,
+        max_keys: usize,
+        max_value_bytes: usize,
+    ) -> Result<ScanPage>;
+    fn has_prefix(&self, prefix: &str) -> Result<bool>;
 }
-impl SnapshotStore for InternalDb {
-    fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-        self.load_validator_state_raw_bounded(KEY, maximum)
+impl OutboxStore for InternalDb {
+    fn write_batch(&self, puts: &[(String, Vec<u8>)], deletes: &[String]) -> Result<()> {
+        self.write_outbox_batch_sync(puts, deletes)
     }
-    fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
-        self.save_validator_state_raw_sync(KEY, bytes)
+    fn scan(
+        &self,
+        prefix: &str,
+        after: &str,
+        max_keys: usize,
+        max_value_bytes: usize,
+    ) -> Result<ScanPage> {
+        self.scan_validator_state_prefix(prefix, after, max_keys, max_value_bytes)
     }
-    fn replace_sync_with(&self, bytes: &[u8], extra: &[(String, Vec<u8>)]) -> Result<()> {
-        self.save_outbox_with_sync(bytes, extra)
+    fn has_prefix(&self, prefix: &str) -> Result<bool> {
+        self.validator_state_prefix_has_key_other_than(prefix, "")
     }
 }
 
@@ -209,20 +251,34 @@ struct Snapshot {
     entries: Vec<UnverifiedRecord>,
     deliveries: Vec<Delivery>,
 }
+
+/// The keys and values one mutation writes, in one synced batch.
+#[derive(Default)]
+struct Batch {
+    puts: Vec<(String, Vec<u8>)>,
+    deletes: Vec<String>,
+}
+
 struct State {
     snapshot: Snapshot,
     failed: Option<String>,
-    /// This exclusive writer has successfully synced the current full snapshot.
-    /// Decoding a snapshot after reopen never grants this process-local receipt.
-    snapshot_synced: bool,
+    /// Records whose body and state this exclusive writer has synced itself.
+    /// Loading a record after reopen never grants this process-local receipt.
+    synced: HashSet<RecordId>,
+    /// Stored size (key plus value) of every key, and their sum.
+    sizes: HashMap<String, usize>,
+    total_bytes: usize,
+    /// The close history's quota bytes, checked before every close commit.
+    close_bytes: usize,
     /// Advanced by every write attempt, successful or not; None once
     /// exhausted, which refuses every cleanup projection.
     mutation_epoch: Option<u64>,
 }
 
 pub struct PropagationOutbox {
-    store: Arc<dyn SnapshotStore>,
+    store: Arc<dyn OutboxStore>,
     domain: OutboxDomain,
+    domain_digest: UInt256,
     limits: Limits,
     state: Mutex<State>,
     _writer: Option<PropagationOutboxWriterLease>,
@@ -235,36 +291,63 @@ impl PropagationOutbox {
         Self::load(db, domain, limits, Some(writer)).map(Arc::new)
     }
 
+    /// Loads under the writer lease the caller holds for the whole read.
     fn load(
-        store: Arc<dyn SnapshotStore>,
+        store: Arc<dyn OutboxStore>,
         domain: OutboxDomain,
         limits: Limits,
         writer: Option<PropagationOutboxWriterLease>,
     ) -> Result<Self> {
         validate_domain(&domain)?;
         validate_limits(&limits)?;
-        let snapshot = match store.load(limits.max_snapshot_bytes)? {
-            Some(bytes) => decode_snapshot(&bytes, &domain, &limits)?,
-            None => {
-                let snapshot = Snapshot {
-                    next_close_generation: 1,
-                    closing: Vec::new(),
-                    next_id: 1,
-                    entries: Vec::new(),
-                    deliveries: Vec::new(),
-                };
-                // Retain the domain and ID allocator even with no pending work.
-                store.replace_sync(&encode_snapshot(&snapshot, &domain, &limits)?)?;
-                snapshot
+        if store.has_prefix(LEGACY_KEY)? {
+            fail!(
+                "An earlier development propagation outbox format is present; \
+                 the node database must be recreated"
+            );
+        }
+        let rows = read_rows(store.as_ref(), &limits, LOAD_PAGE_KEYS)?;
+        let domain_digest = domain_digest(&domain)?;
+        let state = if rows.is_empty() {
+            let snapshot = Snapshot {
+                next_close_generation: 1,
+                closing: Vec::new(),
+                next_id: 1,
+                entries: Vec::new(),
+                deliveries: Vec::new(),
+            };
+            // Retain the domain and ID allocator even with no pending work.
+            let meta = encode_meta(&domain_digest, &snapshot)?;
+            let size = META_KEY.len().saturating_add(meta.len());
+            store.write_batch(&[(META_KEY.to_owned(), meta)], &[])?;
+            State {
+                snapshot,
+                failed: None,
+                synced: HashSet::new(),
+                sizes: HashMap::from([(META_KEY.to_owned(), size)]),
+                total_bytes: size,
+                close_bytes: 0,
+                mutation_epoch: Some(0),
+            }
+        } else {
+            let (snapshot, sizes, total_bytes) = decode_rows(&rows, &domain, &limits)?;
+            let mut close_bytes = 0usize;
+            for close in &snapshot.closing {
+                close_bytes = close_bytes
+                    .checked_add(closing::close_quota(close)?)
+                    .ok_or_else(|| error!("Close bytes overflow"))?;
+            }
+            State {
+                snapshot,
+                failed: None,
+                synced: HashSet::new(),
+                sizes,
+                total_bytes,
+                close_bytes,
+                mutation_epoch: Some(0),
             }
         };
-        Ok(Self {
-            store,
-            domain,
-            limits,
-            state: Mutex::new(State { snapshot, failed: None, snapshot_synced: false, mutation_epoch: Some(0) }),
-            _writer: writer,
-        })
+        Ok(Self { store, domain, domain_digest, limits, state: Mutex::new(state), _writer: writer })
     }
 
     pub fn domain(&self) -> &OutboxDomain {
@@ -289,18 +372,19 @@ impl PropagationOutbox {
         if state.snapshot.entries.len() >= self.limits.max_records {
             fail!("Propagation outbox record capacity exhausted");
         }
-        let mut next = state.snapshot.clone();
-        let id = RecordId(next.next_id);
-        next.next_id =
-            next.next_id.checked_add(1).ok_or_else(|| error!("Outbox ID space exhausted"))?;
+        let id = RecordId(state.snapshot.next_id);
+        let next_id = id.0.checked_add(1).ok_or_else(|| error!("Outbox ID space exhausted"))?;
         let pending = record.effects.clone();
-        next.entries.push(UnverifiedRecord {
-            id,
-            stage: PublicationStage::Prepared,
-            record: Arc::new(record),
-            pending,
-        });
-        self.commit(&mut state, next)?;
+        let entry =
+            UnverifiedRecord { id, stage: PublicationStage::Prepared, record: Arc::new(record), pending };
+        let mut batch = Batch::default();
+        self.put_body(&mut batch, &entry)?;
+        self.put_state(&mut batch, &entry, None)?;
+        self.put_meta(&mut batch, next_id, state.snapshot.next_close_generation)?;
+        self.commit(&mut state, batch)?;
+        state.snapshot.next_id = next_id;
+        state.synced.insert(id);
+        state.snapshot.entries.push(entry);
         Ok(id)
     }
 
@@ -308,24 +392,22 @@ impl PropagationOutbox {
     /// succeeded. On restart, even Ready records require fresh authentication.
     pub fn mark_ready(&self, id: RecordId) -> Result<()> {
         let mut state = self.lock()?;
-        let mut next = state.snapshot.clone();
-        let entry = next
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
+        let index = entry_index(&state.snapshot, id)
             .ok_or_else(|| error!("Unknown propagation outbox record {}", id.0))?;
+        let entry = &state.snapshot.entries[index];
         if matches!(entry.stage, PublicationStage::Ready | PublicationStage::Completed) {
             return Ok(());
         }
         if matches!(entry.stage, PublicationStage::DraftDurable | PublicationStage::AcceptedDraft) {
             fail!("Unresolved draft cannot become Ready");
         }
-        entry.stage = if entry.pending.is_empty() {
+        let mut next = entry.clone();
+        next.stage = if next.pending.is_empty() {
             PublicationStage::Completed
         } else {
             PublicationStage::Ready
         };
-        self.commit(&mut state, next)
+        self.replace_entry(&mut state, index, next)
     }
 
     /// Checkpoint actual acceptance independently of routing availability. A
@@ -333,21 +415,18 @@ impl PropagationOutbox {
     /// perform idempotent acceptance before returning an AcceptedSessionBlock.
     pub fn mark_accepted(&self, id: RecordId) -> Result<()> {
         let mut state = self.lock()?;
-        let mut next = state.snapshot.clone();
-        let entry = next
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
+        let index = entry_index(&state.snapshot, id)
             .ok_or_else(|| error!("Unknown publication acceptance record"))?;
-        entry.stage = match entry.stage {
+        let mut next = state.snapshot.entries[index].clone();
+        next.stage = match next.stage {
             PublicationStage::DraftDurable => PublicationStage::AcceptedDraft,
-            PublicationStage::Prepared if entry.pending.is_empty() => PublicationStage::Completed,
+            PublicationStage::Prepared if next.pending.is_empty() => PublicationStage::Completed,
             PublicationStage::Prepared => PublicationStage::Ready,
             PublicationStage::AcceptedDraft
             | PublicationStage::Ready
             | PublicationStage::Completed => return Ok(()),
         };
-        self.commit(&mut state, next)
+        self.replace_entry(&mut state, index, next)
     }
 
     /// Checkpoint only effects whose transport accepted a send attempt. Failed,
@@ -355,11 +434,10 @@ impl PropagationOutbox {
     /// acknowledgement is implied. Duplicate/stale completions are harmless.
     pub fn checkpoint_sent(&self, id: RecordId, sent: &[PublicationEffect]) -> Result<bool> {
         let mut state = self.lock()?;
-        let mut next = state.snapshot.clone();
-        let Some(index) = next.entries.iter().position(|entry| entry.id == id) else {
+        let Some(index) = entry_index(&state.snapshot, id) else {
             return Ok(false);
         };
-        let entry = &mut next.entries[index];
+        let entry = &state.snapshot.entries[index];
         if entry.stage == PublicationStage::Completed {
             return Ok(false);
         }
@@ -369,19 +447,26 @@ impl PropagationOutbox {
         if sent.iter().any(|effect| !entry.record.effects.contains(effect)) {
             fail!("Publication checkpoint contains an effect outside the original intent");
         }
-        let before = entry.pending.len();
-        entry.pending.retain(|effect| !sent.contains(effect));
-        if before == entry.pending.len() {
+        let mut next = entry.clone();
+        let before = next.pending.len();
+        next.pending.retain(|effect| !sent.contains(effect));
+        if before == next.pending.len() {
             return Ok(false);
         }
-        if entry.pending.is_empty() {
-            if next.deliveries.iter().any(|delivery| delivery.record_id == id) {
-                entry.stage = PublicationStage::Completed;
+        if next.pending.is_empty() {
+            if delivery_of(&state.snapshot, id).is_some() {
+                next.stage = PublicationStage::Completed;
             } else {
-                next.entries.remove(index);
+                let mut batch = Batch::default();
+                batch.deletes.push(body_key(id));
+                batch.deletes.push(state_key(id));
+                self.commit(&mut state, batch)?;
+                state.snapshot.entries.remove(index);
+                state.synced.remove(&id);
+                return Ok(true);
             }
         }
-        self.commit(&mut state, next)?;
+        self.replace_entry(&mut state, index, next)?;
         Ok(true)
     }
 
@@ -411,8 +496,12 @@ impl PropagationOutbox {
         if let Some(delivery) =
             state.snapshot.deliveries.iter().find(|d| d.delivery_id == delivery_id)
         {
-            let existing =
-                state.snapshot.entries.iter().find(|e| e.id == delivery.record_id).unwrap();
+            let existing = state
+                .snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == delivery.record_id)
+                .ok_or_else(|| error!("Delivery refers to a missing record"))?;
             let mut original = existing.record.as_ref().clone();
             original.effects.clear();
             // Recovery may conservatively demote local routing claims. Preserve
@@ -426,23 +515,30 @@ impl PropagationOutbox {
         if state.snapshot.entries.len() >= self.limits.max_records {
             fail!("Delivery capacity exhausted; source must retain pending evidence");
         }
-        let mut next = state.snapshot.clone();
-        let record_id = RecordId(next.next_id);
-        next.next_id = next.next_id.checked_add(1).ok_or_else(|| error!("Outbox ID exhausted"))?;
-        next.entries.push(UnverifiedRecord {
+        let record_id = RecordId(state.snapshot.next_id);
+        let next_id = record_id.0.checked_add(1).ok_or_else(|| error!("Outbox ID exhausted"))?;
+        let entry = UnverifiedRecord {
             id: record_id,
             stage: PublicationStage::DraftDurable,
             record: Arc::new(record),
             pending: Vec::new(),
-        });
-        next.deliveries.push(Delivery {
+        };
+        let delivery = Delivery {
             delivery_id: delivery_id.clone(),
             record_id,
             last_mc,
             candidate_already_sent,
             origin,
-        });
-        self.commit(&mut state, next)?;
+        };
+        let mut batch = Batch::default();
+        self.put_body(&mut batch, &entry)?;
+        self.put_state(&mut batch, &entry, Some(&delivery))?;
+        self.put_meta(&mut batch, next_id, state.snapshot.next_close_generation)?;
+        self.commit(&mut state, batch)?;
+        state.snapshot.next_id = next_id;
+        state.synced.insert(record_id);
+        state.snapshot.entries.push(entry);
+        state.snapshot.deliveries.push(delivery);
         Ok(delivery_id)
     }
 
@@ -479,11 +575,24 @@ impl PropagationOutbox {
                 return Ok(Err(reason));
             }
         }
-        let mut next = state.snapshot.clone();
-        next.closing.retain(|close| {
+        if let Some((key, _)) = extra.iter().find(|(key, _)| key.starts_with(KEY_PREFIX)) {
+            fail!("Cleanup journal key {key} collides with the outbox namespace");
+        }
+        let mut batch = Batch::default();
+        let mut released = 0usize;
+        for close in state.snapshot.closing.iter().filter(|close| {
+            associations.iter().any(|a| a.delivery_id == close.binding.delivery_id)
+        }) {
+            batch.deletes.push(close_key(&close.binding.delivery_id));
+            released =
+                released.checked_add(closing::close_quota(close)?).ok_or_else(|| error!("Close bytes overflow"))?;
+        }
+        batch.puts.extend(extra.iter().cloned());
+        self.commit(&mut state, batch)?;
+        state.close_bytes = state.close_bytes.saturating_sub(released);
+        state.snapshot.closing.retain(|close| {
             !associations.iter().any(|a| a.delivery_id == close.binding.delivery_id)
         });
-        self.commit_with(&mut state, next, extra)?;
         Ok(Ok(()))
     }
 
@@ -533,12 +642,16 @@ impl PropagationOutbox {
 
     pub fn delivery(&self, id: &UInt256) -> Result<Option<(Delivery, UnverifiedRecord)>> {
         let state = self.lock()?;
-        Ok(state.snapshot.deliveries.iter().find(|d| &d.delivery_id == id).map(|d| {
-            (
-                d.clone(),
-                state.snapshot.entries.iter().find(|e| e.id == d.record_id).unwrap().clone(),
-            )
-        }))
+        let Some(delivery) = state.snapshot.deliveries.iter().find(|d| &d.delivery_id == id) else {
+            return Ok(None);
+        };
+        let entry = state
+            .snapshot
+            .entries
+            .iter()
+            .find(|e| e.id == delivery.record_id)
+            .ok_or_else(|| error!("Delivery refers to a missing record"))?;
+        Ok(Some((delivery.clone(), entry.clone())))
     }
 
     /// Borrow an actual full delivery under the writer's healthy-state lock.
@@ -570,9 +683,10 @@ impl PropagationOutbox {
     /// A delivery mapping is a permanent source reference, including after
     /// Completed. No delivery or canonical evidence may be reclaimed without a
     /// separate source retirement protocol. A source may compact its full ACK
-    /// only after this exclusive writer synced the complete current snapshot.
-    /// Cold reads need that barrier; repeated requests reuse its successful
-    /// result. An uncertain later write poisons this owner just like admission.
+    /// only after this exclusive writer synced the record's body and state
+    /// itself. Cold reads need that barrier; repeated requests reuse its
+    /// successful result. An uncertain later write poisons this owner just like
+    /// admission.
     pub(crate) fn retain_delivery(&self, expected: &Delivery) -> Result<()> {
         let mut state = self.lock()?;
         if state.snapshot.closing.iter().any(|c| c.binding.delivery_id == expected.delivery_id) {
@@ -584,24 +698,30 @@ impl PropagationOutbox {
         if expected.origin.is_none() {
             fail!("Canonical source reference requires a retained origin");
         }
-        if state.snapshot_synced {
+        if state.synced.contains(&expected.record_id) {
             return Ok(());
         }
-        let next = state.snapshot.clone();
-        self.commit(&mut state, next)
+        let index = entry_index(&state.snapshot, expected.record_id)
+            .ok_or_else(|| error!("Delivery refers to a missing record"))?;
+        let entry = state.snapshot.entries[index].clone();
+        let mut batch = Batch::default();
+        self.put_body(&mut batch, &entry)?;
+        self.put_state(&mut batch, &entry, Some(expected))?;
+        self.commit(&mut state, batch)?;
+        state.synced.insert(expected.record_id);
+        Ok(())
     }
 
     pub fn delivery_for_record(&self, id: RecordId) -> Result<Option<Delivery>> {
-        Ok(self.lock()?.snapshot.deliveries.iter().find(|d| d.record_id == id).cloned())
+        Ok(delivery_of(&self.lock()?.snapshot, id).cloned())
     }
 
     /// Exact targets are frozen once. A replay after configuration changes uses
     /// this original intent, including the empty-effects acceptance obligation.
     pub fn resolve_draft(&self, id: RecordId, mut effects: Vec<PublicationEffect>) -> Result<()> {
         let mut state = self.lock()?;
-        let mut next = state.snapshot.clone();
-        let entry =
-            next.entries.iter_mut().find(|e| e.id == id).ok_or_else(|| error!("Unknown draft"))?;
+        let index = entry_index(&state.snapshot, id).ok_or_else(|| error!("Unknown draft"))?;
+        let entry = &state.snapshot.entries[index];
         if entry.stage == PublicationStage::DraftDurable {
             fail!("Cannot resolve targets before acceptance");
         }
@@ -610,15 +730,16 @@ impl PropagationOutbox {
         }
         effects.sort();
         effects.dedup();
-        Arc::make_mut(&mut entry.record).effects = effects.clone();
-        entry.pending = effects;
-        entry.stage = if entry.pending.is_empty() {
+        let mut next = entry.clone();
+        Arc::make_mut(&mut next.record).effects = effects.clone();
+        next.pending = effects;
+        next.stage = if next.pending.is_empty() {
             PublicationStage::Completed
         } else {
             PublicationStage::Ready
         };
-        validate_record(&entry.record, &self.domain, &self.limits)?;
-        self.commit(&mut state, next)
+        validate_record(&next.record, &self.domain, &self.limits)?;
+        self.replace_entry(&mut state, index, next)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>> {
@@ -629,35 +750,122 @@ impl PropagationOutbox {
         Ok(state)
     }
 
-    fn commit(&self, state: &mut State, next: Snapshot) -> Result<()> {
-        self.commit_with(state, next, &[])
-    }
-
-    /// Commits the next snapshot, and `extra` keys of the same database in
-    /// the same synced batch.
-    fn commit_with(
+    /// Write the new state of the entry at `index` and install it.
+    fn replace_entry(
         &self,
         state: &mut State,
-        next: Snapshot,
-        extra: &[(String, Vec<u8>)],
+        index: usize,
+        next: UnverifiedRecord,
     ) -> Result<()> {
+        let delivery = delivery_of(&state.snapshot, next.id).cloned();
+        validate_pending(&next.record, next.stage, &next.pending)?;
+        let mut batch = Batch::default();
+        self.put_state(&mut batch, &next, delivery.as_ref())?;
+        self.commit(state, batch)?;
+        state.snapshot.entries[index] = next;
+        Ok(())
+    }
+
+    fn put_meta(&self, batch: &mut Batch, next_id: u64, next_close_generation: u64) -> Result<()> {
+        let mut out = value_encoder(META_MAGIC, &self.domain_digest)?;
+        out.u64(next_id)?;
+        out.u64(next_close_generation)?;
+        batch.puts.push((META_KEY.to_owned(), seal(out)));
+        Ok(())
+    }
+
+    fn put_body(&self, batch: &mut Batch, entry: &UnverifiedRecord) -> Result<()> {
+        validate_record(&entry.record, &self.domain, &self.limits)?;
+        batch.puts.push((body_key(entry.id), encode_body(&self.domain_digest, entry, &self.limits)?));
+        Ok(())
+    }
+
+    fn put_state(
+        &self,
+        batch: &mut Batch,
+        entry: &UnverifiedRecord,
+        delivery: Option<&Delivery>,
+    ) -> Result<()> {
+        batch.puts.push((state_key(entry.id), encode_state(&self.domain_digest, entry, delivery)?));
+        Ok(())
+    }
+
+    fn put_close(&self, batch: &mut Batch, close: &ClosingRecord) -> Result<()> {
+        batch.puts.push((
+            close_key(&close.binding.delivery_id),
+            closing::encode_close(&self.domain_digest, close)?,
+        ));
+        Ok(())
+    }
+
+    /// Commit one batch. The aggregate byte budget is checked first and a
+    /// refusal there writes nothing and does not poison the writer; a write
+    /// error does, because its outcome may already be visible.
+    fn commit(&self, state: &mut State, batch: Batch) -> Result<()> {
         state.mutation_epoch = state.mutation_epoch.and_then(|epoch| epoch.checked_add(1));
-        let bytes = encode_snapshot(&next, &self.domain, &self.limits)?;
-        let written = if extra.is_empty() {
-            self.store.replace_sync(&bytes)
-        } else {
-            self.store.replace_sync_with(&bytes, extra)
-        };
-        if let Err(error) = written {
+        let mut total = state.total_bytes;
+        let mut touched: HashMap<&str, usize> = HashMap::new();
+        for key in batch.puts.iter().map(|(key, _)| key).chain(&batch.deletes) {
+            if !touched.contains_key(key.as_str()) {
+                touched.insert(key.as_str(), state.sizes.get(key).copied().unwrap_or(0));
+            }
+        }
+        for old in touched.values() {
+            total = total.checked_sub(*old).ok_or_else(|| error!("Outbox byte accounting"))?;
+        }
+        let mut sized: HashMap<&str, usize> = HashMap::new();
+        for (key, value) in &batch.puts {
+            sized.insert(key.as_str(), key.len().saturating_add(value.len()));
+        }
+        for size in sized.values() {
+            total = total.checked_add(*size).ok_or_else(|| error!("Outbox byte overflow"))?;
+        }
+        if total > self.limits.max_snapshot_bytes {
+            fail!("Propagation outbox byte capacity exhausted");
+        }
+        if let Err(error) = self.store.write_batch(&batch.puts, &batch.deletes) {
             // I/O errors can occur after a write became visible. Do not keep
-            // mutating an in-memory snapshot that may no longer match the WAL.
+            // mutating an in-memory state that may no longer match the WAL.
             state.failed = Some(error.to_string());
             return Err(error);
         }
-        state.snapshot = next;
-        state.snapshot_synced = true;
+        let sized: Vec<(String, usize)> =
+            sized.into_iter().map(|(key, size)| (key.to_owned(), size)).collect();
+        for key in &batch.deletes {
+            state.sizes.remove(key);
+        }
+        for (key, size) in sized {
+            state.sizes.insert(key, size);
+        }
+        state.total_bytes = total;
         Ok(())
     }
+}
+
+fn entry_index(snapshot: &Snapshot, id: RecordId) -> Option<usize> {
+    snapshot.entries.iter().position(|entry| entry.id == id)
+}
+
+fn delivery_of(snapshot: &Snapshot, id: RecordId) -> Option<&Delivery> {
+    snapshot.deliveries.iter().find(|delivery| delivery.record_id == id)
+}
+
+fn body_key(id: RecordId) -> String {
+    format!("{BODY_PREFIX}{:016x}", id.0)
+}
+fn state_key(id: RecordId) -> String {
+    format!("{STATE_PREFIX}{:016x}", id.0)
+}
+fn close_key(delivery_id: &UInt256) -> String {
+    format!("{CLOSE_PREFIX}{}", delivery_id.to_hex_string())
+}
+fn parse_record_key(key: &str, prefix: &str) -> Result<RecordId> {
+    let hex = key.strip_prefix(prefix).ok_or_else(|| error!("Outbox key outside its kind"))?;
+    if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        fail!("Malformed outbox record key {key}");
+    }
+    Ok(RecordId(u64::from_str_radix(hex, 16)?))
 }
 
 /// Domain-, session-, block- and role-bound identity. Effects and wall clock are
@@ -684,15 +892,28 @@ fn delivery_coordinates(
     out.append(b"RTOS-finality-delivery-v1")?;
     out.id(&domain.zerostate)?;
     out.append(&domain.global_id.to_le_bytes())?;
-    out.byte(match domain.wire_profile {
-        WireProfile::Legacy => 0,
-        WireProfile::T0 => 1,
-    })?;
+    out.byte(wire_byte(domain.wire_profile))?;
     out.byte(u8::try_from(protocol.version())?)?;
     out.hash(profile)?;
     out.hash(session_id)?;
     out.id(block_id)?;
     out.byte(u8::from(is_final))?;
+    Ok(UInt256::calc_file_hash(&out.bytes))
+}
+
+fn wire_byte(profile: WireProfile) -> u8 {
+    match profile {
+        WireProfile::Legacy => 0,
+        WireProfile::T0 => 1,
+    }
+}
+
+fn domain_digest(domain: &OutboxDomain) -> Result<UInt256> {
+    let mut out = Encoder { bytes: Vec::new(), maximum: 256 };
+    out.append(b"RTOS-outbox-domain-v1")?;
+    out.id(&domain.zerostate)?;
+    out.append(&domain.global_id.to_le_bytes())?;
+    out.byte(wire_byte(domain.wire_profile))?;
     Ok(UInt256::calc_file_hash(&out.bytes))
 }
 
@@ -808,21 +1029,17 @@ pub(crate) fn validate_recovery_record(entry: &UnverifiedRecord, limits: &Limits
     validate_domain(&entry.record.domain)?;
     validate_record(&entry.record, &entry.record.domain, limits)?;
     validate_pending(&entry.record, entry.stage, &entry.pending)?;
-    let next_id = entry.id.0.checked_add(1).ok_or_else(|| error!("Outbox ID exhausted"))?;
-    if entry.id.0 == 0 {
+    if entry.id.0 == 0 || entry.id.0 == u64::MAX {
         fail!("Invalid outbox record ID");
     }
-    encode_snapshot(
-        &Snapshot {
-            next_close_generation: 1,
-            closing: Vec::new(),
-            next_id,
-            entries: vec![entry.clone()],
-            deliveries: Vec::new(),
-        },
-        &entry.record.domain,
-        limits,
-    )?;
+    let digest = domain_digest(&entry.record.domain)?;
+    let size = encode_body(&digest, entry, limits)?
+        .len()
+        .checked_add(encode_state(&digest, entry, None)?.len())
+        .ok_or_else(|| error!("Outbox record size overflow"))?;
+    if size > limits.max_snapshot_bytes {
+        fail!("Propagation outbox byte capacity exhausted");
+    }
     Ok(())
 }
 
@@ -887,61 +1104,81 @@ impl Encoder {
     }
 }
 
-fn encode_snapshot(snapshot: &Snapshot, domain: &OutboxDomain, limits: &Limits) -> Result<Vec<u8>> {
-    if snapshot.entries.len() > limits.max_records {
-        fail!("Outbox record capacity exhausted");
-    }
-    let mut out = Encoder { bytes: Vec::new(), maximum: limits.max_snapshot_bytes - DIGEST_BYTES };
-    out.append(MAGIC)?;
+/// The common head of every stored value: its kind, the schema and the domain.
+fn value_encoder(magic: &[u8; 8], domain_digest: &UInt256) -> Result<Encoder> {
+    let mut out = Encoder { bytes: Vec::new(), maximum: u32::MAX as usize };
+    out.append(magic)?;
     out.append(&SCHEMA_VERSION.to_le_bytes())?;
-    out.byte(match domain.wire_profile {
-        WireProfile::Legacy => 0,
-        WireProfile::T0 => 1,
-    })?;
-    out.append(&domain.global_id.to_le_bytes())?;
-    out.id(&domain.zerostate)?;
+    out.hash(domain_digest)?;
+    Ok(out)
+}
+
+/// Append the checksum over everything before it.
+fn seal(mut out: Encoder) -> Vec<u8> {
+    let digest = UInt256::calc_file_hash(&out.bytes);
+    out.bytes.extend_from_slice(digest.as_slice());
+    out.bytes
+}
+
+fn encode_meta(domain_digest: &UInt256, snapshot: &Snapshot) -> Result<Vec<u8>> {
+    let mut out = value_encoder(META_MAGIC, domain_digest)?;
     out.u64(snapshot.next_id)?;
-    out.u32(u32::try_from(snapshot.entries.len())?)?;
-    for entry in &snapshot.entries {
-        let record = &entry.record;
-        validate_record(record, domain, limits)?;
-        out.u64(entry.id.0)?;
-        out.byte(match entry.stage {
-            PublicationStage::Prepared => 0,
-            PublicationStage::Ready => 1,
-            PublicationStage::DraftDurable => 2,
-            PublicationStage::Completed => 3,
-            PublicationStage::AcceptedDraft => 4,
-        })?;
-        out.byte(match record.protocol {
-            SimplexProtocol::Private => 0,
-            SimplexProtocol::BlockSync => 1,
-            SimplexProtocol::PrivateObserversPlumtree => 2,
-        })?;
-        out.hash(&record.profile)?;
-        out.hash(&record.session_id)?;
-        out.id(&record.block_id)?;
-        out.byte(u8::try_from(record.prev.len())?)?;
-        for prev in &record.prev {
-            out.id(prev)?;
-        }
-        out.byte(u8::from(record.carrier.is_final()))?;
-        out.blob(record.carrier.bytes())?;
-        out.byte(u8::from(record.locally_generated))?;
-        out.u64(record.created_at_unix_secs)?;
-        out.u64(record.expires_at_unix_secs)?;
-        out.blob(&record.block_data)?;
-        out.byte(u8::from(record.proof_data.is_some()))?;
-        if let Some(proof) = &record.proof_data {
-            out.blob(proof)?;
-        }
-        out.effects(&record.effects)?;
-        out.effects(&entry.pending)?;
+    out.u64(snapshot.next_close_generation)?;
+    Ok(seal(out))
+}
+
+fn encode_body(domain_digest: &UInt256, entry: &UnverifiedRecord, limits: &Limits) -> Result<Vec<u8>> {
+    let record = &entry.record;
+    let mut out = value_encoder(BODY_MAGIC, domain_digest)?;
+    out.maximum = limits.max_snapshot_bytes;
+    out.u64(entry.id.0)?;
+    out.byte(match record.protocol {
+        SimplexProtocol::Private => 0,
+        SimplexProtocol::BlockSync => 1,
+        SimplexProtocol::PrivateObserversPlumtree => 2,
+    })?;
+    out.hash(&record.profile)?;
+    out.hash(&record.session_id)?;
+    out.id(&record.block_id)?;
+    out.byte(u8::try_from(record.prev.len())?)?;
+    for prev in &record.prev {
+        out.id(prev)?;
     }
-    out.u32(u32::try_from(snapshot.deliveries.len())?)?;
-    for delivery in &snapshot.deliveries {
+    out.byte(u8::from(record.carrier.is_final()))?;
+    out.blob(record.carrier.bytes())?;
+    out.byte(u8::from(record.locally_generated))?;
+    out.u64(record.created_at_unix_secs)?;
+    out.u64(record.expires_at_unix_secs)?;
+    out.blob(&record.block_data)?;
+    out.byte(u8::from(record.proof_data.is_some()))?;
+    if let Some(proof) = &record.proof_data {
+        out.blob(proof)?;
+    }
+    Ok(seal(out))
+}
+
+fn encode_state(
+    domain_digest: &UInt256,
+    entry: &UnverifiedRecord,
+    delivery: Option<&Delivery>,
+) -> Result<Vec<u8>> {
+    let mut out = value_encoder(STATE_MAGIC, domain_digest)?;
+    out.u64(entry.id.0)?;
+    out.byte(match entry.stage {
+        PublicationStage::Prepared => 0,
+        PublicationStage::Ready => 1,
+        PublicationStage::DraftDurable => 2,
+        PublicationStage::Completed => 3,
+        PublicationStage::AcceptedDraft => 4,
+    })?;
+    out.effects(&entry.record.effects)?;
+    out.effects(&entry.pending)?;
+    out.byte(u8::from(delivery.is_some()))?;
+    if let Some(delivery) = delivery {
+        if delivery.record_id != entry.id {
+            fail!("Delivery belongs to another record");
+        }
         out.hash(&delivery.delivery_id)?;
-        out.u64(delivery.record_id.0)?;
         out.u32(delivery.last_mc)?;
         out.byte(u8::from(delivery.candidate_already_sent))?;
         out.byte(u8::from(delivery.origin.is_some()))?;
@@ -955,10 +1192,7 @@ fn encode_snapshot(snapshot: &Snapshot, domain: &OutboxDomain, limits: &Limits) 
             }
         }
     }
-    closing::encode_closing(snapshot, domain, limits, &mut out)?;
-    let digest = UInt256::calc_file_hash(&out.bytes);
-    out.bytes.extend_from_slice(digest.as_slice());
-    Ok(out.bytes)
+    Ok(seal(out))
 }
 
 struct Decoder<'a> {
@@ -969,7 +1203,7 @@ impl<'a> Decoder<'a> {
     fn take(&mut self, size: usize) -> Result<&'a [u8]> {
         let end = self.offset.checked_add(size).ok_or_else(|| error!("Outbox length overflow"))?;
         let bytes =
-            self.bytes.get(self.offset..end).ok_or_else(|| error!("Truncated outbox snapshot"))?;
+            self.bytes.get(self.offset..end).ok_or_else(|| error!("Truncated outbox value"))?;
         self.offset = end;
         Ok(bytes)
     }
@@ -1012,7 +1246,7 @@ impl<'a> Decoder<'a> {
     fn effects(&mut self, limits: &Limits) -> Result<Vec<PublicationEffect>> {
         let count = self.count(limits.max_effects_per_record)?;
         // Do not preallocate from an untrusted count. Each push is preceded by
-        // actual, bounded input consumption, including for truncated snapshots.
+        // actual, bounded input consumption, including for truncated values.
         let mut effects = Vec::new();
         for _ in 0..count {
             let kind = match self.byte()? {
@@ -1035,80 +1269,81 @@ impl<'a> Decoder<'a> {
         }
         Ok(effects)
     }
+    fn finish(&self) -> Result<()> {
+        if self.offset != self.bytes.len() {
+            fail!("Trailing outbox value bytes");
+        }
+        Ok(())
+    }
 }
 
-fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Result<Snapshot> {
-    if bytes.len() > limits.max_snapshot_bytes || bytes.len() < DIGEST_BYTES {
-        fail!("Outbox snapshot length invalid");
+/// Check a value's checksum, kind, schema and domain; returns its payload.
+fn open_value<'a>(
+    bytes: &'a [u8],
+    magic: &[u8; 8],
+    domain_digest: &UInt256,
+) -> Result<Decoder<'a>> {
+    if bytes.len() < DIGEST_BYTES {
+        fail!("Outbox value too short");
     }
     let (payload, digest) = bytes.split_at(bytes.len() - DIGEST_BYTES);
     if UInt256::calc_file_hash(payload).as_slice() != digest {
-        fail!("Outbox snapshot checksum mismatch");
+        fail!("Outbox value checksum mismatch");
     }
     let mut input = Decoder { bytes: payload, offset: 0 };
-    if input.take(8)? != MAGIC {
-        fail!("Unknown outbox snapshot magic");
+    if input.take(8)? != magic {
+        fail!("Outbox value of another kind");
     }
-    let version = u16::from_le_bytes(input.take(2)?.try_into()?);
-    if !(1..=SCHEMA_VERSION).contains(&version) {
+    if u16::from_le_bytes(input.take(2)?.try_into()?) != SCHEMA_VERSION {
         fail!("Unknown outbox schema version");
     }
-    let wire_profile = match input.byte()? {
-        0 => WireProfile::Legacy,
-        1 => WireProfile::T0,
-        _ => return Err(error!("Unknown outbox wire profile")),
-    };
-    let global_id = i32::from_le_bytes(input.take(4)?.try_into()?);
-    let stored_domain = OutboxDomain { wire_profile, global_id, zerostate: input.id()? };
-    if &stored_domain != domain {
-        fail!("Outbox snapshot belongs to another network or wire profile");
+    if &input.hash()? != domain_digest {
+        fail!("Outbox value belongs to another network or wire profile");
     }
-    let next_id = input.u64()?;
-    if next_id == 0 {
-        fail!("Invalid outbox ID allocator");
+    Ok(input)
+}
+
+struct DecodedBody {
+    record: PublicationRecord,
+}
+
+fn decode_body(
+    bytes: &[u8],
+    id: RecordId,
+    domain: &OutboxDomain,
+    domain_digest: &UInt256,
+    limits: &Limits,
+) -> Result<DecodedBody> {
+    let mut input = open_value(bytes, BODY_MAGIC, domain_digest)?;
+    if input.u64()? != id.0 {
+        fail!("Outbox body stored under another record key");
     }
-    let count = input.count(limits.max_records)?;
-    let mut entries = Vec::new();
-    let mut ids = BTreeSet::new();
-    for _ in 0..count {
-        let id = RecordId(input.u64()?);
-        if id.0 == 0 || id.0 >= next_id || !ids.insert(id) {
-            fail!("Invalid or repeated outbox record ID");
-        }
-        let stage = match input.byte()? {
-            0 => PublicationStage::Prepared,
-            1 => PublicationStage::Ready,
-            2 if version >= 2 => PublicationStage::DraftDurable,
-            3 if version >= 2 => PublicationStage::Completed,
-            4 if version >= 3 => PublicationStage::AcceptedDraft,
-            _ => return Err(error!("Unknown outbox publication stage")),
-        };
-        let protocol = SimplexProtocol::try_from(u32::from(input.byte()?))?;
-        let profile = input.hash()?;
-        let session_id = input.hash()?;
-        let block_id = input.id()?;
-        let prev_count = input.byte()?;
-        if !(1..=2).contains(&prev_count) {
-            fail!("Invalid outbox previous-block count");
-        }
-        let mut prev = Vec::new();
-        for _ in 0..prev_count {
-            prev.push(input.id()?);
-        }
-        let final_ = input.boolean()?;
-        let carrier = input.blob(limits.max_carrier_bytes)?;
-        let carrier =
-            if final_ { StoredCarrier::Final(carrier) } else { StoredCarrier::Approval(carrier) };
-        let locally_generated = input.boolean()?;
-        let created_at_unix_secs = input.u64()?;
-        let expires_at_unix_secs = input.u64()?;
-        let block_data = input.blob(limits.max_block_bytes)?;
-        let proof_data =
-            if input.boolean()? { Some(input.blob(limits.max_proof_bytes)?) } else { None };
-        let effects = input.effects(limits)?;
-        let pending = input.effects(limits)?;
-        let record = PublicationRecord {
-            domain: stored_domain.clone(),
+    let protocol = SimplexProtocol::try_from(u32::from(input.byte()?))?;
+    let profile = input.hash()?;
+    let session_id = input.hash()?;
+    let block_id = input.id()?;
+    let prev_count = input.byte()?;
+    if !(1..=2).contains(&prev_count) {
+        fail!("Invalid outbox previous-block count");
+    }
+    let mut prev = Vec::new();
+    for _ in 0..prev_count {
+        prev.push(input.id()?);
+    }
+    let final_ = input.boolean()?;
+    let carrier = input.blob(limits.max_carrier_bytes)?;
+    let carrier =
+        if final_ { StoredCarrier::Final(carrier) } else { StoredCarrier::Approval(carrier) };
+    let locally_generated = input.boolean()?;
+    let created_at_unix_secs = input.u64()?;
+    let expires_at_unix_secs = input.u64()?;
+    let block_data = input.blob(limits.max_block_bytes)?;
+    let proof_data =
+        if input.boolean()? { Some(input.blob(limits.max_proof_bytes)?) } else { None };
+    input.finish()?;
+    Ok(DecodedBody {
+        record: PublicationRecord {
+            domain: domain.clone(),
             protocol,
             profile,
             session_id,
@@ -1120,80 +1355,202 @@ fn decode_snapshot(bytes: &[u8], domain: &OutboxDomain, limits: &Limits) -> Resu
             locally_generated,
             created_at_unix_secs,
             expires_at_unix_secs,
-            effects,
-        };
-        validate_record(&record, domain, limits)?;
-        validate_pending(&record, stage, &pending)?;
-        entries.push(UnverifiedRecord { id, stage, record: Arc::new(record), pending });
+            effects: Vec::new(),
+        },
+    })
+}
+
+struct DecodedState {
+    stage: PublicationStage,
+    effects: Vec<PublicationEffect>,
+    pending: Vec<PublicationEffect>,
+    delivery: Option<Delivery>,
+}
+
+fn decode_state(
+    bytes: &[u8],
+    id: RecordId,
+    domain_digest: &UInt256,
+    limits: &Limits,
+) -> Result<DecodedState> {
+    let mut input = open_value(bytes, STATE_MAGIC, domain_digest)?;
+    if input.u64()? != id.0 {
+        fail!("Outbox state stored under another record key");
     }
+    let stage = match input.byte()? {
+        0 => PublicationStage::Prepared,
+        1 => PublicationStage::Ready,
+        2 => PublicationStage::DraftDurable,
+        3 => PublicationStage::Completed,
+        4 => PublicationStage::AcceptedDraft,
+        _ => return Err(error!("Unknown outbox publication stage")),
+    };
+    let effects = input.effects(limits)?;
+    let pending = input.effects(limits)?;
+    let delivery = if input.boolean()? {
+        Some(Delivery {
+            delivery_id: input.hash()?,
+            record_id: id,
+            last_mc: input.u32()?,
+            candidate_already_sent: input.boolean()?,
+            origin: if input.boolean()? {
+                Some(RecoveryOrigin {
+                    carrier_version: input.u32()?,
+                    local_adnl: input.hash()?,
+                    source_validator: input.hash()?,
+                    local_validator_index: if input.boolean()? {
+                        Some(input.u32()?)
+                    } else {
+                        None
+                    },
+                })
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+    input.finish()?;
+    Ok(DecodedState { stage, effects, pending, delivery })
+}
+
+fn decode_meta(bytes: &[u8], domain_digest: &UInt256) -> Result<(u64, u64)> {
+    let mut input = open_value(bytes, META_MAGIC, domain_digest)?;
+    let next_id = input.u64()?;
+    let next_close_generation = input.u64()?;
+    input.finish()?;
+    if next_id == 0 || next_close_generation == 0 {
+        fail!("Invalid outbox ID allocator");
+    }
+    Ok((next_id, next_close_generation))
+}
+
+/// Every row under the outbox prefix, read in pages of `page` keys.
+fn read_rows(
+    store: &dyn OutboxStore,
+    limits: &Limits,
+    page: usize,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut rows = Vec::new();
+    let mut after = String::new();
+    let mut total = 0usize;
+    loop {
+        let (entries, last, done) =
+            store.scan(KEY_PREFIX, &after, page, limits.max_snapshot_bytes)?;
+        for (key, value) in entries {
+            total = total
+                .checked_add(key.len().saturating_add(value.len()))
+                .ok_or_else(|| error!("Outbox byte overflow"))?;
+            if total > limits.max_snapshot_bytes {
+                fail!("Stored propagation outbox exceeds its byte budget");
+            }
+            rows.push((key, value));
+        }
+        if done || last.is_empty() {
+            return Ok(rows);
+        }
+        after = last;
+    }
+}
+
+/// Rebuild and check the whole outbox from its rows: every value bound to its
+/// key and domain, bodies paired with states, identities unique and derived,
+/// allocators above every stored identifier and the close history consistent.
+fn decode_rows(
+    rows: &[(String, Vec<u8>)],
+    domain: &OutboxDomain,
+    limits: &Limits,
+) -> Result<(Snapshot, HashMap<String, usize>, usize)> {
+    let digest = domain_digest(domain)?;
+    let mut meta = None;
+    let mut bodies: BTreeMap<RecordId, DecodedBody> = BTreeMap::new();
+    let mut states: BTreeMap<RecordId, DecodedState> = BTreeMap::new();
+    let mut closes = Vec::new();
+    let mut sizes = HashMap::new();
+    let mut total = 0usize;
+    for (key, value) in rows {
+        let size = key.len().saturating_add(value.len());
+        total = total.checked_add(size).ok_or_else(|| error!("Outbox byte overflow"))?;
+        if total > limits.max_snapshot_bytes {
+            fail!("Stored propagation outbox exceeds its byte budget");
+        }
+        if sizes.insert(key.clone(), size).is_some() {
+            fail!("Repeated outbox key {key}");
+        }
+        if key == META_KEY {
+            meta = Some(decode_meta(value, &digest)?);
+        } else if key.starts_with(BODY_PREFIX) {
+            let id = parse_record_key(key, BODY_PREFIX)?;
+            bodies.insert(id, decode_body(value, id, domain, &digest, limits)?);
+        } else if key.starts_with(STATE_PREFIX) {
+            let id = parse_record_key(key, STATE_PREFIX)?;
+            states.insert(id, decode_state(value, id, &digest, limits)?);
+        } else if let Some(hex) = key.strip_prefix(CLOSE_PREFIX) {
+            let close = closing::decode_close(value, &digest)?;
+            if close.binding.delivery_id.to_hex_string() != hex {
+                fail!("Outbox close stored under another delivery key");
+            }
+            closes.push(close);
+        } else {
+            fail!("Unknown outbox key {key}");
+        }
+    }
+    let (next_id, next_close_generation) =
+        meta.ok_or_else(|| error!("Propagation outbox keys exist without their metadata"))?;
+    if bodies.len() != states.len() || bodies.keys().ne(states.keys()) {
+        fail!("Outbox record body and state do not pair");
+    }
+    if bodies.len() > limits.max_records {
+        fail!("Outbox record capacity exhausted");
+    }
+    let mut entries = Vec::with_capacity(bodies.len());
     let mut deliveries = Vec::new();
     let mut delivery_ids = BTreeSet::new();
-    let mut delivery_records = BTreeSet::new();
-    if version >= 2 {
-        for _ in 0..input.count(limits.max_records)? {
-            let delivery = Delivery {
-                delivery_id: input.hash()?,
-                record_id: RecordId(input.u64()?),
-                last_mc: input.u32()?,
-                candidate_already_sent: input.boolean()?,
-                origin: if input.boolean()? {
-                    Some(RecoveryOrigin {
-                        carrier_version: input.u32()?,
-                        local_adnl: input.hash()?,
-                        source_validator: input.hash()?,
-                        local_validator_index: if input.boolean()? {
-                            Some(input.u32()?)
-                        } else {
-                            None
-                        },
-                    })
-                } else {
-                    None
-                },
-            };
-            let entry = entries
-                .iter()
-                .find(|e| e.id == delivery.record_id)
-                .ok_or_else(|| error!("Delivery refers to missing record"))?;
-            if delivery.delivery_id != delivery_id(&entry.record)?
+    for ((id, body), (_, state)) in bodies.into_iter().zip(states) {
+        if id.0 == 0 || id.0 >= next_id {
+            fail!("Outbox record ID above its allocator");
+        }
+        let mut record = body.record;
+        record.effects = state.effects;
+        validate_record(&record, domain, limits)?;
+        validate_pending(&record, state.stage, &state.pending)?;
+        let has_delivery = state.delivery.is_some();
+        if let Some(delivery) = state.delivery {
+            if delivery.delivery_id != delivery_id(&record)?
                 || !delivery_ids.insert(delivery.delivery_id.clone())
-                || !delivery_records.insert(delivery.record_id)
             {
                 fail!("Invalid duplicate or mismatched delivery identity");
             }
             deliveries.push(delivery);
         }
-    }
-    if entries.iter().any(|e| {
-        matches!(
-            e.stage,
+        if matches!(
+            state.stage,
             PublicationStage::DraftDurable
                 | PublicationStage::AcceptedDraft
                 | PublicationStage::Completed
-        ) && !delivery_records.contains(&e.id)
-    }) {
-        fail!("Delivery stage without identity");
+        ) && !has_delivery
+        {
+            fail!("Delivery stage without identity");
+        }
+        // Only a Draft creates an empty Prepared intent, and a Draft always has
+        // a retained delivery identity; otherwise mark_accepted would create
+        // an identity-less Completed record that cannot reopen.
+        if state.stage == PublicationStage::Prepared && record.effects.is_empty() && !has_delivery
+        {
+            fail!("Empty Prepared publication requires a delivery identity");
+        }
+        entries.push(UnverifiedRecord {
+            id,
+            stage: state.stage,
+            record: Arc::new(record),
+            pending: state.pending,
+        });
     }
-    // The version-1 writer required nonempty effects; version-2 introduced
-    // empty Prepared only through a Draft with a retained Delivery identity.
-    // Otherwise mark_accepted would create an identity-less Completed record
-    // that cannot be decoded on the next restart.
-    if entries.iter().any(|entry| {
-        entry.stage == PublicationStage::Prepared
-            && entry.record.effects.is_empty()
-            && !delivery_records.contains(&entry.id)
-    }) {
-        fail!("Empty Prepared publication requires a delivery identity");
-    }
-    let (next_close_generation, closing) = if version >= 4 {
-        closing::decode_closing(&mut input, domain, limits, next_id, &entries, &deliveries)?
-    } else {
-        (1, Vec::new())
-    };
-    if input.offset != payload.len() {
-        fail!("Trailing outbox snapshot bytes");
-    }
-    Ok(Snapshot { next_close_generation, closing, next_id, entries, deliveries })
+    closes.sort_by_key(|close| close.binding.close_generation);
+    let snapshot = Snapshot { next_close_generation, closing: closes, next_id, entries, deliveries };
+    closing::validate_history(&snapshot, domain)?;
+    Ok((snapshot, sizes, total))
 }
 
 /// Load legacy close coordinates from the existing bounded node ledger only.
@@ -1203,25 +1560,50 @@ pub(crate) fn load_legacy_close_request(
     db: &Arc<InternalDb>,
     request: &consensus_common::finality_delivery::CloseFinalityRequest,
 ) -> Result<consensus_common::finality_delivery::CloseFinalityRequest> {
-    let limits = Limits::default();
     let domain = OutboxDomain {
         zerostate: request.domain.pin.zerostate.clone(),
         global_id: request.domain.pin.global_id,
         wire_profile: request.domain.wire_profile,
     };
+    let key = close_key(&request.canonical.node_receipt);
     let bytes = db
-        .load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)?
-        .ok_or_else(|| error!("Legacy source close has no node ledger"))?;
-    let snapshot = decode_snapshot(&bytes, &domain, &limits)?;
-    let record = snapshot
-        .closing
-        .iter()
-        .find(|record| record.binding.delivery_id == request.canonical.node_receipt)
+        .load_validator_state_key_bounded(&key, closing::MAX_CLOSE_VALUE_BYTES)?
         .ok_or_else(|| error!("Legacy source close has no exact node closing record"))?;
-    closing::restore_legacy_request(request, record)
+    let record = closing::decode_close(&bytes, &domain_digest(&domain)?)?;
+    if record.binding.delivery_id != request.canonical.node_receipt {
+        fail!("Legacy source close has no exact node closing record");
+    }
+    closing::restore_legacy_request(request, &record)
 }
 
-/// Test-only observation of the existing atomic DB snapshot. Does not claim a
+/// Every row of a whole in-memory outbox, for seeding tests.
+#[cfg(test)]
+fn encode_snapshot_rows(
+    snapshot: &Snapshot,
+    domain: &OutboxDomain,
+    limits: &Limits,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let digest = domain_digest(domain)?;
+    let mut rows = vec![(META_KEY.to_owned(), encode_meta(&digest, snapshot)?)];
+    for entry in &snapshot.entries {
+        let delivery = delivery_of(snapshot, entry.id);
+        rows.push((body_key(entry.id), encode_body(&digest, entry, limits)?));
+        rows.push((state_key(entry.id), encode_state(&digest, entry, delivery)?));
+    }
+    for close in &snapshot.closing {
+        rows.push((close_key(&close.binding.delivery_id), closing::encode_close(&digest, close)?));
+    }
+    Ok(rows)
+}
+
+/// Every outbox row of `db`, read with one iterator so the rows are one
+/// point-in-time view. Never opens a competing outbox writer.
+#[cfg(test)]
+fn cold_rows(db: &InternalDb, limits: &Limits) -> Result<Vec<(String, Vec<u8>)>> {
+    read_rows(db, limits, usize::MAX)
+}
+
+/// Test-only observation of the existing durable state. Does not claim a
 /// writer, create a database key, or replace any state. Stop/join the actual
 /// writer before treating an observed in-progress write as a durability proof.
 #[cfg(test)]
@@ -1233,16 +1615,21 @@ pub(crate) fn inspect_delivery(
 ) -> Result<Option<(Delivery, UnverifiedRecord)>> {
     validate_domain(domain)?;
     validate_limits(limits)?;
-    let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
+    let rows = cold_rows(db, limits)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let (snapshot, _, _) = decode_rows(&rows, domain, limits)?;
+    let Some(delivery) = snapshot.deliveries.iter().find(|delivery| &delivery.delivery_id == id)
+    else {
         return Ok(None);
     };
-    let snapshot = decode_snapshot(&bytes, domain, limits)?;
-    Ok(snapshot.deliveries.iter().find(|delivery| &delivery.delivery_id == id).map(|delivery| {
-        (
-            delivery.clone(),
-            snapshot.entries.iter().find(|entry| entry.id == delivery.record_id).unwrap().clone(),
-        )
-    }))
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.id == delivery.record_id)
+        .ok_or_else(|| error!("Delivery refers to a missing record"))?;
+    Ok(Some((delivery.clone(), entry.clone())))
 }
 
 /// Read-only coherent observation. Never opens a competing outbox writer.
@@ -1252,82 +1639,218 @@ pub(crate) fn inspect_closure_progress(
     domain: &OutboxDomain,
 ) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
     let limits = Limits::default();
-    let Some(bytes) = db.load_validator_state_raw_bounded(KEY, limits.max_snapshot_bytes)? else {
+    let rows = cold_rows(db, &limits)?;
+    if rows.is_empty() {
         return Ok((Vec::new(), Vec::new()));
-    };
-    inspect_closure_snapshot(&bytes, domain)
-}
-
-/// Pure validation of the actual bytes about to reach the synchronous DB API.
-#[cfg(test)]
-pub(crate) fn inspect_closure_snapshot(
-    bytes: &[u8],
-    domain: &OutboxDomain,
-) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
-    let snapshot = decode_snapshot(bytes, domain, &Limits::default())?;
+    }
+    let (snapshot, _, _) = decode_rows(&rows, domain, &limits)?;
     Ok((snapshot.entries, snapshot.closing))
 }
 
+/// Every outbox row of `db` as one byte string, for comparing whole durable
+/// states; `inspect_exported_rows` decodes it.
 #[cfg(test)]
-mod tests {
+pub(crate) fn export_rows(db: &InternalDb) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (key, value) in cold_rows(db, &Limits::default())? {
+        out.extend_from_slice(&u32::try_from(key.len())?.to_le_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&u32::try_from(value.len())?.to_le_bytes());
+        out.extend_from_slice(&value);
+    }
+    Ok(out)
+}
+
+/// The records and closes of rows exported by `export_rows`.
+#[cfg(test)]
+pub(crate) fn inspect_exported_rows(
+    bytes: &[u8],
+    domain: &OutboxDomain,
+) -> Result<(Vec<UnverifiedRecord>, Vec<ClosingRecord>)> {
+    let mut input = Decoder { bytes, offset: 0 };
+    let mut rows = Vec::new();
+    while input.offset < bytes.len() {
+        let key = String::from_utf8(input.blob(1 << 10)?)?;
+        let value = input.blob(64 << 20)?;
+        rows.push((key, value));
+    }
+    let (snapshot, _, _) = decode_rows(&rows, domain, &Limits::default())?;
+    Ok((snapshot.entries, snapshot.closing))
+}
+
+/// The records whose state and the closes one write batch puts, decoded under
+/// `domain`. Pure: reads only the batch about to reach the database.
+#[cfg(test)]
+pub(crate) fn inspect_closure_batch(
+    puts: &[(String, Vec<u8>)],
+    domain: &OutboxDomain,
+) -> Result<(Vec<RecordId>, Vec<ClosingRecord>)> {
+    let digest = domain_digest(domain)?;
+    let mut records = Vec::new();
+    let mut closes = Vec::new();
+    for (key, value) in puts {
+        if key.starts_with(STATE_PREFIX) {
+            let id = parse_record_key(key, STATE_PREFIX)?;
+            decode_state(value, id, &digest, &Limits::default())?;
+            records.push(id);
+        } else if key.starts_with(CLOSE_PREFIX) {
+            closes.push(closing::decode_close(value, &digest)?);
+        }
+    }
+    Ok((records, closes))
+}
+
+/// Keyed stores for tests: an in-memory map with injected failures and a real
+/// RocksDB table.
+#[cfg(test)]
+pub(crate) mod test_stores {
     use super::*;
-    use std::{
-        process::Command,
-        sync::atomic::{AtomicU8, Ordering},
-    };
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use storage::{
         block_handle_db::NodeStateDb,
         db::rocksdb::{AccessType, RocksDb},
     };
 
+    /// `failure`: 1 refuses before the write; 2 applies the batch and then
+    /// reports an uncertain error; 3 applies only the first operation of the
+    /// batch (a torn batch, which models corruption) and reports an error.
     #[derive(Default)]
-    struct MemoryStore {
-        bytes: Mutex<Option<Vec<u8>>>,
-        /// 1 fails before commit; 2 simulates an ambiguous error after commit.
-        failure: AtomicU8,
-        sync_attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) struct MemoryStore {
+        pub(crate) rows: Mutex<BTreeMap<String, Vec<u8>>>,
+        pub(crate) failure: AtomicU8,
+        pub(crate) sync_attempts: AtomicUsize,
+        /// Bytes of every put value, summed over all batches.
+        pub(crate) written_bytes: AtomicUsize,
     }
-    impl SnapshotStore for MemoryStore {
-        fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-            let bytes = self.bytes.lock().unwrap();
-            if bytes.as_ref().is_some_and(|bytes| bytes.len() > maximum) {
-                fail!("Stored snapshot exceeds read limit");
-            }
-            Ok(bytes.clone())
+    impl MemoryStore {
+        pub(crate) fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+            self.rows.lock().unwrap().clone()
         }
-        fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
+    }
+    impl OutboxStore for MemoryStore {
+        fn write_batch(&self, puts: &[(String, Vec<u8>)], deletes: &[String]) -> Result<()> {
             self.sync_attempts.fetch_add(1, Ordering::Relaxed);
             let failure = self.failure.load(Ordering::Acquire);
             if failure == 1 {
                 fail!("Injected write failure before commit");
             }
-            *self.bytes.lock().unwrap() = Some(bytes.to_vec());
+            let mut rows = self.rows.lock().unwrap();
+            for (index, (key, value)) in puts.iter().enumerate() {
+                if failure == 3 && index > 0 {
+                    break;
+                }
+                self.written_bytes.fetch_add(value.len(), Ordering::Relaxed);
+                rows.insert(key.clone(), value.clone());
+            }
+            if failure != 3 || puts.is_empty() {
+                for key in deletes {
+                    rows.remove(key);
+                    if failure == 3 {
+                        break;
+                    }
+                }
+            }
             if failure == 2 {
                 fail!("Injected uncertain write failure after commit");
             }
+            if failure == 3 {
+                fail!("Injected torn batch");
+            }
             Ok(())
         }
+        fn scan(
+            &self,
+            prefix: &str,
+            after: &str,
+            max_keys: usize,
+            max_value_bytes: usize,
+        ) -> Result<ScanPage> {
+            let rows = self.rows.lock().unwrap();
+            let mut out = Vec::new();
+            let mut last = String::new();
+            for (key, value) in rows.range(prefix.to_owned()..) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if !after.is_empty() && key.as_str() <= after {
+                    continue;
+                }
+                if out.len() == max_keys {
+                    return Ok((out, last, false));
+                }
+                last = key.clone();
+                if value.len() <= max_value_bytes {
+                    out.push((key.clone(), value.clone()));
+                }
+            }
+            Ok((out, last, true))
+        }
+        fn has_prefix(&self, prefix: &str) -> Result<bool> {
+            Ok(self.rows.lock().unwrap().keys().any(|key| key.starts_with(prefix)))
+        }
     }
-    struct DiskStore(NodeStateDb);
+
+    pub(crate) struct DiskStore(NodeStateDb);
     impl DiskStore {
-        fn open(path: &std::path::Path, access: AccessType) -> Result<Arc<Self>> {
+        pub(crate) fn open(path: &std::path::Path, access: AccessType) -> Result<Arc<Self>> {
             let db = RocksDb::new(path, "outbox", None, access)?;
             Ok(Arc::new(Self(NodeStateDb::with_db(db, "publication_test", true)?)))
         }
     }
-    impl SnapshotStore for DiskStore {
-        fn load(&self, maximum: usize) -> Result<Option<Vec<u8>>> {
-            let value = self.0.try_get_raw(KEY.as_bytes())?;
-            match value {
-                Some(bytes) if bytes.len() > maximum => Err(error!("Snapshot exceeds read limit")),
-                Some(bytes) => Ok(Some(bytes.to_vec())),
-                None => Ok(None),
-            }
+    impl OutboxStore for DiskStore {
+        fn write_batch(&self, puts: &[(String, Vec<u8>)], deletes: &[String]) -> Result<()> {
+            let puts: Vec<(&[u8], &[u8])> =
+                puts.iter().map(|(k, v)| (k.as_bytes(), v.as_slice())).collect();
+            let deletes: Vec<&[u8]> = deletes.iter().map(|k| k.as_bytes()).collect();
+            self.0.write_batch_sync(&puts, &deletes)
         }
-        fn replace_sync(&self, bytes: &[u8]) -> Result<()> {
-            self.0.put_raw_sync(KEY.as_bytes(), bytes)
+        fn scan(
+            &self,
+            prefix: &str,
+            after: &str,
+            max_keys: usize,
+            max_value_bytes: usize,
+        ) -> Result<ScanPage> {
+            let start = if after.is_empty() { prefix } else { after };
+            let mut out = Vec::new();
+            let mut last = String::new();
+            let mut done = true;
+            self.0.for_each_from(start.as_bytes(), &mut |key, value| {
+                if !key.starts_with(prefix.as_bytes()) {
+                    return Ok(false);
+                }
+                if key == after.as_bytes() {
+                    return Ok(true);
+                }
+                if out.len() == max_keys {
+                    done = false;
+                    return Ok(false);
+                }
+                last = String::from_utf8(key.to_vec())?;
+                if value.len() <= max_value_bytes {
+                    out.push((last.clone(), value.to_vec()));
+                }
+                Ok(true)
+            })?;
+            Ok((out, last, done))
+        }
+        fn has_prefix(&self, prefix: &str) -> Result<bool> {
+            let mut found = false;
+            self.0.for_each_from(prefix.as_bytes(), &mut |key, _| {
+                found = key.starts_with(prefix.as_bytes());
+                Ok(false)
+            })?;
+            Ok(found)
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_stores::{DiskStore, MemoryStore};
+    use super::*;
+    use std::{process::Command, sync::atomic::Ordering};
+    use storage::db::rocksdb::AccessType;
 
     fn block_id(seqno: u32) -> BlockIdExt {
         BlockIdExt::with_params(
@@ -1367,6 +1890,9 @@ mod tests {
     fn memory(store: Arc<MemoryStore>, limits: Limits) -> PropagationOutbox {
         PropagationOutbox::load(store, domain(), limits, None).unwrap()
     }
+    fn reload(store: Arc<MemoryStore>) -> Result<PropagationOutbox> {
+        PropagationOutbox::load(store, domain(), Limits::default(), None)
+    }
 
     #[test]
     fn outbox_checkpoints_share_immutable_recovery_evidence() -> Result<()> {
@@ -1400,6 +1926,77 @@ mod tests {
         Ok(())
     }
 
+    /// A transition writes only the changed record's state, whatever the
+    /// number and size of the other records held.
+    #[test]
+    fn outbox_transition_cost_is_independent_of_retained_records() -> Result<()> {
+        let mut costs = Vec::new();
+        for held in [1u32, 300] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let mut ids = Vec::new();
+            for index in 1..=held {
+                let mut intent = record(1 + index % 200);
+                let seqno = index;
+                intent.session_id = UInt256::from_slice(&[seqno.to_le_bytes(); 8].concat());
+                intent.block_data = vec![7; 16 << 10];
+                ids.push(store.enqueue(intent)?);
+            }
+            let id = ids[0];
+            store.mark_ready(id)?;
+            let before = disk.written_bytes.load(Ordering::Relaxed);
+            let writes = disk.sync_attempts.load(Ordering::Relaxed);
+            assert!(store.checkpoint_sent(id, &[effect(PublicationKind::Candidate)])?);
+            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes + 1);
+            costs.push(disk.written_bytes.load(Ordering::Relaxed) - before);
+        }
+        assert_eq!(costs[0], costs[1], "a checkpoint rewrote state it did not change");
+        assert!(costs[0] < 1024, "a checkpoint wrote {} bytes", costs[0]);
+        Ok(())
+    }
+
+    /// Measurement only: wall time and bytes allocated on this thread per
+    /// transition, with 1, 100 and 1000 records held (each with a 16 KiB body).
+    /// Allocation includes the in-memory test store's copy of each value.
+    #[test]
+    #[ignore = "measurement; prints the cost of one transition"]
+    fn outbox_transition_cpu_and_allocation_measurement() -> Result<()> {
+        #[cfg(feature = "jemalloc")]
+        fn allocated() -> u64 {
+            tikv_jemalloc_ctl::thread::allocatedp::mib()
+                .and_then(|mib| mib.read())
+                .map(|counter| counter.get())
+                .unwrap_or(0)
+        }
+        #[cfg(not(feature = "jemalloc"))]
+        fn allocated() -> u64 {
+            0
+        }
+        for held in [1u32, 100, 1000] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let mut ids = Vec::new();
+            for index in 1..=held {
+                let mut intent = record(1 + index % 200);
+                intent.session_id = UInt256::from_slice(&[index.to_le_bytes(); 8].concat());
+                intent.block_data = vec![7; 16 << 10];
+                ids.push(store.enqueue(intent)?);
+            }
+            let measured: Vec<RecordId> = ids.iter().take(64).copied().collect();
+            let started = std::time::Instant::now();
+            let before = allocated();
+            for id in &measured {
+                store.mark_ready(*id)?;
+                store.checkpoint_sent(*id, &[effect(PublicationKind::Candidate)])?;
+            }
+            let operations = (measured.len() * 2) as u128;
+            let elapsed = started.elapsed().as_micros() / operations;
+            let bytes = u128::from(allocated().saturating_sub(before)) / operations;
+            eprintln!("outbox transition with {held} records held: {elapsed} us, {bytes} bytes allocated");
+        }
+        Ok(())
+    }
+
     #[test]
     fn outbox_target_freeze_preserves_held_draft_and_syncs_complete_evidence() -> Result<()> {
         for failure in [0, 1, 2] {
@@ -1426,7 +2023,7 @@ mod tests {
             assert_eq!(restored.record.proof_data, held.record.proof_data);
             assert_eq!(restored.record.carrier, held.record.carrier);
             if failure == 1 {
-                assert_eq!(restored, held, "a rejected write must preserve the prior snapshot");
+                assert_eq!(restored, held, "a rejected write must preserve the prior state");
             } else {
                 assert_eq!(restored.stage, PublicationStage::Ready);
                 assert_eq!(restored.pending, targets);
@@ -1533,28 +2130,15 @@ mod tests {
         Ok(())
     }
 
+    /// A snapshot key of an earlier development format refuses open: the outbox
+    /// never starts empty beside old source references.
     #[test]
-    fn outbox_version_one_migrates_without_losing_partial_effects() -> Result<()> {
+    fn outbox_earlier_format_refuses_open() {
         let disk = Arc::new(MemoryStore::default());
-        let store = memory(disk.clone(), Limits::default());
-        let id = store.enqueue(record(1))?;
-        store.mark_ready(id)?;
-        let mut bytes = disk.load(1 << 20)?.unwrap();
-        // v1 layout is the same entry encoding without the v2 delivery table.
-        bytes.truncate(bytes.len() - DIGEST_BYTES - 4 - 12);
-        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&[0; DIGEST_BYTES]);
-        checksum(&mut bytes);
-        *disk.bytes.lock().unwrap() = Some(bytes);
-        drop(store);
-        let store = memory(disk.clone(), Limits::default());
-        assert_eq!(store.pending()?[0].id, id);
-        assert_eq!(store.pending()?[0].stage, PublicationStage::Ready);
-        store.stage_draft(record(2), 0, false, None)?;
-        let migrated = disk.load(1 << 20)?.unwrap();
-        assert_eq!(&migrated[8..10], &SCHEMA_VERSION.to_le_bytes());
-        assert_eq!(decode_snapshot(&migrated, &domain(), &Limits::default())?.entries.len(), 2);
-        Ok(())
+        disk.rows.lock().unwrap().insert(LEGACY_KEY.to_owned(), vec![1, 2, 3]);
+        let error = reload(disk.clone()).err().unwrap();
+        assert!(error.to_string().contains("earlier development"), "{error}");
+        assert_eq!(disk.rows.lock().unwrap().len(), 1, "open wrote nothing");
     }
 
     #[test]
@@ -1615,92 +2199,153 @@ mod tests {
         Ok(())
     }
 
+    /// An uncertain batch reopens as the old or the new state; a torn batch,
+    /// which models corruption, may be refused. The writer stays poisoned.
     #[test]
-    fn outbox_version_two_upgrades_and_cannot_claim_new_accepted_stage() -> Result<()> {
+    fn outbox_uncertain_batch_reopens_old_or_new_and_torn_batch_is_refused() -> Result<()> {
+        // A stage_draft batch carries body, state and meta.
+        for failure in [1u8, 2, 3] {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            store.enqueue(record(1))?;
+            disk.failure.store(failure, Ordering::SeqCst);
+            assert!(store.stage_draft(record(2), 7, false, None).is_err());
+            assert!(store.pending().is_err(), "the writer stays poisoned");
+            assert!(store.enqueue(record(3)).is_err());
+            disk.failure.store(0, Ordering::SeqCst);
+            drop(store);
+            match failure {
+                1 => assert_eq!(reload(disk)?.pending()?.len(), 1, "old state"),
+                2 => assert_eq!(reload(disk)?.pending()?.len(), 2, "new state"),
+                _ => assert!(reload(disk).is_err(), "a torn batch is refused"),
+            }
+        }
+        // A completion that deletes body and state, torn after the first delete.
         let disk = Arc::new(MemoryStore::default());
         let store = memory(disk.clone(), Limits::default());
-        let identity = store.stage_draft(record(1), 7, false, None)?;
-        let id = store.delivery(&identity)?.unwrap().0.record_id;
-        let mut bytes = disk.load(1 << 20)?.unwrap();
-        bytes.drain(bytes.len() - DIGEST_BYTES - 12..bytes.len() - DIGEST_BYTES);
-        bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
-        checksum(&mut bytes);
-        *disk.bytes.lock().unwrap() = Some(bytes);
+        let id = store.enqueue(record(1))?;
+        store.mark_ready(id)?;
+        disk.failure.store(3, Ordering::SeqCst);
+        assert!(store
+            .checkpoint_sent(
+                id,
+                &[
+                    effect(PublicationKind::Candidate),
+                    effect(PublicationKind::Block),
+                    effect(PublicationKind::Finality)
+                ]
+            )
+            .is_err());
+        disk.failure.store(0, Ordering::SeqCst);
         drop(store);
-        let store = memory(disk.clone(), Limits::default());
-        assert_eq!(store.delivery(&identity)?.unwrap().0.record_id, id);
-        store.mark_accepted(id)?;
-        let accepted = disk.load(1 << 20)?.unwrap();
-        assert_eq!(&accepted[8..10], &SCHEMA_VERSION.to_le_bytes());
-        for version in [1u16, 2] {
-            let mut invalid = accepted.clone();
-            invalid[8..10].copy_from_slice(&version.to_le_bytes());
-            checksum(&mut invalid);
-            assert!(decode_snapshot(&invalid, &domain(), &Limits::default()).is_err());
-        }
-        for end in 0..accepted.len() {
-            assert!(decode_snapshot(&accepted[..end], &domain(), &Limits::default()).is_err());
-        }
-        let mut entry = store.delivery(&identity)?.unwrap().1;
-        entry.pending.push(effect(PublicationKind::Block));
-        assert!(validate_recovery_record(&entry, &Limits::default()).is_err());
+        assert!(reload(disk).is_err(), "half a record is refused");
         Ok(())
     }
 
     #[test]
-    fn outbox_empty_prepared_requires_identity_but_preserves_v2_empty_intent() -> Result<()> {
+    fn outbox_relationships_are_checked_at_open() -> Result<()> {
+        let baseline = || -> Result<(Arc<MemoryStore>, RecordId)> {
+            let disk = Arc::new(MemoryStore::default());
+            let store = memory(disk.clone(), Limits::default());
+            let id = store.enqueue(record(1))?;
+            store.stage_draft(record(2), 7, false, None)?;
+            Ok((disk, id))
+        };
+        let (disk, _) = baseline()?;
+        assert!(reload(disk.clone()).is_ok());
+        let edit = |change: &dyn Fn(&mut BTreeMap<String, Vec<u8>>)| -> Result<bool> {
+            let (disk, _) = baseline()?;
+            change(&mut disk.rows.lock().unwrap());
+            Ok(reload(disk).is_err())
+        };
+        let first = RecordId(1);
+        // Missing metadata beside records is corruption, not a first open.
+        assert!(edit(&|rows| { rows.remove(META_KEY); })?);
+        // An orphan body and an orphan state.
+        assert!(edit(&|rows| { rows.remove(&state_key(first)); })?);
+        assert!(edit(&|rows| { rows.remove(&body_key(first)); })?);
+        // A value moved under another record's key.
+        assert!(edit(&|rows| {
+            let body = rows.remove(&body_key(first)).unwrap();
+            let state = rows.remove(&state_key(first)).unwrap();
+            rows.insert(body_key(RecordId(5)), body);
+            rows.insert(state_key(RecordId(5)), state);
+        })?);
+        // A record above the allocator.
+        assert!(edit(&|rows| {
+            let body = rows.remove(&body_key(first)).unwrap();
+            rows.insert(body_key(RecordId(9)), body);
+        })?);
+        // An unknown key in the namespace.
+        assert!(edit(&|rows| { rows.insert(format!("{KEY_PREFIX}x"), vec![0]); })?);
+        // A body stored as a state, and every truncation of every value.
+        assert!(edit(&|rows| {
+            let body = rows.get(&body_key(first)).unwrap().clone();
+            rows.insert(state_key(first), body);
+        })?);
+        let (disk, _) = baseline()?;
+        let rows = disk.snapshot();
+        for (key, value) in &rows {
+            for end in 0..value.len() {
+                let (disk, _) = baseline()?;
+                disk.rows.lock().unwrap().insert(key.clone(), value[..end].to_vec());
+                assert!(reload(disk).is_err(), "{key} truncated to {end}");
+            }
+        }
+        // Another domain refuses every value.
+        let mut other = domain();
+        other.global_id += 1;
+        let (disk, _) = baseline()?;
+        assert!(PropagationOutbox::load(disk, other, Limits::default(), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn outbox_empty_prepared_requires_identity() -> Result<()> {
         let limits = Limits::default();
+        let digest = domain_digest(&domain())?;
         let mut empty = record(1);
         empty.effects.clear();
+        let entry = UnverifiedRecord {
+            id: RecordId(1),
+            stage: PublicationStage::Prepared,
+            record: Arc::new(empty.clone()),
+            pending: Vec::new(),
+        };
         let snapshot = Snapshot {
             next_close_generation: 1,
             closing: Vec::new(),
             next_id: 2,
-            entries: vec![UnverifiedRecord {
-                id: RecordId(1),
-                stage: PublicationStage::Prepared,
-                record: Arc::new(empty.clone()),
-                pending: Vec::new(),
-            }],
+            entries: Vec::new(),
             deliveries: Vec::new(),
         };
-        let encoded = encode_snapshot(&snapshot, &domain(), &limits)?;
-        for version in [1u16, 2, 3] {
-            let mut invalid = encoded.clone();
-            invalid.drain(invalid.len() - DIGEST_BYTES - 12..invalid.len() - DIGEST_BYTES);
-            if version == 1 {
-                invalid.truncate(invalid.len() - DIGEST_BYTES - 4);
-                invalid.extend_from_slice(&[0; DIGEST_BYTES]);
-            }
-            invalid[8..10].copy_from_slice(&version.to_le_bytes());
-            checksum(&mut invalid);
-            let error = decode_snapshot(&invalid, &domain(), &limits).err().unwrap();
-            assert!(error.to_string().contains("Empty Prepared publication requires"));
-        }
-        // Reproduce the actual version-2 writer's legal Draft -> Prepared([])
-        // output, including its stable delivery mapping. Acceptance must still
-        // discharge this historical empty intent and survive another reopen.
-        let identity = delivery_id(&empty)?;
-        let mut legal = snapshot;
-        legal.deliveries.push(Delivery {
-            delivery_id: identity.clone(),
+        let rows = |delivery: Option<&Delivery>| -> Result<Arc<MemoryStore>> {
+            let disk = Arc::new(MemoryStore::default());
+            let mut map = disk.rows.lock().unwrap();
+            map.insert(META_KEY.to_owned(), encode_meta(&digest, &snapshot)?);
+            map.insert(body_key(entry.id), encode_body(&digest, &entry, &limits)?);
+            map.insert(state_key(entry.id), encode_state(&digest, &entry, delivery)?);
+            drop(map);
+            Ok(disk)
+        };
+        let error = reload(rows(None)?).err().unwrap();
+        assert!(error.to_string().contains("Empty Prepared publication requires"), "{error}");
+        let delivery = Delivery {
+            delivery_id: delivery_id(&empty)?,
             record_id: RecordId(1),
             last_mc: 7,
             candidate_already_sent: true,
             origin: None,
-        });
-        let mut bytes = encode_snapshot(&legal, &domain(), &limits)?;
-        bytes.drain(bytes.len() - DIGEST_BYTES - 12..bytes.len() - DIGEST_BYTES);
-        bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
-        checksum(&mut bytes);
-        let disk = Arc::new(MemoryStore::default());
-        *disk.bytes.lock().unwrap() = Some(bytes);
-        let store = memory(disk.clone(), limits.clone());
-        assert_eq!(store.delivery(&identity)?.unwrap().1.stage, PublicationStage::Prepared);
+        };
+        let disk = rows(Some(&delivery))?;
+        let store = reload(disk.clone())?;
+        assert_eq!(store.delivery(&delivery.delivery_id)?.unwrap().1.stage, PublicationStage::Prepared);
         store.mark_accepted(RecordId(1))?;
         drop(store);
-        let reopened = memory(disk, limits);
-        assert_eq!(reopened.delivery(&identity)?.unwrap().1.stage, PublicationStage::Completed);
+        assert_eq!(
+            reload(disk)?.delivery(&delivery.delivery_id)?.unwrap().1.stage,
+            PublicationStage::Completed
+        );
         Ok(())
     }
 
@@ -1801,8 +2446,10 @@ mod tests {
         Ok(())
     }
 
+    /// The aggregate byte budget is checked before a commit: a refusal writes
+    /// nothing, does not poison, and every acknowledged state reopens.
     #[test]
-    fn outbox_total_byte_capacity_does_not_poison_or_overwrite_previous_snapshot() -> Result<()> {
+    fn outbox_total_byte_capacity_does_not_poison_or_overwrite_previous_state() -> Result<()> {
         let store = Arc::new(MemoryStore::default());
         let limits = Limits {
             max_records: 3,
@@ -1818,15 +2465,17 @@ mod tests {
         let mut first = record(1);
         first.block_data.resize(512, 0);
         let id = outbox.enqueue(first)?;
-        let saved = store.load(limits.max_snapshot_bytes)?;
+        let saved = store.snapshot();
         let mut second = record(2);
         second.block_data.resize(512, 0);
         assert!(outbox.enqueue(second).is_err());
-        assert_eq!(store.load(limits.max_snapshot_bytes)?, saved);
+        assert_eq!(store.snapshot(), saved);
         assert_eq!(outbox.pending()?.len(), 1);
         outbox.mark_ready(id)?;
         drop(outbox);
-        assert_eq!(memory(store, limits).pending()?[0].stage, PublicationStage::Ready);
+        assert_eq!(memory(store.clone(), limits.clone()).pending()?[0].stage, PublicationStage::Ready);
+        let total: usize = store.snapshot().iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert!(total <= limits.max_snapshot_bytes);
         Ok(())
     }
 
@@ -1858,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn outbox_canonical_reference_reuses_only_current_writer_synced_snapshot() -> Result<()> {
+    fn outbox_canonical_reference_reuses_only_current_writer_synced_record() -> Result<()> {
         for failure in [1, 2] {
             let disk = Arc::new(MemoryStore::default());
             let store = memory(disk.clone(), Limits::default());
@@ -1871,11 +2520,11 @@ mod tests {
             let id = store.stage_draft(record(1), 7, true, Some(origin))?;
             let (delivery, original) = store.delivery(&id)?.unwrap();
             let writes = disk.sync_attempts.load(Ordering::Relaxed);
-            let bytes = disk.bytes.lock().unwrap().clone();
+            let rows = disk.snapshot();
             for _ in 0..8 { store.retain_delivery(&delivery)?; }
             assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes,
-                "canonical reference must reuse this writer's already synced full snapshot");
-            assert_eq!(*disk.bytes.lock().unwrap(), bytes);
+                "canonical reference must reuse this writer's already synced record");
+            assert_eq!(disk.snapshot(), rows);
             let mut forged = delivery.clone();
             forged.last_mc += 1;
             assert!(store.retain_delivery(&forged).is_err());
@@ -1957,56 +2606,20 @@ mod tests {
         Ok(())
     }
 
-    fn checksum(bytes: &mut [u8]) {
-        let end = bytes.len() - DIGEST_BYTES;
-        let digest = UInt256::calc_file_hash(&bytes[..end]);
-        bytes[end..].copy_from_slice(digest.as_slice());
-    }
-
+    /// Loading reads every page while the caller holds the writer lease.
     #[test]
-    fn outbox_recovery_rejects_corruption_unknown_domains_and_unbounded_lengths() -> Result<()> {
-        let store = Arc::new(MemoryStore::default());
-        let outbox = memory(store.clone(), Limits::default());
-        outbox.enqueue(record(1))?;
-        let bytes = store.load(1 << 20)?.unwrap();
-        drop(outbox);
-        for length in 0..bytes.len() {
-            assert!(decode_snapshot(&bytes[..length], &domain(), &Limits::default()).is_err());
+    fn outbox_paginated_load_reads_every_record() -> Result<()> {
+        let disk = Arc::new(MemoryStore::default());
+        let store = memory(disk.clone(), Limits::default());
+        for seqno in 1..=300u32 {
+            let mut intent = record(1 + seqno % 200);
+            intent.session_id = UInt256::from_slice(&[seqno.to_le_bytes(); 8].concat());
+            store.enqueue(intent)?;
         }
-        let mut other = domain();
-        other.zerostate.file_hash = UInt256::from([90; 32]);
-        assert!(decode_snapshot(&bytes, &other, &Limits::default()).is_err());
-        other = domain();
-        other.global_id += 1;
-        assert!(decode_snapshot(&bytes, &other, &Limits::default()).is_err());
-        other = domain();
-        other.wire_profile = WireProfile::Legacy;
-        assert!(decode_snapshot(&bytes, &other, &Limits::default()).is_err());
-        // Repair the checksum to exercise semantic parsing, not only hashing.
-        // header: magic(8), schema(2), wire(1), global(4), pin(80), next(8), count(4).
-        for (index, value) in [(8, 99), (10, 99), (115, 99), (116, 99)] {
-            let mut bad = bytes.clone();
-            bad[index] = value;
-            checksum(&mut bad);
-            assert!(decode_snapshot(&bad, &domain(), &Limits::default()).is_err());
-        }
-        let mut bad = bytes.clone();
-        bad[103..107].copy_from_slice(&u32::MAX.to_le_bytes());
-        checksum(&mut bad);
-        assert!(decode_snapshot(&bad, &domain(), &Limits::default()).is_err());
-        // This fixture's block-data length follows its fixed metadata, one
-        // previous ID and a three-byte carrier. Do not allocate its forged size.
-        let mut huge_body = bytes.clone();
-        huge_body[367..371].copy_from_slice(&u32::MAX.to_le_bytes());
-        checksum(&mut huge_body);
-        assert!(decode_snapshot(&huge_body, &domain(), &Limits::default()).is_err());
-        let mut trailing = bytes[..bytes.len() - DIGEST_BYTES].to_vec();
-        trailing.push(0);
-        trailing.extend_from_slice(&[0; DIGEST_BYTES]);
-        checksum(&mut trailing);
-        assert!(decode_snapshot(&trailing, &domain(), &Limits::default()).is_err());
-        *store.bytes.lock().unwrap() = Some(bad);
-        assert!(PropagationOutbox::load(store, domain(), Limits::default(), None).is_err());
+        drop(store);
+        let rows = read_rows(disk.as_ref(), &Limits::default(), 7)?;
+        assert_eq!(rows.len(), 601);
+        assert_eq!(reload(disk)?.pending()?.len(), 300);
         Ok(())
     }
 
@@ -2122,6 +2735,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outbox_internal_db_rejects_second_writer_and_releases_failed_open() -> Result<()> {
         use crate::{collator_test_bundle::create_engine_allocated, internal_db::InternalDbConfig};
+        use std::sync::atomic::AtomicU8;
         let directory = tempfile::tempdir()?;
         let db = Arc::new(
             InternalDb::with_update(
