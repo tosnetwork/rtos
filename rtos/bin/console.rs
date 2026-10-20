@@ -7,867 +7,1323 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
-use rtos::config::TonNodeConfig;
+
+//! The node console. It talks to the control port with the reference
+//! console's command names, argument syntax, output text and exit codes.
+
+use adnl::{
+    client::{AdnlClient, AdnlClientConfig},
+    common::{TaggedTlObject, Timeouts},
+};
 use rtos_api::{
-    serialize_boxed,
+    deserialize_boxed, serialize_boxed,
     ton::{
         self,
-        engine::validator::{onestat::OneStat, ControlQueryError},
-        rpc::engine::validator::ControlQuery,
+        engine::validator::ControlQueryError,
+        rpc::engine::validator::{
+            AddAdnlId, AddCustomOverlay, AddValidatorAdnlAddress, AddValidatorPermanentKey,
+            AddValidatorTempKey, ControlQuery, DelAdnlId, DelCustomOverlay,
+            DelValidatorAdnlAddress, DelValidatorPermanentKey, DelValidatorTempKey,
+            ExportAllPrivateKeys, ExportPublicKey, GenerateKeyPair, GetConfig, GetStats, GetTime,
+            ImportPrivateKey, ImportShardOverlayCertificate, SetExtMessagesBroadcastDisabled,
+            SetVerbosity, ShowCustomOverlays, Sign, SignShardOverlayCertificate,
+        },
         Bool,
     },
-    AnyBoxedSerialize, IntoBoxed, TLObject,
+    AnyBoxedSerialize, Constructor, IntoBoxed, TLObject, WireProfile,
 };
-use rtos_block::{
-    base64_decode, base64_encode, error, fail, write_boc, BlockIdExt, BuilderData, Deserializable,
-    IBitstring, Result, Serializable, ShardAccount, SliceData, UInt256, UnixTime,
-};
-use rtos_block_json::parse_state;
+use rtos_block::{base64_encode, sha256_digest, KeyOption, KeyOptionJson, UInt256};
 use secrets_vault::vault_block::get_key_option_factory;
-use std::{convert::TryInto, env, fs::File, io::BufReader, str::FromStr, time::Duration};
+use std::{
+    collections::VecDeque,
+    fmt,
+    io::{BufRead, Write},
+    net::SocketAddr,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-#[cfg(test)]
-const PUBLIC_CONFIG_KEY: &str = "y+54dF9ZIQoIRQuH2+wE10fF5SV4GWrEv9m0lXHEmLU=";
+/// The reference console's per-query timeout.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The reference error codes the console reports itself.
+const ERROR_CODE_ERROR: i32 = 602;
+const ERROR_CODE_PROTOVIOLATION: i32 = 621;
+const ERROR_CODE_TIMEOUT: i32 = 652;
 
-trait SendReceive<Q> {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject>;
-    fn receive(
-        answer: TLObject,
-        _params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        downcast::<rtos_api::ton::engine::validator::Success>(answer)?;
-        Ok(("success".to_string(), vec![]))
+/// A reference status: a general error or an OS error, printed as the
+/// reference prints a failed status.
+#[derive(Clone, Debug, PartialEq)]
+struct Status {
+    /// The OS error text of an OS error.
+    os: Option<String>,
+    code: i32,
+    message: String,
+}
+
+impl Status {
+    fn error(message: impl Into<String>) -> Self {
+        Self { os: None, code: 0, message: message.into() }
+    }
+
+    fn with_code(code: i32, message: impl Into<String>) -> Self {
+        Self { os: None, code, message: message.into() }
+    }
+
+    /// An OS error with the reference message for the failed operation.
+    fn io(error: &std::io::Error, message: String) -> Self {
+        match error.raw_os_error() {
+            Some(errno) => {
+                let text = std::io::Error::from_raw_os_error(errno).to_string();
+                let text = match text.rfind(" (os error ") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                Self { os: Some(text), code: errno, message }
+            }
+            None => Self::error(format!("{message}: {error}")),
+        }
+    }
+
+    fn prefix(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}{}", self.message);
+        self
     }
 }
 
-/*
-trait ConsoleCommand: SendReceive {
-    fn _name() -> &'static str;
-    fn help() -> &'static str;
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.os {
+            None => write!(f, "[Error : {} : {}]", self.code, self.message),
+            Some(text) => write!(f, "[PosixError : {} : {} : {}]", text, self.code, self.message),
+        }
+    }
 }
-*/
 
-macro_rules! commands {
-    ($($command: ident, $name: literal, $help: literal)*) => {
-        $(
-            struct $command;
-        )*
-        fn command_help(name: &str) -> Result<&str> {
-            match name {
-                $($name => Ok($help), )*
-                _ => fail!("command {} not supported", name)
+type Res<T> = std::result::Result<T, Status>;
+
+/// Reads a file as the reference file helpers read it.
+fn read_file(path: &str) -> Res<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| Status::io(&e, format!("File \"{path}\" can't be opened for reading")))
+}
+
+/// Writes a file as the reference file helpers write it: created for the
+/// owner only, truncated if it exists.
+fn write_file(path: &str, data: &[u8]) -> Res<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            Status::io(
+                &e,
+                format!("File \"{path}\" can't be opened/created for writing with truncation"),
+            )
+        })?;
+    file.write_all(data)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| Status::io(&e, format!("Failed to write file \"{path}\"")))
+}
+
+/// The reference decimal parser: the token must be the canonical text of a
+/// value of the type.
+fn integer<T: std::str::FromStr + ToString>(word: &str) -> Res<T> {
+    match word.parse::<T>() {
+        Ok(value) if value.to_string() == word => Ok(value),
+        _ => Err(Status::error(format!("Can't parse \"{word}\" as number"))),
+    }
+}
+
+fn hex_decode(word: &str) -> Res<Vec<u8>> {
+    if word.len() % 2 != 0 {
+        return Err(Status::error("Wrong hex string length"));
+    }
+    hex::decode(word).map_err(|_| Status::error("Wrong hex string"))
+}
+
+/// The reference base64 decoder: padding is required, and bits left over
+/// must be zero.
+fn base64_decode(text: &str) -> Res<Vec<u8>> {
+    let mut data = text.as_bytes();
+    let mut padding = 0;
+    while let Some((b'=', rest)) = data.split_last() {
+        data = rest;
+        padding += 1;
+    }
+    if padding >= 3 {
+        return Err(Status::error("Wrong string padding"));
+    }
+    if (data.len() + padding) & 3 != 0 {
+        return Err(Status::error("Wrong padding length"));
+    }
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    for chunk in data.chunks(4) {
+        let mut c = 0u32;
+        for (t, byte) in chunk.iter().enumerate() {
+            let v = value(*byte).ok_or_else(|| Status::error("Wrong character in the string"))?;
+            c |= v << ((3 - t) * 6);
+        }
+        let [_, b0, b1, b2] = c.to_be_bytes();
+        out.push(b0);
+        match chunk.len() {
+            2 if c & 0xffff != 0 => return Err(Status::error("Wrong padding in the string")),
+            2 => {}
+            3 if c & 0xff != 0 => return Err(Status::error("Wrong padding in the string")),
+            3 => out.push(b1),
+            _ => {
+                out.push(b1);
+                out.push(b2);
             }
         }
-        fn command_send<Q: ToString>(
-            name: &str,
-            params: &mut impl Iterator<Item = Q>
-        ) -> Result<TLObject> {
-            match name {
-                $($name => $command::send(params), )*
-                _ => fail!("command {} not supported", name)
-            }
+    }
+    Ok(out)
+}
+
+/// The reference command tokenizer: words separated by white space.
+struct Tokenizer<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Tokenizer<'a> {
+    fn new(line: &'a str) -> Self {
+        Self { rest: line }
+    }
+
+    fn skip_space(&mut self) {
+        self.rest = self.rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+    }
+
+    fn endl(&mut self) -> bool {
+        self.skip_space();
+        self.rest.is_empty()
+    }
+
+    fn check_endl(&mut self) -> Res<()> {
+        if self.endl() {
+            Ok(())
+        } else {
+            Err(Status::error("extra data after query"))
         }
-        fn command_receive<Q: ToString>(
-            name: &str,
-            answer: TLObject,
-            params: &mut impl Iterator<Item = Q>
-        ) -> Result<(String, Vec<u8>)> {
-            match name {
-                $($name => $command::receive(answer, params), )*
-                _ => fail!("an error occured while receiving a response (command: {})", name)
-            }
+    }
+
+    fn raw(&mut self) -> Res<&'a str> {
+        self.skip_space();
+        if self.rest.is_empty() {
+            return Err(Status::error("failed to parse token: EOL"));
         }
+        let end = self
+            .rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '\x0b')
+            .unwrap_or(self.rest.len());
+        let (word, rest) = self.rest.split_at(end);
+        self.rest = rest;
+        Ok(word)
+    }
+
+    fn string(&mut self) -> Res<String> {
+        self.raw().map(str::to_string)
+    }
+
+    fn integer<T: std::str::FromStr + ToString>(&mut self) -> Res<T> {
+        integer(self.raw()?)
+    }
+
+    fn hex(&mut self) -> Res<Vec<u8>> {
+        hex_decode(self.raw()?)
+    }
+
+    /// A key hash: 64 hex digits or 44 base64 characters. A shorter decoded
+    /// hash is zero-filled; a longer one is refused.
+    fn key_hash(&mut self) -> Res<UInt256> {
+        let word = self.raw()?;
+        let data = match word.len() {
+            64 => hex_decode(word)?,
+            44 => base64_decode(word)?,
+            _ => return Err(Status::error("cannot parse keyhash: bad length")),
+        };
+        if data.len() > 32 {
+            return Err(Status::error("cannot parse keyhash: bad length"));
+        }
+        let mut hash = [0u8; 32];
+        hash[..data.len()].copy_from_slice(&data);
+        Ok(UInt256::from(hash))
+    }
+
+    /// A shard: a workchain and a signed shard as two words, or one
+    /// `wc:shard` word with 16 hex digits, optionally in parentheses.
+    fn shard(&mut self) -> Res<(i32, i64)> {
+        let word = self.raw()?;
+        if let Ok(workchain) = integer::<i32>(word) {
+            let shard = self.integer::<i64>()?;
+            return Ok((workchain, shard));
+        }
+        let text = match word.strip_prefix('(').and_then(|w| w.strip_suffix(')')) {
+            Some(inner) => inner,
+            None => word,
+        };
+        let separator = text.find(':').or_else(|| text.find(','));
+        let separator = match separator {
+            Some(at) if text.len() - at - 1 == 16 => at,
+            _ => return Err(Status::error(format!("invalid shard {text}"))),
+        };
+        let workchain = integer::<i32>(&text[..separator])?;
+        let mut shard = 0u64;
+        for c in text[separator + 1..].chars() {
+            let digit = c.to_digit(16).ok_or_else(|| Status::error("not a hex digit"))?;
+            shard = shard.wrapping_mul(16).wrapping_add(u64::from(digit));
+        }
+        Ok((workchain, shard as i64))
+    }
+}
+
+/// The key hash as the reference prints it.
+fn hex_upper(bytes: &[u8]) -> String {
+    hex::encode_upper(bytes)
+}
+
+/// The JSON value type names of the reference JSON parser.
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "Null",
+        serde_json::Value::Number(_) => "Number",
+        serde_json::Value::Bool(_) => "Boolean",
+        serde_json::Value::String(_) => "String",
+        serde_json::Value::Array(_) => "Array",
+        serde_json::Value::Object(_) => "Object",
+    }
+}
+
+/// Reads TL objects from JSON as the reference schema reader does: absent
+/// and null fields keep their defaults, numbers may be strings.
+mod tl_json {
+    use super::{base64_decode, integer, json_type, Res, Status};
+    use rtos_api::ton::{self, Bool};
+    use rtos_block::UInt256;
+    use serde_json::{Map, Value};
+
+    fn number_text(value: &Value) -> Res<String> {
+        match value {
+            Value::Number(number) => Ok(number.to_string()),
+            Value::String(text) => Ok(text.clone()),
+            other => Err(Status::error(format!("Expected number, got {}", json_type(other)))),
+        }
+    }
+
+    fn int32(value: &Value) -> Res<i32> {
+        integer::<i32>(&number_text(value)?)
+    }
+
+    fn int64(value: &Value) -> Res<i64> {
+        integer::<i64>(&number_text(value)?)
+    }
+
+    fn boolean(value: &Value) -> Res<Bool> {
+        let flag = match value {
+            Value::Bool(flag) => *flag,
+            other => match int32(other) {
+                Ok(number) => number != 0,
+                Err(_) => {
+                    return Err(Status::error(format!("Expected bool, got {}", json_type(other))))
+                }
+            },
+        };
+        Ok(if flag { Bool::BoolTrue } else { Bool::BoolFalse })
+    }
+
+    fn string(value: &Value) -> Res<String> {
+        match value {
+            Value::String(text) => Ok(text.clone()),
+            other => Err(Status::error(format!("Expected string, got {}", json_type(other)))),
+        }
+    }
+
+    fn int256(value: &Value) -> Res<UInt256> {
+        let raw = base64_decode(&string(value)?)?;
+        let raw: [u8; 32] = raw.try_into().map_err(|_| Status::error("Wrong length for UInt"))?;
+        Ok(UInt256::from(raw))
+    }
+
+    fn array(value: &Value) -> Res<&Vec<Value>> {
+        match value {
+            Value::Array(items) => Ok(items),
+            other => Err(Status::error(format!("Expected array, got {}", json_type(other)))),
+        }
+    }
+
+    /// An object field: `None` when absent or null.
+    fn field<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
+        object.get(name).filter(|value| !value.is_null())
+    }
+
+    /// Each element of a vector of objects; a null element is a default
+    /// object.
+    fn objects<T: Default>(
+        value: &Value,
+        read: impl Fn(&Map<String, Value>) -> Res<T>,
+    ) -> Res<Vec<T>> {
+        array(value)?
+            .iter()
+            .map(|item| match item {
+                Value::Object(object) => read(object),
+                Value::Null => Ok(T::default()),
+                other => Err(Status::error(format!("Expected object, got {}", json_type(other)))),
+            })
+            .collect()
+    }
+
+    fn node(
+        object: &Map<String, Value>,
+    ) -> Res<ton::engine::validator::customoverlaynode::CustomOverlayNode> {
+        let mut node = ton::engine::validator::customoverlaynode::CustomOverlayNode::default();
+        if let Some(value) = field(object, "adnl_id") {
+            node.adnl_id = int256(value)?;
+        }
+        if let Some(value) = field(object, "msg_sender") {
+            node.msg_sender = boolean(value)?;
+        }
+        if let Some(value) = field(object, "msg_sender_priority") {
+            node.msg_sender_priority = int32(value)?;
+        }
+        if let Some(value) = field(object, "block_sender") {
+            node.block_sender = boolean(value)?;
+        }
+        Ok(node)
+    }
+
+    fn shard(object: &Map<String, Value>) -> Res<ton::ton_node::shardid::ShardId> {
+        let mut shard = ton::ton_node::shardid::ShardId::default();
+        if let Some(value) = field(object, "workchain") {
+            shard.workchain = int32(value)?;
+        }
+        if let Some(value) = field(object, "shard") {
+            shard.shard = int64(value)?;
+        }
+        Ok(shard)
+    }
+
+    /// A custom overlay description.
+    pub(super) fn custom_overlay(
+        object: &Map<String, Value>,
+    ) -> Res<ton::engine::validator::customoverlay::CustomOverlay> {
+        let mut overlay = ton::engine::validator::customoverlay::CustomOverlay::default();
+        if let Some(value) = field(object, "name") {
+            overlay.name = string(value)?;
+        }
+        if let Some(value) = field(object, "nodes") {
+            overlay.nodes = objects(value, node)?;
+        }
+        if let Some(value) = field(object, "sender_shards") {
+            overlay.sender_shards = objects(value, shard)?;
+        }
+        if let Some(value) = field(object, "skip_public_msg_send") {
+            overlay.skip_public_msg_send = boolean(value)?;
+        }
+        if let Some(value) = field(object, "use_quic") {
+            overlay.use_quic = boolean(value)?;
+        }
+        Ok(overlay)
+    }
+}
+
+/// A private key read from its serialized form, as the reference key
+/// import reads it.
+fn import_private_key(data: &[u8]) -> Res<ton::PrivateKey> {
+    if data.len() < 4 {
+        return Err(Status::with_code(ERROR_CODE_PROTOVIOLATION, "too short key"));
+    }
+    let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let key = &data[4..];
+    let key = || -> Res<UInt256> {
+        let key: [u8; 32] =
+            key.try_into().map_err(|_| Status::with_code(ERROR_CODE_ERROR, "bad length"))?;
+        Ok(UInt256::from(key))
     };
+    if id == ton::pk::privatekey::Ed25519::constructor_const() {
+        Ok(ton::PrivateKey::Pk_Ed25519(ton::pk::privatekey::Ed25519 { key: key()? }))
+    } else if id == ton::pk::privatekey::Aes::constructor_const() {
+        Ok(ton::PrivateKey::Pk_Aes(ton::pk::privatekey::Aes { key: key()? }))
+    } else {
+        Err(Status::with_code(ERROR_CODE_PROTOVIOLATION, format!("unknown magic {}", id as i32)))
+    }
 }
 
-commands! {
-    AddAdnlAddr, "addadnl",
-        "addadnl <keyhash> <category>\tuse key as ADNL addr"
-    AddValidatorAdnlAddr, "addvalidatoraddr",
-        "addvalidatoraddr <permkeyhash> <keyhash> <expireat>\tadd validator ADNL addr"
-    AddValidatorPermKey, "addpermkey",
-        "addpermkey <keyhash> <election-date> <expire-at>\tadd validator permanent key"
-    AddValidatorTempKey, "addtempkey",
-        "addtempkey <permkeyhash> <keyhash> <expire-at>\tadd validator temp key"
-    ExportPub, "exportpub",
-        "exportpub <keyhash>\texports public key by key hash"
-    GetStats, "getstats",
-        "getstats\tget status full node or validator"
-    NewKeypair, "newkey",
-        "newkey\tgenerates new key pair on server"
-    ImportPrivateKey, "importprivatekey",
-        "importprivatekey <keytype> <key>\timports private key on server"
-    GetValidatorConfig, "get_validator_config",
-        "get_validator_config\tget config from node or validator"
-    Sign, "sign",
-        "sign <keyhash> <data>\tsigns bytestring with privkey"
-    AddCustomOverlay, "add_custom_overlay",
-        "addcustomoverlay <config file name>\tadd custom overlay"
-    DelCustomOverlay, "del_custom_overlay",
-        "delcustomoverlay <custom overlay name>\tdelete custom overlay"
-    ShowCustomOverlays, "show_custom_overlays",
-        "showcustomoverlays\tshow custom overlays"
-    SignShardOverlayCertificate, "sign-shard-overlay-cert",
+/// The short id of a private key: the hash of its serialized public key.
+fn private_key_hash(key: &ton::PrivateKey) -> Res<[u8; 32]> {
+    let public = match key {
+        ton::PrivateKey::Pk_Ed25519(key) => {
+            let option = get_key_option_factory()
+                .from_private_key(key.key.as_array())
+                .map_err(|e| Status::error(e.to_string()))?;
+            return Ok(*option.id().data());
+        }
+        ton::PrivateKey::Pk_Aes(key) => {
+            ton::PublicKey::Pub_Aes(ton::pub_::publickey::Aes { key: key.key.clone() })
+        }
+        _ => return Err(Status::error("private key is not exportable")),
+    };
+    let bytes = serialize_boxed(&public).map_err(|e| Status::error(e.to_string()))?;
+    Ok(sha256_digest(bytes))
+}
+
+fn serialized(key: &ton::PrivateKey) -> Res<Vec<u8>> {
+    serialize_boxed(key).map_err(|e| Status::error(e.to_string()))
+}
+
+/// Reads the answer as the expected type, or fails as the reference console
+/// fails on an answer it cannot read.
+fn answer<T: AnyBoxedSerialize>(data: &[u8], prefix: &str) -> Res<T> {
+    let object = deserialize_boxed(data).map_err(|e| Status::error(format!("{prefix}{e}")))?;
+    object
+        .downcast::<T>()
+        .map_err(|_| Status::error(format!("{prefix}Wrong constructor found at 4")))
+}
+
+const INCORRECT: &str = "received incorrect answer: ";
+
+/// What a command does once it is parsed.
+enum Action {
+    /// Send a query; the closure reads the answer and returns the output.
+    Query(TLObject, Box<dyn FnOnce(&[u8]) -> Res<String> + Send>),
+    /// Print text without asking the server.
+    Print(String),
+    /// Close the console.
+    Quit,
+}
+
+fn query<Q: AnyBoxedSerialize>(
+    function: Q,
+    receive: impl FnOnce(&[u8]) -> Res<String> + Send + 'static,
+) -> Action {
+    Action::Query(function.into_tl_object(), Box::new(receive))
+}
+
+fn success(data: &[u8]) -> Res<String> {
+    answer::<ton::engine::validator::Success>(data, INCORRECT)?;
+    Ok("success\n".to_string())
+}
+
+/// The commands, by name, with the reference help text.
+const COMMANDS: &[(&str, &str)] = &[
+    ("add-adnl", "add-adnl <keyhash> <category>\tuse key as ADNL addr"),
+    (
+        "add-custom-overlay",
+        "add-custom-overlay <filename>\tadd custom overlay with config from file <filename>",
+    ),
+    (
+        "add-perm-key",
+        "add-perm-key <keyhash> <election-date> <expire-at>\tadd validator permanent key",
+    ),
+    ("add-temp-key", "add-temp-key <permkeyhash> <keyhash> <expireat>\tadd validator temp key"),
+    (
+        "add-validator-addr",
+        "add-validator-addr <permkeyhash> <keyhash> <expireat>\tadd validator ADNL addr",
+    ),
+    ("del-adnl", "del-adnl <keyhash>\tdel unused ADNL addr"),
+    ("del-custom-overlay", "del-custom-overlay <name>\tdelete custom overlay with name <name>"),
+    ("del-perm-key", "del-perm-key <keyhash>\tforce del unused validator permanent key"),
+    ("del-temp-key", "del-temp-key <permkeyhash> <keyhash>\tforce del unused validator temp key"),
+    (
+        "del-validator-addr",
+        "del-validator-addr <permkeyhash> <keyhash>\tforce del unused validator ADNL addr",
+    ),
+    (
+        "export-all-private-keys",
+        "export-all-private-keys <directory>\texports all private keys from validator engine and \
+         stores them to <directory>",
+    ),
+    ("export-pub", "export-pub <keyhash>\texports public key by key hash"),
+    ("export-pubf", "export-pub-f <keyhash> <filename>\texports public key by key hash"),
+    ("get-config", "get-config\tdownloads current config"),
+    ("get-stats", "get-stats\tprints stats"),
+    ("get-time", "get-time\tshows current server unixtime"),
+    ("help", "help [command]\tshows help"),
+    ("import-f", "import-f <filename>\timport private key"),
+    (
+        "import-shard-overlay-cert",
+        "import-shard-overlay-cert <wc>:<shard> <key> <certfile>\timport certificate for <key> in \
+         currently active shard overlay",
+    ),
+    ("license", "license\tshows license info"),
+    ("new-key", "new-key\tgenerates new key pair on server"),
+    ("quit", "quit\tcloses client"),
+    (
+        "set-ext-messages-broadcast-disabled",
+        "set-ext-messages-broadcast-disabled <value>\tdisable broadcasting and rebroadcasting ext \
+         messages; value is 0 or 1.",
+    ),
+    ("set-verbosity", "set-verbosity <value>\tchanges verbosity level"),
+    ("show-custom-overlays", "show-custom-overlays\tshow all custom overlays"),
+    ("sign", "sign <keyhash> <data>\tsigns bytestring with privkey"),
+    ("sign-f", "sign-f <keyhash> <infile> <outfile>\tsigns bytestring with privkey"),
+    (
+        "sign-shard-overlay-cert",
         "sign-shard-overlay-cert <wc>:<shard> <key> <expireat> <maxsize> <outfile>\tsign \
-        certificate for <key> in currently active shard overlay"
-    ImportShardOverlayCertificate, "import-shard-overlay-cert",
-        "import-shard-overlay-cert <wc>:<shard> <key> <certfile>\timport certificate for <key> \
-        in currently active shard overlay"
-    SetExtMessagesBroadcastDisabled, "set-ext-messages-broadcast-disabled",
-        "set-ext-messages-broadcast-disabled <value>\tdisable broadcasting and rebroadcasting \
-        ext messages; value is 0 or 1."
-    // TODO: Simplex consensus commands (requires feature = "simplex")
-    // GetSimplexStats, "getsimplexstats",
-    //     "getsimplexstats\tget simplex consensus statistics"
-}
+         certificate for <key> in currently active shard overlay",
+    ),
+];
 
-fn parse_any<A, Q: ToString>(
-    param_opt: Option<Q>,
-    name: &str,
-    parse_value: impl FnOnce(&str) -> Result<A>,
-) -> Result<A> {
-    let value = param_opt.ok_or_else(|| error!("insufficient parameters"))?.to_string();
-    parse_value(value.trim_matches('\"')).map_err(|err| error!("you must give {}: {}", name, err))
-}
+const LICENSE: &str = "Copyright (C) 2019 Telegram Systems LLP.\n\
+License GPLv2+: GNU GPL version 2 or later <https://www.gnu.org/licenses/gpl-2.0.html>\n\
+This is free software: you are free to change and redistribute it.\n\
+There is NO WARRANTY, to the extent permitted by law.\n";
 
-fn downcast<T: rtos_api::AnyBoxedSerialize>(data: TLObject) -> Result<T> {
-    match data.downcast::<T>() {
-        Ok(result) => Ok(result),
-        Err(obj) => fail!("Wrong downcast {:?} to {}", obj, std::any::type_name::<T>()),
+fn help(command: Option<&str>) -> String {
+    match command {
+        None => {
+            let mut text = "list of available commands:\n".to_string();
+            for (_, help) in COMMANDS {
+                text.push_str(help);
+                text.push('\n');
+            }
+            text
+        }
+        Some(name) => match COMMANDS.iter().find(|(command, _)| *command == name) {
+            Some((_, help)) => format!("{help}\n"),
+            None => format!("unknown command '{name}'\n"),
+        },
     }
 }
 
-fn parse_data<Q: ToString>(param_opt: Option<Q>, name: &str) -> Result<ton::bytes> {
-    parse_any(param_opt, &format!("{} in hex format", name), |value| Ok(hex::decode(value)?))
+/// Parses a command and prepares what it does, as the reference command's
+/// argument reading and sending do. `Ok(None)` is a name that is not a
+/// command.
+fn prepare(name: &str, t: &mut Tokenizer<'_>) -> Res<Option<Action>> {
+    let action = match name {
+        "get-time" => {
+            t.check_endl()?;
+            query(GetTime, |data| {
+                let time = answer::<ton::engine::validator::Time>(data, INCORRECT)?.only();
+                Ok(format!("received validator time: time={}\n", time.time))
+            })
+        }
+        "help" => {
+            if t.endl() {
+                return Ok(Some(Action::Print(help(None))));
+            }
+            let command = t.string()?;
+            t.check_endl()?;
+            Action::Print(help(Some(&command)))
+        }
+        "license" => {
+            t.check_endl()?;
+            Action::Print(LICENSE.to_string())
+        }
+        "quit" => {
+            t.check_endl()?;
+            Action::Quit
+        }
+        "new-key" => {
+            t.check_endl()?;
+            query(GenerateKeyPair, |data| {
+                let hash = answer::<ton::engine::validator::KeyHash>(data, INCORRECT)?.only();
+                Ok(format!("created new key {}\n", hex_upper(hash.key_hash.as_slice())))
+            })
+        }
+        "import-f" => {
+            let file = t.string()?;
+            t.check_endl()?;
+            let key = import_private_key(&read_file(&file)?)?;
+            query(ImportPrivateKey { key }, |data| {
+                let hash = answer::<ton::engine::validator::KeyHash>(data, INCORRECT)?.only();
+                Ok(format!("imported key {}\n", hex_upper(hash.key_hash.as_slice())))
+            })
+        }
+        "export-pub" => {
+            let key_hash = t.key_hash()?;
+            t.check_endl()?;
+            query(ExportPublicKey { key_hash }, |data| {
+                answer::<ton::PublicKey>(data, INCORRECT)?;
+                Ok(format!("got public key: {}\n", base64_encode(data)))
+            })
+        }
+        "export-pubf" => {
+            let key_hash = t.key_hash()?;
+            let file = t.string()?;
+            t.check_endl()?;
+            query(ExportPublicKey { key_hash }, move |data| {
+                answer::<ton::PublicKey>(data, INCORRECT)?;
+                write_file(&file, data)?;
+                Ok("got public key\n".to_string())
+            })
+        }
+        "sign" => {
+            let key_hash = t.key_hash()?;
+            let data = t.hex()?;
+            t.check_endl()?;
+            query(Sign { key_hash, data }, |data| {
+                let signature =
+                    answer::<ton::engine::validator::Signature>(data, INCORRECT)?.only();
+                Ok(format!("got signature {}\n", base64_encode(&signature.signature)))
+            })
+        }
+        "sign-f" => {
+            let key_hash = t.key_hash()?;
+            let in_file = t.string()?;
+            let out_file = t.string()?;
+            t.check_endl()?;
+            let data = read_file(&in_file)?;
+            query(Sign { key_hash, data }, move |data| {
+                let signature =
+                    answer::<ton::engine::validator::Signature>(data, INCORRECT)?.only();
+                write_file(&out_file, &signature.signature)?;
+                Ok("got signature\n".to_string())
+            })
+        }
+        "export-all-private-keys" => {
+            let directory = t.string()?;
+            t.check_endl()?;
+            let client =
+                get_key_option_factory().generate().map_err(|e| Status::error(e.to_string()))?;
+            let public: [u8; 32] = client
+                .pub_key()
+                .ok()
+                .and_then(|key| key.try_into().ok())
+                .ok_or_else(|| Status::error("cannot create the client key"))?;
+            let encryption_key = ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
+                key: UInt256::from(public),
+            });
+            query(ExportAllPrivateKeys { encryption_key }, move |data| {
+                export_keys(&client, data, &directory)
+            })
+        }
+        "add-adnl" => {
+            let key_hash = t.key_hash()?;
+            let category = t.integer::<u32>()?;
+            if category > 15 {
+                return Err(Status::error("too big category"));
+            }
+            t.check_endl()?;
+            query(AddAdnlId { key_hash, category: category as i32 }, success)
+        }
+        "add-perm-key" => {
+            let key_hash = t.key_hash()?;
+            let election_date = t.integer::<u32>()?;
+            let expire_at = t.integer::<u32>()?;
+            t.check_endl()?;
+            // The wire fields keep the bit patterns of the unsigned values.
+            query(
+                AddValidatorPermanentKey {
+                    key_hash,
+                    election_date: election_date as i32,
+                    ttl: expire_at as i32,
+                },
+                success,
+            )
+        }
+        "add-temp-key" => {
+            let permanent_key_hash = t.key_hash()?;
+            let key_hash = t.key_hash()?;
+            let expire_at = t.integer::<u32>()?;
+            t.check_endl()?;
+            query(
+                AddValidatorTempKey { permanent_key_hash, key_hash, ttl: expire_at as i32 },
+                success,
+            )
+        }
+        "add-validator-addr" => {
+            let permanent_key_hash = t.key_hash()?;
+            let key_hash = t.key_hash()?;
+            let expire_at = t.integer::<u32>()?;
+            t.check_endl()?;
+            query(
+                AddValidatorAdnlAddress { permanent_key_hash, key_hash, ttl: expire_at as i32 },
+                success,
+            )
+        }
+        "del-adnl" => {
+            let key_hash = t.key_hash()?;
+            t.check_endl()?;
+            query(DelAdnlId { key_hash }, success)
+        }
+        "del-perm-key" => {
+            let key_hash = t.key_hash()?;
+            t.check_endl()?;
+            query(DelValidatorPermanentKey { key_hash }, success)
+        }
+        "del-temp-key" => {
+            let permanent_key_hash = t.key_hash()?;
+            let key_hash = t.key_hash()?;
+            t.check_endl()?;
+            query(DelValidatorTempKey { permanent_key_hash, key_hash }, success)
+        }
+        "del-validator-addr" => {
+            let permanent_key_hash = t.key_hash()?;
+            let key_hash = t.key_hash()?;
+            t.check_endl()?;
+            query(DelValidatorAdnlAddress { permanent_key_hash, key_hash }, success)
+        }
+        "get-config" => {
+            t.check_endl()?;
+            query(GetConfig, |data| {
+                let config = answer::<ton::engine::validator::JsonConfig>(data, INCORRECT)?.only();
+                Ok(format!("---------\n{}--------\n", config.data))
+            })
+        }
+        "set-verbosity" => {
+            let verbosity = t.integer::<u8>()?;
+            t.check_endl()?;
+            query(SetVerbosity { verbosity: i32::from(verbosity) }, success)
+        }
+        "get-stats" => {
+            t.check_endl()?;
+            query(GetStats, |data| {
+                let stats = answer::<ton::engine::validator::Stats>(data, INCORRECT)?.only();
+                Ok(stats
+                    .stats
+                    .iter()
+                    .map(|stat| format!("{}\t\t\t{}\n", stat.key, stat.value))
+                    .collect())
+            })
+        }
+        // The reference reads no end of line for the three commands below.
+        "sign-shard-overlay-cert" => {
+            let (workchain, shard) = t.shard()?;
+            let key = t.key_hash()?;
+            let expire_at = t.integer::<i32>()?;
+            let max_size = t.integer::<u32>()?;
+            let out_file = t.string()?;
+            query(
+                SignShardOverlayCertificate {
+                    workchain,
+                    shard,
+                    signed_key: ton::engine::validator::keyhash::KeyHash { key_hash: key }
+                        .into_boxed(),
+                    expire_at,
+                    // The wire field is signed; the size keeps its bit pattern.
+                    max_size: max_size as i32,
+                },
+                move |data| {
+                    match answer::<ton::overlay::Certificate>(data, "received incorrect cert: ")? {
+                        ton::overlay::Certificate::Overlay_Certificate(_) => {}
+                        _ => {
+                            return Err(Status::error(
+                                "received incorrect cert: Wrong constructor found at 4",
+                            ))
+                        }
+                    }
+                    write_file(&out_file, data)
+                        .map_err(|e| e.prefix("Failed to write certificate to file: "))?;
+                    Ok("saved certificate\n".to_string())
+                },
+            )
+        }
+        "import-shard-overlay-cert" => {
+            let (workchain, shard) = t.shard()?;
+            let key = t.key_hash()?;
+            let in_file = t.string()?;
+            let data = read_file(&in_file)?;
+            let cert = certificate(&data)?;
+            query(
+                ImportShardOverlayCertificate {
+                    workchain,
+                    shard,
+                    signed_key: ton::engine::validator::keyhash::KeyHash { key_hash: key }
+                        .into_boxed(),
+                    cert,
+                },
+                |data| {
+                    answer::<ton::engine::validator::Success>(data, INCORRECT)?;
+                    Ok("successfully sent certificate to overlay manager\n".to_string())
+                },
+            )
+        }
+        "set-ext-messages-broadcast-disabled" => {
+            let value = t.integer::<i32>()?;
+            if !(0..=1).contains(&value) {
+                return Err(Status::error("value should be 0 or 1"));
+            }
+            let disabled = if value == 1 { Bool::BoolTrue } else { Bool::BoolFalse };
+            query(SetExtMessagesBroadcastDisabled { disabled }, success)
+        }
+        "add-custom-overlay" => {
+            let file = t.string()?;
+            t.check_endl()?;
+            let data = read_file(&file)?;
+            let json: serde_json::Value =
+                serde_json::from_slice(&data).map_err(|e| Status::error(e.to_string()))?;
+            let object = json.as_object().ok_or_else(|| {
+                Status::error(format!("Expected object, got {}", json_type(&json)))
+            })?;
+            let overlay = tl_json::custom_overlay(object)?;
+            query(AddCustomOverlay { overlay }, success)
+        }
+        "del-custom-overlay" => {
+            let name = t.string()?;
+            t.check_endl()?;
+            query(DelCustomOverlay { name }, success)
+        }
+        "show-custom-overlays" => {
+            t.check_endl()?;
+            query(ShowCustomOverlays, |data| {
+                let config =
+                    answer::<ton::engine::validator::CustomOverlaysConfig>(data, INCORRECT)?;
+                Ok(show_custom_overlays(&config.only()))
+            })
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(action))
 }
 
-fn parse_int256<Q: ToString>(param_opt: Option<Q>, name: &str) -> Result<UInt256> {
-    parse_any(param_opt, &format!("{} in hex or base64 format", name), |value| {
-        let value = match value.len() {
-            44 => base64_decode(value)?,
-            64 => hex::decode(value)?,
-            length => fail!("wrong hash: {} with length: {}", value, length),
-        };
-        Ok(UInt256::with_array(value.as_slice().try_into()?))
-    })
-}
-
-fn parse_int<Q: ToString>(param_opt: Option<Q>, name: &str) -> Result<ton::int> {
-    parse_any(param_opt, name, |value| Ok(ton::int::from_str(value)?))
-}
-
-fn stats_to_json<'a>(stats: impl IntoIterator<Item = &'a OneStat>) -> serde_json::Value {
-    let map = stats
-        .into_iter()
-        .map(|stat| {
-            let value = if stat.value.is_empty() {
-                "null".into()
-            } else if let Ok(value) = stat.value.parse::<i64>() {
-                value.into()
-            } else if let Ok(value) = serde_json::from_str(&stat.value) {
-                value
+/// An overlay certificate from a file, read as the reference reads it.
+fn certificate(data: &[u8]) -> Res<ton::overlay::Certificate> {
+    if data.len() < 4 {
+        return Err(Status::error("incorrect certificateNot enough data to read at 0"));
+    }
+    match deserialize_boxed(data) {
+        Ok(object) => object.downcast::<ton::overlay::Certificate>().map_err(|_| {
+            let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            Status::error(format!("incorrect certificateUnknown constructor found 0x{id:08x} at 4"))
+        }),
+        Err(error) => {
+            let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let known = [
+                ton::overlay::Certificate::Overlay_Certificate(Default::default()),
+                ton::overlay::Certificate::Overlay_CertificateV2(Default::default()),
+                ton::overlay::Certificate::Overlay_EmptyCertificate,
+            ]
+            .iter()
+            .filter_map(|certificate| serialize_boxed(certificate).ok())
+            .any(|bytes| bytes.get(..4) == Some(&data[..4]));
+            if known {
+                Err(Status::error(format!("incorrect certificate{error}")))
             } else {
-                stat.value.trim_matches('\"').into()
-            };
-            (stat.key.clone(), value)
-        })
-        .collect::<serde_json::Map<_, _>>();
-    map.into()
-}
-
-impl<Q: ToString> SendReceive<Q> for GetStats {
-    fn send(_params: &mut impl Iterator) -> Result<TLObject> {
-        Ok(ton::rpc::engine::validator::GetStats.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let data = serialize_boxed(&answer)?;
-        let stats = downcast::<rtos_api::ton::engine::validator::Stats>(answer)?;
-        let description = stats_to_json(stats.stats().iter());
-        let description = format!("{:#}", description);
-        Ok((description, data))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for NewKeypair {
-    fn send(_params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        Ok(ton::rpc::engine::validator::GenerateKeyPair.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let answer = downcast::<rtos_api::ton::engine::validator::KeyHash>(answer)?;
-        let key_hash = answer.key_hash().as_slice().to_vec();
-        let msg = format!(
-            "received public key hash: {} {}",
-            hex::encode(&key_hash),
-            base64_encode(&key_hash)
-        );
-        Ok((msg, key_hash))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for ImportPrivateKey {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let key_type = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let pvt_key = parse_int256(params.next(), "key")?;
-
-        if key_type != "ed25519" {
-            fail!("Unsupported key type: {}", key_type);
-        }
-
-        Ok(ton::rpc::engine::validator::ImportPrivateKey {
-            key: rtos_api::ton::PrivateKey::Pk_Ed25519(ton::pk::privatekey::Ed25519 {
-                key: pvt_key,
-            }),
-        }
-        .into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let answer = downcast::<rtos_api::ton::engine::validator::KeyHash>(answer)?;
-        let key_hash = answer.key_hash().as_slice().to_vec();
-        let msg = format!(
-            "received public key hash: {} {}",
-            hex::encode(&key_hash),
-            base64_encode(&key_hash)
-        );
-        Ok((msg, key_hash))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for GetValidatorConfig {
-    fn send(_params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        Ok(ton::rpc::engine::validator::GetConfig.into_tl_object())
-    }
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let json_name =
-            params.next().ok_or_else(|| error!("insufficient output json filename"))?.to_string();
-        let answer = downcast::<rtos_api::ton::engine::validator::JsonConfig>(answer)?;
-        std::fs::write(&json_name, answer.data())
-            .map_err(|err| error!("cannot write config to file {json_name}: {err}"))?;
-        Ok((answer.only().data, Vec::new()))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for ExportPub {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let ret = ton::rpc::engine::validator::ExportPublicKey {
-            key_hash: parse_int256(params.next(), "key_hash")?,
-        };
-        Ok(ret.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let answer = downcast::<rtos_api::ton::PublicKey>(answer)?;
-        let pub_key = match answer.key() {
-            Some(key) => key.clone().into_vec(),
-            None => fail!("Public key not found in answer!"),
-        };
-        let msg = format!("imported key: {} {}", hex::encode(&pub_key), base64_encode(&pub_key));
-        Ok((msg, pub_key))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for Sign {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let key_hash = parse_int256(params.next(), "key_hash")?;
-        let data = parse_data(params.next(), "data")?;
-        let ret = ton::rpc::engine::validator::Sign { key_hash, data };
-        Ok(ret.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let answer = downcast::<rtos_api::ton::engine::validator::Signature>(answer)?;
-        let signature = answer.signature().clone();
-        let msg =
-            format!("got signature: {} {}", hex::encode(&signature), base64_encode(&signature));
-        Ok((msg, signature))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for AddValidatorPermKey {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let key_hash = parse_int256(params.next(), "key_hash")?;
-        let election_date = parse_int(params.next(), "election_date")?;
-        // The wire field carries the absolute expiry.
-        let ttl = parse_int(params.next(), "expire_at")?;
-        let ret =
-            ton::rpc::engine::validator::AddValidatorPermanentKey { key_hash, election_date, ttl };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for AddValidatorTempKey {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let permanent_key_hash = parse_int256(params.next(), "permanent_key_hash")?;
-        let key_hash = parse_int256(params.next(), "key_hash")?;
-        let ttl = parse_int(params.next(), "expire_at")?;
-        let ret =
-            ton::rpc::engine::validator::AddValidatorTempKey { permanent_key_hash, key_hash, ttl };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for AddValidatorAdnlAddr {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let permanent_key_hash = parse_int256(params.next(), "permanent_key_hash")?;
-        let key_hash = parse_int256(params.next(), "key_hash")?;
-        let ttl = parse_int(params.next(), "expire_at")?;
-        let ret = ton::rpc::engine::validator::AddValidatorAdnlAddress {
-            permanent_key_hash,
-            key_hash,
-            ttl,
-        };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for AddAdnlAddr {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let key_hash = parse_int256(params.next(), "key_hash")?;
-        let category = parse_int(params.next(), "category")?;
-        if !(0..=15).contains(&category) {
-            fail!("category must be not negative and less than 16")
-        }
-        let ret = ton::rpc::engine::validator::AddAdnlId { key_hash, category };
-        Ok(ret.into_tl_object())
-    }
-}
-
-
-impl<Q: ToString> SendReceive<Q> for AddCustomOverlay {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let config_file_name =
-            params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let file = File::open(config_file_name)?;
-        let reader = BufReader::new(file);
-        let json_value: serde_json::Value = serde_json::from_reader(reader)?;
-        let overlay = TonNodeConfig::parse_custom_overlay_json(&json_value)?;
-        let ret = ton::rpc::engine::validator::AddCustomOverlay { overlay };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for DelCustomOverlay {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let name = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let ret = ton::rpc::engine::validator::DelCustomOverlay { name };
-        Ok(ret.into_tl_object())
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for ShowCustomOverlays {
-    fn send(_params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let ret = ton::rpc::engine::validator::ShowCustomOverlays;
-        Ok(ret.into_tl_object())
-    }
-    fn receive(answer: TLObject, _params: &mut impl Iterator) -> Result<(String, Vec<u8>)> {
-        let Ok(overlays) =
-            downcast::<rtos_api::ton::engine::validator::CustomOverlaysConfig>(answer)
-        else {
-            return Ok(("received incorrect answer".to_string(), vec![]));
-        };
-        // Description is same as the cpp node
-        let mut description = format!("{} custom overlays:\n\n", overlays.overlays().len());
-        for overlay in overlays.overlays() {
-            description.push_str(&format!(
-                "Overlay \"{}\": {} nodes\n",
-                overlay.name,
-                overlay.nodes.len()
-            ));
-            for node in &overlay.nodes {
-                description.push_str(&format!("  {}", base64_encode(node.adnl_id.as_slice())));
-                if matches!(node.msg_sender, Bool::BoolTrue) {
-                    description.push_str(&format!(" (msg sender, p={})", node.msg_sender_priority));
-                }
-                if matches!(node.block_sender, Bool::BoolTrue) {
-                    description.push_str(" (block sender)");
-                }
-                description.push_str("\n");
+                Err(Status::error(format!(
+                    "incorrect certificateUnknown constructor found 0x{id:08x} at 4"
+                )))
             }
-            description.push_str(" Sender shards:\n");
-            for shard in &overlay.sender_shards {
-                description
-                    .push_str(&format!("  ({},{:016x})\n", shard.workchain, shard.shard as u64));
+        }
+    }
+}
+
+/// The reference listing of custom overlays.
+fn show_custom_overlays(
+    config: &ton::engine::validator::customoverlaysconfig::CustomOverlaysConfig,
+) -> String {
+    let mut text = format!("{} custom overlays:\n\n", config.overlays.len());
+    for overlay in config.overlays.iter() {
+        text.push_str(&format!("Overlay \"{}\": {} nodes\n", overlay.name, overlay.nodes.len()));
+        for node in overlay.nodes.iter() {
+            text.push_str(&format!("  {}", base64_encode(node.adnl_id.as_slice())));
+            if node.msg_sender == Bool::BoolTrue {
+                text.push_str(&format!(" (msg sender, p={})", node.msg_sender_priority));
             }
-            if matches!(overlay.skip_public_msg_send, Bool::BoolTrue) {
-                description.push_str("Don't send external messages to public overlays\n");
+            if node.block_sender == Bool::BoolTrue {
+                text.push_str(" (block sender)");
             }
-            description.push_str("\n");
+            text.push('\n');
         }
-        let data = serialize_boxed(&overlays)?;
-        Ok((description, data))
-    }
-}
-
-/// A shard token as the reference console reads it: a workchain followed by
-/// a signed 64-bit shard, or one `wc:hexshard` / `(wc,hexshard)` word.
-fn parse_shard<Q: ToString>(params: &mut impl Iterator<Item = Q>) -> Result<(i32, i64)> {
-    let word = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-    if let Ok(workchain) = word.parse::<i32>() {
-        let shard = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        return Ok((workchain, shard.parse::<i64>().map_err(|e| error!("invalid shard: {e}"))?));
-    }
-    let text = word.strip_prefix('(').and_then(|w| w.strip_suffix(')')).unwrap_or(&word);
-    let separator =
-        text.find(':').or_else(|| text.find(',')).ok_or_else(|| error!("invalid shard {text}"))?;
-    if text.len() - separator - 1 != 16 {
-        fail!("invalid shard {text}");
-    }
-    let workchain = text[..separator].parse::<i32>().map_err(|e| error!("invalid shard: {e}"))?;
-    let shard = u64::from_str_radix(&text[separator + 1..], 16)
-        .map_err(|e| error!("invalid shard: {e}"))?;
-    Ok((workchain, shard as i64))
-}
-
-fn key_hash_boxed(key: UInt256) -> ton::engine::validator::KeyHash {
-    ton::engine::validator::keyhash::KeyHash { key_hash: key }.into_boxed()
-}
-
-impl<Q: ToString> SendReceive<Q> for SignShardOverlayCertificate {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let (workchain, shard) = parse_shard(params)?;
-        let key = parse_int256(params.next(), "key")?;
-        let expire_at = parse_int(params.next(), "expireat")?;
-        let max_size = parse_any(params.next(), "maxsize", |value| Ok(u32::from_str(value)?))?;
-        params.next().ok_or_else(|| error!("insufficient parameters"))?;
-        Ok(ton::rpc::engine::validator::SignShardOverlayCertificate {
-            workchain,
-            shard,
-            signed_key: key_hash_boxed(key),
-            expire_at,
-            // The wire field is signed; the size keeps its bit pattern.
-            max_size: max_size as i32,
+        if !overlay.sender_shards.is_empty() {
+            text.push_str("Sender shards:\n");
+            for shard in overlay.sender_shards.iter() {
+                text.push_str(&format!("  ({},{:016x})\n", shard.workchain, shard.shard as u64));
+            }
         }
-        .into_tl_object())
-    }
-    /// Only a version-1 certificate is accepted, and the reply is saved to
-    /// the output file exactly as received.
-    fn receive(
-        answer: TLObject,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        parse_shard(params)?;
-        let out_file = params.nth(3).ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let data = serialize_boxed(&answer)?;
-        match downcast::<ton::overlay::Certificate>(answer) {
-            Ok(ton::overlay::Certificate::Overlay_Certificate(_)) => {}
-            _ => fail!("received incorrect cert"),
+        if overlay.skip_public_msg_send == Bool::BoolTrue {
+            text.push_str("Don't send external messages to public overlays\n");
         }
-        std::fs::write(&out_file, &data)
-            .map_err(|e| error!("Failed to write certificate to file: {e}"))?;
-        Ok(("saved certificate".to_string(), data))
-    }
-}
-
-impl<Q: ToString> SendReceive<Q> for ImportShardOverlayCertificate {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let (workchain, shard) = parse_shard(params)?;
-        let key = parse_int256(params.next(), "key")?;
-        let in_file = params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string();
-        let data = std::fs::read(&in_file)?;
-        let cert = rtos_api::deserialize_boxed(&data)
-            .map_err(|e| error!("incorrect certificate: {e}"))?
-            .downcast::<ton::overlay::Certificate>()
-            .map_err(|object| error!("incorrect certificate: {object:?}"))?;
-        Ok(ton::rpc::engine::validator::ImportShardOverlayCertificate {
-            workchain,
-            shard,
-            signed_key: key_hash_boxed(key),
-            cert,
+        if overlay.use_quic == Bool::BoolTrue {
+            text.push_str("Use QUIC for custom overlay broadcasts\n");
         }
-        .into_tl_object())
+        text.push('\n');
     }
-    fn receive(
-        answer: TLObject,
-        _params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        downcast::<rtos_api::ton::engine::validator::Success>(answer)?;
-        Ok(("successfully sent certificate to overlay manager".to_string(), vec![]))
-    }
+    text
 }
 
-impl<Q: ToString> SendReceive<Q> for SetExtMessagesBroadcastDisabled {
-    fn send(params: &mut impl Iterator<Item = Q>) -> Result<TLObject> {
-        let value = parse_int(params.next(), "value")?;
-        let disabled = match value {
-            0 => Bool::BoolFalse,
-            1 => Bool::BoolTrue,
-            _ => fail!("value should be 0 or 1"),
-        };
-        Ok(ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled { disabled }
-            .into_tl_object())
+/// Decrypts the exported key set and stores each key in the directory under
+/// its hash, as the reference console does.
+fn export_keys(client: &Arc<dyn KeyOption>, data: &[u8], directory: &str) -> Res<String> {
+    let exported = answer::<ton::engine::validator::ExportedPrivateKeys>(data, INCORRECT)?.only();
+    let plain = rtos::network::control::decrypt_with(client, &exported.encrypted_data)
+        .map_err(|e| Status::error(format!("cannot decrypt data: {e}")))?;
+    if plain.len() < 32 {
+        return Err(Status::error("data is too small"));
     }
+    let mut rest = &plain[..plain.len() - 32];
+    let mut keys = Vec::new();
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            return Err(Status::error("unexpected end of data"));
+        }
+        let size = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        // The reference compares the size with what is left before the
+        // size word is taken off.
+        if size > rest.len() {
+            return Err(Status::error("unexpected end of data"));
+        }
+        rest = &rest[4..];
+        let take = size.min(rest.len());
+        let key = import_private_key(&rest[..take])
+            .map_err(|e| e.prefix("cannot parse private key: "))?;
+        keys.push(key);
+        rest = &rest[take..];
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .map_err(|e| Status::io(&e, format!("cannot create directory {directory}: ")))?;
+    let mut text = format!("exported {} private keys\n", keys.len());
+    for key in &keys {
+        let hash = hex_upper(&private_key_hash(key)?);
+        write_file(&format!("{directory}/{hash}"), &serialized(key)?)
+            .map_err(|e| e.prefix("failed to write file: "))?;
+        text.push_str(&format!("pubkey_hash {hash}\n"));
+    }
+    text.push_str(&format!("written all files to {directory}\n"));
+    Ok(text)
 }
 
-/// ControlClient
-struct ControlClient {
-    config: AdnlConsoleConfigJson,
+/// The control port connection; a test replaces it.
+#[async_trait::async_trait]
+trait Transport: Send {
+    /// Sends one function wrapped in a control query; the answer bytes, or
+    /// the error the server or the connection reports.
+    async fn send(&mut self, function: &TLObject) -> Res<Vec<u8>>;
+}
+
+struct ControlPort {
     adnl: AdnlClient,
 }
 
-impl ControlClient {
-    /// Connect to server
-    async fn connect(mut config: AdnlConsoleConfigJson) -> Result<Self> {
-        let client_config =
-            config.config.take().ok_or_else(|| error!("config must contain \"config\" section"))?;
-        let (_, adnl_config) = AdnlClientConfig::from_json_config(&client_config)?;
-        Ok(Self { config, adnl: AdnlClient::connect(&adnl_config).await? })
-    }
-
-    /// Shutdown client
-    async fn shutdown(self) -> Result<()> {
-        self.adnl.shutdown().await
-    }
-
-    async fn command(&mut self, cmd: &str) -> Result<(String, Vec<u8>)> {
-        let result = shell_words::split(cmd)?;
-        let mut params = result.iter();
-        match params.next().expect("takes_value set for COMMANDS").as_str() {
-            "config_param" | "cparam" => self.process_config_param(&mut params).await,
-            "ebid" | "election-bid" | "election_bid" => {
-                self.process_election_bid(&mut params).await
+#[async_trait::async_trait]
+impl Transport for ControlPort {
+    async fn send(&mut self, function: &TLObject) -> Res<Vec<u8>> {
+        let data = serialize_boxed(function).map_err(|e| Status::error(e.to_string()))?;
+        let wrapped: TaggedTlObject = ControlQuery { data }.into_tl_object().into();
+        let answer =
+            tokio::time::timeout(QUERY_TIMEOUT, self.adnl.query_raw(&wrapped, WireProfile::Legacy))
+                .await
+                .map_err(|_| Status::with_code(ERROR_CODE_TIMEOUT, "timeout for adnl query query"))?
+                .map_err(|e| Status::error(e.to_string()))?;
+        if let Ok(object) = deserialize_boxed(&answer) {
+            if let Ok(error) = object.downcast::<ControlQueryError>() {
+                let error = error.only();
+                return Err(Status::with_code(error.code, error.message));
             }
-            "recover_stake" => self.process_recover_stake(&mut params).await,
-            name => self.process_command(name, &mut params).await,
         }
+        Ok(answer)
     }
+}
 
-    async fn process_any_type_command(
-        &mut self,
-        name: &str,
-        prepare: impl FnOnce(&str) -> Result<TLObject>,
-        process: impl FnOnce(&str, TLObject) -> Result<(String, Vec<u8>)>,
-    ) -> Result<(String, Vec<u8>)> {
-        let query = match prepare(name) {
-            Ok(query) => query,
-            Err(err) => {
-                let help =
-                    command_help(name).map_or_else(|err| err.to_string(), |help| help.to_string());
-                println!("{}\n{}", err, help);
-                return Err(err);
-            }
-        };
-        let boxed = ControlQuery { data: serialize_boxed(&query)? }.into_tl_object().into();
-        let answer = self
-            .adnl
-            .query(&boxed)
-            .await
-            .map_err(|err| error!("Error receiving answer: {}", err))?;
-        match answer.downcast::<ControlQueryError>() {
-            Err(answer) => match process(name, answer) {
-                Err(answer) => fail!("Wrong response to {:?}: {:?}", query, answer),
-                Ok(result) => Ok(result),
+/// How one command line ended.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Done,
+    Failed,
+    /// Not a command: the reference console goes on waiting.
+    Unknown,
+    Quit,
+}
+
+/// Runs one command line and returns its output and outcome.
+async fn run_line(line: &str, transport: &mut dyn Transport) -> (String, Outcome) {
+    let mut tokenizer = Tokenizer::new(line);
+    if tokenizer.endl() {
+        return (String::new(), Outcome::Unknown);
+    }
+    let name = match tokenizer.raw() {
+        Ok(name) => name,
+        Err(_) => return (String::new(), Outcome::Unknown),
+    };
+    let failed = |status: Status| (format!("Failed {name} query: {status}\n"), Outcome::Failed);
+    match prepare(name, &mut tokenizer) {
+        Ok(None) => (format!("unknown command '{name}'\n"), Outcome::Unknown),
+        Ok(Some(Action::Print(text))) => (text, Outcome::Done),
+        Ok(Some(Action::Quit)) => (String::new(), Outcome::Quit),
+        Ok(Some(Action::Query(function, receive))) => match transport.send(&function).await {
+            Ok(data) => match receive(&data) {
+                Ok(text) => (text, Outcome::Done),
+                Err(status) => failed(status),
             },
-            Ok(error) => fail!("Error response to {:?}: {:?}", query, error),
-        }
+            Err(status) => failed(status),
+        },
+        Err(status) => failed(status),
     }
+}
 
-    async fn process_command<Q: ToString>(
-        &mut self,
-        name: &str,
-        params: &mut (impl Iterator<Item = Q> + Clone),
-    ) -> Result<(String, Vec<u8>)> {
-        let mut params_clone = params.clone();
-        self.process_any_type_command(
-            name,
-            |name| command_send(name, params),
-            |name, answer| command_receive(name, answer, &mut params_clone),
-        )
-        .await
-    }
-
-    async fn process_recover_stake<Q: ToString>(
-        &mut self,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let query_id = UnixTime::now() as u64;
-        // recover-stake.fif
-        let mut data = 0x47657424u32.to_be_bytes().to_vec();
-        data.extend_from_slice(&query_id.to_be_bytes());
-        let len = data.len() * 8;
-        let body = BuilderData::with_raw(data, len)?;
-        let body = body.into_cell()?;
-        log::trace!("message body {}", body);
-        let data = write_boc(&body)?;
-        let path =
-            params.next().map(|path| path.to_string()).unwrap_or("recover-query.boc".to_string());
-        std::fs::write(&path, &data)?;
-        Ok((format!("Message body is {} saved to path {}", base64_encode(&data), path), data))
-    }
-
-    // @input elect_time expire_time <validator-query.boc>
-    // @output validator-query.boc
-    async fn process_election_bid<Q: ToString>(
-        &mut self,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let wallet_id =
-            parse_any(self.config.wallet_id.as_ref(), "wallet_id", |value| {
-                match value.strip_prefix("-1:") {
-                    Some(stripped) => Ok(hex::decode(stripped)?),
-                    None => fail!("use masterchain wallet"),
-                }
-            })?;
-        let elect_time = parse_int(params.next(), "elect_time")?;
-        if elect_time <= 0 {
-            fail!("<elect-utime> must be a positive integer")
-        }
-        let elect_time_str = elect_time.to_string();
-        let expire_time = parse_int(params.next(), "expire_time")?;
-        if expire_time <= elect_time {
-            fail!("<expire-utime> must be a grater than elect_time")
-        }
-        let expire_time_str = expire_time.to_string();
-        let max_factor =
-            self.config.max_factor.ok_or_else(|| error!("you must give max_factor as real"))?;
-        if !(1.0..=100.0).contains(&max_factor) {
-            fail!("<max-factor> must be a real number 1..100")
-        }
-        let max_factor = (max_factor * 65536.0) as u32;
-
-        let (s, perm) = self.process_command("newkey", &mut Vec::<String>::new().iter()).await?;
-        log::trace!("{}", s);
-        let perm_str = hex::encode_upper(&perm);
-
-        let (s, pub_key) = self.process_command("exportpub", &mut [&perm_str].iter()).await?;
-        log::trace!("{}", s);
-
-        let (s, _) = self
-            .process_command(
-                "addpermkey",
-                &mut [&perm_str, &elect_time_str, &expire_time_str].iter(),
-            )
-            .await?;
-        log::trace!("{}", s);
-
-        let (s, _) = self
-            .process_command("addtempkey", &mut [&perm_str, &perm_str, &expire_time_str].iter())
-            .await?;
-        log::trace!("{}", s);
-
-        let (s, adnl) = self.process_command("newkey", &mut Vec::<String>::new().iter()).await?;
-        log::trace!("{}", s);
-        let adnl_str = hex::encode_upper(&adnl);
-
-        let (s, _) = self.process_command("addadnl", &mut [&adnl_str, "0"].iter()).await?;
-        log::trace!("{}", s);
-
-        let (s, _) = self
-            .process_command(
-                "addvalidatoraddr",
-                &mut [&perm_str, &adnl_str, &elect_time_str].iter(),
-            )
-            .await?;
-        log::trace!("{}", s);
-
-        // validator-elect-req.fif
-        let mut data = 0x654C5074u32.to_be_bytes().to_vec();
-        data.extend_from_slice(&elect_time.to_be_bytes());
-        data.extend_from_slice(&max_factor.to_be_bytes());
-        data.extend_from_slice(&wallet_id);
-        data.extend_from_slice(&adnl);
-        let data_str = hex::encode_upper(&data);
-        log::trace!("data to sign {}", data_str);
-        let (s, signature) =
-            self.process_command("sign", &mut [&perm_str, &data_str].iter()).await?;
-        log::trace!("{}", s);
-        get_key_option_factory()
-            .from_public_key(&pub_key[..].try_into()?)
-            .verify(&data, &signature)?;
-
-        let query_id = UnixTime::now() as u64;
-        // validator-elect-signed.fif
-        let mut data = 0x4E73744Bu32.to_be_bytes().to_vec();
-        data.extend_from_slice(&query_id.to_be_bytes());
-        data.extend_from_slice(&pub_key);
-        data.extend_from_slice(&elect_time.to_be_bytes());
-        data.extend_from_slice(&max_factor.to_be_bytes());
-        data.extend_from_slice(&adnl);
-        let len = data.len() * 8;
-        let mut body = BuilderData::with_raw(data, len)?;
-        let len = signature.len() * 8;
-        body.checked_append_reference(BuilderData::with_raw(signature, len)?.into_cell()?)?;
-        let body = body.into_cell()?;
-
-        log::trace!("message body {}", body);
-        let data = write_boc(&body)?;
-        let path =
-            params.next().map(|path| path.to_string()).unwrap_or("validator-query.boc".to_string());
-
-        std::fs::write(&path, &data)?;
-        Ok((format!("Message body is {} saved to path {}", base64_encode(&data), path), data))
-    }
-
-    // @input <tcp-port-to-listen-to>
-    // @output <number-of-proxied-messages>
-
-    // @input index zerostate.json <config-param.boc>
-    // @output config-param.boc
-    async fn process_config_param<Q: ToString>(
-        &mut self,
-        params: &mut impl Iterator<Item = Q>,
-    ) -> Result<(String, Vec<u8>)> {
-        let index = parse_int(params.next(), "index")?;
-        if index < 0 {
-            fail!("<index> must not be a negative integer")
-        }
-        let zerostate = parse_any(params.next(), "zerostate.json", |value| Ok(value.to_string()))?;
-        let path =
-            params.next().map(|path| path.to_string()).unwrap_or("config-param.boc".to_string());
-
-        let zerostate = std::fs::read_to_string(&zerostate)
-            .map_err(|err| error!("Can't read zerostate json file {} : {}", zerostate, err))?;
-        let zerostate =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&zerostate)
-                .map_err(|err| error!("Can't parse read zerostate json file: {}", err))?;
-        let zerostate = parse_state(&zerostate)
-            .map_err(|err| error!("Can't parse read zerostate json file: {}", err))?;
-
-        let key = SliceData::load_builder(index.write_to_new_cell()?)?;
-        let config_param_cell = zerostate
-            .read_custom()
-            .map_err(|err| error!("Can't read McStateExtra from zerostate: {}", err))?
-            .ok_or_else(|| error!("Can't find McStateExtra in zerostate"))?
-            .config()
-            .config_params
-            .get(key)
-            .map_err(|err| error!("Can't read config param {} from zerostate: {}", index, err))?
-            .ok_or_else(|| error!("Can't find config param {} in zerostate", index))?
-            .reference_opt(0)
-            .ok_or_else(|| {
-                error!("Can't parse config param {}: wrong format - no reference", index)
-            })?;
-
-        let data = write_boc(&config_param_cell)
-            .map_err(|err| error!("Can't serialize config param {}: {}", index, err))?;
-
-        std::fs::write(&path, &data).map_err(|err| {
-            error!("Can't write config param {} to file {}: {}", index, path, err)
-        })?;
-
-        Ok((format!("Config param {} saved to path {}", index, path), data))
-    }
-
-    // @input <config-param-json-path> <key-bin-path> <output-message-boc-path>
-    // @output base64_boc and boc
-    // prepare message to set config param valid for 30 seconds
+/// The console's connection settings file: the client key, the server
+/// address and the server key.
+#[derive(serde::Deserialize)]
+struct ConnectionJson {
+    client_key: Option<KeyOptionJson>,
+    server_address: String,
+    server_key: KeyOptionJson,
+    timeouts: Option<Timeouts>,
 }
 
 #[derive(serde::Deserialize)]
-struct AdnlConsoleConfigJson {
-    config: Option<AdnlClientConfigJson>,
-    wallet_id: Option<String>,
-    max_factor: Option<f32>,
+struct ConsoleJson {
+    config: Option<ConnectionJson>,
+}
+
+struct Connection {
+    address: SocketAddr,
+    client: Arc<dyn KeyOption>,
+    server: Arc<dyn KeyOption>,
+    timeouts: Timeouts,
+}
+
+fn fatal(message: String) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2)
+}
+
+/// A key from a file holding the serialized key, as the reference console
+/// reads its key files.
+fn key_file(path: &str, private: bool) -> Res<Arc<dyn KeyOption>> {
+    let data = read_file(path).map_err(|e| e.prefix("failed to read: "))?;
+    if private {
+        match import_private_key(&data)? {
+            ton::PrivateKey::Pk_Ed25519(key) => get_key_option_factory()
+                .from_private_key(key.key.as_array())
+                .map_err(|e| Status::error(e.to_string())),
+            _ => Err(Status::error("the console key must be an Ed25519 key")),
+        }
+    } else {
+        let key = deserialize_boxed(&data)
+            .ok()
+            .and_then(|object| object.downcast::<ton::PublicKey>().ok())
+            .ok_or_else(|| Status::error("bad public key"))?;
+        match key {
+            ton::PublicKey::Pub_Ed25519(key) => {
+                Ok(get_key_option_factory().from_public_key(key.key.as_array()))
+            }
+            _ => Err(Status::error("the server key must be an Ed25519 key")),
+        }
+    }
+}
+
+/// The connection from a settings file: `{"config": {"client_key",
+/// "server_address", "server_key"}}`. Without a client key the console
+/// uses a new one.
+fn connection_from_json(text: &[u8]) -> Res<Connection> {
+    let json: ConsoleJson =
+        serde_json::from_slice(text).map_err(|e| Status::error(format!("bad config: {e}")))?;
+    let json = json.config.ok_or_else(|| Status::error("config must hold \"config\""))?;
+    let factory = get_key_option_factory();
+    let client = match &json.client_key {
+        Some(key) => factory.from_private_key_json(key),
+        None => factory.generate(),
+    }
+    .map_err(|e| Status::error(e.to_string()))?;
+    let server =
+        factory.from_public_key_json(&json.server_key).map_err(|e| Status::error(e.to_string()))?;
+    let address = json
+        .server_address
+        .parse()
+        .map_err(|e| Status::error(format!("bad server address: {e}")))?;
+    let timeouts = json.timeouts.unwrap_or_default();
+    Ok(Connection { address, client, server, timeouts })
+}
+
+fn connection(args: &clap::ArgMatches) -> Res<Connection> {
+    if let Some(path) = args.get_one::<String>("config") {
+        return connection_from_json(&read_file(path)?);
+    }
+    let address = args
+        .get_one::<String>("address")
+        .ok_or_else(|| Status::error("server address is not set"))?;
+    let address = std::net::ToSocketAddrs::to_socket_addrs(address.as_str())
+        .ok()
+        .and_then(|mut all| all.next())
+        .ok_or_else(|| Status::error(format!("bad server address {address}")))?;
+    let client = key_file(
+        args.get_one::<String>("key").ok_or_else(|| Status::error("private key is not set"))?,
+        true,
+    )
+    .map_err(|e| Status::error(format!("bad private key: {e}")))?;
+    let server = key_file(
+        args.get_one::<String>("pub")
+            .ok_or_else(|| Status::error("server public key is not set"))?,
+        false,
+    )
+    .map_err(|e| Status::error(format!("bad server public key: {e}")))?;
+    Ok(Connection { address, client, server, timeouts: Timeouts::default() })
+}
+
+fn args() -> clap::ArgMatches {
+    clap::Command::new("console")
+        .about("console for validator for TOS Blockchain")
+        .version(env!("CARGO_PKG_VERSION"))
+        .arg(
+            clap::Arg::new("address").short('a').long("address").help("server address").num_args(1),
+        )
+        .arg(clap::Arg::new("key").short('k').long("key").help("private key").num_args(1))
+        .arg(clap::Arg::new("pub").short('p').long("pub").help("server public key").num_args(1))
+        .arg(
+            clap::Arg::new("config")
+                .short('C')
+                .long("config")
+                .help("connection settings file: client key, server address and server key")
+                .num_args(1),
+        )
+        .arg(
+            clap::Arg::new("disable-readline")
+                .short('r')
+                .long("disable-readline")
+                .help("disable readline")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("enable-readline")
+                .short('R')
+                .long("enable-readline")
+                .help("enable readline")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("verbosity")
+                .short('v')
+                .long("verbosity")
+                .help("set verbosity level")
+                .num_args(1)
+                .value_parser(|value: &str| match integer::<i32>(value) {
+                    Ok(level @ 0..=9) => Ok(level),
+                    _ => Err("verbosity must be 0..9".to_string()),
+                }),
+        )
+        .arg(
+            clap::Arg::new("cmd")
+                .short('c')
+                .long("cmd")
+                .help("schedule command")
+                .allow_hyphen_values(true)
+                .action(clap::ArgAction::Append)
+                .num_args(1),
+        )
+        .arg(
+            clap::Arg::new("timeout")
+                .short('t')
+                .long("timeout")
+                .help("timeout in batch mode")
+                .num_args(1)
+                .value_parser(|value: &str| value.parse::<f64>().map_err(|e| e.to_string())),
+        )
+        .get_matches()
+}
+
+/// Connects, retrying until the server answers, as the reference client
+/// keeps reconnecting.
+async fn connect(connection: &Connection) -> AdnlClient {
+    let config = AdnlClientConfig::new(
+        Some(connection.client.clone()),
+        connection.address,
+        connection.server.clone(),
+        connection.timeouts.clone(),
+    );
+    loop {
+        match AdnlClient::connect(&config).await {
+            Ok(client) => return client,
+            Err(error) => {
+                log::debug!("connection to {} failed: {error}", connection.address);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+fn say(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    // A closed output is not the console's failure to report.
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
+}
+
+async fn console(args: clap::ArgMatches) -> i32 {
+    let connection = match connection(&args) {
+        Ok(connection) => connection,
+        Err(status) => fatal(status.message),
+    };
+    let commands: VecDeque<String> =
+        args.get_many::<String>("cmd").map(|all| all.cloned().collect()).unwrap_or_default();
+    let batch = !commands.is_empty();
+    say(&format!(
+        "connecting to [{}]\nlocal key: {}\nremote key: {}\n",
+        connection.address,
+        hex_upper(connection.client.id().data()),
+        hex_upper(connection.server.id().data()),
+    ));
+    let mut port = ControlPort { adnl: connect(&connection).await };
+    say("conn ready\n");
+    if batch {
+        run_batch(commands, &mut port).await
+    } else {
+        run_interactive(&mut port).await
+    }
+}
+
+/// Runs the scheduled commands in order. A failure exits with 2. A line
+/// that is not a command stops the run; with nothing after it the console
+/// exits with 0, otherwise it waits, as the reference console does.
+async fn run_batch(mut commands: VecDeque<String>, transport: &mut dyn Transport) -> i32 {
+    while let Some(line) = commands.pop_front() {
+        let (text, outcome) = run_line(&line, transport).await;
+        say(&text);
+        match outcome {
+            Outcome::Done => {}
+            Outcome::Failed => return 2,
+            Outcome::Quit => return 0,
+            Outcome::Unknown if commands.is_empty() => return 0,
+            Outcome::Unknown => std::future::pending::<()>().await,
+        }
+    }
+    0
+}
+
+async fn run_interactive(transport: &mut dyn Transport) -> i32 {
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(line) = lines.recv().await {
+        let (text, outcome) = run_line(&line, transport).await;
+        say(&text);
+        if outcome == Outcome::Quit {
+            break;
+        }
+    }
+    0
 }
 
 #[tokio::main]
 async fn main() {
-    // init_test_log();
-    let args = clap::Command::new(env!("CARGO_PKG_NAME"))
-        .version(env!("CARGO_PKG_VERSION"))
-        .arg(
-            clap::Arg::new("CONFIG")
-                .short('C')
-                .long("config")
-                .help("config for console")
-                .required(true)
-                .default_value("console.json")
-                .num_args(1),
-        )
-        .arg(
-            clap::Arg::new("COMMANDS")
-                .allow_hyphen_values(true)
-                .short('c')
-                .long("cmd")
-                .help("schedule command")
-                .action(clap::ArgAction::Append)
-                .num_args(1..),
-        )
-        .arg(
-            clap::Arg::new("TIMEOUT")
-                .short('t')
-                .long("timeout")
-                .help("timeout in batch mode")
-                .num_args(1),
-        )
-        .arg(
-            clap::Arg::new("VERBOSE")
-                .long("verbose")
-                .help("verbose regim")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            clap::Arg::new("JSON")
-                .short('j')
-                .long("json")
-                .help("output in json format")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .get_matches();
-
-    if !args.get_flag("JSON") {
-        println!(
-            "RTOS node console {}\nCOMMIT_ID: {}\nBUILD_DATE: {}\nCOMMIT_DATE: {}\nGIT_BRANCH: {}",
-            env!("CARGO_PKG_VERSION"),
-            env!("BUILD_GIT_COMMIT"),
-            env!("BUILD_TIME"),
-            env!("BUILD_GIT_DATE"),
-            env!("BUILD_GIT_BRANCH")
-        );
-    }
-
-    if args.get_flag("VERBOSE") {
-        let encoder_boxed = Box::new(log4rs::encode::pattern::PatternEncoder::new("{m}{n}"));
-        let console =
-            log4rs::append::console::ConsoleAppender::builder().encoder(encoder_boxed).build();
-        let config = log4rs::config::Config::builder()
-            .appender(log4rs::config::Appender::builder().build("console", Box::new(console)))
-            .build(
-                log4rs::config::Root::builder().appender("console").build(log::LevelFilter::Trace),
-            )
-            .unwrap();
-        log4rs::init_config(config).unwrap();
-    }
-
-    let config = args.get_one::<String>("CONFIG").expect("required set for config");
-    let config = std::fs::read_to_string(config)
-        .unwrap_or_else(|_| panic!("Can't read config file {}", config));
-    let config = serde_json::from_str(&config).expect("Can't parse config");
-    let timeout = match args.get_one::<String>("TIMEOUT") {
-        Some(timeout) => u64::from_str(timeout).expect("timeout must be set in microseconds"),
-        None => 0,
-    };
-    let timeout = Duration::from_micros(timeout);
-    let mut client = ControlClient::connect(config).await.expect("Can't create client");
-    if let Some(commands) = args.get_many::<String>("COMMANDS") {
-        // batch mode - call commands and exit
-        for command in commands {
-            match client.command(command.trim_matches('\"')).await {
-                Ok((result, _)) => println!("{}", result),
-                Err(err) => panic!("Error executing command: {}", err),
-            }
-            tokio::time::sleep(timeout).await;
-        }
-    } else {
-        // interactive mode
-        loop {
-            let mut line = String::default();
-            std::io::stdin().read_line(&mut line).expect("Can't read line from stdin");
-            match line.trim_end() {
-                "" => continue,
-                "quit" => break,
-                command => match client.command(command).await {
-                    Ok((result, _)) => println!("{}", result),
-                    Err(err) => println!("{}", err),
-                },
-            }
+    let args = args();
+    // The batch deadline exits with 7 wherever the console is.
+    if let Some(seconds) = args.get_one::<f64>("timeout").copied() {
+        // A deadline too far to represent never comes.
+        if let Ok(delay) = Duration::try_from_secs_f64(seconds.max(0.0)) {
+            let deadline = Instant::now() + delay;
+            std::thread::spawn(move || {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                std::process::exit(7);
+            });
         }
     }
-    client.shutdown().await.ok();
+    let code = console(args).await;
+    std::process::exit(code);
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
 
     use super::*;
     use rtos::{
@@ -876,7 +1332,7 @@ mod test {
         engine_traits::{EngineAlloc, EngineOperations},
         internal_db::{state_gc_resolver::AllowStateGcSmartResolver, InternalDb, InternalDbConfig},
         network::{
-            control::{ControlServer, DataSource},
+            control::{encrypt_for, ControlServer, DataSource},
             node_network::NodeNetwork,
         },
         shard_state::ShardStateStuff,
@@ -885,22 +1341,19 @@ mod test {
     };
     #[cfg(feature = "telemetry")]
     use rtos::{collator_test_bundle::create_engine_telemetry, engine_traits::EngineTelemetry};
-    use rtos_api::deserialize_boxed;
     use rtos_block::{
-        Account, AccountId, AccountIdPrefixFull, AccountStorage, Block, BlockInfo, BlockLimits,
-        Cell, CurrencyCollection, HashmapAugType, Message, MsgAddressInt, ParamLimits,
-        ShardAccounts, ShardIdent, ShardStateUnsplit, StateInit, StorageInfo, TickTock,
+        base64_decode as std_base64_decode, error, fail, write_boc, Account, AccountId,
+        AccountIdPrefixFull, AccountStorage, Block, BlockIdExt, BlockInfo, Cell,
+        CurrencyCollection, Deserializable, HashmapAugType, IBitstring, Message, MsgAddressInt,
+        Result, Serializable, ShardAccount, ShardAccounts, ShardIdent, ShardStateUnsplit,
+        SliceData, StateInit, StorageInfo, TickTock,
     };
     use std::{
         collections::HashMap,
         fs,
         path::Path,
-        sync::{
-            atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering},
-            Arc,
-        },
+        sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering},
         thread,
-        time::Duration,
     };
     use storage::block_handle_db::BlockHandle;
 
@@ -1040,7 +1493,7 @@ mod test {
             )?;
             ss.write_custom(Some(&ms))?;
             let address = MsgAddressInt::standard(-1, config_addr.clone());
-            let public_key = base64_decode(PUBLIC_CONFIG_KEY).unwrap();
+            let public_key = std_base64_decode(PUBLIC_CONFIG_KEY).unwrap();
             let mut builder = 7u32.write_to_new_cell()?; // seqno
             builder.append_raw(&public_key, 256)?;
             builder.append_bit_zero()?;
@@ -1513,7 +1966,7 @@ mod test {
 
     async fn init_test(
         counter: Option<Arc<AtomicU64>>,
-    ) -> (ControlServer, ControlClient, Arc<TestEngine>) {
+    ) -> (ControlServer, ControlPort, Arc<TestEngine>, String) {
         // init_test_log();
         static INDEX: AtomicU16 = AtomicU16::new(0);
         let index = INDEX.fetch_add(1, Ordering::Relaxed);
@@ -1563,14 +2016,14 @@ mod test {
         .await
         .unwrap();
         let adnl_client_config = ADNL_CLIENT_CONFIG.replace(":control_port", &control_port);
-        let config = serde_json::from_str(&adnl_client_config).unwrap();
-        let client = ControlClient::connect(config).await.unwrap();
-        (server, client, engine)
+        let connection = connection_from_json(adnl_client_config.as_bytes()).unwrap();
+        let client = ControlPort { adnl: connect(&connection).await };
+        (server, client, engine, connection.address.to_string())
     }
 
-    async fn done_test(server: ControlServer, client: ControlClient, engine: Arc<TestEngine>) {
+    async fn done_test(server: ControlServer, client: ControlPort, engine: Arc<TestEngine>) {
         server.shutdown().await;
-        client.shutdown().await.ok();
+        client.adnl.shutdown().await.ok();
         engine.stop().await;
         let db_path = format!("{}{}", DB_PATH, engine.index);
         drop(engine);
@@ -1583,308 +2036,519 @@ mod test {
         }
     }
 
-    async fn test_one_cmd(cmd: &str, check_result: impl FnOnce(Vec<u8>)) {
-        let (server, mut client, engine) = init_test(None).await;
-        let (answer, result) = client.command(cmd).await.unwrap();
-        println!("{} => {}", cmd, answer);
-        check_result(result);
-        done_test(server, client, engine).await;
+    const PUBLIC_CONFIG_KEY: &str = "y+54dF9ZIQoIRQuH2+wE10fF5SV4GWrEv9m0lXHEmLU=";
+
+    /// Reference console runs: command, exit code, output.
+    const REFERENCE: &str = include_str!("../src/tests/data/control-surface/cpp-console.tsv");
+    /// The files those runs read, as the reference console read them.
+    const CASES: &str = "src/tests/data/control-surface/console";
+    const CASE_PREFIX: &str = "cases/console2/";
+
+    fn unescape(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        }
+        out
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_new_key_one() {
-        let cmd = "newkey";
-        test_one_cmd(cmd, |result| assert_eq!(result.len(), 32)).await;
+    fn reference_rows() -> Vec<(String, i32, String)> {
+        REFERENCE
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let command = unescape(fields.next().unwrap());
+                let exit = fields.next().unwrap().parse().unwrap();
+                let output = unescape(fields.next().unwrap_or(""));
+                (command, exit, output)
+            })
+            .collect()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_stats() {
-        fn check(result: Vec<u8>, ethalon: &[(&str, &str)]) {
-            let stats = deserialize_boxed(&result).unwrap();
-            let stats = downcast::<rtos_api::ton::engine::validator::Stats>(stats).unwrap();
-            // check if stats in JSON
-            let json = format!("{:#}", stats_to_json(stats.stats().iter()));
-            serde_json::from_str::<serde_json::Value>(&json)
-                .unwrap_or_else(|e| panic!("it must be JSON {e}"));
-            for stat in stats.stats().iter() {
-                match ethalon.iter().find(|(key, _)| key == &stat.key) {
-                    Some((name, value)) => assert_eq!(&stat.value, value, "for {}", name),
-                    None => println!("unknown stats: {} => {}", stat.key, stat.value),
+    fn exit_code(outcome: &Outcome) -> i32 {
+        match outcome {
+            Outcome::Failed => 2,
+            _ => 0,
+        }
+    }
+
+    /// The status a reference failure line reports.
+    fn reported_status(output: &str) -> Status {
+        let inner = output
+            .split_once(" query: [Error : ")
+            .map(|(_, rest)| rest.trim_end_matches("]\n"))
+            .unwrap();
+        let (code, message) = inner.split_once(" : ").unwrap();
+        Status::with_code(code.parse().unwrap(), message)
+    }
+
+    /// Rows whose failure the reference server reported.
+    const SERVER_FAILURES: &[&str] = &[
+        "export-pub 3333",
+        "export-pub 9UmV",
+        "del-temp-key ",
+        "set-verbosity 11",
+        "add-custom-overlay cases/console2/ov1.json",
+        "add-custom-overlay cases/console2/ov2.json",
+        "del-custom-overlay ",
+    ];
+
+    /// Rows where this console's answer differs, with the reason.
+    const KNOWN_DIFFERENCES: &[(&str, &str)] = &[(
+        "add-custom-overlay cases/console2/malformed.json",
+        "the JSON parser's own message for a malformed file",
+    )];
+
+    /// Answers each query as the reference server answered it in the
+    /// recorded run, and keeps the query.
+    struct Replay {
+        command: String,
+        output: String,
+        cases: std::path::PathBuf,
+        sent: Vec<TLObject>,
+        overlay: Option<ton::engine::validator::customoverlay::CustomOverlay>,
+    }
+
+    impl Replay {
+        fn answer(&self, function: &TLObject) -> Res<Vec<u8>> {
+            let command = self.command.as_str();
+            if SERVER_FAILURES.iter().any(|prefix| command.starts_with(prefix)) {
+                if let Some(path) = self.output.split("keyring/").nth(1) {
+                    // The key the reference server looked for is the one sent.
+                    let sent = function.clone().downcast::<ExportPublicKey>().unwrap();
+                    assert_eq!(hex_upper(sent.key_hash.as_slice()), path[..64], "{command}");
+                }
+                return Err(reported_status(&self.output));
+            }
+            if command == "new-key" {
+                let hash = self.output.trim_end().rsplit(' ').next().unwrap();
+                let key_hash = UInt256::from_slice(&hex::decode(hash).unwrap());
+                return Ok(serialize_boxed(
+                    &ton::engine::validator::keyhash::KeyHash { key_hash }.into_boxed(),
+                )
+                .unwrap());
+            }
+            if command.starts_with("export-pub ") {
+                let text = self.output.trim_end().rsplit(' ').next().unwrap();
+                return Ok(base64_decode(text).unwrap());
+            }
+            if command.starts_with("export-pubf ") {
+                return Ok(fs::read(self.cases.join("pub.out")).unwrap());
+            }
+            if command.starts_with("sign ") || command.starts_with("sign-f ") {
+                let signature = if command.starts_with("sign ") {
+                    base64_decode(self.output.trim_end().rsplit(' ').next().unwrap()).unwrap()
+                } else {
+                    fs::read(self.cases.join("sig.out")).unwrap()
+                };
+                return Ok(serialize_boxed(
+                    &ton::engine::validator::signature::Signature { signature }.into_boxed(),
+                )
+                .unwrap());
+            }
+            if command == "get-time" {
+                let time = self.output.trim_end().rsplit('=').next().unwrap().parse().unwrap();
+                return Ok(serialize_boxed(
+                    &ton::engine::validator::time::Time { time }.into_boxed(),
+                )
+                .unwrap());
+            }
+            if command == "show-custom-overlays" {
+                let overlays = self.overlay.clone().into_iter().collect::<Vec<_>>();
+                return Ok(serialize_boxed(
+                    &ton::engine::validator::customoverlaysconfig::CustomOverlaysConfig {
+                        overlays: overlays.into(),
+                    }
+                    .into_boxed(),
+                )
+                .unwrap());
+            }
+            if command.starts_with("export-all-private-keys ") {
+                let query = function.clone().downcast::<ExportAllPrivateKeys>().unwrap();
+                let ton::PublicKey::Pub_Ed25519(key) = query.encryption_key else {
+                    panic!("an Ed25519 encryption key");
+                };
+                let mut plain = Vec::new();
+                for key in exported_keys() {
+                    let bytes = serialize_boxed(&key).unwrap();
+                    plain.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    plain.extend_from_slice(&bytes);
+                }
+                plain.extend_from_slice(&[0x5a; 32]);
+                let encrypted_data = encrypt_for(key.key.as_slice(), &plain).unwrap();
+                return Ok(serialize_boxed(
+                    &ton::engine::validator::exportedprivatekeys::ExportedPrivateKeys {
+                        encrypted_data,
+                    }
+                    .into_boxed(),
+                )
+                .unwrap());
+            }
+            // Everything else the reference server answered with success.
+            Ok(serialize_boxed(&ton::engine::validator::Success::Engine_Validator_Success).unwrap())
+        }
+    }
+
+    /// Keys for the export run, ordered by hash as the server orders them.
+    fn exported_keys() -> Vec<ton::PrivateKey> {
+        let mut keys: Vec<ton::PrivateKey> = (1u8..=4)
+            .map(|seed| {
+                ton::PrivateKey::Pk_Ed25519(ton::pk::privatekey::Ed25519 {
+                    key: UInt256::from([seed; 32]),
+                })
+            })
+            .collect();
+        keys.sort_by_key(|key| private_key_hash(key).unwrap());
+        keys
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for Replay {
+        async fn send(&mut self, function: &TLObject) -> Res<Vec<u8>> {
+            if let Ok(query) = function.clone().downcast::<AddCustomOverlay>() {
+                if self.overlay.is_none() {
+                    self.overlay = Some(query.overlay.clone());
+                }
+            }
+            self.sent.push(function.clone());
+            self.answer(function)
+        }
+    }
+
+    /// Copies the cases; a binary case is kept as `NAME.hex` and becomes
+    /// `NAME` again.
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let name = entry.file_name().into_string().unwrap();
+            match name.strip_suffix(".hex") {
+                Some(binary) => {
+                    let text = fs::read_to_string(entry.path()).unwrap();
+                    fs::write(to.join(binary), hex::decode(text.trim()).unwrap()).unwrap();
+                }
+                None => {
+                    fs::copy(entry.path(), to.join(&name)).unwrap();
                 }
             }
         }
-
-        let ethalon_stats = [
-            ("in_current_vset_p34", "false"),
-            ("in_next_vset_p36", "false"),
-            ("validation_stats", "{}"),
-            ("collation_stats", "{}"),
-            ("masterchainblocknumber", "19"),
-            ("masterchainblocktime", "19"),
-            ("sync_status", "\"no_set_status\""),
-            ("public_overlay_key_id", "\"b52Bb8xv6roWwIDGQnBIdL7hsl3Sy3Ro9ITEV9UlIz8=\""),
-            ("tps_10", "0"),
-            ("tps_300", "0"),
-            ("validation_status", "\"Active\""),
-        ];
-        test_one_cmd("getstats", |result| check(result, &ethalon_stats)).await;
     }
 
+    /// Every recorded reference command line gives the reference output and
+    /// exit code here, and reaches the server exactly when the reference
+    /// console did.
+    #[tokio::test]
+    async fn console_lines_answer_as_the_reference_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = dir.path().join("cases");
+        copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join(CASES), &cases);
+        let prefix = format!("{}/", cases.display());
+        let mut overlay = None;
+        let mut checked = 0;
+        for (command, exit, expected) in reference_rows() {
+            let line = command.replace(CASE_PREFIX, &prefix);
+            let expected_here = expected.replace(CASE_PREFIX, &prefix);
+            let mut replay = Replay {
+                command: command.clone(),
+                output: expected.clone(),
+                cases: cases.clone(),
+                sent: Vec::new(),
+                overlay: overlay.clone(),
+            };
+            let (output, outcome) = run_line(&line, &mut replay).await;
+            if replay.overlay.is_some() {
+                overlay = replay.overlay.clone();
+            }
+            if let Some((_, why)) = KNOWN_DIFFERENCES.iter().find(|(c, _)| *c == command) {
+                assert!(
+                    output.starts_with("Failed add-custom-overlay query: [Error : 0 : "),
+                    "{why}"
+                );
+                assert_eq!(exit_code(&outcome), exit, "{command}");
+                continue;
+            }
+            if command.starts_with("export-all-private-keys ") {
+                let mut lines = format!("exported {} private keys\n", exported_keys().len());
+                for key in exported_keys() {
+                    lines.push_str(&format!(
+                        "pubkey_hash {}\n",
+                        hex_upper(&private_key_hash(&key).unwrap())
+                    ));
+                }
+                lines.push_str(&format!("written all files to {}exported\n", prefix));
+                assert_eq!(output, lines, "{command}");
+                // The reference output has the same shape.
+                assert_eq!(expected.lines().count(), 6);
+                for key in exported_keys() {
+                    let hash = hex_upper(&private_key_hash(&key).unwrap());
+                    let path = cases.join("exported").join(&hash);
+                    assert_eq!(fs::read(&path).unwrap(), serialize_boxed(&key).unwrap());
+                    let mode = fs::metadata(&path).unwrap().permissions();
+                    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o600);
+                }
+                checked += 1;
+                continue;
+            }
+            assert_eq!(output, expected_here, "{command}");
+            assert_eq!(exit_code(&outcome), exit, "{command}");
+            let reaches_server = !expected.starts_with("Failed ")
+                || SERVER_FAILURES.iter().any(|p| command.starts_with(p))
+                || command.contains("/nonexistent-dir/");
+            let local = ["help", "license", "quit", "bogus-cmd"];
+            let reaches_server = reaches_server
+                && !local.iter().any(|name| command.split(' ').next() == Some(*name));
+            assert_eq!(!replay.sent.is_empty(), reaches_server, "{command}");
+            checked += 1;
+        }
+        assert!(checked >= 50, "{checked} rows checked");
+    }
+
+    /// The listing the reference console printed for two overlays, one with
+    /// sender shards and flags and one with neither.
+    #[test]
+    fn custom_overlays_list_as_the_reference_console_lists_them() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(CASES);
+        let overlays = ["ov1.json", "ov3.json"]
+            .iter()
+            .map(|name| {
+                let json: serde_json::Value =
+                    serde_json::from_slice(&fs::read(dir.join(name)).unwrap()).unwrap();
+                tl_json::custom_overlay(json.as_object().unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let config = ton::engine::validator::customoverlaysconfig::CustomOverlaysConfig {
+            overlays: overlays.into(),
+        };
+        let expected =
+            include_str!("../src/tests/data/control-surface/cpp-show-custom-overlays.txt");
+        assert_eq!(show_custom_overlays(&config), expected);
+    }
+
+    #[test]
+    fn file_errors_print_as_reference_os_errors() {
+        let error = read_file("/nonexistent-dir/x").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[PosixError : No such file or directory : 2 : File \"/nonexistent-dir/x\" can't be \
+             opened for reading]"
+        );
+    }
+
+    #[test]
+    fn base64_follows_the_reference_rules() {
+        assert_eq!(base64_decode("QUJD").unwrap(), b"ABC");
+        assert_eq!(base64_decode("QUI=").unwrap(), b"AB");
+        assert_eq!(base64_decode("QQ==").unwrap(), b"A");
+        for (text, error) in [
+            ("QQ===", "Wrong string padding"),
+            ("QUJ", "Wrong padding length"),
+            ("QU*D", "Wrong character in the string"),
+            ("QR==", "Wrong padding in the string"),
+            ("QUN=", "Wrong padding in the string"),
+        ] {
+            assert_eq!(base64_decode(text).unwrap_err().message, error, "{text}");
+        }
+    }
+
+    #[test]
+    fn integers_must_be_canonical() {
+        assert_eq!(integer::<u32>("4294967295").unwrap(), u32::MAX);
+        assert_eq!(integer::<i32>("-5").unwrap(), -5);
+        for word in ["+5", "05", "-0", "4294967296", "1.0", "x"] {
+            assert_eq!(
+                integer::<u32>(word).unwrap_err().message,
+                format!("Can't parse \"{word}\" as number")
+            );
+        }
+        assert!(integer::<i32>("-0").is_err());
+    }
+
+    async fn pending_finishes(commands: &[&str], transport: &mut Replay) -> Option<i32> {
+        let commands = commands.iter().map(|c| c.to_string()).collect();
+        tokio::time::timeout(Duration::from_millis(300), run_batch(commands, transport)).await.ok()
+    }
+
+    fn replay(command: &str, output: &str) -> Replay {
+        Replay {
+            command: command.to_string(),
+            output: output.to_string(),
+            cases: std::path::PathBuf::new(),
+            sent: Vec::new(),
+            overlay: None,
+        }
+    }
+
+    /// The reference batch rules: a failure exits with 2 at once, quit exits
+    /// with 0 at once, and a line that is not a command ends the run with 0
+    /// only when nothing follows it.
+    #[tokio::test]
+    async fn batch_runs_stop_as_the_reference_console_stops() {
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(
+            pending_finishes(&["set-verbosity 3", "set-verbosity 4"], &mut ok).await,
+            Some(0)
+        );
+        assert_eq!(ok.sent.len(), 2);
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(
+            pending_finishes(&["set-verbosity 3", "quit", "set-verbosity 4"], &mut ok).await,
+            Some(0)
+        );
+        assert_eq!(ok.sent.len(), 1);
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(
+            pending_finishes(&["set-verbosity x", "set-verbosity 4"], &mut ok).await,
+            Some(2)
+        );
+        assert!(ok.sent.is_empty());
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(pending_finishes(&["set-verbosity 3", "bogus"], &mut ok).await, Some(0));
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(pending_finishes(&["bogus", "set-verbosity 3"], &mut ok).await, None);
+        assert!(ok.sent.is_empty());
+        let mut ok = replay("add-adnl", "success\n");
+        assert_eq!(pending_finishes(&["", "set-verbosity 3"], &mut ok).await, None);
+    }
+
+    /// The console against this node's control port: keys, signing, time and
+    /// statistics answer in the reference form.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_election_bid() {
-        const OUT_FILE: &str = "../target/test_election_bid_file.boc";
-        let now = UnixTime::now() + 86400;
-        let cmd = format!("election-bid {} {} \"{}\"", now, now + 10001, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 164);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
+    async fn console_drives_the_control_port() {
+        let (server, mut client, engine, _) = init_test(None).await;
+        let (created, outcome) = run_line("new-key", &mut client).await;
+        assert_eq!(outcome, Outcome::Done, "{created}");
+        let hash = created.strip_prefix("created new key ").unwrap().trim_end().to_string();
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash, hash.to_uppercase());
+        let (public, _) = run_line(&format!("export-pub {hash}"), &mut client).await;
+        let public = public.strip_prefix("got public key: ").unwrap().trim_end();
+        let public = base64_decode(public).unwrap();
+        let key = deserialize_boxed(&public).unwrap().downcast::<ton::PublicKey>().unwrap();
+        let ton::PublicKey::Pub_Ed25519(key) = key else { panic!("an Ed25519 key") };
+        let (signed, _) = run_line(&format!("sign {hash} 616263"), &mut client).await;
+        let signature =
+            base64_decode(signed.strip_prefix("got signature ").unwrap().trim_end()).unwrap();
+        get_key_option_factory()
+            .from_public_key(key.key.as_array())
+            .verify(b"abc", &signature)
+            .unwrap();
+        let (time, _) = run_line("get-time", &mut client).await;
+        assert!(time.starts_with("received validator time: time="), "{time}");
+        let (stats, outcome) = run_line("get-stats", &mut client).await;
+        assert_eq!(outcome, Outcome::Done, "{stats}");
+        assert!(stats.starts_with("unixtime\t\t\t"), "{stats}");
+        assert!(stats.contains("\nmasterchainblocktime\t\t\t19\n"), "{stats}");
+        let (added, _) =
+            run_line(&format!("add-perm-key {hash} 100 2000000000"), &mut client).await;
+        assert_eq!(added, "success\n");
+        let (missing, outcome) = run_line(
+            "export-pub 3333333333333333333333333333333333333333333333333333333333333333",
+            &mut client,
+        )
         .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_recover_stake() {
-        const OUT_FILE: &str = "../target/test_recover_stake_file.boc";
-        let cmd = format!("recover_stake \"{}\"", OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 25);
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_config_param() {
-        const IN_FILE: &str = "../target/zerostate.json";
-        const OUT_FILE: &str = "../target/test_config_param_file.boc";
-        std::fs::write(IN_FILE, SAMPLE_ZERO_STATE).unwrap();
-        let cmd = format!("cparam 23 \"{}\" \"{}\"", IN_FILE, OUT_FILE);
-        test_one_cmd(&cmd, |result| {
-            assert_eq!(result.len(), 53);
-            let limits = BlockLimits::construct_from_bytes(&result).unwrap();
-            assert_eq!(limits.bytes(), &ParamLimits::with_limits(131072, 524288, 1048576).unwrap());
-            assert_eq!(limits.gas(), &ParamLimits::with_limits(900000, 1200000, 2000000).unwrap());
-            assert_eq!(limits.lt_delta(), &ParamLimits::with_limits(1000, 5000, 10000).unwrap());
-            fs::remove_file(IN_FILE).unwrap();
-            fs::remove_file(OUT_FILE).unwrap();
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_new_key_with_export() {
-        let (server, mut client, engine) = init_test(None).await;
-        let (_, result) = client.command("newkey").await.unwrap();
-        assert_eq!(result.len(), 32);
-        let cmd = format!("exportpub {}", base64_encode(&result));
-        let (_, result) = client.command(&cmd).await.unwrap();
-        assert_eq!(result.len(), 32);
+        assert_eq!(outcome, Outcome::Failed);
+        assert!(
+            missing.starts_with("Failed export-pub query: [Error : 2 : key not in db"),
+            "{missing}"
+        );
+        // A key file in the reference form imports under its hash.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("k.pk");
+        let key = ton::PrivateKey::Pk_Ed25519(ton::pk::privatekey::Ed25519 {
+            key: UInt256::from([9; 32]),
+        });
+        fs::write(&file, serialize_boxed(&key).unwrap()).unwrap();
+        let (imported, _) = run_line(&format!("import-f {}", file.display()), &mut client).await;
+        assert_eq!(
+            imported,
+            format!("imported key {}\n", hex_upper(&private_key_hash(&key).unwrap()))
+        );
         done_test(server, client, engine).await;
     }
 
-    macro_rules! parse_test {
-        ($func:expr, $param:expr) => {
-            $func($param.split_whitespace().next(), "test")
+    /// The reference console against this node's control port gives what
+    /// this console gives. Runs when RTOS_REFERENCE_CONSOLE names the
+    /// reference console binary. It fails today: the reference console
+    /// proves its key through TCP authentication over an ephemeral
+    /// handshake key, and the control server still takes the client's
+    /// identity from the handshake, so it refuses the console as unlisted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reference_console_reads_this_node_as_this_console_does() {
+        let Ok(binary) = std::env::var("RTOS_REFERENCE_CONSOLE") else {
+            eprintln!("RTOS_REFERENCE_CONSOLE is not set: skipped");
+            return;
         };
-    }
-
-    #[test]
-    fn test_parse_int() {
-        assert_eq!(parse_test!(parse_int, "0").unwrap(), 0);
-        assert_eq!(parse_test!(parse_int, "-1").unwrap(), -1);
-        assert_eq!(parse_test!(parse_int, "1600000000").unwrap(), 1600000000);
-        parse_test!(parse_int, "qwe").expect_err("must generate error");
-        parse_int(Option::<&str>::None, "test").expect_err("must generate error");
-    }
-
-    #[test]
-    fn test_parse_int256() {
-        let ethalon = "GfgI79Xf3q7r4q1SPz7wAqBt0W6CjavuADODoz/DQE8=";
-        assert_eq!(
-            parse_test!(parse_int256, ethalon).unwrap(),
-            ethalon.parse::<UInt256>().unwrap()
-        );
-        assert_eq!(
-            parse_test!(
-                parse_int256,
-                "19F808EFD5DFDEAEEBE2AD523F3EF002A06DD16E828DABEE003383A33FC3404F"
-            )
+        let (server, mut client, engine, address) = init_test(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client_key = dir.path().join("client.pk");
+        let server_key = dir.path().join("server.pub");
+        let client_secret: [u8; 32] =
+            std_base64_decode("oEivbTDjSOSCgooUM0DAS2z2hIdnLw/PT82A/OFLDmA=")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let server_public: [u8; 32] =
+            std_base64_decode("cujCRU4rQbSw48yHVHxQtRPhUlbo+BuZggFTQSu04Y8=")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        fs::write(
+            &client_key,
+            serialize_boxed(&ton::PrivateKey::Pk_Ed25519(ton::pk::privatekey::Ed25519 {
+                key: UInt256::from(client_secret),
+            }))
             .unwrap(),
-            ethalon.parse::<UInt256>().unwrap()
-        );
-        parse_test!(parse_int256, "11").expect_err("must generate error");
-        parse_int256(Option::<&str>::None, "test").expect_err("must generate error");
-    }
-
-    #[test]
-    fn test_parse_data() {
-        let ethalon = vec![10, 77];
-        assert_eq!(parse_test!(parse_data, "0A4D").unwrap(), ethalon);
-        parse_test!(parse_data, "QQ").expect_err("must generate error");
-        parse_test!(parse_data, "GfgI79Xf3q7r4q1SPz7wAqBt0W6CjavuADODoz/DQE8=")
-            .expect_err("must generate error");
-        parse_data(Option::<&str>::None, "test").expect_err("must generate error");
-    }
-
-    #[test]
-    fn test_stats_to_json() {
-        let mut stats = [OneStat { key: "key".to_string(), value: String::new() }];
-        let value = stats_to_json(stats.iter());
-        let ethalon = serde_json::json!({"key": "null"});
-        assert_eq!(ethalon, value);
-
-        stats[0].value = "12345".into();
-        let value = stats_to_json(stats.iter());
-        let ethalon = serde_json::json!({"key": 12345});
-        assert_eq!(ethalon, value);
-
-        stats[0].value = "\"Some text\"".into();
-        let value = stats_to_json(stats.iter());
-        let ethalon = serde_json::json!({"key": "Some text"});
-        assert_eq!(ethalon, value);
-
-        stats[0].value = "\"777\"".into();
-        let value = stats_to_json(stats.iter());
-        let ethalon = serde_json::json!({"key": "777"});
-        assert_eq!(ethalon, value);
-
-        stats[0].value = serde_json::json!({"a": 777}).to_string();
-        let value = stats_to_json(stats.iter());
-        let ethalon = serde_json::json!({"key": {"a": 777}});
-        assert_eq!(ethalon, value);
-    }
-
-}
-
-#[cfg(test)]
-mod certificate_command_tests {
-    use super::*;
-
-    fn words(line: &str) -> Vec<String> {
-        shell_words::split(line).unwrap()
-    }
-
-    fn v1_certificate() -> ton::overlay::Certificate {
-        ton::overlay::certificate::Certificate {
-            issued_by: ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
-                key: UInt256::from([7; 32]),
-            }),
-            expire_at: 1_700_000_000,
-            max_size: 1 << 24,
-            signature: vec![9; 64].into(),
-        }
-        .into_boxed()
-    }
-
-    #[test]
-    fn shards_parse_in_every_reference_form() {
-        for (line, expected) in [
-            ("0 -9223372036854775808", (0, i64::MIN)),
-            ("-1 -9223372036854775808", (-1, i64::MIN)),
-            ("0:8000000000000000", (0, i64::MIN)),
-            ("(0,4000000000000000)", (0, 0x4000000000000000)),
-            ("-1,8000000000000000", (-1, i64::MIN)),
-        ] {
-            assert_eq!(parse_shard(&mut words(line).into_iter()).unwrap(), expected, "{line}");
-        }
-        for bad in ["0:80", "x:8000000000000000", "0 x", ""] {
-            assert!(parse_shard(&mut words(bad).into_iter()).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn sign_sends_wire_integers_and_saves_the_reply_byte_exact() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("cert.bin");
-        let key = "11".repeat(32);
-        let line = format!("0:8000000000000000 {key} -5 4294967295 {}", out.display());
-        let query = command_send("sign-shard-overlay-cert", &mut words(&line).into_iter())
-            .unwrap()
-            .downcast::<ton::rpc::engine::validator::SignShardOverlayCertificate>()
-            .unwrap();
-        assert_eq!((query.workchain, query.shard), (0, i64::MIN));
-        assert_eq!((query.expire_at, query.max_size), (-5, -1));
-        assert_eq!(query.signed_key.key_hash(), &UInt256::from([0x11; 32]));
-        // The output file holds the reply bytes exactly.
-        let reply = v1_certificate();
-        let expected = serialize_boxed(&reply).unwrap();
-        let (message, data) = command_receive(
-            "sign-shard-overlay-cert",
-            reply.into_tl_object(),
-            &mut words(&line).into_iter(),
         )
         .unwrap();
-        assert_eq!(message, "saved certificate");
-        assert_eq!(std::fs::read(&out).unwrap(), expected);
-        assert_eq!(data, expected);
-        // The two-word shard form finds the same output file.
-        let out2 = dir.path().join("cert2.bin");
-        let line2 = format!("0 -9223372036854775808 {key} 10 768 {}", out2.display());
-        command_receive(
-            "sign-shard-overlay-cert",
-            v1_certificate().into_tl_object(),
-            &mut words(&line2).into_iter(),
+        fs::write(
+            &server_key,
+            serialize_boxed(&ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
+                key: UInt256::from(server_public),
+            }))
+            .unwrap(),
         )
         .unwrap();
-        assert_eq!(std::fs::read(&out2).unwrap(), expected);
-        // Only a version-1 certificate is accepted.
-        let v2: ton::overlay::Certificate = ton::overlay::certificate::CertificateV2 {
-            issued_by: ton::PublicKey::Pub_Ed25519(ton::pub_::publickey::Ed25519 {
-                key: UInt256::from([7; 32]),
-            }),
-            expire_at: 1,
-            max_size: 1,
-            flags: 1,
-            signature: vec![9; 64].into(),
+        let (created, _) = run_line("new-key", &mut client).await;
+        let hash = created.strip_prefix("created new key ").unwrap().trim_end().to_string();
+        let lines = [
+            format!("export-pub {hash}"),
+            format!("sign {hash} 616263"),
+            "export-pub 3333333333333333333333333333333333333333333333333333333333333333"
+                .to_string(),
+            "set-verbosity 11".to_string(),
+            "show-custom-overlays".to_string(),
+            "help get-time".to_string(),
+            "sign x".to_string(),
+        ];
+        for line in &lines {
+            let output = std::process::Command::new(&binary)
+                .args(["-a", &address, "-k"])
+                .arg(&client_key)
+                .arg("-p")
+                .arg(&server_key)
+                .args(["-r", "-t", "10", "-c", line])
+                .output()
+                .unwrap();
+            let full = String::from_utf8_lossy(&output.stdout);
+            let reference = full.split("conn ready\n").nth(1).unwrap_or("").to_string();
+            let (ours, outcome) = run_line(line, &mut client).await;
+            assert_eq!(reference, ours, "{line}: {full}");
+            assert_eq!(output.status.code(), Some(exit_code(&outcome)), "{line}");
         }
-        .into_boxed();
-        let out3 = dir.path().join("cert3.bin");
-        let line3 = format!("0:8000000000000000 {key} 1 1 {}", out3.display());
-        let error = command_receive(
-            "sign-shard-overlay-cert",
-            v2.into_tl_object(),
-            &mut words(&line3).into_iter(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("received incorrect cert"));
-        assert!(!out3.exists());
-        // The console reads the size as an unsigned token.
-        let bad = format!("0:8000000000000000 {key} 1 -1 {}", out3.display());
-        assert!(command_send("sign-shard-overlay-cert", &mut words(&bad).into_iter()).is_err());
-    }
-
-    #[test]
-    fn import_reads_any_certificate_from_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("cert.bin");
-        std::fs::write(&file, serialize_boxed(&v1_certificate()).unwrap()).unwrap();
-        let line = format!("-1:8000000000000000 {} {}", "22".repeat(32), file.display());
-        let query = command_send("import-shard-overlay-cert", &mut words(&line).into_iter())
-            .unwrap()
-            .downcast::<ton::rpc::engine::validator::ImportShardOverlayCertificate>()
-            .unwrap();
-        assert_eq!((query.workchain, query.shard), (-1, i64::MIN));
-        assert_eq!(query.cert, v1_certificate());
-        std::fs::write(&file, b"junk").unwrap();
-        assert!(command_send("import-shard-overlay-cert", &mut words(&line).into_iter())
-            .unwrap_err()
-            .to_string()
-            .contains("incorrect certificate"));
-    }
-
-    #[test]
-    fn ext_messages_value_is_zero_or_one() {
-        for (value, expected) in [("0", Bool::BoolFalse), ("1", Bool::BoolTrue)] {
-            let query =
-                command_send("set-ext-messages-broadcast-disabled", &mut words(value).into_iter())
-                    .unwrap()
-                    .downcast::<ton::rpc::engine::validator::SetExtMessagesBroadcastDisabled>()
-                    .unwrap();
-            assert_eq!(query.disabled, expected);
-        }
-        let error =
-            command_send("set-ext-messages-broadcast-disabled", &mut words("2").into_iter())
-                .unwrap_err();
-        assert!(error.to_string().contains("value should be 0 or 1"));
+        done_test(server, client, engine).await;
     }
 }

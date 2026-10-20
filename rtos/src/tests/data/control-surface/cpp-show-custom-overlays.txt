@@ -1,0 +1,14 @@
+2 custom overlays:
+
+Overlay "ov1": 2 nodes
+  ERERERERERERERERERERERERERERERERERERERERERE= (msg sender, p=3)
+  IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI= (block sender)
+Sender shards:
+  (0,8000000000000000)
+  (-1,8000000000000000)
+Don't send external messages to public overlays
+Use QUIC for custom overlay broadcasts
+
+Overlay "ov3": 1 nodes
+  MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=
+

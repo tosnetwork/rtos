@@ -33,8 +33,8 @@ rust_src_path: Path
 cpp_log_level: int
 cpp_build_command: str
 
-# Validator permanent key lifetime used by `addpermkey` in this harness.
-# `addpermkey {key} {start} {expire}` takes Unix timestamps. A hard-coded
+# Validator permanent key lifetime used by `add-perm-key` in this harness.
+# `add-perm-key {key} {start} {expire}` takes Unix timestamps. A hard-coded
 # constant in the past silently produces an already-expired key — fine
 # today only because enforcement is lenient, fragile if it tightens. Derive
 # the expiry from wall-clock time so the harness stays valid over time.
@@ -408,7 +408,7 @@ def wait_control_server(node_index: int, console_config_path: str | Path):
     for _ in range(10):
         time.sleep(timeout)
         try:
-            run_console(["-c", "getstats"], node_index, console_config_path)
+            run_console(["-c", "get-stats"], node_index, console_config_path)
             print(" done")
             return
         except RuntimeError:
@@ -418,13 +418,13 @@ def wait_control_server(node_index: int, console_config_path: str | Path):
 
 def generate_validator_key(node_index: int, console_config_path: str | Path) -> str:
     print(f"Generating validator key for node {node_index}...", end="")
-    params = ["-c", "newkey"]
+    params = ["-c", "new-key"]
     output = run_console(params, node_index, console_config_path)
     output_lines = output.split("\n")
     key = None
     for line in output_lines:
-        if "received public key hash:" in line:
-            key = line.split("received public key hash:")[1].strip().split(" ")[1]
+        if line.startswith("created new key "):
+            key = line.split(" ")[3]
             break
     if key is None:
         raise RuntimeError(f"Failed to find validator key for node {node_index}")
@@ -436,7 +436,7 @@ def generate_validator_key(node_index: int, console_config_path: str | Path) -> 
 
 def import_validator_key(node_index: int, console_config_path: str | Path, key: str):
     print(f"Adding validator key for node {node_index}...", end="")
-    params = ["-c", f"addpermkey {key} {int(time.time())} {validator_key_expire_at()}"]
+    params = ["-c", f"add-perm-key {key} {int(time.time())} {validator_key_expire_at()}"]
     run_console(params, node_index, console_config_path)
     print(" done")
 
@@ -445,13 +445,14 @@ def export_validator_pubkey(
     node_index: int, console_config_path: str | Path, key: str
 ) -> str:
     print(f"Exporting validator public key for node {node_index}...", end="")
-    params = ["-c", f"exportpub {key}"]
+    params = ["-c", f"export-pub {key}"]
     output = run_console(params, node_index, console_config_path)
     output_lines = output.split("\n")
     pubkey = None
     for line in output_lines:
-        if "imported key:" in line:
-            pubkey = line.split("imported key:")[1].strip().split(" ")[0]
+        if line.startswith("got public key: "):
+            # The serialized key: a 4-byte type, then the 32-byte key.
+            pubkey = base64.b64decode(line.split(" ")[3])[4:].hex()
             break
     if pubkey is None:
         raise RuntimeError(f"Failed to find validator pubkey for node {node_index}")

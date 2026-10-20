@@ -131,14 +131,11 @@ do
     
     # 0 is full node
     if [ $N -ne 0 ]; then
-        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c newkey | cut -c 92-)
-        ./console -C $TEST_ROOT/tmp/console$N.json -c "addpermkey ${CONSOLE_OUTPUT} ${NOWDATE} 1610000000" > tmp_output_console
-        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c "exportpub ${CONSOLE_OUTPUT}")
-        # echo $CONSOLE_OUTPUT
-        VALIDATOR_PUB_KEY_HEX[$N]=$(echo "${CONSOLE_OUTPUT}" | grep 'imported key:' | awk '{print $3}')
-        # VALIDATOR_PUB_KEY_BASE64[$N]=$(echo "${CONSOLE_OUTPUT}" | grep 'imported key:' | awk '{print $4}')
-        # echo "INFO: VALIDATOR_PUB_KEY_HEX[$N] = ${VALIDATOR_PUB_KEY_HEX[$N]}"
-        # echo "INFO: VALIDATOR_PUB_KEY_BASE64[$N] = ${VALIDATOR_PUB_KEY_BASE64[$N]}"
+        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c new-key | grep '^created new key ' | awk '{print $4}')
+        ./console -C $TEST_ROOT/tmp/console$N.json -c "add-perm-key ${CONSOLE_OUTPUT} ${NOWDATE} 1610000000" > tmp_output_console
+        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c "export-pub ${CONSOLE_OUTPUT}")
+        # The answer is the serialized key: a 4-byte type, then the 32-byte key.
+        VALIDATOR_PUB_KEY_HEX[$N]=$(echo "${CONSOLE_OUTPUT}" | grep '^got public key: ' | awk '{print $4}' | base64 -d | tail -c 32 | xxd -p -c 32)
     fi
 
     cp $NODE_TARGET/config.json $TEST_ROOT/tmp/config$N.json

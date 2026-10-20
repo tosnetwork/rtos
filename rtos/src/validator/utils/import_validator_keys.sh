@@ -2,7 +2,8 @@
 
 # import_validator_keys.sh - Import validator private keys using console CLI
 # This script extracts validator private keys in the same way as extract_validator_keys.sh
-# and imports them using the console CLI importprivatekey and addpermkey commands
+# and imports them using the console CLI import-f, add-perm-key and
+# add-validator-addr commands
 
 # Display usage information
 function show_usage {
@@ -161,22 +162,21 @@ for validator_base64 in $validators; do
     if [ -n "$validator_private_key" ] && [ "$validator_private_key" != "" ]; then
         echo "  Importing validator private key..."
         
-        # Import the private key using console CLI
-        import_output=$(console -C "$CONSOLE_CONFIG" -c "importprivatekey ed25519 $validator_private_key" 2>&1)
+        # Import the key file using console CLI
+        import_output=$(console -C "$CONSOLE_CONFIG" -c "import-f $KEYRING_DIR/$validator_id_hex" 2>&1)
         
-        if echo "$import_output" | grep -q "received public key hash"; then
+        if echo "$import_output" | grep -q "^imported key "; then
             # Extract the key hash from the output
-            validator_key_hash_hex=$(echo "$import_output" | grep "received public key hash:" | awk '{print $5}')
-            validator_key_hash_base64=$(echo "$import_output" | grep "received public key hash:" | awk '{print $6}')
+            validator_key_hash_hex=$(echo "$import_output" | grep "^imported key " | awk '{print $3}')
             
             echo "  ✓ Successfully imported validator key, hash: $validator_key_hash_hex"
             
             # Add permanent key for validation
             echo "  Adding permanent key for validation..."
-            echo "console -C "$CONSOLE_CONFIG" -c addpermkey $validator_key_hash_hex $validator_election_date $validator_expire_at"
-            addperm_output=$(console -C "$CONSOLE_CONFIG" -c "addpermkey $validator_key_hash_hex $validator_election_date $validator_expire_at" 2>&1)
+            echo "console -C "$CONSOLE_CONFIG" -c add-perm-key $validator_key_hash_hex $validator_election_date $validator_expire_at"
+            addperm_output=$(console -C "$CONSOLE_CONFIG" -c "add-perm-key $validator_key_hash_hex $validator_election_date $validator_expire_at" 2>&1)
             
-            if echo "$addperm_output" | grep -q "success" || [ $? -eq 0 ]; then
+            if echo "$addperm_output" | grep -q "^success$"; then
                 echo "  ✓ Successfully added permanent key for validation"
             else
                 echo "  ✗ Failed to add permanent key: $addperm_output"
@@ -198,20 +198,20 @@ for validator_base64 in $validators; do
     if [ -n "$adnl_private_key" ] && [ "$adnl_private_key" != "" ]; then
         echo "  Importing ADNL private key..."
         
-        # Import the ADNL private key using console CLI
-        import_output=$(console -C "$CONSOLE_CONFIG" -c "importprivatekey ed25519 $adnl_private_key" 2>&1)
+        # Import the ADNL key file using console CLI
+        import_output=$(console -C "$CONSOLE_CONFIG" -c "import-f $KEYRING_DIR/$adnl_id_hex" 2>&1)
         
-        if echo "$import_output" | grep -q "received public key hash"; then
+        if echo "$import_output" | grep -q "^imported key "; then
             # Extract the key hash from the output
-            adnl_key_hash_hex=$(echo "$import_output" | grep "received public key hash:" | awk '{print $5}')
+            adnl_key_hash_hex=$(echo "$import_output" | grep "^imported key " | awk '{print $3}')
             echo "  ✓ Successfully imported ADNL key, hash: $adnl_key_hash_hex"
             
             # Associate ADNL key with validator key
             if [ -n "$validator_key_hash_hex" ] && [ -n "$adnl_key_hash_hex" ]; then
                 echo "  Adding validator ADNL address..."
-                addaddr_output=$(console -C "$CONSOLE_CONFIG" -c "addvalidatoraddr $validator_key_hash_hex $adnl_key_hash_hex $validator_expire_at" 2>&1)
+                addaddr_output=$(console -C "$CONSOLE_CONFIG" -c "add-validator-addr $validator_key_hash_hex $adnl_key_hash_hex $validator_expire_at" 2>&1)
                 
-                if echo "$addaddr_output" | grep -q "success" || [ $? -eq 0 ]; then
+                if echo "$addaddr_output" | grep -q "^success$"; then
                     echo "  ✓ Successfully added validator ADNL address"
                     imported_count=$((imported_count + 1))
                 else
