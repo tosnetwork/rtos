@@ -2482,10 +2482,9 @@ mod tests {
 
     /// The reference console against this node's control port gives what
     /// this console gives. Runs when RTOS_REFERENCE_CONSOLE names the
-    /// reference console binary. It fails today: the reference console
-    /// proves its key through TCP authentication over an ephemeral
-    /// handshake key, and the control server still takes the client's
-    /// identity from the handshake, so it refuses the console as unlisted.
+    /// reference console binary. The reference console proves its key
+    /// through TCP authentication over a handshake key of its own, so this
+    /// also checks that the control server knows clients by that proof.
     #[tokio::test(flavor = "multi_thread")]
     async fn reference_console_reads_this_node_as_this_console_does() {
         let Ok(binary) = std::env::var("RTOS_REFERENCE_CONSOLE") else {

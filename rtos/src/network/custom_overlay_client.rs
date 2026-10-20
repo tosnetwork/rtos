@@ -223,25 +223,13 @@ impl CustomOverlayClient {
     }
 
     pub fn sends_msgs_to(&self, to: &AccountIdPrefixFull) -> bool {
-        if self.is_msg_sender.load(Ordering::Relaxed) {
-            for shard in &self.shards {
-                if shard.contains_full_prefix(to) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.is_msg_sender.load(Ordering::Relaxed)
+            && sender_shards_cover(&self.shards, |shard| shard.contains_full_prefix(to))
     }
 
     pub fn sends_blocks_to(&self, shard: &ShardIdent) -> bool {
-        if self.is_block_sender.load(Ordering::Relaxed) {
-            for s in &self.shards {
-                if s.intersect_with(shard) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.is_block_sender.load(Ordering::Relaxed)
+            && sender_shards_cover(&self.shards, |s| s.intersect_with(shard))
     }
 
     fn listen_broadcasts(
@@ -523,5 +511,27 @@ impl CustomOverlayClient {
         };
         let id_short = OverlayShortId::from_data(hash(overlay_key)?);
         Ok(id_short)
+    }
+}
+
+/// Whether an overlay's sender shards cover a destination, as the reference
+/// node decides: an overlay that names no sender shards sends to every shard.
+fn sender_shards_cover(shards: &[ShardIdent], covers: impl Fn(&ShardIdent) -> bool) -> bool {
+    shards.is_empty() || shards.iter().any(covers)
+}
+
+#[cfg(test)]
+mod sender_shard_tests {
+    use super::sender_shards_cover;
+    use rtos_block::{AccountIdPrefixFull, ShardIdent};
+
+    #[test]
+    fn an_overlay_without_sender_shards_sends_to_every_shard() {
+        let to = AccountIdPrefixFull::workchain(0, 0x8000_0000_0000_0000);
+        assert!(sender_shards_cover(&[], |shard| shard.contains_full_prefix(&to)));
+        let masterchain = [ShardIdent::masterchain()];
+        assert!(!sender_shards_cover(&masterchain, |shard| shard.contains_full_prefix(&to)));
+        let basechain = [ShardIdent::full(0)];
+        assert!(sender_shards_cover(&basechain, |shard| shard.contains_full_prefix(&to)));
     }
 }

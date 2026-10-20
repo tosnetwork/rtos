@@ -269,6 +269,17 @@ impl AdnlServerConfig {
     }
 }
 
+/// The identity of a client that has not authenticated, as the reference
+/// server derives it: the SHA-256 of a fixed prefix and the peer's IP
+/// address, with an IPv6 address in brackets. No client key hashes to it.
+fn anonymous_peer_id(address: &std::net::SocketAddr) -> Arc<KeyId> {
+    let host = match address.ip() {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    KeyId::from_data(rtos_block::sha256_digest(format!("tos-adnl-ext-ip:{host}")))
+}
+
 /// TCP authentication context
 struct TcpAuthState {
     nonce: Option<Vec<u8>>,
@@ -341,6 +352,7 @@ impl AdnlServerThread {
 
     async fn run(
         mut stream: AdnlStream,
+        anonymous_id: Arc<KeyId>,
         key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>>,
         clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
@@ -467,7 +479,11 @@ impl AdnlServerThread {
                 fail!("Message from unknown client {}", base64_encode(&recv_buf[32..64]))
             }
         }
-        let (mut crypto, peers) = Self::parse_init_packet(&key, &mut recv_buf)?;
+        let (mut crypto, mut peers) = Self::parse_init_packet(&key, &mut recv_buf)?;
+        // The handshake key only sets up the session; as in the reference
+        // server, a client is known by the key it proves through TCP
+        // authentication, and is anonymous until it does.
+        peers.set_other(anonymous_id);
         let auth = TcpAuthState { nonce: None, remote_id: None };
         recv_buf.truncate(0);
         let mut send_buf = Vec::new();
@@ -588,6 +604,7 @@ impl AdnlServerThread {
                     let pub_key = get_key_option_factory().from_public_key(&pub_key);
                     pub_key.verify(nonce, complete.signature.as_slice())?;
                     thread.auth.remote_id = Some(pub_key.id().data().clone());
+                    thread.peers.set_other(pub_key.id().clone());
                     thread.auth.nonce = None;
                     continue;
                 }
@@ -607,6 +624,13 @@ impl AdnlServerThread {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         #[cfg(feature = "telemetry")] telemetry: Arc<AdnlServerTelemetry>,
     ) {
+        let anonymous_id = match stream.peer_addr() {
+            Ok(address) => anonymous_peer_id(&address),
+            Err(error) => {
+                log::warn!(target: TARGET, "ADNL server cannot read the peer address: {error}");
+                return;
+            }
+        };
         let stream = AdnlStream::from_stream_with_timeouts(stream, config.timeouts());
         let clients = config.clients.clone();
         let key = config.server_key.clone();
@@ -617,6 +641,7 @@ impl AdnlServerThread {
             let start = Instant::now();
             if let Err(e) = AdnlServerThread::run(
                 stream,
+                anonymous_id,
                 key,
                 clients,
                 subscribers,
@@ -907,3 +932,20 @@ mod test;
 #[cfg(test)]
 #[path = "server_permissions_tests.rs"]
 mod permissions_tests;
+
+#[cfg(test)]
+mod anonymous_peer_tests {
+    use super::anonymous_peer_id;
+
+    /// The reference identity of an unauthenticated peer: the SHA-256 of
+    /// "tos-adnl-ext-ip:" and the address host, IPv6 in brackets.
+    #[test]
+    fn anonymous_ids_follow_the_peer_address() {
+        let v4 = anonymous_peer_id(&"127.0.0.1:4000".parse().unwrap());
+        assert_eq!(v4.data(), &rtos_block::sha256_digest("tos-adnl-ext-ip:127.0.0.1"));
+        let other_port = anonymous_peer_id(&"127.0.0.1:5000".parse().unwrap());
+        assert_eq!(v4.data(), other_port.data());
+        let v6 = anonymous_peer_id(&"[::1]:4000".parse().unwrap());
+        assert_eq!(v6.data(), &rtos_block::sha256_digest("tos-adnl-ext-ip:[::1]"));
+    }
+}
