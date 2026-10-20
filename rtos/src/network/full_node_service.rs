@@ -69,6 +69,10 @@ pub struct FullNodeOverlayService {
     pss_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, PersistentStateIdV2, Option<i64>, Vec<u8>)>>,
     #[cfg(test)]
     pss_observations: std::sync::Mutex<Vec<(BlockIdExt, Option<i64>, Option<usize>)>>,
+    // Persistent-state requests in arrival order: "prepare", "size" and
+    // "<offset>+<size>" for slices.
+    #[cfg(test)]
+    pss_requests: std::sync::Mutex<Vec<String>>,
 }
 
 impl FullNodeOverlayService {
@@ -91,6 +95,8 @@ impl FullNodeOverlayService {
             pss_reply: Default::default(),
             #[cfg(test)]
             pss_observations: Default::default(),
+            #[cfg(test)]
+            pss_requests: Default::default(),
         }
     }
 
@@ -125,6 +131,11 @@ impl FullNodeOverlayService {
     #[cfg(test)]
     pub(crate) fn test_pss_observations(&self) -> Vec<(BlockIdExt, Option<i64>, Option<usize>)> {
         self.pss_observations.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pss_requests(&self) -> Vec<String> {
+        self.pss_requests.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -830,10 +841,18 @@ impl Subscriber for FullNodeOverlayService {
         {
             let pss = if query.is::<DownloadPersistentStateSliceV2>() {
                 let request = query.clone().downcast::<DownloadPersistentStateSliceV2>().unwrap();
+                self.pss_requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}+{}", request.offset, request.max_size));
                 Some((request.state, Some(request.offset)))
             } else if query.is::<GetPersistentStateSizeV2>() {
+                self.pss_requests.lock().unwrap().push("size".to_string());
                 Some((query.clone().downcast::<GetPersistentStateSizeV2>().unwrap().state, None))
             } else { None };
+            if query.is::<PreparePersistentState>() {
+                self.pss_requests.lock().unwrap().push("prepare".to_string());
+            }
             if let Some((state, offset)) = pss {
                 self.pss_observations.lock().unwrap().push((state.block.clone(), offset, None));
                 let mut reply = self.pss_reply.lock().unwrap();

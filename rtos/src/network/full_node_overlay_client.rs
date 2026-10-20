@@ -97,6 +97,14 @@ pub(crate) fn next_key_block_ids(answer: KeyBlocks) -> Result<Vec<BlockIdExt>> {
     Ok(answer.blocks)
 }
 
+/// An advertised persistent-state size: positive and addressable.
+pub(crate) fn checked_state_size(size: i64) -> Result<usize> {
+    if size <= 0 {
+        fail!("Advertised persistent state size {size} is not positive");
+    }
+    Ok(usize::try_from(size)?)
+}
+
 fn checked_pss_slice(
     offset: usize,
     max_size: usize,
@@ -518,7 +526,6 @@ pub struct FullNodeOverlayClient {
     #[cfg(test)]
     test_consumer_gate: std::sync::Mutex<Option<Arc<super::test_broadcast_faults::ConsumerGate>>>,
     active_peers: lockfree::set::Set<Arc<KeyId>>,
-    bad_peers: lockfree::set::Set<Arc<KeyId>>,
     engine: Arc<dyn EngineOperations>,
     client: Arc<OverlayClient>,
     ext_messages: OnceLock<Arc<ShardExtMessages>>,
@@ -530,6 +537,12 @@ pub struct FullNodeOverlayClient {
 
 impl FullNodeOverlayClient {
     const TIMEOUT_PREPARE: u64 = 6000; // Milliseconds
+
+    // The bound on a persistent-state size answer over RLDP.
+    const STATE_SIZE_ANSWER_BYTES: usize = 1024;
+    // Answer deadline of the ADNL persistent-state prepare and part-size
+    // queries, in milliseconds.
+    const TIMEOUT_STATE_PREPARE: u64 = 1_000;
     const FAN_OUT_PEERS: usize = 5;
 
     pub(crate) fn new(
@@ -549,7 +562,6 @@ impl FullNodeOverlayClient {
             #[cfg(test)]
             test_consumer_gate: std::sync::Mutex::new(None),
             active_peers: lockfree::set::Set::new(),
-            bad_peers: lockfree::set::Set::new(),
             engine,
             client,
             ext_messages: OnceLock::new(),
@@ -1150,58 +1162,95 @@ impl FullNodeOverlayClient {
         }
     }
 
+    /// Asks one neighbour whether it serves a persistent state and its size:
+    /// for a whole state preparePersistentState over ADNL and then
+    /// getPersistentStateSizeV2 over RLDP, for a part getPersistentStateSizeV2
+    /// over ADNL. `None` when the neighbour does not have it.
     pub async fn check_persistent_state(
         &self,
         id: &PersistentStatePartId,
         masterchain_block_id: &BlockIdExt,
     ) -> Result<Option<(Arc<Neighbour>, usize)>> {
-        if let PersistentStatePartId::WholeState(id) = &id {
-            let request = PreparePersistentState {
-                block: id.clone(),
+        let (peer, _) = self.client.choose_peer(None).await?;
+        let size = GetPersistentStateSizeV2 {
+            state: PersistentStateIdV2 {
+                block: id.block_id().clone(),
                 masterchain_block: masterchain_block_id.clone(),
+                effective_shard: id.part_prefix() as i64,
+            },
+        };
+        let size = if let PersistentStatePartId::WholeState(block) = id {
+            if !self.prepare_persistent_state(&peer, block, masterchain_block_id).await? {
+                return Ok(None);
             }
-            .into_tl_object()
-            .into();
-            let (prepare, peer): (PreparedState, _) = self
+            let request = TaggedObject {
+                object: size,
+                #[cfg(feature = "telemetry")]
+                tag: GetPersistentStateSizeV2::constructor_const(),
+            };
+            let bytes = self
                 .client
-                .send_adnl_query_to_all_peers(
+                .send_rldp_query_raw_bounded(
                     &request,
-                    Some(Self::TIMEOUT_PREPARE),
-                    None,
-                    &self.bad_peers,
-                    |result| matches!(result, &PreparedState::TonNode_PreparedState),
+                    &peer,
+                    0,
+                    true,
+                    adnl::QueryResponseLimits {
+                        wire_bytes: Self::STATE_SIZE_ANSWER_BYTES,
+                        decoded_bytes: Self::STATE_SIZE_ANSWER_BYTES,
+                    },
                 )
                 .await?;
-            match prepare {
-                PreparedState::TonNode_NotFoundState => Ok(None),
-                PreparedState::TonNode_PreparedState => Ok(Some((peer, 0))),
-            }
-        } else {
-            let request = GetPersistentStateSizeV2 {
-                state: PersistentStateIdV2 {
-                    block: id.block_id().clone(),
-                    masterchain_block: masterchain_block_id.clone(),
-                    effective_shard: id.part_prefix() as i64,
-                },
-            }
-            .into_tl_object()
-            .into();
-            let (size, peer): (PersistentStateSize, _) = self
+            // After a prepared state the size must be known.
+            match self
                 .client
-                .send_adnl_query_to_all_peers(
-                    &request,
-                    Some(Self::TIMEOUT_PREPARE),
-                    None,
-                    &self.bad_peers,
-                    |result| matches!(result, &PersistentStateSize::TonNode_PersistentStateSize(_)),
-                )
-                .await?;
-            match size {
-                PersistentStateSize::TonNode_PersistentStateSizeNotFound => Ok(None),
-                PersistentStateSize::TonNode_PersistentStateSize(size) => {
-                    Ok(Some((peer, size.size as usize)))
+                .network_context()
+                .stack
+                .overlay
+                .wire_profile()
+                .deserialize_value(&bytes)?
+            {
+                PersistentStateSize::TonNode_PersistentStateSize(size) => size.size,
+                PersistentStateSize::TonNode_PersistentStateSizeNotFound => {
+                    fail!("{} prepared persistent state {} but has no size for it", peer.id(), id)
                 }
             }
+        } else {
+            let request = size.into_tl_object().into();
+            let answer: Option<PersistentStateSize> = self
+                .client
+                .send_adnl_query_to_peer(&peer, &request, Some(Self::TIMEOUT_STATE_PREPARE))
+                .await?;
+            match answer {
+                None => fail!("No persistent state size for {} from {}", id, peer.id()),
+                Some(PersistentStateSize::TonNode_PersistentStateSizeNotFound) => return Ok(None),
+                Some(PersistentStateSize::TonNode_PersistentStateSize(size)) => size.size,
+            }
+        };
+        Ok(Some((peer, checked_state_size(size)?)))
+    }
+
+    /// preparePersistentState over ADNL to `peer`: whether it serves the state.
+    async fn prepare_persistent_state(
+        &self,
+        peer: &Arc<Neighbour>,
+        block: &BlockIdExt,
+        masterchain_block_id: &BlockIdExt,
+    ) -> Result<bool> {
+        let request = PreparePersistentState {
+            block: block.clone(),
+            masterchain_block: masterchain_block_id.clone(),
+        }
+        .into_tl_object()
+        .into();
+        let answer: Option<PreparedState> = self
+            .client
+            .send_adnl_query_to_peer(peer, &request, Some(Self::TIMEOUT_STATE_PREPARE))
+            .await?;
+        match answer {
+            None => fail!("No preparePersistentState answer for {} from {}", block, peer.id()),
+            Some(PreparedState::TonNode_NotFoundState) => Ok(false),
+            Some(PreparedState::TonNode_PreparedState) => Ok(true),
         }
     }
 
@@ -1297,31 +1346,6 @@ impl FullNodeOverlayClient {
             tag: DownloadPersistentStateSliceV2::constructor_const(),
         };
         self.client.send_rldp_query_raw_bounded(&request, peer, attempt, true, limits).await
-    }
-
-    pub async fn download_persistent_state_part(
-        &self,
-        block_id: &PersistentStatePartId,
-        masterchain_block_id: &BlockIdExt,
-        offset: usize,
-        max_size: usize,
-        peer: &Arc<Neighbour>,
-        attempt: u32,
-    ) -> Result<Vec<u8>> {
-        let request = TaggedObject {
-            object: DownloadPersistentStateSliceV2 {
-                state: PersistentStateIdV2 {
-                    block: block_id.block_id().clone(),
-                    masterchain_block: masterchain_block_id.clone(),
-                    effective_shard: block_id.part_prefix() as i64,
-                },
-                offset: offset as i64,
-                max_size: max_size as i64,
-            },
-            #[cfg(feature = "telemetry")]
-            tag: DownloadPersistentStateSliceV2::constructor_const(),
-        };
-        self.client.send_rldp_query_raw(&request, peer, attempt, true).await
     }
 
     // tonNode.prepareZeroState block:tonNode.blockIdExt = tonNode.PreparedState;

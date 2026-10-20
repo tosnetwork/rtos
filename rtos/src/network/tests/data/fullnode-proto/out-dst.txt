@@ -1,0 +1,12 @@
+DST whole_5mib ok queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/2098176 9/rldp/94271ee8/2098176 9/rldp/94271ee8/1049607 slices 0+2097152 2097152+2097152 4194304+1048583 
+DST whole_exact_2mib ok queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/2098176 slices 0+2097152 
+DST whole_small ok queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/1124 slices 0+100 
+DST whole_notfound error 651 queries 9/adnl/dc44a7f3/0 slices 
+DST whole_size_notfound error 0 queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 slices 
+DST whole_zero error 0 queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 slices 
+DST whole_oversized error 621 queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/2098176 9/rldp/94271ee8/2098176 slices 0+2097152 2097152+2097152 
+DST whole_truncated error 621 queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/2098176 9/rldp/94271ee8/2098176 slices 0+2097152 2097152+2097152 
+DST whole_last_oversized error 621 queries 9/adnl/dc44a7f3/0 9/rldp/00c1a022/1024 9/rldp/94271ee8/2098176 9/rldp/94271ee8/2098176 9/rldp/94271ee8/1034 slices 0+2097152 2097152+2097152 4194304+10 
+DST part_3mib ok queries 9/adnl/00c1a022/0 9/rldp/94271ee8/2098176 9/rldp/94271ee8/1049600 slices 0+2097152 2097152+1048576 
+DST part_notfound error 651 queries 9/adnl/00c1a022/0 slices 
+DST part_truncated error 621 queries 9/adnl/00c1a022/0 9/rldp/94271ee8/2098176 9/rldp/94271ee8/1049600 slices 0+2097152 2097152+1048576 

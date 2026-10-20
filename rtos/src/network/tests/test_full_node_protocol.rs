@@ -133,15 +133,36 @@ pub(super) struct StoredBlock {
 pub(super) struct MemoryBlocks {
     handles: std::collections::HashMap<BlockIdExt, Arc<BlockHandle>>,
     blocks: std::collections::HashMap<BlockIdExt, StoredBlock>,
+    // A persistent state served for every part id of its block, and how its
+    // slices misbehave: "", "oversized" or "truncated" past the first slice.
+    state: std::sync::Mutex<Option<(BlockIdExt, Vec<u8>, &'static str)>>,
+    // The first block stands for the last applied masterchain block.
+    last_mc: Option<Arc<BlockIdExt>>,
+    // Broadcasts the listener handed over.
+    pub ext_messages: std::sync::Mutex<Vec<Vec<u8>>>,
+    pub finality: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "telemetry")]
+    telemetry: crate::network::telemetry::FullNodeNetworkTelemetry,
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32
 }
 
 impl MemoryBlocks {
     pub(super) fn new(blocks: Vec<(BlockIdExt, StoredBlock)>) -> Self {
         let storage = crate::collator_test_bundle::create_block_handle_storage(None).unwrap();
         let mut handles = std::collections::HashMap::new();
-        for (id, block) in &blocks {
+        for (index, (id, block)) in blocks.iter().enumerate() {
+            // The first block stands for a recent masterchain head, which lets
+            // the listener process broadcasts.
+            let meta = if index == 0 {
+                storage::types::BlockMeta::with_data(0, unix_now(), 0, 0, 0)
+            } else {
+                storage::types::BlockMeta::default()
+            };
             let handle = storage
-                .create_handle(id.clone(), storage::types::BlockMeta::default(), None)
+                .create_handle(id.clone(), meta, None)
                 .unwrap()
                 .unwrap();
             if block.has_data {
@@ -158,7 +179,22 @@ impl MemoryBlocks {
             }
             handles.insert(id.clone(), handle);
         }
-        Self { handles, blocks: blocks.into_iter().collect() }
+        let last_mc = blocks.first().map(|(id, _)| Arc::new(id.clone()));
+        Self {
+            handles,
+            blocks: blocks.into_iter().collect(),
+            state: Default::default(),
+            last_mc,
+            ext_messages: Default::default(),
+            finality: Default::default(),
+            #[cfg(feature = "telemetry")]
+            telemetry: crate::network::telemetry::FullNodeNetworkTelemetry::new_service(),
+        }
+    }
+
+    pub(super) fn serve_state(&self, block: &BlockIdExt, bytes: Vec<u8>, misbehave: &'static str) {
+        self.handles[block].set_persistent_state();
+        *self.state.lock().unwrap() = Some((block.clone(), bytes, misbehave));
     }
 }
 
@@ -183,6 +219,67 @@ impl EngineOperations for MemoryBlocks {
     ) -> Result<Vec<u8>> {
         let b = self.blocks.get(handle.id()).ok_or_else(|| error!("no proof"))?;
         Ok(if is_link { b.link.clone() } else { b.proof.clone() })
+    }
+    fn check_stop(&self) -> bool {
+        false
+    }
+    async fn check_sync(&self) -> Result<bool> {
+        Ok(true)
+    }
+    fn now(&self) -> u32 {
+        unix_now()
+    }
+    fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
+        Ok(self.last_mc.clone())
+    }
+    #[cfg(feature = "telemetry")]
+    fn full_node_service_telemetry(&self) -> &crate::network::telemetry::FullNodeNetworkTelemetry {
+        &self.telemetry
+    }
+    async fn process_ext_msg_broadcast(
+        &self,
+        broadcast: rtos_api::ton::ton_node::broadcast::ExternalMessageBroadcast,
+        _src: Arc<rtos_block::KeyId>,
+    ) {
+        self.ext_messages.lock().unwrap().push(broadcast.message.data);
+    }
+    async fn process_block_finality_broadcast(
+        self: Arc<Self>,
+        _broadcast: rtos_api::ton::ton_node::broadcast::BlockFinalityBroadcast,
+        _src: Arc<rtos_block::KeyId>,
+        _received_bytes: usize,
+    ) -> Result<()> {
+        self.finality.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn load_persistent_state_size(&self, id: &PersistentStatePartId) -> Result<u64> {
+        match &*self.state.lock().unwrap() {
+            Some((block, bytes, _)) if block == id.block_id() => Ok(bytes.len() as u64),
+            _ => fail!("no persistent state {id}"),
+        }
+    }
+    async fn load_persistent_state_slice(
+        &self,
+        id: &PersistentStatePartId,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let state = self.state.lock().unwrap();
+        let Some((block, bytes, misbehave)) = &*state else { fail!("no persistent state") };
+        if block != id.block_id() {
+            fail!("no persistent state {id}");
+        }
+        let (offset, length) = (offset as usize, length as usize);
+        let end = (offset + length).min(bytes.len());
+        let mut out = bytes[offset.min(end)..end].to_vec();
+        match *misbehave {
+            "oversized" if offset > 0 => out.push(0x5c),
+            "truncated" if offset > 0 => {
+                out.pop();
+            }
+            _ => {}
+        }
+        Ok(out)
     }
 }
 
@@ -602,3 +699,6 @@ fn key_block_answers_follow_the_reference_requester() {
         }
     }
 }
+
+#[path = "test_full_node_protocol_wire.rs"]
+mod wire;

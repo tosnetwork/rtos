@@ -14,6 +14,11 @@ use rtos_block::{fail, BlockIdExt, BocReader, Result};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use storage::types::PersistentStatePartId;
 
+/// Persistent states are downloaded in parts of this size.
+const PART_SIZE: usize = 1 << 21;
+/// Transport attempts for one slice before the download attempt ends.
+const SLICE_TRANSPORT_ATTEMPTS: u32 = 30;
+
 /// A downloaded chunk is complete only after every byte reaches its writer.
 /// This boundary does not claim that the destination has been synced to disk.
 fn append_downloaded_chunk(dest: &mut impl Write, bytes: &[u8]) -> Result<usize> {
@@ -55,86 +60,134 @@ pub async fn download_pss_part<T: Write + Seek>(
         futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
     };
 
-    // Download
+    let fetch = |offset: usize, max_size: usize, attempt: u32| {
+        let peer = peer.clone();
+        async move {
+            overlay
+                .download_persistent_state_part_bounded(
+                    id,
+                    master_id,
+                    offset,
+                    max_size,
+                    &peer,
+                    attempt,
+                    adnl::QueryResponseLimits { wire_bytes: max_size, decoded_bytes: max_size },
+                )
+                .await
+        }
+    };
+    download_slices(id, size, dest, check_stop, fetch).await
+}
 
+/// Downloads the parts of a persistent state of `size` advertised bytes into
+/// `dest`, from its current end: parts of PART_SIZE, the last one bounded by
+/// the advertised size, each from `fetch(offset, size, transport attempt)`.
+pub(crate) async fn download_slices<T, F, Fut>(
+    id: &PersistentStatePartId,
+    size: usize,
+    dest: &mut T,
+    check_stop: &(dyn Fn() -> Result<()> + Sync + Send),
+    mut fetch: F,
+) -> Result<(usize, usize)>
+where
+    T: Write + Seek,
+    F: FnMut(usize, usize, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    // Download: parts of PART_SIZE, the last one bounded by the advertised
+    // size, all from the peer that advertised it. A part longer or shorter
+    // than requested ends the attempt, as does any failed request.
     let now = std::time::Instant::now();
-
-    let max_size = 1 << 20; // part max size
     let mut offset = dest.seek(SeekFrom::End(0))? as usize;
-    let mut peer_attempt = 0;
-    let mut part_attempt = 0;
-    let mut errors = 0;
+    if offset > size {
+        fail!("download_pss_part {}: {} bytes stored, {} advertised", id, offset, size);
+    }
     let mut part = 0;
     let mut cells_count = 0;
 
-    log::info!(
-        "download_pss_part: starting from offset {}, id: {}, master_id: {}",
-        offset,
-        id,
-        master_id
-    );
+    log::info!("download_pss_part: starting from offset {}, id: {}, size: {}", offset, id, size);
 
-    loop {
+    while offset < size {
         check_stop()?;
-        let result = overlay
-            .download_persistent_state_part(id, master_id, offset, max_size, &peer, peer_attempt)
-            .await;
-        match result {
-            Ok(next_bytes) => {
-                if offset == 0 {
-                    let (boc_header, _) =
-                        BocReader::new().read_header(&mut Cursor::new(&next_bytes))?;
-                    cells_count = boc_header.cells_count;
-                    if cells_count == 0 {
-                        fail!("download_pss_part: got header with cells_count == 0");
-                    }
-                }
-                part_attempt = 0;
-                let len = append_downloaded_chunk(dest, &next_bytes)?;
-                if part % 10 == 0 {
-                    if size > 0 {
-                        log::info!(
-                            "download_pss_part {}: downloaded: {}% ({}/{})",
-                            id,
-                            (offset * 100) / size,
-                            offset,
-                            size
-                        );
-                    } else {
-                        log::info!("download_pss_part {}: downloaded: {}", id, offset);
-                    };
-                }
-                part += 1;
-                if len < max_size {
-                    offset += len;
-                    log::info!(
-                        "download_pss_part {}: DONE in {:#?}, total length is {}",
+        let max_size = PART_SIZE.min(size - offset);
+        // The reference gives a slice 20 s. RLDP here has no per-query
+        // deadline: its transfer timeout follows the peer's roundtrip, so a
+        // slice that outlives it is asked again from the same peer, with the
+        // allowance growing on every attempt. An answer above the requested
+        // size ends the attempt at once.
+        let mut transport_attempt = 0u32;
+        let next_bytes = loop {
+            check_stop()?;
+            match fetch(offset, max_size, transport_attempt).await {
+                Ok(bytes) => break bytes,
+                Err(e) if e.downcast_ref::<adnl::ResponseLimitExceeded>().is_some() => {
+                    fail!(
+                        "download_pss_part {}: part at {} exceeds {} bytes: {}",
                         id,
-                        now.elapsed(),
-                        offset
+                        offset,
+                        max_size,
+                        e
+                    )
+                }
+                Err(e) => {
+                    transport_attempt = transport_attempt.saturating_add(1);
+                    if transport_attempt > SLICE_TRANSPORT_ATTEMPTS {
+                        fail!("download_pss_part {} at {}: {}", id, offset, e);
+                    }
+                    log::warn!(
+                        "download_pss_part {} at {}: {}, attempt {}",
+                        id,
+                        offset,
+                        e,
+                        transport_attempt
                     );
-                    break;
+                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
                 }
-                offset += max_size;
             }
-            Err(e) => {
-                errors += 1;
-                part_attempt += 1;
-                peer_attempt += 1;
-                log::error!(
-                    "download_pss_part {}: {}, attempt: {}, total errors: {}",
-                    id,
-                    e,
-                    part_attempt,
-                    errors
-                );
-                if part_attempt > 30 {
-                    fail!("Error download_pss_part after {} attempts: {}", part_attempt, e)
-                }
-                futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+        };
+        if next_bytes.len() > max_size {
+            fail!(
+                "download_pss_part {}: part at {} is {} bytes, {} requested",
+                id,
+                offset,
+                next_bytes.len(),
+                max_size
+            );
+        }
+        if next_bytes.len() < max_size {
+            fail!(
+                "download_pss_part {}: stream ended at {} of {} advertised bytes",
+                id,
+                offset.saturating_add(next_bytes.len()),
+                size
+            );
+        }
+        if offset == 0 {
+            let (boc_header, _) = BocReader::new().read_header(&mut Cursor::new(&next_bytes))?;
+            cells_count = boc_header.cells_count;
+            if cells_count == 0 {
+                fail!("download_pss_part: got header with cells_count == 0");
             }
         }
+        let len = append_downloaded_chunk(dest, &next_bytes)?;
+        offset = offset.saturating_add(len);
+        if part % 10 == 0 {
+            log::info!(
+                "download_pss_part {}: downloaded: {}% ({}/{})",
+                id,
+                (offset * 100) / size,
+                offset,
+                size
+            );
+        }
+        part += 1;
     }
+    log::info!(
+        "download_pss_part {}: DONE in {:#?}, total length is {}",
+        id,
+        now.elapsed(),
+        offset
+    );
 
     Ok((offset, cells_count))
 }
