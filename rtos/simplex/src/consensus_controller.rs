@@ -242,6 +242,22 @@ pub(crate) fn parse_pending_finalizations_max(value: Option<&str>) -> usize {
     }
 }
 
+/// What the outbound path did with a request to cast one of this node's own
+/// votes (C++ `VoteCastOutcome`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoteCastOutcome {
+    /// The vote went past the finality gate. Its intent may have been
+    /// committed, a signature produced, or the vote applied and sent; or one of
+    /// those steps failed. None of it can be undone, so the vote is neither cast
+    /// again nor treated as not cast.
+    Submitted,
+    /// Refused before any intent was committed, because finality was behind
+    /// when the vote reached the gate. The vote was not journalled, signed,
+    /// applied or sent. A skip or final vote is handed back to the FSM, which
+    /// keeps it and requests it again once finality catches up.
+    SuppressedBeforeIntentFinalityBehind,
+}
+
 /// Why one candidate's finalization attempt did not finish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FinalizationFailure {
@@ -1051,7 +1067,12 @@ impl ConsensusController {
                 self.session_id().to_hex_string(),
             );
         }
-        backend.simplex_state_mut().set_finality_behind(over);
+        backend.simplex_state_mut().set_finality_behind(self.description.as_ref(), over);
+        if !over {
+            // The clear may have queued the votes the backlog held back; the main
+            // loop drains them on its next pass.
+            backend.runtime_mut().set_next_awake_time(self.now());
+        }
         #[cfg(test)]
         self.backlog_transitions.push((over, self.pending_finalizations));
     }
@@ -1812,17 +1833,20 @@ impl ConsensusController {
         &mut self,
         backend: &mut dyn ConsensusBackend,
         vote: Vote,
-    ) {
+    ) -> VoteCastOutcome {
         // C++ pool.cpp cast_our_vote: finality fell behind while this vote was
         // being prepared. The consensus bookkeeping that produced it stays as it
-        // is, but the vote is not journalled, signed, applied or sent.
+        // is, but the vote is not journalled, signed, applied or sent. The FSM,
+        // the only party that still knows about it, gets a skip or final vote
+        // back to request again once finality catches up.
         if backend.simplex_state().finality_behind() {
             log::debug!(
                 "Session {} broadcast_vote: finality is behind, not casting {:?}",
                 self.session_id().to_hex_string(),
                 vote
             );
-            return;
+            backend.simplex_state_mut().vote_suppressed(vote);
+            return VoteCastOutcome::SuppressedBeforeIntentFinalityBehind;
         }
 
         // Track first notarize vote in this slot (stage 2 latency).
@@ -1861,7 +1885,7 @@ impl ConsensusController {
                     e
                 );
                 self.telemetry.increment_error();
-                return;
+                return VoteCastOutcome::Submitted;
             }
         };
 
@@ -1873,7 +1897,7 @@ impl ConsensusController {
         // local accounting applied it: a vote this node itself rejects must not
         // reach a peer, directly or inside a certificate built on it.
         let Some(local_idx) = self.description.local_validator_index() else {
-            return;
+            return VoteCastOutcome::Submitted;
         };
         let boxed = rtos_api::IntoBoxed::into_boxed(signed_vote.clone());
         let raw_vote: RawVoteData = match self.description.opts().wire_profile.serialize(&boxed) {
@@ -1885,7 +1909,7 @@ impl ConsensusController {
                     e
                 );
                 self.telemetry.increment_error();
-                return;
+                return VoteCastOutcome::Submitted;
             }
         };
         if !self.on_vote(backend, local_idx.value(), boxed, raw_vote) {
@@ -1893,7 +1917,7 @@ impl ConsensusController {
                 "Session {} broadcast_vote: own vote was not applied locally; not broadcasting it",
                 self.session_id().to_hex_string()
             );
-            return;
+            return VoteCastOutcome::Submitted;
         }
 
         log::trace!(
@@ -1903,6 +1927,7 @@ impl ConsensusController {
 
         // Send to every other validator; local accounting is already done.
         backend.send_vote(signed_vote);
+        VoteCastOutcome::Submitted
     }
 }
 

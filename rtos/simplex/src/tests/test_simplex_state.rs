@@ -7303,7 +7303,7 @@ fn is_skip(vote: &Vote) -> bool {
 fn test_finality_behind_gives_up_notarize_for_the_slot() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
-    state.set_finality_behind(true);
+    state.set_finality_behind(&desc, true);
 
     let hash = UInt256::from([7u8; 32]);
     let candidate = create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0);
@@ -7312,7 +7312,7 @@ fn test_finality_behind_gives_up_notarize_for_the_slot() {
     assert!(state.is_notarization_abandoned(&desc, SlotIndex::new(0)));
 
     // The backlog clears: C++ try_notarize is one-shot, so nothing asks again.
-    state.set_finality_behind(false);
+    state.set_finality_behind(&desc, false);
     state.check_all(&desc);
     assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 0);
     assert!(
@@ -7325,8 +7325,8 @@ fn test_finality_behind_gives_up_notarize_for_the_slot() {
 fn test_finality_cleared_before_candidate_notarizes_normally() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
-    state.set_finality_behind(true);
-    state.set_finality_behind(false);
+    state.set_finality_behind(&desc, true);
+    state.set_finality_behind(&desc, false);
 
     let candidate =
         create_test_candidate(0, UInt256::from([7u8; 32]), BlockIdExt::default(), None, 0);
@@ -7345,7 +7345,7 @@ fn test_finality_behind_suppresses_finalize_vote() {
         state.on_candidate(&desc, candidate).expect("on_candidate should succeed");
         assert_eq!(count_votes(&drain_events(&mut state), is_notarize), 1);
 
-        state.set_finality_behind(behind);
+        state.set_finality_behind(&desc, behind);
         let signers = vec![ValidatorIndex::new(0), ValidatorIndex::new(1), ValidatorIndex::new(2)];
         let cert = create_test_notar_cert(&desc, SlotIndex::new(0), hash.clone(), &signers);
         state.set_notarize_certificate(&desc, SlotIndex::new(0), &hash, cert).unwrap();
@@ -7359,12 +7359,12 @@ fn test_finality_behind_suppresses_finalize_vote() {
 }
 
 #[test]
-fn test_finality_behind_timeout_casts_no_skip_and_marks_nothing() {
+fn test_finality_behind_timeout_defers_the_skips_and_records_the_timeout() {
     let desc = create_test_desc(4, 2);
     let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
     let t0 = desc.get_time();
     state.reset_timeouts_on_start(&desc);
-    state.set_finality_behind(true);
+    state.set_finality_behind(&desc, true);
 
     desc.set_time(t0 + Duration::from_secs(5));
     state.check_all(&desc);
@@ -7372,13 +7372,20 @@ fn test_finality_behind_timeout_casts_no_skip_and_marks_nothing() {
     assert_eq!(count_votes(&drain_events(&mut state), is_skip), 0);
     let window = state.get_window(WindowIndex::new(0)).unwrap();
     assert!(!window.slots[0].voted_skip && !window.slots[1].voted_skip);
-    assert!(!window.had_timeouts, "no skip was cast, so the window had none");
+    assert!(window.had_timeouts, "the deadline passed, so the window records a timeout");
     assert_eq!(
         state.timeout_slot,
         SlotIndex::new(2),
         "the alarm is still consumed to the window end"
     );
     assert!(state.skip_timestamp.is_none(), "and not re-armed until the next window");
+    let recovery = state.recovery_state();
+    assert_eq!((recovery.deferred_skip_windows, recovery.deferred_skip_slots), (1, 2));
+
+    // The clear casts the deferred skips at once.
+    state.set_finality_behind(&desc, false);
+    assert_eq!(count_votes(&drain_events(&mut state), is_skip), 2);
+    assert_eq!(state.recovery_state(), RecoveryState::default());
 }
 
 #[test]
@@ -7386,7 +7393,7 @@ fn test_finality_behind_suppresses_restart_skip_votes() {
     for behind in [false, true] {
         let desc = create_test_desc(4, 2);
         let mut state = SimplexState::new(&desc).expect("Failed to create SimplexState");
-        state.set_finality_behind(behind);
+        state.set_finality_behind(&desc, behind);
         let queued = state.generate_restart_skip_votes(WindowIndex::new(1), 2);
         assert_eq!(queued, if behind { 0 } else { 2 }, "behind={behind}");
         assert_eq!(count_votes(&drain_events(&mut state), is_skip), queued as usize);
@@ -7626,5 +7633,596 @@ fn test_timeout_cursor_follows_the_cpp_cursor_at_every_transition() -> rtos_bloc
     assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
     assert_eq!(state.timeout_slot, SlotIndex::new(5), "window transition: start_slot + 1");
     assert_eq!(state.timeout_base, Some(t1 + state.first_block_timeout), "a fresh base");
+    Ok(())
+}
+
+/*
+    ========================================================================
+    Recovery after a finalization backlog (C++ consensus.cpp deferred skips
+    and votes refused before their intent, tos d590082e43)
+
+    Expected values come from the C++ reference harness
+    test-skip-after-finality-backlog at tos 8b6b935691 (memo evidence
+    2026-10-20-a142-rust/cpp-runs-isolated, a142-backlog-<mode>.stdout): the
+    requested votes by identity, their order where the C++ test asserts one,
+    and the deadlines from the same timing (W=4, first block 0.3 s, target
+    rate 0.4 s, multiplier 1.2 unless a mode sets another). A request here is
+    the FSM's BroadcastVote event; the session-processor tests observe the
+    intent, signature and outgoing stages.
+    ========================================================================
+*/
+
+/// The C++ harness timing with another first-block timeout or multiplier.
+fn cpp_timer_desc_with(first_block_ms: u64, multiplier: f64) -> SessionDescription {
+    let opts = crate::SessionOptions {
+        first_block_timeout: Duration::from_millis(first_block_ms),
+        target_rate: Duration::from_millis(400),
+        first_block_timeout_multiplier: multiplier,
+        ..Default::default()
+    };
+    create_test_desc_with_options(4, 4, opts)
+}
+
+fn started_state_with(desc: &SessionDescription) -> rtos_block::Result<SimplexState> {
+    desc.set_time(t0());
+    let mut state = SimplexState::new(desc)?;
+    state.reset_timeouts_on_start(desc);
+    Ok(state)
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// C++ RECOVERY_STATE_BOUND: the kept state covers at most the slots of the
+/// current window and of one window it superseded.
+const RECOVERY_BOUND: usize = 8;
+
+/// The C++ recovery-state sampler: the most deferred slots plus refused votes,
+/// and the most deferred windows, seen at any sample; each sample is checked
+/// against the bound.
+#[derive(Default)]
+struct RecoverySampler {
+    peak_entries: usize,
+    peak_windows: usize,
+    samples: usize,
+}
+
+impl RecoverySampler {
+    fn sample(&mut self, state: &SimplexState) {
+        let s = state.recovery_state();
+        let entries = s.deferred_skip_slots + s.suppressed_votes;
+        assert!(
+            entries <= RECOVERY_BOUND && s.deferred_skip_windows <= 2,
+            "recovery state unbounded: {s:?}"
+        );
+        self.peak_entries = self.peak_entries.max(entries);
+        self.peak_windows = self.peak_windows.max(s.deferred_skip_windows);
+        self.samples += 1;
+    }
+}
+
+/// Advance to `at`, run the FSM and return its events; sample the recovery state.
+fn tick(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    at: SystemTime,
+    sampler: &mut RecoverySampler,
+) -> Vec<SimplexEvent> {
+    desc.set_time(at);
+    state.check_all(desc);
+    sampler.sample(state);
+    drain_events(state)
+}
+
+fn backlog(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    over: bool,
+    sampler: &mut RecoverySampler,
+) -> Vec<SimplexEvent> {
+    state.set_finality_behind(desc, over);
+    sampler.sample(state);
+    drain_events(state)
+}
+
+/// The vote requests of `events`, in order, by kind and slot.
+fn requests(events: &[SimplexEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SimplexEvent::BroadcastVote(Vote::Skip(v)) => Some(format!("skip:{}", v.slot.value())),
+            SimplexEvent::BroadcastVote(Vote::Finalize(v)) => {
+                Some(format!("final:{}", v.slot.value()))
+            }
+            SimplexEvent::BroadcastVote(Vote::Notarize(v)) => {
+                Some(format!("notar:{}", v.slot.value()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn skips(begin: u32, end: u32) -> Vec<String> {
+    (begin..end).map(|slot| format!("skip:{slot}")).collect()
+}
+
+/// The skip votes of `events`, as the votes themselves (for refusal tests).
+fn skip_votes(events: &[SimplexEvent]) -> Vec<Vote> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SimplexEvent::BroadcastVote(vote @ Vote::Skip(_)) => Some(vote.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// stall-recovers: the window-0 deadline expires while behind; after the
+/// clear every slot of the expired range is skipped once, and the next
+/// window's timeout skips too, after the adaptive first-block timeout the
+/// deferred expiry recorded. C++ peaks: 4 entries, 1 deferred window.
+#[test]
+fn test_backlog_stall_recovers_deferred_skips_after_the_clear() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    desc.set_time(t0() + ms(100));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+
+    let deadline = t0() + ms(700);
+    assert!(requests(&tick(&mut state, &desc, deadline - ms(1), &mut sampler)).is_empty());
+    assert!(
+        requests(&tick(&mut state, &desc, deadline + ms(500), &mut sampler)).is_empty(),
+        "nothing is cast while finality is behind"
+    );
+
+    desc.set_time(t0() + ms(1300));
+    let recovered = requests(&backlog(&mut state, &desc, false, &mut sampler));
+    assert_eq!(recovered, skips(0, 4), "C++: skips 0-3 once after the clear");
+
+    // Peers skip window 0; window 1 is observed and times out on its own.
+    let t1 = t0() + ms(1400);
+    desc.set_time(t1);
+    for slot in 0..4 {
+        install_skip_cert(&mut state, &desc, slot)?;
+    }
+    assert_eq!(requests(&drain_events(&mut state)), Vec::<String>::new());
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+    let w1_deadline = t1 + ms(300).mul_f64(1.2) + ms(400);
+    assert!(requests(&tick(&mut state, &desc, w1_deadline - ms(1), &mut sampler)).is_empty());
+    assert_eq!(
+        requests(&tick(&mut state, &desc, w1_deadline, &mut sampler)),
+        skips(4, 8),
+        "C++: the window after recovery times out with the backed-off first-block timeout"
+    );
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 1), "C++ peaks");
+    Ok(())
+}
+
+/// short-hold: the backlog clears before the deadline; the deadline is neither
+/// brought forward to the clear nor lost. C++ first_block_timeout 1.5 s.
+#[test]
+fn test_backlog_short_hold_keeps_the_original_deadline() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(1500, 1.2);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    desc.set_time(t0() + ms(300));
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+
+    let deadline = t0() + ms(1900);
+    assert!(
+        requests(&tick(&mut state, &desc, deadline - ms(1), &mut sampler)).is_empty(),
+        "clearing the backlog did not bring the deadline forward"
+    );
+    assert_eq!(requests(&tick(&mut state, &desc, deadline, &mut sampler)), skips(0, 4));
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (0, 0), "C++ peaks");
+    Ok(())
+}
+
+/// final-redrive: slot 0 is notarized locally, its certificate arrives while
+/// behind, and the timeout (moved to slot 1, due base + 2 target rates)
+/// expires. After the clear the final vote comes first, then skips 1-3; slot 0
+/// is never skipped. C++ peaks: 3 entries, 1 deferred window.
+#[test]
+fn test_backlog_final_redrive_comes_before_the_deferred_skips() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let hash = UInt256::from([0x51u8; 32]);
+    state.on_candidate(
+        &desc,
+        create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0),
+    )?;
+    assert_eq!(requests(&drain_events(&mut state)), vec!["notar:0".to_string()]);
+
+    desc.set_time(t0() + ms(50));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    let cert = create_test_notar_cert(&desc, SlotIndex::new(0), hash.clone(), &peer_signers());
+    state.set_notarize_certificate(&desc, SlotIndex::new(0), &hash, cert)?;
+    assert!(requests(&drain_events(&mut state)).is_empty(), "the final vote waits");
+
+    let deadline = t0() + ms(1100);
+    assert!(requests(&tick(&mut state, &desc, deadline + ms(500), &mut sampler)).is_empty());
+
+    desc.set_time(t0() + ms(1700));
+    let recovered = requests(&backlog(&mut state, &desc, false, &mut sampler));
+    let mut expected = vec!["final:0".to_string()];
+    expected.extend(skips(1, 4));
+    assert_eq!(recovered, expected, "C++: the final vote, then skips 1-3; never skip 0");
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (3, 1), "C++ peaks");
+    Ok(())
+}
+
+/// superseded-deferral: peers skip window 0 while this node is behind; the new
+/// window supersedes the deferred skips, which are never cast, and the new
+/// window's timeout keeps the adaptive history of the expired one (multiplier
+/// 3). C++ peaks: 4 entries, 1 deferred window.
+#[test]
+fn test_backlog_superseded_deferral_is_never_cast() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(300, 3.0);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    desc.set_time(t0() + ms(100));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    assert!(requests(&tick(&mut state, &desc, t0() + ms(1200), &mut sampler)).is_empty());
+
+    let t1 = t0() + ms(1300);
+    desc.set_time(t1);
+    for slot in 0..4 {
+        install_skip_cert(&mut state, &desc, slot)?;
+    }
+    drain_events(&mut state);
+    sampler.sample(&state);
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+
+    let w1_deadline = t1 + ms(900) + ms(400);
+    assert!(requests(&tick(&mut state, &desc, w1_deadline - ms(1), &mut sampler)).is_empty());
+    assert_eq!(requests(&tick(&mut state, &desc, w1_deadline, &mut sampler)), skips(4, 8));
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 1), "C++ peaks");
+    Ok(())
+}
+
+/// notar-rearm: out-of-order certificates for slots 3 and 2 arrive after the
+/// expired deadline; the one for the last slot re-arms the timeout. They do not
+/// cancel the deferred skips, and the re-armed alarm does not duplicate them.
+#[test]
+fn test_backlog_notar_rearm_neither_cancels_nor_duplicates() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    desc.set_time(t0() + ms(100));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    assert!(requests(&tick(&mut state, &desc, t0() + ms(1200), &mut sampler)).is_empty());
+    install_notar_cert(&mut state, &desc, 3, 0x33)?;
+    install_notar_cert(&mut state, &desc, 2, 0x32)?;
+    assert!(requests(&drain_events(&mut state)).is_empty());
+    let rearmed = t0() + ms(300) + ms(1600);
+    assert_eq!(state.skip_timestamp, Some(rearmed), "re-armed at base + W target rates");
+
+    desc.set_time(t0() + ms(1400));
+    assert_eq!(requests(&backlog(&mut state, &desc, false, &mut sampler)), skips(0, 4));
+    assert!(
+        requests(&tick(&mut state, &desc, rearmed + ms(500), &mut sampler)).is_empty(),
+        "the re-armed timeout does not duplicate the skips"
+    );
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 1), "C++ peaks");
+    Ok(())
+}
+
+/// repeated-toggle: repeated over/clear events create no duplicate requests.
+#[test]
+fn test_backlog_repeated_toggle_requests_each_skip_once() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    desc.set_time(t0() + ms(100));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    let mut all = requests(&tick(&mut state, &desc, t0() + ms(1200), &mut sampler));
+    all.extend(requests(&backlog(&mut state, &desc, true, &mut sampler)));
+    all.extend(requests(&backlog(&mut state, &desc, false, &mut sampler)));
+    all.extend(requests(&backlog(&mut state, &desc, false, &mut sampler)));
+    all.extend(requests(&backlog(&mut state, &desc, true, &mut sampler)));
+    all.extend(requests(&backlog(&mut state, &desc, false, &mut sampler)));
+    all.extend(requests(&tick(&mut state, &desc, t0() + ms(3000), &mut sampler)));
+    assert_eq!(all, skips(0, 4), "C++: exactly four skip requests");
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 1), "C++ peaks");
+    Ok(())
+}
+
+/// many-windows-behind: peers skip fifteen windows while this node stays
+/// behind (multiplier 1.0); each new window supersedes the last deferral, so
+/// the kept state stays at one window. After the clear only the last window is
+/// skipped. C++ peaks: 4 entries, 1 deferred window.
+#[test]
+fn test_backlog_many_windows_behind_keeps_one_window() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(300, 1.0);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    let mut now = t0();
+    let mut all = Vec::new();
+    for window in 0..15u32 {
+        now += ms(800);
+        all.extend(requests(&tick(&mut state, &desc, now, &mut sampler)));
+        for slot in window * 4..window * 4 + 4 {
+            install_skip_cert(&mut state, &desc, slot)?;
+        }
+        all.extend(requests(&drain_events(&mut state)));
+        sampler.sample(&state);
+        assert_eq!(state.current_leader_window_idx, WindowIndex::new(window + 1));
+    }
+    now += ms(800);
+    all.extend(requests(&tick(&mut state, &desc, now, &mut sampler)));
+    assert!(all.is_empty(), "nothing is cast while finality is behind: {all:?}");
+    assert_eq!(
+        requests(&backlog(&mut state, &desc, false, &mut sampler)),
+        skips(60, 64),
+        "C++: only the last window is skipped"
+    );
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 1), "C++ peaks");
+    Ok(())
+}
+
+/// shutdown-pending: the group stops with deferred skips pending; nothing about
+/// them outlives the state (C++: nothing cast by a stopped group).
+#[test]
+fn test_backlog_deferred_skips_are_memory_only() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    desc.set_time(t0() + ms(100));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    assert!(requests(&tick(&mut state, &desc, t0() + ms(1200), &mut sampler)).is_empty());
+    assert_eq!(state.recovery_state().deferred_skip_slots, 4);
+    let fresh = SimplexState::new(&desc)?;
+    assert_eq!(fresh.recovery_state(), RecoveryState::default(), "nothing is persisted");
+    Ok(())
+}
+
+/// The skips the alarm requested while finality was fine reach the gate after
+/// the backlog went over and are refused; Consensus keeps them.
+fn refuse_window0_skips(
+    state: &mut SimplexState,
+    desc: &SessionDescription,
+    sampler: &mut RecoverySampler,
+) -> Vec<Vote> {
+    let refused = skip_votes(&tick(state, desc, t0() + ms(700), sampler));
+    assert_eq!(refused.len(), 4, "the window-0 skips were requested");
+    desc.set_time(t0() + ms(720));
+    assert!(backlog(state, desc, true, sampler).is_empty());
+    refused
+}
+
+/// race-refused-then-clear: four window-0 skips are refused while behind; the
+/// clear requests each exact vote once more. C++ peaks: 4 entries, 0 windows.
+#[test]
+fn test_backlog_refused_skips_are_requested_again_once() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let refused = refuse_window0_skips(&mut state, &desc, &mut sampler);
+    for vote in refused.clone() {
+        state.vote_suppressed(vote);
+    }
+    sampler.sample(&state);
+    assert!(drain_events(&mut state).is_empty(), "nothing while behind");
+    let again = skip_votes(&backlog(&mut state, &desc, false, &mut sampler));
+    assert_eq!(again, refused, "C++: each exact vote once more");
+    assert!(requests(&backlog(&mut state, &desc, true, &mut sampler)).is_empty());
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 0), "C++ peaks");
+    Ok(())
+}
+
+/// race-clear-before-refusal: the refusals arrive after the clear; they bring
+/// the skips back themselves, each once. Rust's gate refuses synchronously, so
+/// production cannot reach this today; the branch keeps the C++ semantics.
+#[test]
+fn test_backlog_refusal_after_the_clear_requests_the_vote_again_at_once() -> rtos_block::Result<()>
+{
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let refused = refuse_window0_skips(&mut state, &desc, &mut sampler);
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+    for vote in refused.clone() {
+        state.vote_suppressed(vote);
+    }
+    sampler.sample(&state);
+    assert_eq!(skip_votes(&drain_events(&mut state)), refused, "C++: each skip once");
+    assert_eq!(state.recovery_state(), RecoveryState::default(), "nothing is kept");
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (0, 0), "C++ peaks");
+    Ok(())
+}
+
+/// race-final-after-clear: a final vote refused after the clear is requested
+/// again at once, with its exact candidate; no skip is requested.
+#[test]
+fn test_backlog_final_refused_after_the_clear_is_requested_again() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(600_000, 1.2);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let hash = UInt256::from([0x52u8; 32]);
+    state.on_candidate(
+        &desc,
+        create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0),
+    )?;
+    drain_events(&mut state);
+    let cert = create_test_notar_cert(&desc, SlotIndex::new(0), hash.clone(), &peer_signers());
+    state.set_notarize_certificate(&desc, SlotIndex::new(0), &hash, cert)?;
+    let final_vote = Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash });
+    let requested: Vec<Vote> = drain_events(&mut state)
+        .into_iter()
+        .filter_map(|e| match e {
+            SimplexEvent::BroadcastVote(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requested, vec![final_vote.clone()]);
+
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    assert!(backlog(&mut state, &desc, false, &mut sampler).is_empty());
+    state.vote_suppressed(final_vote.clone());
+    let again: Vec<Vote> = drain_events(&mut state)
+        .into_iter()
+        .filter_map(|e| match e {
+            SimplexEvent::BroadcastVote(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again, vec![final_vote], "C++: the final vote once more, the exact candidate");
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (0, 0), "C++ peaks");
+    Ok(())
+}
+
+/// race-new-window: peers skip the window while the refusals are on their way;
+/// the refused skips are obsolete, and the next window's adaptive timeout
+/// (multiplier 3, from the window-0 alarm) is untouched. C++ peaks: 0, 0.
+#[test]
+fn test_backlog_refusals_after_a_new_window_are_obsolete() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(300, 3.0);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let refused = refuse_window0_skips(&mut state, &desc, &mut sampler);
+    let t1 = t0() + ms(800);
+    desc.set_time(t1);
+    for slot in 0..4 {
+        install_skip_cert(&mut state, &desc, slot)?;
+    }
+    drain_events(&mut state);
+    assert_eq!(state.current_leader_window_idx, WindowIndex::new(1));
+    for vote in refused {
+        state.vote_suppressed(vote);
+    }
+    sampler.sample(&state);
+    desc.set_time(t1 + ms(100));
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+
+    let w1_deadline = t1 + ms(900) + ms(400);
+    assert!(requests(&tick(&mut state, &desc, w1_deadline - ms(1), &mut sampler)).is_empty());
+    assert_eq!(requests(&tick(&mut state, &desc, w1_deadline, &mut sampler)), skips(4, 8));
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (0, 0), "C++ peaks");
+    Ok(())
+}
+
+/// race-notar-rearm: a certificate for the window's last slot re-arms the
+/// timeout while the refusals are kept; the clear requests each once, and the
+/// re-armed alarm requests nothing more.
+#[test]
+fn test_backlog_refusals_and_a_notar_rearm_request_each_once() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let refused = refuse_window0_skips(&mut state, &desc, &mut sampler);
+    for vote in refused.clone() {
+        state.vote_suppressed(vote);
+    }
+    install_notar_cert(&mut state, &desc, 3, 0x33)?;
+    assert!(requests(&drain_events(&mut state)).is_empty());
+    sampler.sample(&state);
+    let rearmed = t0() + ms(300) + ms(1600);
+    desc.set_time(t0() + ms(800));
+    assert_eq!(skip_votes(&backlog(&mut state, &desc, false, &mut sampler)), refused);
+    assert!(requests(&tick(&mut state, &desc, rearmed + ms(500), &mut sampler)).is_empty());
+    Ok(())
+}
+
+/// bootstrap-suppressed: the skips the startup path casts are refused and
+/// recovered. C++ peaks: 4 entries, 0 windows.
+#[test]
+fn test_backlog_refused_startup_skips_are_requested_again() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(600_000, 1.2);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    assert_eq!(state.generate_restart_skip_votes(WindowIndex::new(1), 4), 4);
+    let refused = skip_votes(&drain_events(&mut state));
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    for vote in refused.clone() {
+        state.vote_suppressed(vote);
+    }
+    sampler.sample(&state);
+    assert_eq!(skip_votes(&backlog(&mut state, &desc, false, &mut sampler)), refused);
+    assert_eq!((sampler.peak_entries, sampler.peak_windows), (4, 0), "C++ peaks");
+    Ok(())
+}
+
+/// Only skip and final votes are kept after a refusal; a refused notarize vote
+/// is neither kept nor asked for again (C++ try_notarize does not use
+/// request_vote).
+#[test]
+fn test_backlog_refused_notarize_is_not_kept() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(600_000, 1.2);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let hash = UInt256::from([0x53u8; 32]);
+    state.on_candidate(
+        &desc,
+        create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0),
+    )?;
+    let notar = drain_events(&mut state).into_iter().find_map(|e| match e {
+        SimplexEvent::BroadcastVote(v @ Vote::Notarize(_)) => Some(v),
+        _ => None,
+    });
+    assert!(notar.is_some());
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    if let Some(notar) = notar {
+        state.vote_suppressed(notar);
+    }
+    assert_eq!(state.recovery_state().suppressed_votes, 0);
+    assert!(requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty());
+    Ok(())
+}
+
+/// A refused final vote stays needed after the local decision marked the slot
+/// completed: only finalization of the slot makes it obsolete. A finalization
+/// certificate then drops it.
+#[test]
+fn test_backlog_refused_final_is_obsolete_only_after_finalization() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc_with(600_000, 1.2);
+    let mut state = started_state_with(&desc)?;
+    let mut sampler = RecoverySampler::default();
+    let hash = UInt256::from([0x54u8; 32]);
+    state.on_candidate(
+        &desc,
+        create_test_candidate(0, hash.clone(), BlockIdExt::default(), None, 0),
+    )?;
+    drain_events(&mut state);
+    let cert = create_test_notar_cert(&desc, SlotIndex::new(0), hash.clone(), &peer_signers());
+    state.set_notarize_certificate(&desc, SlotIndex::new(0), &hash, cert)?;
+    drain_events(&mut state);
+    let final_vote =
+        Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash.clone() });
+    assert!(backlog(&mut state, &desc, true, &mut sampler).is_empty());
+    state.vote_suppressed(final_vote.clone());
+    state.vote_suppressed(final_vote.clone());
+    assert_eq!(state.recovery_state().suppressed_votes, 1, "one entry per exact vote");
+
+    let final_cert =
+        create_test_final_cert(&desc, SlotIndex::new(0), hash.clone(), &peer_signers());
+    state.set_finalize_certificate(&desc, SlotIndex::new(0), &hash, final_cert)?;
+    drain_events(&mut state);
+    assert!(
+        requests(&backlog(&mut state, &desc, false, &mut sampler)).is_empty(),
+        "a finalized slot's refused final vote is dropped"
+    );
+    assert_eq!(state.recovery_state(), RecoveryState::default());
+    Ok(())
+}
+
+/// D4 (merged-head behaviour, C++ d2-range-start-voted): the alarm leaves a
+/// slot whose skip is already cast alone; it requests no second skip for it.
+#[test]
+fn test_alarm_requests_no_second_skip_for_an_already_skipped_slot() -> rtos_block::Result<()> {
+    let desc = cpp_timer_desc();
+    desc.set_time(t0());
+    let mut state = SimplexState::new(&desc)?;
+    state.mark_slot_voted_on_restart(&desc, &Vote::Skip(SkipVote { slot: SlotIndex::new(0) }));
+    state.reset_timeouts_on_start(&desc);
+    drain_events(&mut state);
+    let skips_cast = skips_at_deadline(&mut state, &desc, t0() + ms(700));
+    assert_eq!(skips_cast, vec![1, 2, 3], "C++: requests=0 for slot 0, 1 for slots 1-3");
     Ok(())
 }

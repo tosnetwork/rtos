@@ -13399,7 +13399,7 @@ fn test_finality_behind_drops_own_vote_before_journal() {
         slot: SlotIndex::new(0),
     });
 
-    processor.simplex_state.set_finality_behind(true);
+    processor.simplex_state.set_finality_behind(processor.runtime.description(), true);
     processor.broadcast_vote(vote.clone());
     assert!(
         !receiver.drain_actions().iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })),
@@ -13407,7 +13407,7 @@ fn test_finality_behind_drops_own_vote_before_journal() {
     );
     assert_eq!(h.signature_count(), 0, "nor signed or journalled");
 
-    processor.simplex_state.set_finality_behind(false);
+    processor.simplex_state.set_finality_behind(processor.runtime.description(), false);
     processor.broadcast_vote(vote);
     assert!(receiver.drain_actions().iter().any(|a| matches!(a, ReceiverAction::SendVote { .. })));
     assert_eq!(h.signature_count(), 1);
@@ -13443,7 +13443,10 @@ fn test_finality_behind_at_parent_ready_abandons_notarization_after_validation()
         let time = fixture.description.get_time();
         insert_pending_validation(&mut fixture.processor, &id, raw, time);
 
-        fixture.processor.simplex_state.set_finality_behind(behind_at_parent_ready);
+        fixture
+            .processor
+            .simplex_state
+            .set_finality_behind(fixture.processor.runtime.description(), behind_at_parent_ready);
         fixture.processor.check_validation();
         assert!(
             fixture.processor.validation.pending_approve_contains(&id),
@@ -13451,7 +13454,10 @@ fn test_finality_behind_at_parent_ready_abandons_notarization_after_validation()
         );
 
         // The backlog clears before validation and storage complete.
-        fixture.processor.simplex_state.set_finality_behind(false);
+        fixture
+            .processor
+            .simplex_state
+            .set_finality_behind(fixture.processor.runtime.description(), false);
         while fixture.processor.simplex_state.pull_event().is_some() {}
         let candidate = crate::block::Candidate::new(
             crate::block::CandidateId {
@@ -13513,5 +13519,372 @@ fn test_handle_notarization_reached_does_not_relay_when_persist_fails() {
     assert!(
         !actions.iter().any(|a| matches!(a, ReceiverAction::SendCertificate { .. })),
         "a certificate that was not stored must not be relayed"
+    );
+}
+
+/*
+    ========================================================================
+    Votes refused before their intent while finality is behind (C++ Pool
+    VoteCastOutcome, tos d590082e43)
+
+    The C++ reference harness observes each vote at request, committed
+    intent, committed signed record and verified broadcast, and requires each
+    stage exactly once per recovered vote (memo evidence
+    2026-10-20-a142-rust/cpp-runs-isolated). Here the same stages are the
+    signing journal records, the signer calls and the receiver's sends.
+    ========================================================================
+*/
+
+/// A signing-journal harness whose session has the C++ harness timing: four
+/// slots per window, first block 0.3 s, target rate 0.4 s.
+fn a142_harness() -> rtos_block::Result<crate::signing_coordinator::tests::Harness> {
+    use crate::{
+        pq_fixture as f,
+        signing_coordinator::tests::{binding, custody_backend, custody_descriptor, Harness},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    // A real, public test key in custody: every vote is signed and verified for real.
+    let root = std::env::temp_dir().join(format!("rtos-a142-{}", UInt256::rand()));
+    std::fs::create_dir(&root)?;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    let seed_path = root.join("public-test.seed");
+    std::fs::write(&seed_path, [0x91u8; 32])?;
+    std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))?;
+    let now_secs = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as u32;
+    let custody = rtos_pq_consensus::PqConsensusCustody::load(
+        UInt256::from([2; 32]),
+        &[rtos_pq_consensus::ConfiguredKey { key_file: seed_path, valid_from: 0, expire_at: 0 }],
+        now_secs,
+    )?;
+    let store = custody
+        .held_keys(&UInt256::from([2; 32]))
+        .values()
+        .next()
+        .map(|held| held.store.clone())
+        .ok_or_else(|| error!("the test custody holds no key"))?;
+    let (mut nodes, keys) = f::members();
+    nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store))?;
+    let opts = SessionOptions {
+        slots_per_leader_window: 4,
+        first_block_timeout: Duration::from_millis(300),
+        target_rate: Duration::from_millis(400),
+        first_block_timeout_multiplier: 1.2,
+        ..Default::default()
+    };
+    let description = Arc::new(
+        SessionDescription::new(
+            &opts,
+            f::session(),
+            42,
+            &nodes,
+            keys[1].clone(),
+            &ShardIdent::masterchain(),
+            SystemTime::now(),
+            None,
+        )?
+        .bind_pq_session(7)?,
+    );
+    let db = crate::database::SimplexDb::open(root.join("db"), "own-signing")?;
+    let mut journal_binding = binding(&description);
+    journal_binding.expire_at = Some(u64::from(store.expire_at()));
+    journal_binding.slots_per_window = 4;
+    let coordinator = Arc::new(crate::signing_coordinator::SigningCoordinator::open(
+        db.clone(),
+        journal_binding,
+        description.get_source_public_key(description.get_self_idx()).clone(),
+        &root,
+        true,
+        custody_backend(&description, store.clone()),
+    )?);
+    description.install_coordinator(coordinator.clone())?;
+    Ok(Harness {
+        root,
+        db,
+        description,
+        coordinator,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        store: Some(store),
+    })
+}
+
+fn a142_processor(
+    h: &crate::signing_coordinator::tests::Harness,
+) -> (SessionProcessor, Arc<MockReceiver>) {
+    let mut processor =
+        make_pq_processor_with_description_for_test(h.db.clone(), h.description.clone());
+    let receiver = MockReceiver::new();
+    processor.receiver = receiver.clone();
+    (processor, receiver)
+}
+
+/// The votes the receiver was asked to send, in order.
+fn sent_votes(receiver: &MockReceiver) -> rtos_block::Result<Vec<crate::simplex_state::Vote>> {
+    let mut votes = Vec::new();
+    for action in receiver.drain_actions() {
+        if let ReceiverAction::SendVote { vote } = action {
+            votes.push(crate::utils::extract_vote(&vote.into_boxed())?);
+        }
+    }
+    Ok(votes)
+}
+
+/// The number of records in this node's signing journal (intents and signed votes).
+fn journal_records(h: &crate::signing_coordinator::tests::Harness) -> rtos_block::Result<usize> {
+    Ok(h.db.storage.get_by_prefix(crate::signing_coordinator::PREFIX.to_vec(), None).wait()?.len())
+}
+
+fn signer_calls(h: &crate::signing_coordinator::tests::Harness) -> usize {
+    h.signature_count()
+}
+
+fn set_behind(processor: &mut SessionProcessor, behind: bool) {
+    processor.simplex_state.set_finality_behind(processor.runtime.description(), behind);
+}
+
+fn skip_vote(slot: u32) -> crate::simplex_state::Vote {
+    crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot: SlotIndex::new(slot) })
+}
+
+/// bootstrap-suppressed and race-refused-then-clear: the startup skips are
+/// requested while finality is fine, reach the gate after the backlog went
+/// over and are refused before any intent: nothing is journalled, signed or
+/// sent. The clear requests each exact vote again, and each is journalled,
+/// signed and sent exactly once (C++: request, intent, signed and outgoing
+/// once each for skips 0-3). Later toggles cast nothing more.
+#[test]
+fn test_refused_skips_are_journalled_signed_and_sent_once_after_the_clear() -> rtos_block::Result<()>
+{
+    let h = a142_harness()?;
+    let (mut processor, receiver) = a142_processor(&h);
+    let journal_before = journal_records(&h)?;
+    assert_eq!(processor.simplex_state.generate_restart_skip_votes(WindowIndex::new(1), 4), 4);
+    set_behind(&mut processor, true);
+    processor.process_simplex_events();
+
+    assert_eq!(sent_votes(&receiver)?, Vec::new(), "a refused skip is not sent");
+    assert_eq!(signer_calls(&h), 0, "nor signed");
+    assert_eq!(journal_records(&h)?, journal_before, "nor journalled");
+    assert_eq!(processor.simplex_state.recovery_state().suppressed_votes, 4);
+
+    set_behind(&mut processor, false);
+    processor.process_simplex_events();
+    let expected: Vec<_> = (0..4).map(skip_vote).collect();
+    assert_eq!(sent_votes(&receiver)?, expected, "each exact vote once, in slot order");
+    assert_eq!(signer_calls(&h), 4, "each signed once");
+    assert!(journal_records(&h)? > journal_before, "and journalled");
+    let journalled = journal_records(&h)?;
+
+    set_behind(&mut processor, true);
+    set_behind(&mut processor, false);
+    processor.process_simplex_events();
+    assert_eq!(sent_votes(&receiver)?, Vec::new(), "repeated toggles cast nothing more");
+    assert_eq!(signer_calls(&h), 4);
+    assert_eq!(journal_records(&h)?, journalled);
+    Ok(())
+}
+
+/// The gate's outcome is machine-identifiable, and only skip and final votes
+/// are kept: a refused notarize vote is reported but neither kept nor asked for
+/// again. A vote past the gate is Submitted.
+#[test]
+fn test_vote_cast_outcome_and_kept_kinds() -> rtos_block::Result<()> {
+    use crate::{
+        consensus_controller::VoteCastOutcome,
+        simplex_state::{NotarizeVote, Vote},
+    };
+    let h = a142_harness()?;
+    let (mut processor, receiver) = a142_processor(&h);
+    let desc = h.description.clone();
+    processor.simplex_state.mark_slot_voted_on_restart(&desc, &skip_vote(1));
+    let notarize = Vote::Notarize(NotarizeVote {
+        slot: SlotIndex::new(2),
+        block_hash: UInt256::from([7; 32]),
+    });
+
+    set_behind(&mut processor, true);
+    let outcomes: Vec<_> = [notarize.clone(), skip_vote(1)]
+        .into_iter()
+        .map(|vote| {
+            processor.with_consensus_backend(|controller, backend| {
+                controller.broadcast_vote_after_persist(backend, vote)
+            })
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            VoteCastOutcome::SuppressedBeforeIntentFinalityBehind,
+            VoteCastOutcome::SuppressedBeforeIntentFinalityBehind
+        ]
+    );
+    assert_eq!(processor.simplex_state.recovery_state().suppressed_votes, 1, "only the skip");
+
+    set_behind(&mut processor, false);
+    processor.process_simplex_events();
+    assert_eq!(sent_votes(&receiver)?, vec![skip_vote(1)], "the notarize vote is not resent");
+
+    let outcome = processor.with_consensus_backend(|controller, backend| {
+        controller.broadcast_vote_after_persist(backend, notarize)
+    });
+    assert_eq!(outcome, VoteCastOutcome::Submitted);
+    Ok(())
+}
+
+/// Journal and signing failures happen at or after the intent boundary: they
+/// stay Submitted, nothing is kept, and no backlog transition casts the vote
+/// again.
+#[test]
+fn test_journal_failures_stay_submitted_and_are_never_retried() -> rtos_block::Result<()> {
+    use crate::consensus_controller::VoteCastOutcome;
+    for stage in [
+        "before_intent",
+        "after_intent",
+        "before_sign",
+        "after_sign",
+        "before_signed",
+        "after_signed",
+    ] {
+        let h = a142_harness()?;
+        let (mut processor, receiver) = a142_processor(&h);
+        let desc = h.description.clone();
+        processor.simplex_state.mark_slot_voted_on_restart(&desc, &skip_vote(1));
+        if let Ok(mut fail_at) = h.coordinator.fail_at.lock() {
+            *fail_at = Some(stage);
+        }
+        let outcome = processor.with_consensus_backend(|controller, backend| {
+            controller.broadcast_vote_after_persist(backend, skip_vote(1))
+        });
+        assert_eq!(outcome, VoteCastOutcome::Submitted, "{stage}");
+        assert_eq!(processor.simplex_state.recovery_state().suppressed_votes, 0, "{stage}");
+        if let Ok(mut fail_at) = h.coordinator.fail_at.lock() {
+            *fail_at = None;
+        }
+        let calls = signer_calls(&h);
+        set_behind(&mut processor, true);
+        set_behind(&mut processor, false);
+        processor.process_simplex_events();
+        assert_eq!(sent_votes(&receiver)?, Vec::new(), "{stage}: not cast again");
+        assert_eq!(signer_calls(&h), calls, "{stage}: not signed again");
+    }
+    Ok(())
+}
+
+/// race-final-after-clear, in the Rust shape: a final vote waits for its
+/// notarization certificate to be durable; the backlog goes over before that
+/// wait completes, so the vote reaches the gate behind and is refused. After
+/// the clear the exact vote is requested again, signed and sent once
+/// (C++: notarize once, final once, no skip).
+#[test]
+fn test_final_refused_after_its_durability_wait_is_cast_once_after_the_clear(
+) -> rtos_block::Result<()> {
+    use crate::simplex_state::{FinalizeVote, Vote};
+    let h = a142_harness()?;
+    let (mut processor, receiver) = a142_processor(&h);
+    let desc = h.description.clone();
+    let hash = UInt256::from([0x61; 32]);
+    let final_vote =
+        Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash.clone() });
+    processor.simplex_state.mark_slot_voted_on_restart(&desc, &final_vote);
+    let id = RawCandidateId { slot: SlotIndex::new(0), hash };
+    let pending = ManualAsyncResult::pending();
+    processor.database.insert_notar_cert_store(id, pending.clone());
+
+    processor.broadcast_vote(final_vote.clone());
+    assert_eq!(processor.database.pending_count(), 1, "the final vote waits for durability");
+    set_behind(&mut processor, true);
+    pending.complete_ok();
+    processor.process_pending_async_db_results();
+    assert_eq!(sent_votes(&receiver)?, Vec::new());
+    assert_eq!(signer_calls(&h), 0);
+    assert_eq!(processor.simplex_state.recovery_state().suppressed_votes, 1);
+    // A consumed storage result reports itself as taken, as the real one does.
+    pending.complete_taken_sentinel();
+
+    set_behind(&mut processor, false);
+    processor.process_simplex_events();
+    processor.process_pending_async_db_results();
+    assert_eq!(sent_votes(&receiver)?, vec![final_vote], "the exact final vote once");
+    assert_eq!(signer_calls(&h), 1);
+    Ok(())
+}
+
+/// shutdown-pending and shutdown-suppressed: the group stops with a refused
+/// skip kept, a final vote whose durability wait completes only during the
+/// stop, and deferred skips of an expired timeout. The stop delivers the
+/// pending callback, which is refused behind the backlog; a backlog clear
+/// after the stop requests the kept and deferred votes, and none of them is
+/// journalled, signed or sent (C++: nothing is cast by a stopped group).
+#[test]
+fn test_stopped_group_casts_nothing_it_kept_or_deferred() -> rtos_block::Result<()> {
+    use crate::simplex_state::{FinalizeVote, Vote};
+    let h = a142_harness()?;
+    let (mut processor, receiver) = a142_processor(&h);
+    let desc = h.description.clone();
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    desc.set_time(t0);
+    processor.simplex_state.reset_timeouts_on_start(&desc);
+    let hash = UInt256::from([0x62; 32]);
+    let final_vote =
+        Vote::Finalize(FinalizeVote { slot: SlotIndex::new(0), block_hash: hash.clone() });
+    processor.simplex_state.mark_slot_voted_on_restart(&desc, &final_vote);
+    processor.simplex_state.mark_slot_voted_on_restart(&desc, &skip_vote(1));
+    let pending = ManualAsyncResult::pending();
+    processor
+        .database
+        .insert_notar_cert_store(RawCandidateId { slot: SlotIndex::new(0), hash }, pending.clone());
+    processor.broadcast_vote(final_vote);
+
+    set_behind(&mut processor, true);
+    processor.broadcast_vote(skip_vote(1));
+    desc.set_time(t0 + Duration::from_millis(800));
+    processor.simplex_state.check_all(&desc);
+    processor.process_simplex_events();
+    let kept = processor.simplex_state.recovery_state();
+    assert_eq!((kept.suppressed_votes, kept.deferred_skip_slots), (1, 4), "{kept:?}");
+
+    pending.complete_ok();
+    processor.stop(false);
+    assert_eq!(processor.simplex_state.recovery_state().suppressed_votes, 2, "refused in stop");
+
+    set_behind(&mut processor, false);
+    processor.process_simplex_events();
+    processor.process_pending_async_db_results();
+    assert_eq!(sent_votes(&receiver)?, Vec::new(), "nothing is sent by a stopped group");
+    assert_eq!(signer_calls(&h), 0, "nor signed");
+    Ok(())
+}
+
+/// The real backlog producer: the clear at the root's completion hands the
+/// refused vote back to the FSM queue and wakes the main loop at once.
+#[test]
+fn test_backlog_clear_requeues_refused_votes_and_wakes_the_main_loop() {
+    let (mut fixture, _recording, _listener) = backlog_fixture();
+    fixture.processor.consensus.set_pending_finalizations_max_for_test(16);
+    let top = seed_chain_over_missing_root(&mut fixture, 40, 16);
+    finalize_backlog_trigger(&mut fixture, &top);
+    assert!(fixture.processor.simplex_state.finality_behind());
+
+    let desc = fixture.description.clone();
+    let slot = fixture.processor.simplex_state.get_first_non_progressed_slot();
+    let vote = crate::simplex_state::Vote::Skip(crate::simplex_state::SkipVote { slot });
+    fixture.processor.simplex_state.mark_slot_voted_on_restart(&desc, &vote);
+    while fixture.processor.simplex_state.pull_event().is_some() {}
+    fixture.processor.broadcast_vote(vote.clone());
+    assert_eq!(fixture.processor.simplex_state.recovery_state().suppressed_votes, 1);
+
+    seed_backlog_node(&mut fixture, 40, None, false, true);
+    fixture.processor.reset_next_awake_time();
+    retry_backlog(&mut fixture);
+    assert!(!fixture.processor.simplex_state.finality_behind());
+    let mut requeued = Vec::new();
+    while let Some(event) = fixture.processor.simplex_state.pull_event() {
+        if let SimplexEvent::BroadcastVote(v) = event {
+            requeued.push(v);
+        }
+    }
+    assert!(requeued.contains(&vote), "the refused vote is requested again: {requeued:?}");
+    assert!(
+        fixture.processor.runtime.get_next_awake_time() <= fixture.processor.now(),
+        "the main loop wakes to drain it"
     );
 }

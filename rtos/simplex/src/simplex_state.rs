@@ -66,7 +66,7 @@ use crate::{
 use rtos_block::{error, fail, BlockIdExt, Result, UInt256};
 use std::{
     cmp,
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     fmt::{Display, Formatter},
     mem,
     sync::Arc,
@@ -457,6 +457,36 @@ pub(crate) enum WindowAlloc {
     /// Bypass the horizon guard. C++ `slot_at()` parity.
     /// Use ONLY after the certificate passed quorum/storage checks.
     VerifiedCertificate,
+}
+
+/// A skip range whose timeout expired while finality was behind (C++
+/// `DeferredSkips`): cast when the backlog clears, dropped once a later
+/// leader window is observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeferredSkipRange {
+    begin: SlotIndex,
+    end: SlotIndex,
+}
+
+/// The kinds of this node's own votes kept after a refusal before their
+/// intent, in the order recovery requests them again (C++ `FINAL_KIND`,
+/// `SKIP_KIND`). A notarize vote is never kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SuppressedVoteKind {
+    Final,
+    Skip,
+}
+
+/// What is kept for recovery after a finalization backlog (C++
+/// `QueryConsensusRecoveryState::Result`); read by tests, which bound it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecoveryState {
+    pub deferred_skip_windows: usize,
+    /// Slots covered by the deferred ranges, summed over windows.
+    pub deferred_skip_slots: usize,
+    pub suppressed_votes: usize,
+    pub current_window: WindowIndex,
 }
 
 /// Leader window containing slots
@@ -969,6 +999,15 @@ pub(crate) struct SimplexState {
     /// until the backlog clears (C++ `FinalizationBacklog`). Not persisted.
     finality_behind: bool,
 
+    /// Skip ranges whose timeout expired while finality was behind, by leader
+    /// window (C++ `deferred_skips_`). In memory only.
+    deferred_skips: BTreeMap<WindowIndex, DeferredSkipRange>,
+
+    /// Skip and final votes refused before their intent, kept exactly until
+    /// finality catches up (C++ `suppressed_votes_`). Keyed by slot and kind; a
+    /// key is present only while no request for that vote is outstanding.
+    suppressed_votes: BTreeMap<(SlotIndex, SuppressedVoteKind), Vote>,
+
     /// Mapping from candidate hash to CandidateId
     ///
     /// Populated by `on_candidate` when a candidate is received.
@@ -1117,6 +1156,8 @@ impl SimplexState {
             num_validators,
             local_is_validator: desc.is_validator(),
             finality_behind: false,
+            deferred_skips: BTreeMap::new(),
+            suppressed_votes: BTreeMap::new(),
             candidate_ids: HashMap::new(),
             first_non_progressed_slot: SlotIndex(0),
             skip_intervals: BTreeSet::new(),
@@ -2312,9 +2353,173 @@ impl SimplexState {
 // The stop-producing signal from the finalization pipeline (C++
 // `FinalizationBacklog`) and the one-shot notarize abandonment it causes.
 impl SimplexState {
-    /// Finality can fall behind and catch up; this follows it both ways.
-    pub fn set_finality_behind(&mut self, behind: bool) {
+    /// Finality can fall behind and catch up; this follows it both ways
+    /// (C++ `handle(FinalizationBacklog)`). Only the transition to clear
+    /// recovers anything; a repeated event in either direction changes nothing.
+    pub fn set_finality_behind(&mut self, desc: &SessionDescription, behind: bool) {
+        let cleared = self.finality_behind && !behind;
         self.finality_behind = behind;
+        if cleared {
+            self.recover_after_backlog(desc);
+        }
+    }
+
+    /// Pool refused one of this node's own votes before committing its intent,
+    /// because finality was behind when the vote reached the gate (C++
+    /// `VoteCastOutcome::SuppressedBeforeIntentFinalityBehind`). Nothing about
+    /// the vote exists outside this state, so the exact vote is kept and
+    /// requested again once finality catches up. Only skip and final votes are
+    /// kept: a refused notarize vote is neither undone nor asked for again.
+    /// At most one request per exact vote is outstanding: a kept vote is
+    /// requested again only after it left the map, and it re-enters only by
+    /// being refused again.
+    pub(crate) fn vote_suppressed(&mut self, vote: Vote) {
+        let kind = match &vote {
+            Vote::Notarize(_) => return,
+            Vote::Finalize(_) => SuppressedVoteKind::Final,
+            Vote::Skip(_) => SuppressedVoteKind::Skip,
+        };
+        if self.vote_obsolete(&vote) {
+            log::debug!("SimplexState::vote_suppressed: {vote:?} is no longer needed");
+            return;
+        }
+        if self.finality_behind {
+            self.suppressed_votes.insert((Self::vote_slot(&vote), kind), vote);
+            return;
+        }
+        // The backlog cleared before this refusal arrived. That recovery has
+        // already run and could not see this vote, so nothing else will ask for it.
+        self.broadcast_vote(vote);
+    }
+
+    fn vote_slot(vote: &Vote) -> SlotIndex {
+        match vote {
+            Vote::Notarize(v) => v.slot,
+            Vote::Finalize(v) => v.slot,
+            Vote::Skip(v) => v.slot,
+        }
+    }
+
+    /// The local state of `slot` if it is tracked and not finalized (C++
+    /// `slot_at`). Finalization here is the finalized boundary, which only a
+    /// finalization certificate moves, never a local final vote. Nothing is created.
+    fn tracked_slot(&self, slot: SlotIndex) -> Option<&Slot> {
+        if slot < self.first_non_finalized_slot {
+            return None;
+        }
+        self.get_window(slot.window_index(self.slots_per_leader_window)).and_then(|window| {
+            window.slots.get(slot.offset_in_window(self.slots_per_leader_window) as usize)
+        })
+    }
+
+    /// Whether a refused vote is no longer needed by anyone: its slot is
+    /// finalized or no longer tracked, or, for a skip, a later leader window was
+    /// observed, which needs a certificate for every slot of the vote's window.
+    /// The slot's own decision is also checked, though nothing undoes it.
+    fn vote_obsolete(&self, vote: &Vote) -> bool {
+        let slot = Self::vote_slot(vote);
+        let Some(state) = self.tracked_slot(slot) else {
+            return true;
+        };
+        match vote {
+            Vote::Skip(_) => {
+                slot.window_index(self.slots_per_leader_window) < self.current_leader_window_idx
+                    || !state.voted_skip
+                    || state.voted_final
+            }
+            Vote::Finalize(_) => !state.voted_final,
+            Vote::Notarize(_) => true,
+        }
+    }
+
+    /// Request again every kept refused vote of `kind` still needed, in slot order.
+    fn resubmit_suppressed(&mut self, kind: SuppressedVoteKind) {
+        let keys: Vec<(SlotIndex, SuppressedVoteKind)> =
+            self.suppressed_votes.keys().filter(|(_, k)| *k == kind).copied().collect();
+        for key in keys {
+            if let Some(vote) = self.suppressed_votes.remove(&key) {
+                if !self.vote_obsolete(&vote) {
+                    self.broadcast_vote(vote);
+                }
+            }
+        }
+    }
+
+    /// The skip timeout of `window` expired over `[range_start, window_end)`
+    /// while finality was behind (C++ `defer_skips`). The deadline did pass, so
+    /// the window records it exactly as a cast skip would; the votes wait for
+    /// the backlog to clear. A second expiry in the same window only widens it.
+    fn defer_skips(&mut self, window: WindowIndex, range_start: SlotIndex, window_end: SlotIndex) {
+        if self.alarm_slots(range_start, window_end).is_empty() {
+            return;
+        }
+        if let Some(leader_window) = self.get_window_mut(window) {
+            leader_window.had_timeouts = true;
+        }
+        let range = self
+            .deferred_skips
+            .entry(window)
+            .or_insert(DeferredSkipRange { begin: range_start, end: window_end });
+        range.begin = range.begin.min(range_start);
+        let begin = range.begin;
+        log::warn!(
+            "SimplexState::defer_skips: ({window}) the skip timeout expired while finality is \
+             behind; skips from slot {begin} wait for the backlog to clear"
+        );
+    }
+
+    /// Finality caught up (C++ `recover_after_backlog`). Cast what the backlog
+    /// held back, in the order normal operation would have cast it: first the
+    /// final votes for slots this node notarized and saw notarized, then the
+    /// skips whose timeouts expired meanwhile. A slot that just received a final
+    /// vote is not skipped. The timeout itself is not touched: an unexpired
+    /// deadline keeps its time, and no alarm is armed. Refused votes are
+    /// requested again in the same order, finals with finals, skips with skips.
+    fn recover_after_backlog(&mut self, desc: &SessionDescription) {
+        self.resubmit_suppressed(SuppressedVoteKind::Final);
+        let mut finals = Vec::new();
+        for window in &self.leader_windows {
+            let mut slot = window.start_slot;
+            for slot_state in &window.slots {
+                if slot >= self.first_non_finalized_slot {
+                    if let (Some(voted), Some(_)) =
+                        (&slot_state.voted_notar, &slot_state.observed_notar_certificate)
+                    {
+                        finals.push((slot, voted.hash.clone()));
+                    }
+                }
+                slot += 1;
+            }
+        }
+        for (slot, hash) in finals {
+            self.try_final(desc, slot, &hash);
+        }
+        self.resubmit_suppressed(SuppressedVoteKind::Skip);
+        let deferred = mem::take(&mut self.deferred_skips);
+        for (window, range) in deferred {
+            log::info!(
+                "SimplexState::recover_after_backlog: finality caught up; casting the skips of \
+                 window {window} deferred from slot {}",
+                range.begin
+            );
+            self.cast_skips(range.begin, range.end, false);
+        }
+    }
+
+    /// Read-only: the size of the state kept for recovery after a finalization
+    /// backlog (C++ `QueryConsensusRecoveryState`).
+    #[cfg(test)]
+    pub(crate) fn recovery_state(&self) -> RecoveryState {
+        RecoveryState {
+            deferred_skip_windows: self.deferred_skips.len(),
+            deferred_skip_slots: self
+                .deferred_skips
+                .values()
+                .map(|range| range.end - range.begin)
+                .fold(0usize, |sum, n| sum.saturating_add(n as usize)),
+            suppressed_votes: self.suppressed_votes.len(),
+            current_window: self.current_leader_window_idx,
+        }
     }
 
     /// Whether finalization is behind and this group must not produce.
@@ -2507,7 +2712,14 @@ impl SimplexState {
              [{range_start}, {window_end})"
         );
 
-        self.alarm_skip_range(range_start, window_end);
+        if self.finality_behind {
+            // The deadline has passed, but no vote may be cast while finality is
+            // behind. The expired range is kept rather than dropped: the alarm
+            // fires once and nothing else would ask for these skips again.
+            self.defer_skips(window_idx, range_start, window_end);
+        } else {
+            self.cast_skips(range_start, window_end, true);
+        }
         self.timeout_slot = window_end;
     }
 
@@ -2534,37 +2746,52 @@ impl SimplexState {
         slots
     }
 
-    /// C++ 8812403 `alarm()` body: skip every slot of `[begin, end)` that is
-    /// not voted final, unless finality is behind.
-    fn alarm_skip_range(&mut self, begin: SlotIndex, end: SlotIndex) {
-        if self.finality_behind || !self.local_is_validator {
+    /// C++ `cast_skips`: skip every slot of `[begin, end)` that is not voted
+    /// final. A slot whose skip is already cast is left alone, so no second
+    /// request for the same vote is made. `record_history` is set only when the
+    /// skip timeout itself fires: the adaptive first-block timeout of the next
+    /// window depends on whether this one timed out, and a skip cast later, on
+    /// recovery, must not rewrite that for a window that may have been replaced.
+    fn cast_skips(&mut self, begin: SlotIndex, end: SlotIndex, record_history: bool) {
+        if !self.local_is_validator {
             return;
         }
         let slots = self.alarm_slots(begin, end);
-        if slots.is_empty() {
-            return;
-        }
-        let slots_str: Vec<String> = slots.iter().map(|s| format!("{}", s)).collect();
-        log::warn!(
-            "SimplexState::process_timeouts: SKIP VOTING for {} slots: [{}]",
-            slots.len(),
-            slots_str.join(",")
-        );
+        let mut cast = Vec::new();
         for slot in slots {
-            self.broadcast_vote(Vote::Skip(SkipVote { slot }));
             let window_idx = slot.window_index(self.slots_per_leader_window);
             let offset = slot.offset_in_window(self.slots_per_leader_window) as usize;
-            if let Some(window) = self.get_window_mut(window_idx) {
-                // C++ previous_window_had_skip_ is set per cast skip.
+            let Some(window) = self.get_window_mut(window_idx) else {
+                continue;
+            };
+            if record_history {
+                // C++ previous_window_had_skip_.
                 window.had_timeouts = true;
-                if let Some(slot_state) = window.slots.get_mut(offset) {
-                    slot_state.is_voted = true;
-                    slot_state.voted_skip = true;
-                    slot_state.is_timeout_skipped = true;
-                    // C++ alarm() only sets voted_skip; the pending candidate is
-                    // kept and rules out a different one for the slot.
-                }
             }
+            let Some(slot_state) = window.slots.get_mut(offset) else {
+                continue;
+            };
+            if slot_state.voted_skip {
+                continue;
+            }
+            slot_state.is_voted = true;
+            slot_state.voted_skip = true;
+            slot_state.is_timeout_skipped = true;
+            // C++ only sets voted_skip; the pending candidate is kept and rules
+            // out a different one for the slot.
+            cast.push(slot);
+        }
+        if cast.is_empty() {
+            return;
+        }
+        let slots_str: Vec<String> = cast.iter().map(|s| format!("{}", s)).collect();
+        log::warn!(
+            "SimplexState::cast_skips: SKIP VOTING for {} slots: [{}]",
+            cast.len(),
+            slots_str.join(",")
+        );
+        for slot in cast {
+            self.broadcast_vote(Vote::Skip(SkipVote { slot }));
         }
     }
 
@@ -4571,6 +4798,9 @@ impl SimplexState {
         // Advance to new window; arm its timeout unless a notarization already
         // moved the cursor past its start (C++ `timeout_slot_ <= start_slot`).
         self.current_leader_window_idx = now_window;
+        // A later window is observed only once every slot before it has a
+        // certificate, so the skips deferred for those windows are not needed.
+        self.deferred_skips.retain(|window, _| *window >= now_window);
         self.observe_window_timeouts(desc);
 
         // C++ parity: populate new window's available_bases and first slot base.
@@ -5612,7 +5842,7 @@ impl SimplexState {
     /// injecting events without running full FSM vote accumulation.
     #[cfg(test)]
     pub fn skip_range_for_test(&mut self, begin: SlotIndex, end: SlotIndex) {
-        self.alarm_skip_range(begin, end);
+        self.cast_skips(begin, end, true);
     }
 
     /// Skip every slot of `window_idx` that is not voted final, as an alarm
@@ -5621,7 +5851,7 @@ impl SimplexState {
     pub fn try_skip_window(&mut self, window_idx: WindowIndex) {
         let begin = window_idx.window_start(self.slots_per_leader_window);
         let end = (window_idx + 1).window_start(self.slots_per_leader_window);
-        self.alarm_skip_range(begin, end);
+        self.cast_skips(begin, end, true);
     }
 
     /// The skip timeout cursor (C++ `timeout_slot_`).
@@ -5781,6 +6011,9 @@ impl SimplexState {
 
             // Advance to new window; arm its timeout as a window observation does.
             self.current_leader_window_idx = window_idx;
+            // A later window is observed only once every slot before it has a
+            // certificate, so the skips deferred for those windows are not needed.
+            self.deferred_skips.retain(|window, _| *window >= window_idx);
             self.observe_window_timeouts(desc);
         } else {
             log::trace!(

@@ -57,6 +57,49 @@ use std::{
 */
 lazy_static! {
     static ref SIMPLEX_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    static ref BACKLOG_OBSERVATIONS: Mutex<BacklogObservations> =
+        Mutex::new(BacklogObservations::default());
+}
+
+/// What the test log shows of the finalization backlog: the session threads
+/// that deferred an expired skip timeout because finality was behind, when a
+/// node last reported its backlog cleared, and when blocks were finalized.
+#[derive(Default)]
+struct BacklogObservations {
+    deferred_threads: HashSet<thread::ThreadId>,
+    last_clear: Option<Instant>,
+    finalized_at: Vec<Instant>,
+}
+
+/// Logged by the FSM when a skip timeout expires while finality is behind.
+const DEFERRED_SKIP_LOG: &str = "the skip timeout expired while finality is behind";
+/// Logged by the consensus controller when a node's backlog clears.
+const BACKLOG_CLEARED_LOG: &str = "the finalization backlog has cleared";
+/// Most finalization times kept, which bounds the observation memory.
+const MAX_FINALIZATION_OBSERVATIONS: usize = 100_000;
+
+fn observe_backlog_log(message: &str, thread_id: thread::ThreadId) {
+    let deferred = message.contains(DEFERRED_SKIP_LOG);
+    let cleared = message.contains(BACKLOG_CLEARED_LOG);
+    if !deferred && !cleared {
+        return;
+    }
+    if let Ok(mut observed) = BACKLOG_OBSERVATIONS.lock() {
+        if deferred {
+            observed.deferred_threads.insert(thread_id);
+        }
+        if cleared {
+            observed.last_clear = Some(Instant::now());
+        }
+    }
+}
+
+fn observe_finalization() {
+    if let Ok(mut observed) = BACKLOG_OBSERVATIONS.lock() {
+        if observed.finalized_at.len() < MAX_FINALIZATION_OBSERVATIONS {
+            observed.finalized_at.push(Instant::now());
+        }
+    }
 }
 
 /// Upper bound for resolver-probe repair requests in integration tests.
@@ -749,6 +792,7 @@ impl SessionListener for SessionInstance {
 
         let seqno = block_id.seq_no();
         self.on_block_finalized_count.fetch_add(1, Ordering::Relaxed);
+        observe_finalization();
 
         let now =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -999,6 +1043,7 @@ where
             };
             let source = format!("{}{}", record.target(), line);
             let thread_id = thread::current().id();
+            observe_backlog_log(&message, thread_id);
 
             // Write to the log file first, then drop the lock to avoid blocking other threads
             // on stdout formatting / printing (important for TRACE-heavy debug sessions).
@@ -2939,9 +2984,9 @@ fn test_empty_collated_data_hash() {
 /// hold, while the finalizations agreed before the stop kept reaching the nodes.
 /// Releasing the gates drains the backlog; the leader window abandoned while
 /// behind is then skipped by its first-block timeout and the group finishes the
-/// run. The timeout is longer than the hold on purpose: a skip timeout that
-/// expires while finality is behind casts no skip and is consumed (C++
-/// consensus.cpp alarm), so the abandoned window would never be left.
+/// run. The timeout here is longer than the hold, so it expires only after the
+/// release; the backlog-stall test below covers a timeout that expires while
+/// finality is behind.
 #[test]
 fn test_simplex_consensus_finalization_backpressure() {
     let report = Arc::new(Mutex::new(None));
@@ -3008,6 +3053,91 @@ fn test_simplex_consensus_finalization_backpressure() {
     // The harness requires every node to reach total_rounds, more than were
     // reached when the gates opened: the drain-and-resume evidence.
     assert!(report.finalized_at_release < 40, "the hold started well before completion");
+}
+
+/// Finalization backpressure held for longer than a skip timeout (C++
+/// test-consensus-simplex2-pq-finality-backlog-stall: 4 nodes, a 10 s hold
+/// against a 1 s first-block timeout).
+///
+/// While acceptance is held every node goes over the backlog limit, so the
+/// skip deadline of the abandoned window expires while finality is behind.
+/// The gate requires that more than a third of the voting weight (here: of the
+/// four equal-weight validators) deferred that expired timeout, and that new
+/// blocks are finalized after the last node cleared its backlog: a timeout
+/// that expires while finality is behind must still be honoured once finality
+/// catches up. Without that the group stays stalled and the run times out.
+#[test]
+fn test_simplex_consensus_finalization_backlog_stall_recovers() {
+    let report = Arc::new(Mutex::new(None));
+    let node_count = 4usize;
+    if let Ok(mut observed) = BACKLOG_OBSERVATIONS.lock() {
+        *observed = BacklogObservations::default();
+    }
+    run_simplex_consensus_test(
+        TestConfig {
+            total_rounds: 40,
+            min_finalized_percent: 0.3,
+            node_count,
+            generation_failure_probability: 0.0,
+            candidate_rejection_probability: 0.0,
+            max_collations: 10000,
+            target_rate: Duration::from_millis(200),
+            first_block_timeout: Duration::from_secs(1),
+            test_name: "simplex_finalization_backlog_stall".to_string(),
+            test_timeout: Duration::from_secs(240),
+            expect_timeout: false,
+            shard: ShardIdent::masterchain(),
+            mc_notification_interval: None,
+            overlay_type: OverlayType::InProcess,
+            net_gremlin: None,
+            restart_gremlin: None,
+            lossy_overlay: None,
+            lossy_overlay_node_indices: None,
+            standstill_timeout: None,
+            slots_per_leader_window: Some(1),
+            certificate_gossip_neighbors: None,
+            finality_hold: Some(FinalityHoldConfig {
+                start_after_finalized: 5,
+                hold_for: Duration::from_secs(10),
+                quiet_tail: Duration::from_secs(4),
+                report: report.clone(),
+            }),
+        },
+        |_instances| {},
+    );
+
+    let Ok(report) = report.lock().map(|report| report.clone()) else {
+        return;
+    };
+    let Some(report) = report else {
+        // Logging disabled: the harness did not run.
+        return;
+    };
+    log::info!("[finality-hold] report: {report:?}");
+    assert!(report.parked_at_release > 0, "acceptance was held");
+    assert_eq!(
+        report.staged_at_release, report.staged_at_quiet_start,
+        "no finalization was agreed during the quiet tail: the group was stopped"
+    );
+    let Ok(observed) = BACKLOG_OBSERVATIONS.lock() else {
+        return;
+    };
+    let deferred = observed.deferred_threads.len();
+    let fresh = observed
+        .last_clear
+        .map(|clear| observed.finalized_at.iter().filter(|at| **at > clear).count())
+        .unwrap_or(0);
+    log::info!(
+        "[finality-hold] {deferred} of {node_count} nodes deferred an expired skip timeout; \
+         {fresh} finalizations after the last clear"
+    );
+    assert!(
+        deferred * 3 > node_count,
+        "more than a third of the voting weight was behind when its skip deadline expired \
+         ({deferred} of {node_count})"
+    );
+    assert!(observed.last_clear.is_some(), "the backlog cleared");
+    assert!(fresh > 0, "new blocks were finalized after the last clear");
 }
 
 /// Sparse certificate fan-out (ConfigParam30 key 15): each node sends a newly
