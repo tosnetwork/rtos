@@ -11,7 +11,10 @@
  */
 use crate::{
     engine_traits::EngineOperations,
-    network::neighbours::{PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR},
+    network::{
+        full_node_overlay_client::FullNodeOverlayClient,
+        neighbours::{PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR},
+    },
 };
 use adnl::common::{
     AdnlPeers, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteVec, TaggedTlObject,
@@ -57,6 +60,7 @@ use crate::types::owned_tasks::OwnedTasks;
 
 pub struct FullNodeOverlayService {
     engine: Arc<dyn EngineOperations>,
+    admission: Arc<FullNodeAdmission>,
     compression: bool,
     tasks: Arc<OwnedTasks>,
     #[cfg(test)]
@@ -83,6 +87,7 @@ impl FullNodeOverlayService {
     ) -> Self {
         Self {
             engine,
+            admission: Arc::new(FullNodeAdmission::with_default_limits()),
             compression,
             tasks,
             #[cfg(test)]
@@ -98,6 +103,17 @@ impl FullNodeOverlayService {
             #[cfg(test)]
             pss_requests: Default::default(),
         }
+    }
+
+    /// A service with its own admission, so that a test controls the limits
+    /// and the clock origin.
+    #[cfg(test)]
+    pub(crate) fn with_admission(
+        engine: Arc<dyn EngineOperations>,
+        admission: Arc<FullNodeAdmission>,
+    ) -> Self {
+        let tasks = Arc::new(OwnedTasks::default());
+        Self { admission, ..Self::new(engine, false, tasks) }
     }
 
     #[cfg(test)]
@@ -824,6 +840,671 @@ impl FullNodeOverlayService {
             }
             Err(query) => Err(query),
         })
+    }
+}
+
+// ------------------------------------------------------------ admission
+//
+// Admission of full-node overlay queries, shared by every public shard
+// overlay of the node. Four sliding windows (global, heavy, medium, small)
+// bound the work the node performs; within them every source may hold at most
+// a quarter (rounded up) of each window it touches, and half of each window is
+// reserved and divided equally among the registered shards. A shard stays
+// counted after it is unregistered until its reserved usage drains. Queries of
+// an unlisted type are not limited. A query refused for capacity is answered
+// with its type's empty answer while the refusal-answer budget lasts, so the
+// requester can ask again; otherwise it gets an error.
+
+/// Sliding window length and allowance of one admission window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RateLimit {
+    pub window_size: f64,
+    pub window_limit: usize,
+}
+
+/// The node's admission limits; small queries keep a fixed allowance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FullNodeRateLimits {
+    pub global: RateLimit,
+    pub heavy: RateLimit,
+    pub medium: RateLimit,
+    pub small: RateLimit,
+}
+
+const RATELIMIT_WINDOW_SIZE: f64 = 1.0;
+const RATELIMIT_GLOBAL: usize = 96;
+const RATELIMIT_HEAVY: usize = 64;
+const RATELIMIT_MEDIUM: usize = 72;
+const RATELIMIT_SMALL: usize = 200;
+// Heavy requests are priced in units of 2 MiB of requested data.
+const HEAVY_REQUEST_COST_UNIT: u64 = 1 << 21;
+// Largest zero state a node serves.
+const MAX_ZEROSTATE_BYTES: u64 = 16 << 20;
+const REFUSAL_ANSWER_MAX_SOURCES: usize = 1024;
+
+impl FullNodeRateLimits {
+    pub(crate) fn new(window_size: f64, global: usize, heavy: usize, medium: usize) -> Self {
+        Self {
+            global: RateLimit { window_size, window_limit: global },
+            heavy: RateLimit { window_size, window_limit: heavy },
+            medium: RateLimit { window_size, window_limit: medium },
+            small: RateLimit { window_size, window_limit: RATELIMIT_SMALL },
+        }
+    }
+
+    /// Refuses limits under which an enabled window could never admit one
+    /// mandatory request from a source.
+    #[cfg(test)]
+    pub(crate) fn check(&self) -> Result<()> {
+        let mandatory = heavy_request_cost(MAX_ZEROSTATE_BYTES);
+        for (name, limit, cost) in [
+            ("global", self.global, mandatory),
+            ("heavy", self.heavy, mandatory),
+            ("medium", self.medium, 1),
+            ("small", self.small, 1),
+        ] {
+            if limit.window_size != 0.0 && per_source_limit(limit.window_limit) < cost {
+                fail!(
+                    "{name} rate limit {} gives each source {} per window, less than the {cost} \
+                    that one mandatory request costs",
+                    limit.window_limit,
+                    per_source_limit(limit.window_limit)
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for FullNodeRateLimits {
+    fn default() -> Self {
+        Self::new(RATELIMIT_WINDOW_SIZE, RATELIMIT_GLOBAL, RATELIMIT_HEAVY, RATELIMIT_MEDIUM)
+    }
+}
+
+fn heavy_request_cost(requested: u64) -> u64 {
+    let cost =
+        requested / HEAVY_REQUEST_COST_UNIT + u64::from(requested % HEAVY_REQUEST_COST_UNIT != 0);
+    cost.max(1)
+}
+
+fn per_source_limit(window_limit: usize) -> u64 {
+    (window_limit / 4 + usize::from(window_limit % 4 != 0)) as u64
+}
+
+fn fits(used: u64, cost: u64, limit: u64) -> bool {
+    cost <= limit && used <= limit - cost
+}
+
+const GLOBAL: usize = 0;
+const HEAVY: usize = 1;
+const MEDIUM: usize = 2;
+const SMALL: usize = 3;
+const WINDOWS: usize = 4;
+
+/// The cost category of a query and its price; `None` for an unlimited type.
+pub(crate) fn query_category(query: &TLObject) -> Option<(usize, u64)> {
+    use rtos_api::ton::rpc::ton_node::{
+        DownloadBlock, GetNextBlocksDescription, GetOutMsgQueueProof,
+    };
+    fn claimed(size: i64) -> u64 {
+        heavy_request_cost(if size > 0 { size as u64 } else { 0 })
+    }
+    if query.is::<GetArchiveSlice>() {
+        let size = query.clone().downcast::<GetArchiveSlice>().map_or(0, |q| q.max_size as i64);
+        return Some((HEAVY, claimed(size)));
+    }
+    if query.is::<DownloadPersistentStateSliceV2>() {
+        let size =
+            query.clone().downcast::<DownloadPersistentStateSliceV2>().map_or(0, |q| q.max_size);
+        return Some((HEAVY, claimed(size)));
+    }
+    if query.is::<DownloadZeroState>() {
+        return Some((HEAVY, heavy_request_cost(MAX_ZEROSTATE_BYTES)));
+    }
+    let medium = query.is::<DownloadBlock>()
+        || query.is::<DownloadBlockFull>()
+        || query.is::<DownloadNextBlockFull>()
+        || query.is::<DownloadNextBlocksFull>()
+        || query.is::<DownloadBlockProof>()
+        || query.is::<DownloadBlockProofLink>()
+        || query.is::<DownloadKeyBlockProof>()
+        || query.is::<DownloadKeyBlockProofLink>()
+        || query.is::<GetOutMsgQueueProof>()
+        || query.is::<PrepareKeyBlockProof>();
+    if medium {
+        return Some((MEDIUM, 1));
+    }
+    let small = query.is::<GetNextBlockDescription>()
+        || query.is::<GetNextBlocksDescription>()
+        || query.is::<PrepareBlockProof>()
+        || query.is::<PrepareBlock>()
+        || query.is::<PrepareZeroState>()
+        || query.is::<GetNextKeyBlockIds>()
+        || query.is::<GetArchiveInfo>()
+        || query.is::<GetShardArchiveInfo>()
+        || query.is::<PreparePersistentState>()
+        || query.is::<GetPersistentStateSizeV2>();
+    small.then_some((SMALL, 1))
+}
+
+/// The empty answer a query refused for capacity may carry: the answer its
+/// handler gives when it has nothing to offer, which the requester takes as
+/// "not ready, ask again". Other types are refused with an error.
+pub(crate) fn capacity_refusal_answer(query: &TLObject) -> Option<TLObject> {
+    if query.is::<DownloadBlockFull>() || query.is::<DownloadNextBlockFull>() {
+        return Some(DataFullBoxed::TonNode_DataFullEmpty.into_tl_object());
+    }
+    if query.is::<DownloadNextBlocksFull>() {
+        return Some(NextBlocksFull { blocks: vec![] }.into_boxed().into_tl_object());
+    }
+    if query.is::<PrepareBlock>() {
+        return Some(Prepared::TonNode_NotFound.into_tl_object());
+    }
+    if query.is::<PrepareBlockProof>() || query.is::<PrepareKeyBlockProof>() {
+        return Some(PreparedProof::TonNode_PreparedProofEmpty.into_tl_object());
+    }
+    if query.is::<PreparePersistentState>() || query.is::<PrepareZeroState>() {
+        return Some(PreparedState::TonNode_NotFoundState.into_tl_object());
+    }
+    None
+}
+
+/// A usage counter over a sliding window; entries newest first.
+#[derive(Default)]
+struct UsageWindow {
+    duration: f64,
+    entries: std::collections::VecDeque<(f64, u64)>,
+    total: u64,
+}
+
+impl UsageWindow {
+    fn new(duration: f64) -> Self {
+        Self { duration, ..Default::default() }
+    }
+    fn gc(&mut self, time: f64) {
+        while let Some(&(at, weight)) = self.entries.back() {
+            if time - at > self.duration {
+                self.total = self.total.saturating_sub(weight);
+                self.entries.pop_back();
+            } else {
+                break;
+            }
+        }
+    }
+    fn used(&mut self, time: f64) -> u64 {
+        self.gc(time);
+        self.total
+    }
+    fn add(&mut self, time: f64, weight: u64) {
+        self.gc(time);
+        match self.entries.front_mut() {
+            Some((at, w)) if *at == time => *w = w.saturating_add(weight),
+            _ => self.entries.push_front((time, weight)),
+        }
+        self.total = self.total.saturating_add(weight);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct Charge {
+    aggregate: [bool; WINDOWS],
+    source: [bool; WINDOWS],
+}
+
+struct ShardUsage {
+    registrations: usize,
+    reserved: [UsageWindow; WINDOWS],
+}
+
+struct SourceUsage {
+    windows: [UsageWindow; WINDOWS],
+    order: u64,
+}
+
+/// Source- and shard-aware admission windows.
+pub(crate) struct SourceAwareRateLimiter {
+    limits: [RateLimit; WINDOWS],
+    aggregate: [UsageWindow; WINDOWS],
+    shared: [UsageWindow; WINDOWS],
+    shards: std::collections::BTreeMap<ShardIdent, ShardUsage>,
+    sources: std::collections::HashMap<Arc<rtos_block::KeyId>, SourceUsage>,
+    // Sources in order of their latest charge.
+    order: std::collections::BTreeMap<u64, Arc<rtos_block::KeyId>>,
+    next_order: u64,
+}
+
+impl SourceAwareRateLimiter {
+    pub(crate) fn new(limits: FullNodeRateLimits) -> Self {
+        let limits = [limits.global, limits.heavy, limits.medium, limits.small];
+        let windows = || limits.map(|l| UsageWindow::new(l.window_size));
+        Self {
+            limits,
+            aggregate: windows(),
+            shared: windows(),
+            shards: Default::default(),
+            sources: Default::default(),
+            order: Default::default(),
+            next_order: 0,
+        }
+    }
+
+    fn windows(&self) -> [UsageWindow; WINDOWS] {
+        self.limits.map(|l| UsageWindow::new(l.window_size))
+    }
+
+    pub(crate) fn register_shard(&mut self, shard: &ShardIdent) {
+        if !self.shards.contains_key(shard) {
+            let reserved = self.windows();
+            self.shards.insert(shard.clone(), ShardUsage { registrations: 0, reserved });
+        }
+        if let Some(usage) = self.shards.get_mut(shard) {
+            usage.registrations = usage.registrations.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn unregister_shard(&mut self, shard: &ShardIdent) {
+        if let Some(usage) = self.shards.get_mut(shard) {
+            usage.registrations = usage.registrations.saturating_sub(1);
+        }
+    }
+
+    /// Charges a query of `category` and `cost` to its source and shard;
+    /// `false` when a window refuses it.
+    pub(crate) fn check_in(
+        &mut self,
+        category: usize,
+        cost: u64,
+        shard: &ShardIdent,
+        source: &Arc<rtos_block::KeyId>,
+        time: f64,
+    ) -> bool {
+        let cost = cost.max(1);
+        let mut charge = Charge::default();
+        if category == SMALL {
+            charge.aggregate[SMALL] = true;
+            charge.source[SMALL] = true;
+        } else {
+            charge.aggregate[GLOBAL] = true;
+            charge.source[GLOBAL] = true;
+            charge.aggregate[category] = true;
+            charge.source[category] = true;
+        }
+        self.admit(charge, cost, shard, source, time)
+    }
+
+    fn limited(&self, w: usize) -> bool {
+        self.limits[w].window_size != 0.0
+    }
+
+    fn reserved_total(&self, w: usize) -> u64 {
+        (self.limits[w].window_limit / 2) as u64
+    }
+
+    fn shard_share(&self, w: usize) -> u64 {
+        if self.shards.is_empty() {
+            0
+        } else {
+            self.reserved_total(w) / self.shards.len() as u64
+        }
+    }
+
+    fn admit(
+        &mut self,
+        charge: Charge,
+        cost: u64,
+        shard: &ShardIdent,
+        source: &Arc<rtos_block::KeyId>,
+        time: f64,
+    ) -> bool {
+        self.expire_sources(time);
+        self.expire_shards(time);
+        // A departed shard is still counted but may not draw on the reservation.
+        let registered = self.shards.get(shard).is_some_and(|s| s.registrations != 0);
+        let mut take_reserved = [0u64; WINDOWS];
+        let mut take_shared = [0u64; WINDOWS];
+        for w in 0..WINDOWS {
+            if !self.limited(w) {
+                continue;
+            }
+            let limit = self.limits[w].window_limit as u64;
+            if charge.source[w] {
+                let used = self.sources.get_mut(source).map_or(0, |s| s.windows[w].used(time));
+                if !fits(used, cost, per_source_limit(limit as usize)) {
+                    return false;
+                }
+            }
+            if !charge.aggregate[w] {
+                continue;
+            }
+            if !fits(self.aggregate[w].used(time), cost, limit) {
+                return false;
+            }
+            let mut reserved_free = 0;
+            if registered {
+                let share = self.shard_share(w);
+                let used = self.shards.get_mut(shard).map_or(0, |s| s.reserved[w].used(time));
+                reserved_free = share.saturating_sub(used);
+            }
+            take_reserved[w] = cost.min(reserved_free);
+            take_shared[w] = cost - take_reserved[w];
+            let shared_limit = limit.saturating_sub(self.reserved_total(w));
+            if !fits(self.shared[w].used(time), take_shared[w], shared_limit) {
+                return false;
+            }
+        }
+        let order = self.next_order;
+        self.next_order = self.next_order.saturating_add(1);
+        let windows = self.windows();
+        let state =
+            self.sources.entry(source.clone()).or_insert_with(|| SourceUsage { windows, order });
+        if state.order != order {
+            self.order.remove(&state.order);
+            state.order = order;
+        }
+        self.order.insert(order, source.clone());
+        for w in 0..WINDOWS {
+            if !self.limited(w) {
+                continue;
+            }
+            if charge.source[w] {
+                if let Some(state) = self.sources.get_mut(source) {
+                    state.windows[w].add(time, cost);
+                }
+            }
+            if !charge.aggregate[w] {
+                continue;
+            }
+            self.aggregate[w].add(time, cost);
+            if take_reserved[w] != 0 {
+                if let Some(usage) = self.shards.get_mut(shard) {
+                    usage.reserved[w].add(time, take_reserved[w]);
+                }
+            }
+            if take_shared[w] != 0 {
+                self.shared[w].add(time, take_shared[w]);
+            }
+        }
+        true
+    }
+
+    fn expire_shards(&mut self, time: f64) {
+        self.shards.retain(|_, usage| {
+            let mut drained = true;
+            for window in usage.reserved.iter_mut() {
+                if window.used(time) != 0 {
+                    drained = false;
+                }
+            }
+            usage.registrations != 0 || !drained
+        });
+    }
+
+    fn expire_sources(&mut self, time: f64) {
+        while let Some((&order, source)) = self.order.iter().next() {
+            let source = source.clone();
+            let Some(state) = self.sources.get_mut(&source) else {
+                self.order.remove(&order);
+                continue;
+            };
+            if state.windows.iter_mut().any(|w| w.used(time) != 0) {
+                return;
+            }
+            self.order.remove(&order);
+            self.sources.remove(&source);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_sources(&mut self, time: f64) -> usize {
+        self.expire_sources(time);
+        self.sources.len()
+    }
+}
+
+/// `rate` tokens a second up to `burst`; starts full.
+#[derive(Clone, Copy)]
+struct TokenBucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    at: f64,
+}
+
+impl TokenBucket {
+    fn new(rate: f64, burst: f64, now: f64) -> Self {
+        Self { rate, burst, tokens: burst, at: now }
+    }
+    fn refill(&mut self, now: f64) {
+        let elapsed = now - self.at;
+        if elapsed > 0.0 {
+            self.tokens = self.burst.min(self.tokens + elapsed * self.rate);
+            self.at = now;
+        }
+    }
+    fn has_token(&self) -> bool {
+        self.tokens >= 1.0
+    }
+    fn take(&mut self) {
+        self.tokens -= 1.0;
+    }
+    fn full(&self) -> bool {
+        self.tokens >= self.burst
+    }
+}
+
+/// The budget for answering capacity refusals: twice the default admission
+/// rate globally and for each source's share, one window's allowance as the
+/// burst. It does not follow the configured limits.
+pub(crate) struct RefusalAnswerBudget {
+    global: TokenBucket,
+    source_rate: f64,
+    source_burst: f64,
+    sources: std::collections::HashMap<Arc<rtos_block::KeyId>, (TokenBucket, u64)>,
+    order: std::collections::BTreeMap<u64, Arc<rtos_block::KeyId>>,
+    next_order: u64,
+}
+
+impl RefusalAnswerBudget {
+    pub(crate) fn new(now: f64) -> Self {
+        let global = RATELIMIT_GLOBAL as f64;
+        let share = per_source_limit(RATELIMIT_GLOBAL) as f64;
+        Self {
+            global: TokenBucket::new(2.0 * global / RATELIMIT_WINDOW_SIZE, global, now),
+            source_rate: 2.0 * share / RATELIMIT_WINDOW_SIZE,
+            source_burst: share,
+            sources: Default::default(),
+            order: Default::default(),
+            next_order: 0,
+        }
+    }
+
+    /// Takes one answer from both budgets, or nothing when either is spent.
+    pub(crate) fn try_take(&mut self, source: &Arc<rtos_block::KeyId>, now: f64) -> bool {
+        self.expire_sources(now);
+        self.global.refill(now);
+        let mut bucket = match self.sources.get(source) {
+            Some((bucket, _)) => {
+                let mut bucket = *bucket;
+                bucket.refill(now);
+                bucket
+            }
+            None if self.sources.len() < REFUSAL_ANSWER_MAX_SOURCES => {
+                TokenBucket::new(self.source_rate, self.source_burst, now)
+            }
+            None => return false,
+        };
+        if let Some((stored, _)) = self.sources.get_mut(source) {
+            *stored = bucket;
+        }
+        if !bucket.has_token() || !self.global.has_token() {
+            return false;
+        }
+        self.global.take();
+        bucket.take();
+        let order = self.next_order;
+        self.next_order = self.next_order.saturating_add(1);
+        if let Some((_, old)) = self.sources.insert(source.clone(), (bucket, order)) {
+            self.order.remove(&old);
+        }
+        self.order.insert(order, source.clone());
+        true
+    }
+
+    fn expire_sources(&mut self, now: f64) {
+        while let Some((&order, source)) = self.order.iter().next() {
+            let source = source.clone();
+            let Some((bucket, _)) = self.sources.get_mut(&source) else {
+                self.order.remove(&order);
+                continue;
+            };
+            bucket.refill(now);
+            if !bucket.full() {
+                return;
+            }
+            self.order.remove(&order);
+            self.sources.remove(&source);
+        }
+    }
+}
+
+/// What admission decided about one query.
+pub(crate) enum Admission {
+    Admitted,
+    /// Refused for capacity, answered with the type's empty answer.
+    Answered(TLObject),
+    /// Refused for capacity without an answer.
+    Refused,
+}
+
+/// The node-wide limiter and refusal-answer budget.
+pub(crate) struct FullNodeAdmission {
+    limiter: std::sync::Mutex<SourceAwareRateLimiter>,
+    budget: std::sync::Mutex<RefusalAnswerBudget>,
+    epoch: std::time::Instant,
+}
+
+impl FullNodeAdmission {
+    /// The admission with the default limits, which `FullNodeRateLimits::check`
+    /// accepts.
+    pub(crate) fn with_default_limits() -> Self {
+        Self {
+            limiter: std::sync::Mutex::new(SourceAwareRateLimiter::new(
+                FullNodeRateLimits::default(),
+            )),
+            budget: std::sync::Mutex::new(RefusalAnswerBudget::new(0.0)),
+            epoch: std::time::Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_start(limits: FullNodeRateLimits, start: f64) -> Result<Self> {
+        limits.check()?;
+        Ok(Self {
+            limiter: std::sync::Mutex::new(SourceAwareRateLimiter::new(limits)),
+            budget: std::sync::Mutex::new(RefusalAnswerBudget::new(start)),
+            epoch: std::time::Instant::now(),
+        })
+    }
+
+    pub(crate) fn now(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64()
+    }
+
+    pub(crate) fn register_shard(&self, shard: &ShardIdent) -> Result<()> {
+        self.limiter.lock().map_err(|_| error!("admission lock poisoned"))?.register_shard(shard);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_shard(&self, shard: &ShardIdent) -> Result<()> {
+        self.limiter.lock().map_err(|_| error!("admission lock poisoned"))?.unregister_shard(shard);
+        Ok(())
+    }
+
+    /// Charges `query` once to its source and shard.
+    pub(crate) fn admit(
+        &self,
+        query: &TLObject,
+        shard: &ShardIdent,
+        source: &Arc<rtos_block::KeyId>,
+        now: f64,
+    ) -> Result<Admission> {
+        let Some((category, cost)) = query_category(query) else {
+            return Ok(Admission::Admitted);
+        };
+        let admitted = self
+            .limiter
+            .lock()
+            .map_err(|_| error!("admission lock poisoned"))?
+            .check_in(category, cost, shard, source, now);
+        if admitted {
+            return Ok(Admission::Admitted);
+        }
+        let Some(answer) = capacity_refusal_answer(query) else {
+            return Ok(Admission::Refused);
+        };
+        let take = self
+            .budget
+            .lock()
+            .map_err(|_| error!("admission lock poisoned"))?
+            .try_take(source, now);
+        Ok(if take { Admission::Answered(answer) } else { Admission::Refused })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_sources(&self, now: f64) -> usize {
+        self.limiter.lock().unwrap().tracked_sources(now)
+    }
+}
+
+/// The full-node query and message consumer of one public shard overlay.
+pub(crate) struct ShardQueryConsumer {
+    service: Arc<FullNodeOverlayService>,
+    shard: ShardIdent,
+}
+
+impl ShardQueryConsumer {
+    pub(crate) fn new(
+        service: Arc<FullNodeOverlayService>,
+        client: &Arc<FullNodeOverlayClient>,
+    ) -> Result<Arc<Self>> {
+        let shard = client.shard().clone();
+        service.admission.register_shard(&shard)?;
+        Ok(Arc::new(Self { service, shard }))
+    }
+}
+
+impl Drop for ShardQueryConsumer {
+    fn drop(&mut self) {
+        if let Err(e) = self.service.admission.unregister_shard(&self.shard) {
+            log::warn!("Cannot unregister shard {} from admission: {e}", self.shard);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Subscriber for ShardQueryConsumer {
+    async fn try_consume_query(
+        &self,
+        query: TLObject,
+        adnl_peers: &AdnlPeers,
+    ) -> Result<QueryResult> {
+        let now = self.service.admission.now();
+        match self.service.admission.admit(&query, &self.shard, adnl_peers.other(), now)? {
+            Admission::Admitted => self.service.try_consume_query(query, adnl_peers).await,
+            Admission::Answered(answer) => {
+                #[cfg(feature = "telemetry")]
+                let tag = answer.bare_object().constructor();
+                Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Object(
+                    TaggedTlObject {
+                        object: answer,
+                        #[cfg(feature = "telemetry")]
+                        tag,
+                    },
+                )))))
+            }
+            Admission::Refused => fail!("too many requests"),
+        }
     }
 }
 

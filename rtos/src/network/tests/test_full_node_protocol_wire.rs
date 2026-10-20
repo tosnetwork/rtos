@@ -30,6 +30,17 @@ pub(super) async fn wire_node(
     shard: &ShardIdent,
     engine: Arc<MemoryBlocks>,
 ) -> WireNode {
+    wire_node_with(tag, port, shard, engine, FullNodeRateLimits::default()).await
+}
+
+/// A node whose service admits queries under `limits`.
+pub(super) async fn wire_node_with(
+    tag: &str,
+    port: u16,
+    shard: &ShardIdent,
+    engine: Arc<MemoryBlocks>,
+    limits: FullNodeRateLimits,
+) -> WireNode {
     let network = crate::test_helper::create_network(None, Some(tag), &format!("127.0.0.1:{port}"))
         .await
         .unwrap();
@@ -55,10 +66,13 @@ pub(super) async fn wire_node(
     )
     .await
     .unwrap();
-    let service = Arc::new(FullNodeOverlayService::new(engine.clone(), false, tasks.clone()));
-    client.add_consumer(service.clone()).unwrap();
+    let service = Arc::new(FullNodeOverlayService::with_admission(
+        engine.clone(),
+        Arc::new(FullNodeAdmission::with_start(limits, 0.0).unwrap()),
+    ));
     let full =
         FullNodeOverlayClient::new(engine.clone(), client.clone(), shard.clone(), tasks).unwrap();
+    client.add_consumer(ShardQueryConsumer::new(service.clone(), &full).unwrap()).unwrap();
     let key = context.stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap().id().clone();
     WireNode { network, client, full, service, engine, key, overlay_id }
 }
@@ -384,4 +398,123 @@ fn advertised_state_sizes_are_validated() {
     assert!(checked_state_size(0).is_err());
     assert!(checked_state_size(-1).is_err());
     assert_eq!(checked_state_size(5).unwrap(), 5);
+}
+
+// ------------------------------------------------------------ A3-12, A3-14
+
+async fn next_blocks_over_rldp(
+    from: &WireNode,
+    to: &WireNode,
+    prev: &BlockIdExt,
+) -> Result<Vec<u8>> {
+    let peer = from.client.neighbours().peer(&to.key).unwrap();
+    from.client
+        .send_rldp_query_raw(
+            &adnl::common::TaggedObject {
+                object: DownloadNextBlocksFull { prev_block: prev.clone(), max_blocks: 10 },
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            &peer,
+            0,
+            true,
+        )
+        .await
+}
+
+async fn query_adnl<D: rtos_api::AnyBoxedSerialize>(
+    from: &WireNode,
+    to: &WireNode,
+    query: TLObject,
+) -> Result<Option<D>> {
+    let peer = from.client.neighbours().peer(&to.key).unwrap();
+    from.client
+        .send_adnl_query_to_peer(
+            &peer,
+            &adnl::common::TaggedTlObject {
+                object: query,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            Some(3_000),
+        )
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_batch_replies_and_admission_refusals() {
+    let shard = ShardIdent::masterchain();
+    let chain = cpp_chain("small", 1, -1, &[(3, 5), (2, 7), (4, 4)]);
+    let prev = chain[0].0.clone();
+    // A long window keeps the allowance from refilling during the test.
+    let limits = FullNodeRateLimits::new(600.0, 96, 64, 72);
+    let a = wire_node_with(
+        "wire_adm_a",
+        4640,
+        &shard,
+        Arc::new(MemoryBlocks::new(chain.clone())),
+        limits,
+    )
+    .await;
+    let b = wire_node_with("wire_adm_b", 4641, &shard, Arc::new(MemoryBlocks::new(chain)), limits)
+        .await;
+    connect(&a, &b);
+    let nodes = vec![a, b];
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let (a, b) = (&nodes[0], &nodes[1]);
+        // A source holds a quarter of the medium window: 18 batches, each the
+        // reference sender's bytes.
+        for i in 0..18 {
+            let bytes = next_blocks_over_rldp(b, a, &prev).await.unwrap();
+            assert_eq!(sha_hex(&bytes), cpp_value(CPP_NBF, "small.max10.sha"), "batch {i}");
+        }
+        // Then the refusal is answered with the type's empty answer.
+        let refused = next_blocks_over_rldp(b, a, &prev).await.unwrap();
+        assert_eq!(
+            hex::encode(&refused),
+            cpp_value(CPP_ADM, "refusalAnswer.downloadNextBlocksFull")
+        );
+        // Unlisted queries are not limited.
+        let caps: Option<rtos_api::ton::ton_node::Capabilities> =
+            query_adnl(b, a, GetCapabilities.into_tl_object()).await.unwrap();
+        let caps = caps.unwrap();
+        assert_eq!((*caps.version_major(), *caps.version_minor()), (3, 2));
+    })
+    .catch_unwind()
+    .await;
+    finish(nodes, outcome).await;
+}
+
+/// An empty answer is "not ready": the peer stays a good neighbour and keeps
+/// its place among the recently good peers, as the reference counts such an
+/// outcome as a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_empty_answers_are_not_peer_faults() {
+    let shard = ShardIdent::masterchain();
+    let chain = cpp_chain("small", 1, -1, &[(3, 5)]);
+    let last = chain[1].0.clone();
+    let a =
+        wire_node("wire_empty_a", 4646, &shard, Arc::new(MemoryBlocks::new(chain.clone()))).await;
+    let b = wire_node("wire_empty_b", 4647, &shard, Arc::new(MemoryBlocks::new(chain))).await;
+    connect(&a, &b);
+    let nodes = vec![a, b];
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let (a, b) = (&nodes[0], &nodes[1]);
+        // The peer is among the recently good ones.
+        b.full.test_mark_active(&a.key);
+        let neighbour = b.client.neighbours().peer(&a.key).unwrap();
+        let before = neighbour.unreliability();
+        // Blocks the peer does not have yet: empty answers.
+        let unknown =
+            BlockIdExt::with_params(ShardIdent::masterchain(), 9, [9; 32].into(), [9; 32].into());
+        for _ in 0..3 {
+            assert!(b.full.download_block_full(&unknown, false).await.is_err());
+            assert!(b.full.download_next_block_full(&last, false).await.is_err());
+        }
+        assert_eq!(b.full.test_active_peers(), vec![a.key.clone()], "the peer keeps its place");
+        assert!(neighbour.unreliability() <= before, "an empty answer is not a failure");
+    })
+    .catch_unwind()
+    .await;
+    finish(nodes, outcome).await;
 }

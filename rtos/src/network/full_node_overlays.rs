@@ -31,7 +31,7 @@ use crate::{
         custom_overlay_client::CustomOverlayClient,
         fast_sync_overlay_client::{fast_sync_transport_authority, FastSyncOverlayClient},
         full_node_overlay_client::{FullNodeOverlayClient, ShardExtMessageCheck, ShardExtMessages},
-        full_node_service::FullNodeOverlayService,
+        full_node_service::{FullNodeOverlayService, ShardQueryConsumer},
         node_network::NodeNetwork,
         overlay_client::OverlayClient,
         pack_block_signatures,
@@ -461,16 +461,21 @@ impl FullNodeOverlaysRouter {
                                 gate,
                             )
                             .await?;
-                            if let Err(error) = client.add_consumer(self.service.clone()) {
-                                let _ = client.delete();
-                                return Err(error);
-                            }
                             let fullnode_client = FullNodeOverlayClient::new(
                                 self.engine.clone(),
-                                client,
+                                client.clone(),
                                 shard.clone(),
                                 self.tasks.clone(),
                             )?;
+                            // Queries and messages of this overlay go through
+                            // the node-wide admission and the shard's state.
+                            if let Err(error) =
+                                ShardQueryConsumer::new(self.service.clone(), &fullnode_client)
+                                    .and_then(|consumer| client.add_consumer(consumer))
+                            {
+                                fullnode_client.stop_and_wait().await?;
+                                return Err(error);
+                            }
                             if let Err(error) = self
                                 .configure_public_authorization(&fullnode_client)
                                 .and_then(|_| self.configure_public_propagation(&fullnode_client))

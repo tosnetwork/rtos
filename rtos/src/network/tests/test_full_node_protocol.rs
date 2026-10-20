@@ -161,10 +161,7 @@ impl MemoryBlocks {
             } else {
                 storage::types::BlockMeta::default()
             };
-            let handle = storage
-                .create_handle(id.clone(), meta, None)
-                .unwrap()
-                .unwrap();
+            let handle = storage.create_handle(id.clone(), meta, None).unwrap().unwrap();
             if block.has_data {
                 handle.set_data();
             }
@@ -698,6 +695,138 @@ fn key_block_answers_follow_the_reference_requester() {
             Err(_) => assert!(!ok, "{key} must be accepted"),
         }
     }
+}
+
+// ------------------------------------------------------------ A3-12 admission
+
+pub(super) const CPP_ADM: &str = include_str!("data/fullnode-proto/out-adm.txt");
+
+/// A query of the named type claiming `size` bytes, as the driver builds it.
+pub(super) fn admission_query(name: &str, size: i64) -> TLObject {
+    use rtos_api::ton::rpc::ton_node::{GetNextBlocksDescription, GetOutMsgQueueProof};
+    match name {
+        "getArchiveSlice" => {
+            GetArchiveSlice { archive_id: 1, offset: 0, max_size: size as i32 }.into_tl_object()
+        }
+        "downloadPersistentStateSliceV2" => {
+            DownloadPersistentStateSliceV2 { max_size: size, ..Default::default() }.into_tl_object()
+        }
+        "downloadZeroState" => DownloadZeroState::default().into_tl_object(),
+        "downloadBlock" => DownloadBlock::default().into_tl_object(),
+        "downloadBlockFull" => DownloadBlockFull::default().into_tl_object(),
+        "downloadNextBlockFull" => DownloadNextBlockFull::default().into_tl_object(),
+        "downloadNextBlocksFull" => {
+            DownloadNextBlocksFull { max_blocks: 10, ..Default::default() }.into_tl_object()
+        }
+        "downloadBlockProof" => DownloadBlockProof::default().into_tl_object(),
+        "downloadBlockProofLink" => DownloadBlockProofLink::default().into_tl_object(),
+        "downloadKeyBlockProof" => DownloadKeyBlockProof::default().into_tl_object(),
+        "downloadKeyBlockProofLink" => DownloadKeyBlockProofLink::default().into_tl_object(),
+        "getOutMsgQueueProof" => GetOutMsgQueueProof::default().into_tl_object(),
+        "prepareKeyBlockProof" => PrepareKeyBlockProof::default().into_tl_object(),
+        "getNextBlockDescription" => GetNextBlockDescription::default().into_tl_object(),
+        "getNextBlocksDescription" => GetNextBlocksDescription::default().into_tl_object(),
+        "prepareBlockProof" => PrepareBlockProof::default().into_tl_object(),
+        "prepareBlock" => PrepareBlock::default().into_tl_object(),
+        "prepareZeroState" => PrepareZeroState::default().into_tl_object(),
+        "getNextKeyBlockIds" => GetNextKeyBlockIds::default().into_tl_object(),
+        "getArchiveInfo" => GetArchiveInfo::default().into_tl_object(),
+        "getShardArchiveInfo" => GetShardArchiveInfo::default().into_tl_object(),
+        "preparePersistentState" => PreparePersistentState::default().into_tl_object(),
+        "getPersistentStateSizeV2" => GetPersistentStateSizeV2::default().into_tl_object(),
+        "getCapabilities" => GetCapabilities.into_tl_object(),
+        other => panic!("unknown query {other}"),
+    }
+}
+
+fn admission_shards() -> [ShardIdent; 3] {
+    [
+        ShardIdent::masterchain(),
+        ShardIdent::with_tagged_prefix(0, 0x4000_0000_0000_0000).unwrap(),
+        ShardIdent::with_tagged_prefix(0, 0xc000_0000_0000_0000).unwrap(),
+    ]
+}
+
+#[test]
+fn admission_constants_and_answers_match_the_reference() {
+    assert_eq!(cpp_value(CPP_ADM, "constants"), "1.000000 96 64 72 200 1024");
+    for (key, value) in cpp_lines(CPP_ADM) {
+        if let Some(name) = key.strip_prefix("refusalAnswer.") {
+            let answer = capacity_refusal_answer(&admission_query(name, 1 << 21))
+                .map(|a| hex::encode(WireProfile::T0.serialize(&a).unwrap()));
+            assert_eq!(answer.as_deref().unwrap_or("-"), value, "refusal answer of {name}");
+        }
+        if let Some(limits) = key.strip_prefix("check.") {
+            let v: Vec<&str> = limits.split('.').collect();
+            // "<window>.<fraction>.<global>.<heavy>.<medium>"
+            let window: f64 = format!("{}.{}", v[0], v[1]).parse().unwrap();
+            let limits = FullNodeRateLimits::new(
+                window,
+                v[2].parse().unwrap(),
+                v[3].parse().unwrap(),
+                v[4].parse().unwrap(),
+            );
+            assert_eq!(if limits.check().is_ok() { "ok" } else { "error" }, value, "{key}");
+        }
+    }
+}
+
+#[test]
+fn admission_replays_the_reference_scripts() {
+    let shards = admission_shards();
+    let mut current: Option<(String, FullNodeAdmission, f64)> = None;
+    let mut queries = 0usize;
+    for (script, line) in cpp_lines(CPP_ADM) {
+        let words: Vec<&str> = line.split(' ').collect();
+        match words[0] {
+            "LIMITS" => {
+                let limits = FullNodeRateLimits::new(
+                    words[1].parse().unwrap(),
+                    words[2].parse().unwrap(),
+                    words[3].parse().unwrap(),
+                    words[4].parse().unwrap(),
+                );
+                assert_eq!(limits.small.window_limit.to_string(), words[5]);
+                let start = words[7].parse::<f64>().unwrap() / 1000.0;
+                current = Some((
+                    script.to_string(),
+                    FullNodeAdmission::with_start(limits, start).unwrap(),
+                    start,
+                ));
+            }
+            "REG" | "UNREG" | "Q" => {
+                let (name, admission, start) = current.as_ref().unwrap();
+                assert_eq!(name, script);
+                if words[0] == "REG" {
+                    admission.register_shard(&shards[words[1].parse::<usize>().unwrap()]).unwrap();
+                } else if words[0] == "UNREG" {
+                    admission
+                        .unregister_shard(&shards[words[1].parse::<usize>().unwrap()])
+                        .unwrap();
+                } else {
+                    let t: i64 = words[1].parse().unwrap();
+                    let source =
+                        rtos_block::KeyId::from_data([words[2].parse::<u8>().unwrap(); 32]);
+                    let shard = &shards[words[3].parse::<usize>().unwrap()];
+                    let query = admission_query(words[4], words[5].parse().unwrap());
+                    let now = start + t as f64 / 1000.0;
+                    let decision = admission.admit(&query, shard, &source, now).unwrap();
+                    let (outcome, answer) = match decision {
+                        Admission::Admitted => ("A", None),
+                        Admission::Answered(answer) => {
+                            ("R", Some(hex::encode(WireProfile::T0.serialize(&answer).unwrap())))
+                        }
+                        Admission::Refused => ("E", None),
+                    };
+                    assert_eq!(outcome, words[6], "{script}: {line}");
+                    assert_eq!(answer.as_deref(), words.get(7).copied(), "{script}: {line}");
+                    queries += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(queries > 8000, "the scripts must have been replayed");
 }
 
 #[path = "test_full_node_protocol_wire.rs"]

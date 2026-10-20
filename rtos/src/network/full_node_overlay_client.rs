@@ -588,6 +588,16 @@ impl FullNodeOverlayClient {
         &self.client
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_active_peers(&self) -> Vec<Arc<KeyId>> {
+        self.active_peers.iter().map(|peer| peer.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_active(&self, peer: &Arc<KeyId>) {
+        self.active_peers.insert(peer.clone()).ok();
+    }
+
     pub fn shard(&self) -> &ShardIdent {
         &self.shard
     }
@@ -1002,9 +1012,10 @@ impl FullNodeOverlayClient {
         let data_full: DataFull = result.inspect_err(|_| {
             self.active_peers.remove(peer.id());
         })?;
-        let id = id.clone();
-        let deserialized: Result<(BlockStuff, BlockProofStuff)> =
+        let block_id = id.clone();
+        let deserialized: Result<Option<(BlockStuff, BlockProofStuff)>> =
             tokio::task::block_in_place(|| {
+                let id = block_id;
                 let (block_data, proof_data, is_link) = match data_full {
                     DataFull::TonNode_DataFull(data_full) => {
                         if id != data_full.id {
@@ -1032,7 +1043,7 @@ impl FullNodeOverlayClient {
                         (block_data, proof_data, data_full.is_link.into())
                     }
                     DataFull::TonNode_DataFullEmpty => {
-                        fail!("DownloadBlockFull returned DataFullEmpty from {}", peer.id())
+                        return Ok(None);
                     }
                 };
                 let proof =
@@ -1041,15 +1052,17 @@ impl FullNodeOverlayClient {
                     })?;
                 let block = BlockStuff::deserialize_block_checked(id, Arc::new(block_data))
                     .map_err(|e| error!("Error deserializing block from {}: {}", peer.id(), e))?;
-                Ok((block, proof))
+                Ok(Some((block, proof)))
             });
         match deserialized {
-            Ok(pair) => {
+            Ok(Some(pair)) => {
                 if !was_active {
                     self.active_peers.insert(peer.id().clone()).ok();
                 }
                 Ok(pair)
             }
+            // An empty answer is "not ready", not a fault of the peer.
+            Ok(None) => fail!("{} does not have block {} yet", peer.id(), id),
             Err(e) => {
                 self.active_peers.remove(peer.id());
                 Err(e)
@@ -1461,15 +1474,9 @@ impl FullNodeOverlayClient {
         let data_full: DataFull = result.inspect_err(|_| {
             self.active_peers.remove(peer.id());
         })?;
-        // DataFullEmpty is normally a "not yet" signal — the next block may
-        // simply not exist yet, so the peer is not logically bad. But when
-        // fan_out_prepare is set, the caller believes the block should already
-        // be on the network (we've been lagging), so a peer returning Empty is
-        // logically stale and we evict it from active_peers.
+        // An empty answer is "not ready": the next block may not exist yet,
+        // or the peer refused the query for capacity. The peer keeps its place.
         if matches!(data_full, DataFull::TonNode_DataFullEmpty) {
-            if fan_out_prepare {
-                self.active_peers.remove(peer.id());
-            }
             return Err(error!("Got DataFullEmpty from {}", peer.id()));
         }
         let deserialized: Result<(BlockStuff, BlockProofStuff)> =
@@ -1553,10 +1560,8 @@ impl FullNodeOverlayClient {
             .send_adnl_query(&object, None, Some(Self::TIMEOUT_PREPARE), Some(&self.active_peers))
             .await?;
         let info = match archive_info {
-            ArchiveInfo::TonNode_ArchiveNotFound => {
-                self.active_peers.remove(peer.id());
-                return Ok(None);
-            }
+            // Not found is "not ready", not a fault of the peer.
+            ArchiveInfo::TonNode_ArchiveNotFound => return Ok(None),
             ArchiveInfo::TonNode_ArchiveInfo(info) => info,
         };
         let mut result = Vec::new();
