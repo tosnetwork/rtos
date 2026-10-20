@@ -167,17 +167,9 @@ pub trait KeyRing: Sync + Send {
     fn sign_data(&self, key_hash: &[u8; 32], data: &[u8]) -> Result<Vec<u8>>;
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
-pub struct CellsGcConfig {
-    pub gc_interval_sec: u32,
-    pub cells_lifetime_sec: u64,
-}
-
-impl Default for CellsGcConfig {
-    fn default() -> Self {
-        CellsGcConfig { gc_interval_sec: 900, cells_lifetime_sec: 1800 }
-    }
-}
+/// Seconds a masterchain state must age before the GC floor moves past it:
+/// the reference `--state-ttl` default.
+pub const DEFAULT_STATE_TTL_SEC: f64 = 86400.0;
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
@@ -594,6 +586,10 @@ pub struct TonNodeConfig {
     /// never written to the file.
     #[serde(skip)]
     shard_overlay_certificate_policy: ShardOverlayCertificatePolicy,
+    /// From the `-s/--state-ttl` option of this run; never written to the
+    /// file.
+    #[serde(skip)]
+    state_ttl: Option<f64>,
 }
 
 pub struct TonNodeGlobalConfig(TonNodeGlobalConfigJson);
@@ -792,8 +788,6 @@ pub struct GC {
     enable_for_archives: bool,
     archives_life_time_hours: Option<u32>, // Hours
     enable_for_shard_state_persistent: bool,
-    #[serde(default)]
-    cells_gc_config: CellsGcConfig,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize, Clone)]
@@ -1034,11 +1028,13 @@ impl TonNodeConfig {
         self.internal_db_path.as_deref().unwrap_or(Self::DEFAULT_DB_ROOT)
     }
 
-    pub fn cells_gc_config(&self) -> CellsGcConfig {
-        match &self.gc {
-            Some(conf) => conf.cells_gc_config.clone(),
-            None => CellsGcConfig::default(),
-        }
+    /// The state TTL of this run, in seconds.
+    pub fn state_ttl(&self) -> f64 {
+        self.state_ttl.unwrap_or(DEFAULT_STATE_TTL_SEC)
+    }
+
+    pub fn set_state_ttl(&mut self, seconds: f64) {
+        self.state_ttl = Some(seconds);
     }
 
     pub fn enable_shard_state_persistent_gc(&self) -> bool {

@@ -15,13 +15,21 @@ async fn open_db_with(
     dir: &std::path::Path,
     archival_mode: Option<storage::archives::epoch::ArchivalModeConfig>,
 ) -> Result<InternalDb> {
+    open_db_restoring(dir, archival_mode, false).await
+}
+
+async fn open_db_restoring(
+    dir: &std::path::Path,
+    archival_mode: Option<storage::archives::epoch::ArchivalModeConfig>,
+    restore_db: bool,
+) -> Result<InternalDb> {
     InternalDb::with_update(
         InternalDbConfig {
             db_directory: dir.to_str().ok_or_else(|| error!("non UTF-8 path"))?.to_owned(),
             archival_mode,
             ..Default::default()
         },
-        false,
+        restore_db,
         false,
         false,
         None,
@@ -284,9 +292,12 @@ async fn interrupted_recovery_keeps_its_beacon_and_is_repeated() -> Result<()> {
         assert!(beacon.exists(), "recovery beacon removed before its metadata was durable");
         let _ = db.stop_states_db().await;
     }
-    let db = open_db(&root).await?;
     assert!(beacon.exists(), "recovery beacon lost across restart");
-    restore::check_db(&db, 0, true, false, &|| Ok(()), None).await?;
+    // Without repair an interrupted restore refuses the start; with repair
+    // the next start repeats it and completes.
+    assert!(open_db(&root).await.is_err(), "an interrupted restore must not be skipped");
+    assert!(beacon.exists());
+    let db = open_db_restoring(&root, None, true).await?;
     assert!(!beacon.exists(), "repeated recovery did not complete");
     db.stop_states_db().await?;
     Ok(())

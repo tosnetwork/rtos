@@ -486,6 +486,12 @@ impl RocksDb {
         Ok(())
     }
 
+    /// Applies one batch atomically, without waiting for a WAL sync.
+    pub(crate) fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.db().write(batch)?;
+        Ok(())
+    }
+
     /// Applies one batch atomically and returns only after its WAL record is
     /// synchronized to stable storage.
     pub(crate) fn write_batch_synced(&self, batch: WriteBatch) -> Result<()> {

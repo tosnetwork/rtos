@@ -403,7 +403,7 @@ fn keeper(
         0,
         0,
         crate::config::ShardStatesCacheMode::Moderate,
-        3600,
+        3600.0,
         stopper.clone(),
         100,
         #[cfg(feature = "telemetry")]
@@ -421,6 +421,8 @@ async fn adopt_floor(engine: &TestEngine) {
     let mut header =
         rtos_block::ShardStateUnsplit::with_ident(rtos_block::ShardIdent::masterchain());
     header.set_seq_no(42);
+    // A GC floor is a masterchain state: it carries the masterchain extra.
+    header.write_custom(Some(&rtos_block::McStateExtra::default())).unwrap();
     let state = crate::shard_state::ShardStateStuff::from_state(
         id.clone(),
         header,

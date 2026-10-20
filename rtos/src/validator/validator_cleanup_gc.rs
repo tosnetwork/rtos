@@ -1,24 +1,23 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! The durable GC masterchain floor that bounds validator consensus cleanup,
-//! and the deletion-gate oracles bound to its pinned state. The floor follows
-//! the reference GC block: it trails every frontier, advances one verified
-//! successor at a time, and never regresses.
+//! The durable GC masterchain floor: it bounds state GC, archive GC and
+//! validator consensus cleanup, and its pinned state backs the deletion-gate
+//! oracles. The floor follows the reference GC block: it starts at the boot
+//! or init block, trails every frontier, advances one verified successor at a
+//! time (again at once after each durable step) and never regresses. One
+//! serialized owner advances it, whoever asks.
 use crate::{
     engine::Engine, engine_traits::EngineOperations, shard_state::ShardStateStuff,
     shard_states_keeper::ShardStatesKeeper,
 };
 use consensus_common::validator_cleanup::{
-    may_advance_gc, parse_canonical_namespace_name, should_adopt_safe_checkpoint, CleanupAncestry,
-    GcAdvanceInputs, NamespaceLayout, ParsedNamespace, PendingValidatorCleanup,
+    parse_canonical_namespace_name, should_adopt_safe_checkpoint, CleanupAncestry, NamespaceLayout,
+    ParsedNamespace, PendingValidatorCleanup,
 };
-use rtos_block::{error, fail, BlockIdExt, HashmapAugType, Result, ShardIdent, UInt256, UnixTime};
+use rtos_block::{error, fail, BlockIdExt, Result, ShardIdent, UInt256};
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
-
-/// Candidates examined by the first-run floor search.
-const BOOTSTRAP_CANDIDATES: u32 = 64;
 
 /// What the floor driver reads: the node's frontiers, masterchain links and
 /// the state keeper that pins and persists the floor.
@@ -30,12 +29,23 @@ pub(crate) trait CleanupFloorSource: Send + Sync {
     fn pss_keeper_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>>;
     fn block_next1(&self, id: &BlockIdExt) -> Result<BlockIdExt>;
     fn keeper(&self) -> Arc<ShardStatesKeeper>;
+    /// The block the floor starts from when none was ever persisted: the
+    /// configured init block, or the zerostate.
+    fn init_block_id(&self) -> BlockIdExt;
+    fn stopping(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]
 impl CleanupFloorSource for Engine {
+    /// The stored state of the last applied block, as the reference keeps
+    /// it in memory: reading it never restores or downloads a state.
     async fn last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
-        self.load_last_applied_mc_state().await
+        let id = self
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("No last applied masterchain block"))?;
+        self.db().load_shard_state_dynamic(&id)
     }
     fn last_rotation_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         self.load_last_rotation_block_id()
@@ -51,6 +61,12 @@ impl CleanupFloorSource for Engine {
     }
     fn keeper(&self) -> Arc<ShardStatesKeeper> {
         self.shard_states_keeper()
+    }
+    fn init_block_id(&self) -> BlockIdExt {
+        self.init_mc_block_id().clone()
+    }
+    fn stopping(&self) -> bool {
+        self.check_stop()
     }
 }
 
@@ -87,9 +103,18 @@ pub(crate) fn shard_catchain_seqno(floor: &ShardStateStuff, shard: &ShardIdent) 
     left.descr.next_catchain_seqno.max(right.descr.next_catchain_seqno).checked_add(1)
 }
 
-async fn advance_inputs(
-    source: &dyn CleanupFloorSource,
-) -> Result<Option<(GcAdvanceInputs, Arc<ShardStateStuff>)>> {
+/// The frontiers the floor must stay strictly below, read from the last
+/// applied masterchain state and the node's durable cursors.
+struct AdvanceInputs {
+    last_rotation_seqno: u32,
+    min_ref_mc_seqno: u32,
+    last_applied_seqno: u32,
+    last_key_block_seqno: u32,
+    shard_client_seqno: u32,
+    pss_keeper_seqno: u32,
+}
+
+async fn advance_inputs(source: &dyn CleanupFloorSource) -> Result<Option<AdvanceInputs>> {
     let last = source.last_applied_mc_state().await?;
     let extra = last.shard_state_extra()?;
     let seqno = |id: Option<Arc<BlockIdExt>>| id.map(|id| id.seq_no());
@@ -109,39 +134,97 @@ async fn advance_inputs(
             None => return Ok(None),
         }
     };
-    let inputs = GcAdvanceInputs {
+    Ok(Some(AdvanceInputs {
         last_rotation_seqno: rotation,
         min_ref_mc_seqno: last.state()?.min_ref_mc_seqno(),
         last_applied_seqno: last.block_id().seq_no(),
         last_key_block_seqno: last_key,
         shard_client_seqno: shard_client,
         pss_keeper_seqno: pss,
-        now: UnixTime::now(),
-        state_ttl: source.keeper().cleanup_state_ttl(),
-    };
-    Ok(Some((inputs, last)))
+    }))
 }
 
-/// Bootstraps or advances the floor by at most one step. A floor whose state
-/// went missing is left alone: cleanup stays disabled.
+/// Wall-clock time in seconds, with its fraction, as the reference compares
+/// the state TTL against it.
+fn system_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Whether the floor at `floor_seqno`, whose state was generated at
+/// `floor_utime`, may move to its successor: every reference condition
+/// holds, the TTL compared as `utime < now - ttl` in fractional seconds.
+/// Arithmetic is checked; overflow refuses.
+fn floor_may_advance(
+    floor_seqno: u32,
+    floor_utime: u32,
+    inputs: &AdvanceInputs,
+    now: f64,
+    state_ttl: f64,
+) -> bool {
+    let Some(behind_head) = floor_seqno.checked_add(1024) else {
+        return false;
+    };
+    inputs.last_applied_seqno > 0
+        && floor_seqno < inputs.last_rotation_seqno
+        && floor_seqno < inputs.min_ref_mc_seqno
+        && behind_head < inputs.last_applied_seqno
+        && floor_seqno < inputs.last_key_block_seqno
+        && floor_seqno < inputs.shard_client_seqno
+        && floor_seqno < inputs.pss_keeper_seqno
+        && f64::from(floor_utime) < now - state_ttl
+}
+
+/// Advances the floor as far as it may go now. Every caller goes through
+/// the keeper's floor owner, so two drivers never advance it at once; after
+/// each durable step the next one is tried at once, as the reference does.
 pub(crate) async fn maintain_cleanup_floor(source: &dyn CleanupFloorSource) -> Result<()> {
     let keeper = source.keeper();
+    let _owner = keeper.floor_owner().lock().await;
+    while advance_cleanup_floor_once(source, &keeper).await? {
+        if source.stopping() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// One step: seeds an unset floor with the init block, or moves the floor
+/// to its successor. True when the floor changed. A floor whose state is
+/// unavailable is never replaced.
+async fn advance_cleanup_floor_once(
+    source: &dyn CleanupFloorSource,
+    keeper: &Arc<ShardStatesKeeper>,
+) -> Result<bool> {
     // Before any frontier is read: work from another epoch is refused.
     let epoch = keeper.cleanup_floor_epoch();
     keeper.resolve_uncertain_cleanup_floor(epoch)?;
-    let Some((inputs, last)) = advance_inputs(source).await? else {
-        return Ok(());
-    };
     if keeper.cleanup_floor_unset() {
-        return bootstrap(&keeper, &inputs, &last, epoch);
+        let init = source.init_block_id();
+        keeper.seed_cleanup_floor(&init, epoch)?;
+        return Ok(true);
     }
     let Some((floor_id, floor_state)) = keeper.cleanup_floor() else {
-        return Ok(());
+        return Ok(false);
     };
-    if !may_advance_gc(floor_id.seq_no(), u64::from(floor_state.state()?.gen_time()), &inputs) {
-        return Ok(());
+    let Some(inputs) = advance_inputs(source).await? else {
+        return Ok(false);
+    };
+    if !floor_may_advance(
+        floor_id.seq_no(),
+        floor_state.state()?.gen_time(),
+        &inputs,
+        system_now(),
+        keeper.cleanup_state_ttl(),
+    ) {
+        return Ok(false);
     }
-    let next = source.block_next1(&floor_id)?;
+    // The reference moves only from a block whose successor is known.
+    let Ok(next) = source.block_next1(&floor_id) else {
+        return Ok(false);
+    };
     let guard = keeper.pin_cleanup_candidate(&next)?;
     let ancestry = |current: &BlockIdExt, candidate: &BlockIdExt| {
         if candidate != guard.state().block_id() {
@@ -160,45 +243,50 @@ pub(crate) async fn maintain_cleanup_floor(source: &dyn CleanupFloorSource) -> R
             "Cleanup floor successor {next} is not a verified descendant of {floor_id}"
         ));
     }
-    keeper.adopt_cleanup_floor(&next, guard, epoch)
+    keeper.adopt_cleanup_floor(&next, guard, epoch)?;
+    Ok(true)
 }
 
-fn bootstrap(
-    keeper: &ShardStatesKeeper,
-    inputs: &GcAdvanceInputs,
-    last: &ShardStateStuff,
-    epoch: u64,
-) -> Result<()> {
-    let bound = [
-        inputs.last_rotation_seqno,
-        inputs.min_ref_mc_seqno,
-        inputs.last_applied_seqno.saturating_sub(1024),
-        inputs.last_key_block_seqno,
-        inputs.shard_client_seqno,
-        inputs.pss_keeper_seqno,
-    ]
-    .into_iter()
-    .min()
-    .unwrap_or(0);
-    let Some(expiry) = inputs.now.checked_sub(inputs.state_ttl) else {
-        return Ok(());
-    };
-    let extra = last.shard_state_extra()?;
-    let lowest = bound.saturating_sub(BOOTSTRAP_CANDIDATES);
-    for seqno in (lowest..bound).rev() {
-        let Some(entry) = extra.prev_blocks.get(&seqno)? else {
-            continue;
-        };
-        let (_, candidate, _) = entry.master_block_id();
-        let Ok(guard) = keeper.pin_cleanup_candidate(&candidate) else {
-            continue;
-        };
-        if u64::from(guard.state().state()?.gen_time()) >= expiry {
-            continue;
+#[cfg(test)]
+mod floor_predicate_tests {
+    use super::*;
+
+    fn inputs() -> AdvanceInputs {
+        AdvanceInputs {
+            last_rotation_seqno: 5000,
+            min_ref_mc_seqno: 5000,
+            last_applied_seqno: 5000,
+            last_key_block_seqno: 5000,
+            shard_client_seqno: 5000,
+            pss_keeper_seqno: 5000,
         }
-        return keeper.adopt_cleanup_floor(&candidate, guard, epoch);
     }
-    Ok(())
+
+    #[test]
+    fn fractional_ttl_boundary_is_strict() {
+        // utime 1000, ttl 1.5: the floor may move only once now exceeds 1001.5.
+        assert!(!floor_may_advance(10, 1000, &inputs(), 1001.5, 1.5));
+        assert!(floor_may_advance(10, 1000, &inputs(), 1001.75, 1.5));
+        assert!(!floor_may_advance(10, 1000, &inputs(), 1001.25, 1.5));
+    }
+
+    #[test]
+    fn every_frontier_is_strict() {
+        let check = |edit: &dyn Fn(&mut AdvanceInputs)| {
+            let mut i = inputs();
+            edit(&mut i);
+            floor_may_advance(10, 0, &i, 1e9, 86400.0)
+        };
+        assert!(check(&|_| {}));
+        assert!(!check(&|i| i.last_rotation_seqno = 10));
+        assert!(!check(&|i| i.min_ref_mc_seqno = 10));
+        assert!(!check(&|i| i.last_applied_seqno = 1034));
+        assert!(check(&|i| i.last_applied_seqno = 1035));
+        assert!(!check(&|i| i.last_key_block_seqno = 10));
+        assert!(!check(&|i| i.shard_client_seqno = 10));
+        assert!(!check(&|i| i.pss_keeper_seqno = 10));
+        assert!(!floor_may_advance(u32::MAX - 1000, 0, &inputs(), 1e9, 0.0));
+    }
 }
 
 /// Stage-local custody veto: only the V1 layout may be deleted here. An

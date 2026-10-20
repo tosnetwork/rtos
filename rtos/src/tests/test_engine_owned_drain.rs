@@ -595,7 +595,11 @@ async fn engine_owned_drain_real_service_recovery_loops_exit_before_database_shu
     let mut absent = engine.zerostate_id().clone();
     absent.seq_no = 9;
     let keeper = engine.shard_states_keeper();
-    keeper.clone().start_workers(engine.clone(), absent.clone(), absent.clone()).unwrap();
+    // The persistent-state keeper fails at once on a cursor outside the
+    // masterchain; it no longer reads GC progress that could fail later.
+    let mut not_masterchain = absent.clone();
+    not_masterchain.shard_id = ShardIdent::with_tagged_prefix(0, SHARD_FULL).unwrap();
+    keeper.clone().start_workers(engine.clone(), absent.clone(), not_masterchain).unwrap();
     let master = start_masterchain_client(engine.clone(), absent.clone()).unwrap();
     let shards = start_shards_client(engine.clone(), absent.clone()).unwrap();
     resend_top_shard_blocks_worker(engine.clone()).unwrap();

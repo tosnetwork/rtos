@@ -512,9 +512,18 @@ fn build_command() -> clap::Command {
         )
         .arg(
             clap::Arg::new("truncate_db")
+                .short('T')
                 .long("truncate-db")
                 .value_name("truncate_db")
-                .help("truncate the database at the specified masterchain block sequence number"),
+                .help("truncate db (with specified seqno as new top masterchain block seqno)"),
+        )
+        .arg(
+            clap::Arg::new("state_ttl")
+                .short('s')
+                .long("state-ttl")
+                .value_name("seconds")
+                .allow_hyphen_values(true)
+                .help("state will be gc'd after this time (in seconds) default=86400"),
         )
         .arg(
             clap::Arg::new("auto_sign")
@@ -549,6 +558,67 @@ fn build_command() -> clap::Command {
             .help("shift the node's time by the specified number of seconds (can be negative) for testing purposes"),
     );
     app
+}
+
+/// Reads a number the way the reference reads its time options: leading
+/// whitespace is skipped, the longest prefix of the form
+/// `[+-]digits[.digits][(e|E)[+-]digits]` is taken and the rest ignored; a
+/// prefix that is not a complete number reads as zero, and a magnitude too
+/// large reads as the largest finite value.
+fn reference_to_double(text: &str) -> f64 {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && matches!(bytes[start], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    {
+        start += 1;
+    }
+    let mut end = start;
+    let digits = |from: usize| {
+        let mut at = from;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        at
+    };
+    if end < bytes.len() && matches!(bytes[end], b'+' | b'-') {
+        end += 1;
+    }
+    let mantissa_start = end;
+    end = digits(end);
+    let mut mantissa_digits = end > mantissa_start;
+    if end < bytes.len() && bytes[end] == b'.' {
+        let fraction = digits(end + 1);
+        mantissa_digits |= fraction > end + 1;
+        end = fraction;
+    }
+    if mantissa_digits && end < bytes.len() && matches!(bytes[end], b'e' | b'E') {
+        end += 1;
+        if end < bytes.len() && matches!(bytes[end], b'+' | b'-') {
+            end += 1;
+        }
+        end = digits(end);
+    }
+    let Some(prefix) = text.get(start..end) else {
+        return 0.0;
+    };
+    match prefix.parse::<f64>() {
+        Ok(value) if value.is_infinite() => {
+            if value > 0.0 {
+                f64::MAX
+            } else {
+                -f64::MAX
+            }
+        }
+        Ok(value) => value,
+        Err(_) => 0.0,
+    }
+}
+
+/// A time option's value in seconds; `None` when the reference refuses it
+/// (not greater than zero).
+fn positive_seconds(text: &str) -> Option<f64> {
+    let value = reference_to_double(text);
+    (value > 0.0).then_some(value)
 }
 
 /// The shard overlay certificate options of this run, in the order given:
@@ -697,6 +767,17 @@ fn run_node() -> i32 {
         }
     };
 
+    let state_ttl = match matches.get_one::<String>("state_ttl") {
+        None => None,
+        Some(text) => match positive_seconds(text) {
+            Some(seconds) => Some(seconds),
+            None => {
+                eprintln!("state-ttl should be positive");
+                return EXIT_CONFIG;
+            }
+        },
+    };
+
     let certificate_policy = match shard_overlay_certificate_policy(&matches) {
         Ok(policy) => policy,
         Err(error) => {
@@ -779,6 +860,9 @@ fn run_node() -> i32 {
     };
 
     config.set_shard_overlay_certificate_policy(certificate_policy);
+    if let Some(seconds) = state_ttl {
+        config.set_state_ttl(seconds);
+    }
 
     if created {
         let path = std::path::Path::new(config_dir_path).join(CONFIG_NAME);
@@ -1058,6 +1142,51 @@ mod shutdown_tests {
             directory.path().to_str().unwrap()
         ));
         assert!(beacon.exists(), "failed stop must require database recovery");
+    }
+
+    /// Every input of the reference table reads to the same value, and the
+    /// time options accept exactly the inputs the reference accepts.
+    #[test]
+    fn time_options_read_numbers_like_the_reference() {
+        let table = include_str!("tests/data/storage-gc-cli-options.tsv");
+        let mut checked = 0;
+        for line in table.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.first() != Some(&"to_double") {
+                continue;
+            }
+            let input = if fields[1] == "-" {
+                String::new()
+            } else {
+                let bytes: Vec<u8> = (0..fields[1].len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&fields[1][i..i + 2], 16).unwrap())
+                    .collect();
+                String::from_utf8(bytes).unwrap()
+            };
+            let expected: f64 = fields[2].parse().unwrap();
+            let value = reference_to_double(&input);
+            assert!(
+                value == expected || (value == 0.0 && expected == 0.0),
+                "{input:?}: {value} != {expected}"
+            );
+            assert_eq!(positive_seconds(&input).is_some(), fields[3] == "1", "{input:?}");
+            checked += 1;
+        }
+        assert!(checked >= 50, "reference table not read");
+        let default =
+            table.lines().find_map(|line| line.strip_prefix("default\tstate_ttl\t")).unwrap();
+        assert_eq!(default.parse::<f64>().unwrap(), crate::config::DEFAULT_STATE_TTL_SEC);
+    }
+
+    #[test]
+    fn state_ttl_option_is_parsed_and_short_flags_exist() {
+        let matches =
+            build_command().try_get_matches_from(["rtos", "-s", "30.5", "-T", "7"]).unwrap();
+        assert_eq!(matches.get_one::<String>("state_ttl").map(String::as_str), Some("30.5"));
+        assert_eq!(matches.get_one::<String>("truncate_db").map(String::as_str), Some("7"));
+        let matches = build_command().try_get_matches_from(["rtos", "--state-ttl", "-1"]).unwrap();
+        assert_eq!(positive_seconds(matches.get_one::<String>("state_ttl").unwrap()), None);
     }
 
     #[test]

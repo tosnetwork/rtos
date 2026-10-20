@@ -53,6 +53,9 @@ pub async fn check_db(
     let restoring = check_restoring(&db.config.db_directory);
 
     if unexpected_termination || restoring || force {
+        // The reference checks of persisted state run first, so neither a
+        // skipped nor a performed repair can hide what they would refuse.
+        check_persisted_gc_floor(db).map_err(|err| restore_failure(err, is_broken))?;
         if force {
             log::info!("Starting check & restore db process forcedly (with cells db refilling)");
         } else if restore_db_enabled {
@@ -61,19 +64,20 @@ pub async fn check_db(
                 starting check & restore process..."
             );
         } else {
-            if unexpected_termination {
-                log::warn!(
-                    "Previous node run was terminated unexpectedly, \
-                    but 'restore_db' option in node config is 'false', \
-                    so restore operation is skipped. Node may work incorrectly."
-                );
-            } else {
-                log::warn!(
-                    "Previous node run was terminated unexpectedly while DB's \
-                    checking or restoring, but now 'restore_db' option in node \
-                    config is 'false', so restore operation is skipped. Node may work incorrectly."
+            // Without repair the node starts like the reference does: on its
+            // durable state, refused by the startup checks if inconsistent.
+            log::warn!(
+                "Previous node run was terminated unexpectedly{}; 'restore_db' is false, \
+                so the database is not repaired and the startup checks decide",
+                if restoring { " while the database was being restored" } else { "" }
+            );
+            if restoring {
+                fail!(
+                    "An interrupted database restore was found and 'restore_db' is false; \
+                    the database is inconsistent"
                 );
             }
+            set_unexpected_termination(&db.config.db_directory)?;
             return Ok(());
         }
 
@@ -111,9 +115,36 @@ pub async fn check_db(
             .sync_pending()
             .await
             .map_err(|err| restore_failure(err, is_broken))?;
+        // The repair must leave a database the reference checks accept.
+        check_persisted_gc_floor(db).map_err(|err| restore_failure(err, is_broken))?;
         reset_restoring(&db.config.db_directory)?;
     }
     set_unexpected_termination(&db.config.db_directory)?;
+    Ok(())
+}
+
+/// The reference startup checks of the persisted GC block that need only
+/// the database: the key decodes, and the floor block has a handle with its
+/// state saved and loadable. Whether the floor lies at or below the head is
+/// checked at boot, against the head the node actually restarts from. An
+/// absent key is accepted: the floor then starts at the init block, whose
+/// state boot checks.
+pub(crate) fn check_persisted_gc_floor(db: &InternalDb) -> Result<()> {
+    use consensus_common::validator_cleanup::{decode_checkpoint, GC_FLOOR_KEY};
+    let Some(value) = db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)? else {
+        return Ok(());
+    };
+    let floor = decode_checkpoint(&value)
+        .ok_or_else(|| error!("Persisted GC floor is malformed; the database is inconsistent"))?;
+    let handle = db.load_block_handle(&floor)?.ok_or_else(|| {
+        error!("GC floor {floor} has no block handle; the database is inconsistent")
+    })?;
+    if !handle.has_saved_state() {
+        fail!("GC floor {floor} has no saved state; the database is inconsistent");
+    }
+    db.load_shard_state_dynamic(&floor).map_err(|e| {
+        error!("GC floor {floor} state cannot be loaded; the database is inconsistent: {e}")
+    })?;
     Ok(())
 }
 

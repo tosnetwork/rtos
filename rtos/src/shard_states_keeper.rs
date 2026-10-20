@@ -17,7 +17,8 @@ use crate::{
     engine::{Engine, Stopper},
     engine_traits::{EngineAlloc, EngineOperations},
     internal_db::{
-        state_gc_resolver::AllowStateGcSmartResolver, InternalDb, LAST_APPLIED_MC_BLOCK,
+        state_gc_resolver::{AllowStateGcSmartResolver, FloorBoundary},
+        InternalDb, LAST_APPLIED_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
 };
@@ -131,8 +132,12 @@ pub struct ShardStatesKeeper {
     /// A truncation is running; no floor is adopted or resolved meanwhile.
     /// Changed only under the `cleanup_floor` lock.
     truncating: std::sync::atomic::AtomicBool,
-    /// The reference state TTL that the floor's state age must exceed.
-    cleanup_state_ttl: u64,
+    /// The reference state TTL, in seconds, that the floor's state age must
+    /// exceed before the floor moves.
+    cleanup_state_ttl: f64,
+    /// The one owner of floor advancement: every driver holds it for a whole
+    /// advancement, so floor steps never interleave.
+    floor_owner: tokio::sync::Mutex<()>,
     #[cfg(test)]
     fail_floor_write_after_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -158,15 +163,12 @@ impl Drop for TruncationGuard {
     }
 }
 
-/// Custody of the validator-cleanup GC floor.
+/// Custody of the durable GC floor.
 pub(crate) enum CleanupFloor {
-    /// No floor was ever persisted; a first-run adoption may set one.
+    /// No floor was ever persisted; it is seeded with the boot or init block.
     Unset,
     /// The persisted floor and the pin that keeps its state alive.
     Pinned(BlockIdExt, PinnedShardStateGuard),
-    /// The persisted floor's state was gone at boot: the key is kept and
-    /// cleanup stays disabled; no replacement is ever bootstrapped.
-    Missing(BlockIdExt),
     /// A floor write returned an error, so the durable key may hold either
     /// floor. Both pins are kept and cleanup is disabled until the key is
     /// re-read.
@@ -185,15 +187,17 @@ impl ShardStatesKeeper {
         pss_cells_cache_max_count: usize,
         pss_prev_part_max_size: usize,
         states_cache_mode: ShardStatesCacheMode,
-        cells_lifetime_sec: u64,
+        state_ttl: f64,
         stopper: Arc<Stopper>,
         max_catch_up_depth: u32,
         #[cfg(feature = "telemetry")] telemetry: Arc<EngineTelemetry>,
         allocated: Arc<EngineAlloc>,
     ) -> Result<Arc<Self>> {
         log::trace!("start_states_gc");
-        let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_repair_protection(
-            cells_lifetime_sec,
+        if !(state_ttl.is_finite() && state_ttl > 0.0) {
+            fail!("State TTL must be a positive number of seconds, got {state_ttl}");
+        }
+        let gc_resolver = Arc::new(AllowStateGcSmartResolver::with_durable_floor(
             db.repair_leases().protection().clone(),
         ));
         let cache_resolver = Arc::new(AllowStateGcSmartResolver::new(0));
@@ -218,7 +222,8 @@ impl ShardStatesKeeper {
             cleanup_floor: parking_lot::Mutex::new(cleanup_floor),
             floor_epoch: std::sync::atomic::AtomicU64::new(0),
             truncating: std::sync::atomic::AtomicBool::new(false),
-            cleanup_state_ttl: cells_lifetime_sec,
+            cleanup_state_ttl: state_ttl,
+            floor_owner: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             fail_floor_write_after_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -259,23 +264,54 @@ impl ShardStatesKeeper {
             return Ok(CleanupFloor::Unset);
         };
         let id = decode_checkpoint(&value)
-            .ok_or_else(|| error!("Malformed persisted validator-cleanup GC floor"))?;
-        Ok(match Self::pin_physical_state(db, resolver, &id) {
-            Ok(guard) => CleanupFloor::Pinned(id, guard),
-            Err(error) => {
-                log::error!(
-                    "Validator-cleanup GC floor {id} state is unavailable; cleanup stays disabled: {error}"
-                );
-                CleanupFloor::Missing(id)
-            }
-        })
+            .ok_or_else(|| error!("Malformed persisted GC floor; the database is inconsistent"))?;
+        // As in the reference, a persisted floor whose state is gone stops
+        // the node; it is never replaced.
+        let guard = Self::pin_physical_state(db, resolver, &id).map_err(|error| {
+            error!("GC floor {id} has no state; the database is inconsistent: {error}")
+        })?;
+        resolver.publish_floor(FloorBoundary::from_state(guard.state())?);
+        Ok(CleanupFloor::Pinned(id, guard))
+    }
+
+    /// The one owner of floor advancement.
+    pub(crate) fn floor_owner(&self) -> &tokio::sync::Mutex<()> {
+        &self.floor_owner
+    }
+
+    /// Seeds a floor that was never persisted with `id`, the boot block or
+    /// the init block, as the reference starts its GC block. The state of
+    /// `id` must be present; a missing one is fatal to the caller.
+    pub(crate) fn seed_cleanup_floor(&self, id: &BlockIdExt, epoch: u64) -> Result<()> {
+        use consensus_common::validator_cleanup::{
+            encode_checkpoint, is_full_masterchain_checkpoint, GC_FLOOR_KEY,
+        };
+        if !is_full_masterchain_checkpoint(id) {
+            fail!("GC floor seed {id} is not a full masterchain block");
+        }
+        let guard = self
+            .pin_cleanup_candidate(id)
+            .map_err(|error| error!("GC floor seed {id} has no state: {error}"))?;
+        let boundary = FloorBoundary::from_state(guard.state())?;
+        let mut slot = self.cleanup_floor.lock();
+        self.check_floor_epoch(epoch)?;
+        if !matches!(&*slot, CleanupFloor::Unset) {
+            return Ok(());
+        }
+        self.db.write_validator_state_batch_sync(
+            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
+            &[],
+        )?;
+        self.gc_resolver.publish_floor(boundary);
+        *slot = CleanupFloor::Pinned(id.clone(), guard);
+        Ok(())
     }
 
     /// The current cleanup floor and its pinned state, if one is in custody.
     pub(crate) fn cleanup_floor(&self) -> Option<(BlockIdExt, Arc<ShardStateStuff>)> {
         match &*self.cleanup_floor.lock() {
             CleanupFloor::Pinned(id, guard) => Some((id.clone(), guard.state_arc())),
-            CleanupFloor::Unset | CleanupFloor::Missing(_) | CleanupFloor::Uncertain { .. } => None,
+            CleanupFloor::Unset | CleanupFloor::Uncertain { .. } => None,
         }
     }
 
@@ -305,6 +341,14 @@ impl ShardStatesKeeper {
         };
         let selected =
             if take_candidate { Some(&candidate.0) } else { previous.as_ref().map(|(id, _)| id) };
+        let boundary = if take_candidate {
+            Some(FloorBoundary::from_state(candidate.1.state())?)
+        } else {
+            previous
+                .as_ref()
+                .map(|(_, guard)| FloorBoundary::from_state(guard.state()))
+                .transpose()?
+        };
         let rewritten = match selected {
             Some(id) => self.db.write_validator_state_batch_sync(
                 &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(id))],
@@ -325,6 +369,10 @@ impl ShardStatesKeeper {
         else {
             return Ok(());
         };
+        // The re-written key is durable now: its floor may decide deletion.
+        if let Some(boundary) = boundary {
+            self.gc_resolver.publish_floor(boundary);
+        }
         *slot = match (take_candidate, previous) {
             (true, _) => CleanupFloor::Pinned(candidate.0, candidate.1),
             (false, Some((id, guard))) => CleanupFloor::Pinned(id, guard),
@@ -371,7 +419,7 @@ impl ShardStatesKeeper {
             .ok_or_else(|| error!("Cleanup floor epoch exhausted; truncation refused"))?;
         let floors: Vec<&BlockIdExt> = match &*slot {
             CleanupFloor::Unset => vec![],
-            CleanupFloor::Pinned(id, _) | CleanupFloor::Missing(id) => vec![id],
+            CleanupFloor::Pinned(id, _) => vec![id],
             CleanupFloor::Uncertain { previous, candidate } => {
                 previous.iter().map(|(id, _)| id).chain([&candidate.0]).collect()
             }
@@ -402,7 +450,7 @@ impl ShardStatesKeeper {
         matches!(&*self.cleanup_floor.lock(), CleanupFloor::Unset)
     }
 
-    pub(crate) fn cleanup_state_ttl(&self) -> u64 {
+    pub(crate) fn cleanup_state_ttl(&self) -> f64 {
         self.cleanup_state_ttl
     }
 
@@ -426,14 +474,14 @@ impl ShardStatesKeeper {
         if guard.state().block_id() != id || !is_full_masterchain_checkpoint(id) {
             fail!("Cleanup floor pin does not match a full masterchain block");
         }
+        // Derived before anything is written, so a published floor always
+        // has its boundary.
+        let boundary = FloorBoundary::from_state(guard.state())?;
         let mut slot = self.cleanup_floor.lock();
         self.check_floor_epoch(epoch)?;
         // Monotonic under the slot lock: only a strict descendant of the
         // current floor, so a stale caller can never move it back.
         match &*slot {
-            CleanupFloor::Missing(old) => {
-                fail!("Cleanup floor {old} is unavailable; it is never replaced")
-            }
             CleanupFloor::Uncertain { .. } => {
                 fail!("Cleanup floor write is uncertain; resolve it before adopting")
             }
@@ -462,9 +510,12 @@ impl ShardStatesKeeper {
         };
         if let Err(error) = written {
             // The key may hold either floor: keep both pins, disable cleanup.
+            // State GC keeps deciding by the previous, durable floor.
             *slot = CleanupFloor::Uncertain { previous, candidate: (id.clone(), guard) };
             return Err(error);
         }
+        // Published only after the synced write succeeded.
+        self.gc_resolver.publish_floor(boundary);
         *slot = CleanupFloor::Pinned(id.clone(), guard);
         drop(slot);
         drop(previous);
@@ -530,6 +581,49 @@ impl ShardStatesKeeper {
                                 Ok(Some(id)) => break 'a (*id).clone(),
                             }
                         };
+                    }
+                })
+            }),
+        )?;
+
+        // The reference re-checks its GC block every second; each check runs
+        // the floor forward as far as it may go.
+        let floor_engine = engine.clone();
+        engine.clone().register_service_task(
+            "state GC floor",
+            0,
+            Box::new(move || {
+                tokio::spawn(async move {
+                    loop {
+                        if floor_engine.check_stop() {
+                            return;
+                        }
+                        // A step may wait on a state; stopping never waits on it.
+                        let step = crate::validator::validator_cleanup_gc::maintain_cleanup_floor(
+                            floor_engine.as_ref(),
+                        );
+                        tokio::pin!(step);
+                        let result = loop {
+                            tokio::select! {
+                                result = &mut step => break Some(result),
+                                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                                    if floor_engine.check_stop() {
+                                        break None;
+                                    }
+                                }
+                            }
+                        };
+                        match result {
+                            None => return,
+                            Some(Err(e)) => log::warn!("state GC floor: {e}"),
+                            Some(Ok(())) => {}
+                        }
+                        for _ in 0..5 {
+                            if floor_engine.check_stop() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
                     }
                 })
             }),
@@ -1236,13 +1330,8 @@ impl ShardStatesKeeper {
                 }
             }
 
-            // update gc resolver
-            let min_id = Self::get_min_processed_mc_id(engine)?;
-            if min_id.seq_no() > handle.id().seq_no() {
-                self.gc_resolver.advance(handle.id(), engine.deref()).await?;
-            } else {
-                self.gc_resolver.advance(&min_id, engine.deref()).await?;
-            }
+            // The state GC follows the durable floor, which the floor
+            // driver moves; nothing to update here.
 
             // wait next mc block
             handle = loop {

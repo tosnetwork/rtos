@@ -26,6 +26,7 @@ use rtos_block::{
     error, fail, BlockIdExt, Cell, CellsFactory, CellsStorage, Result, UInt256, UnixTime,
 };
 use std::{
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU32, AtomicU8, Ordering},
         Arc,
@@ -33,9 +34,29 @@ use std::{
     time::Duration,
 };
 
+/// The order in which states were stored, as the state GC sees it. States
+/// are collected oldest first, and collection stops at the oldest state the
+/// policy keeps, so a later state is never collected before an earlier one.
+pub trait StateInsertionOrder: Send + Sync {
+    /// Whether `id` lies before the oldest stored state the policy keeps,
+    /// as of the last collection pass. A state that is not stored counts as
+    /// collected.
+    fn in_collectable_prefix(&self, id: &BlockIdExt) -> bool;
+}
+
 pub trait AllowStateGcResolver: Send + Sync {
     fn allow_state_gc(&self, block_id: &BlockIdExt, save_utime: u64, gc_utime: u64)
         -> Result<bool>;
+
+    /// Whether the collection policy alone lets `block_id` go, before read
+    /// pins and repair custody are considered. Collection stops at the
+    /// oldest stored state for which this is false.
+    fn state_gc_eligible(&self, block_id: &BlockIdExt) -> Result<bool> {
+        self.allow_state_gc(block_id, 0, u64::MAX)
+    }
+
+    /// Gives the resolver the store order the collection follows.
+    fn attach_insertion_order(&self, _order: Arc<dyn StateInsertionOrder>) {}
 
     /// Captures the progress that will authorize the next GC cycle and
     /// returns its ticket, or `None` when this resolver has no such gate.
@@ -55,6 +76,72 @@ pub trait AllowStateGcResolver: Send + Sync {
 /// Barrier the state GC runs between staging and committing its progress.
 pub type GcProgressBarrier =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>;
+
+/// Store order of the indexed states: a sequence number per state, assigned
+/// when its index entry is first written and removed with it.
+#[derive(Default)]
+struct InsertionOrderMap {
+    by_seq: BTreeMap<u64, BlockIdExt>,
+    by_id: HashMap<BlockIdExt, u64>,
+    next_seq: u64,
+    /// Sequence number of the oldest state the last pass kept by policy;
+    /// every older state is collectable. Zero before the first pass.
+    collectable_end: u64,
+}
+
+pub(crate) struct InsertionOrder(parking_lot::RwLock<InsertionOrderMap>);
+
+impl InsertionOrder {
+    fn seq_key(seq: u64) -> [u8; 8] {
+        seq.to_be_bytes()
+    }
+
+    fn insert(&self, seq: u64, id: BlockIdExt) -> Result<()> {
+        let mut map = self.0.write();
+        map.next_seq = map
+            .next_seq
+            .max(seq.checked_add(1).ok_or_else(|| error!("State store order sequence exhausted"))?);
+        if let Some(old) = map.by_id.insert(id.clone(), seq) {
+            map.by_seq.remove(&old);
+        }
+        map.by_seq.insert(seq, id);
+        Ok(())
+    }
+
+    fn remove(&self, id: &BlockIdExt) -> Option<u64> {
+        let mut map = self.0.write();
+        let seq = map.by_id.remove(id)?;
+        map.by_seq.remove(&seq);
+        Some(seq)
+    }
+
+    fn reserve(&self) -> Result<u64> {
+        let map = self.0.read();
+        Ok(map.next_seq)
+    }
+
+    fn seq_of(&self, id: &BlockIdExt) -> Option<u64> {
+        self.0.read().by_id.get(id).copied()
+    }
+
+    fn snapshot(&self) -> Vec<(u64, BlockIdExt)> {
+        self.0.read().by_seq.iter().map(|(seq, id)| (*seq, id.clone())).collect()
+    }
+
+    fn set_collectable_end(&self, end: u64) {
+        self.0.write().collectable_end = end;
+    }
+}
+
+impl StateInsertionOrder for InsertionOrder {
+    fn in_collectable_prefix(&self, id: &BlockIdExt) -> bool {
+        let map = self.0.read();
+        match map.by_id.get(id) {
+            Some(seq) => *seq < map.collectable_end,
+            None => true,
+        }
+    }
+}
 
 pub(crate) struct DbEntry {
     // Because key in db is not a full BlockIdExt it's need to store it here to use while GC.
@@ -215,6 +302,8 @@ fn state_task_join(task: tokio::task::JoinHandle<()>) -> StateTaskJoin {
 
 pub struct ShardStateDb {
     shardstate_db: Arc<RocksDbTable<BlockIdExt>>,
+    order_db: Arc<RocksDbTable<Vec<u8>>>,
+    order: Arc<InsertionOrder>,
     dynamic_boc_db: Arc<DynamicBocDb>,
     storer: tokio::sync::mpsc::UnboundedSender<StateCommand>,
     write_failure: tokio::sync::watch::Sender<Option<String>>,
@@ -240,6 +329,96 @@ impl ShardStateDb {
     pub(crate) const MASK_STOPPED: u8 = 0x80;
     const GC_QUEUE_POLL_INTERVAL_MS: u64 = 10_000;
     const PUT_QUEUE_POLL_INTERVAL_MS: u64 = 100;
+    const ORDER_CF_SUFFIX: &'static str = "_order";
+
+    /// Reads the persisted store order. An indexed state without an order
+    /// record is appended after the recorded ones, oldest save time first;
+    /// an order record without an indexed state is dropped.
+    fn load_insertion_order(
+        shardstate_db: &RocksDbTable<BlockIdExt>,
+        order_db: &RocksDbTable<Vec<u8>>,
+    ) -> Result<InsertionOrder> {
+        let order = InsertionOrder(parking_lot::RwLock::new(InsertionOrderMap::default()));
+        let mut stale = Vec::new();
+        order_db.for_each(&mut |key, value| {
+            let seq = <[u8; 8]>::try_from(key)
+                .map(u64::from_be_bytes)
+                .map_err(|_| error!("Malformed state store order key"))?;
+            let id = BlockIdExt::deserialize(value)?;
+            if shardstate_db.contains(&id)? {
+                order.insert(seq, id)?;
+            } else {
+                stale.push(key.to_vec());
+            }
+            Ok(true)
+        })?;
+        for key in stale {
+            order_db.delete_raw(&key)?;
+        }
+        let mut missing = Vec::new();
+        shardstate_db.for_each(&mut |_key, value| {
+            let entry = DbEntry::deserialize(value)?;
+            if order.seq_of(&entry.block_id).is_none() {
+                missing.push((entry.save_utime, entry.block_id));
+            }
+            Ok(true)
+        })?;
+        missing.sort_by(|(a_time, a_id), (b_time, b_id)| {
+            (
+                a_time,
+                a_id.seq_no(),
+                a_id.shard().workchain_id(),
+                a_id.shard().shard_prefix_with_tag(),
+            )
+                .cmp(&(
+                    b_time,
+                    b_id.seq_no(),
+                    b_id.shard().workchain_id(),
+                    b_id.shard().shard_prefix_with_tag(),
+                ))
+        });
+        for (_, id) in missing {
+            let seq = order.reserve()?;
+            order_db.put_raw(&InsertionOrder::seq_key(seq), &id.serialize())?;
+            order.insert(seq, id)?;
+        }
+        Ok(order)
+    }
+
+    /// The store order the state GC follows.
+    pub fn insertion_order(&self) -> Arc<dyn StateInsertionOrder> {
+        self.order.clone()
+    }
+
+    /// Indexed states oldest first, as stored.
+    pub fn states_in_store_order(&self) -> Vec<BlockIdExt> {
+        self.order.snapshot().into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// One collection pass: the states in store order up to the oldest one
+    /// the policy keeps. That boundary is published to readers before the
+    /// candidates are returned.
+    fn collectable_prefix(&self, gc_resolver: &dyn AllowStateGcResolver) -> Vec<BlockIdExt> {
+        let entries = self.order.snapshot();
+        let mut end = entries.last().map_or(0, |(seq, _)| seq.saturating_add(1));
+        let mut prefix = Vec::new();
+        for (seq, id) in entries {
+            match gc_resolver.state_gc_eligible(&id) {
+                Ok(true) => prefix.push(id),
+                Ok(false) => {
+                    end = seq;
+                    break;
+                }
+                Err(e) => {
+                    log::warn!(target: TARGET, "ShardStateDb GC: eligibility of {id}: {e}");
+                    end = seq;
+                    break;
+                }
+            }
+        }
+        self.order.set_collectable_end(end);
+        prefix
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -263,8 +442,17 @@ impl ShardStateDb {
             allocated.clone(),
         )?;
 
+        let shardstate_db = Arc::new(RocksDbTable::with_db(db.clone(), shardstate_db_cf, true)?);
+        let order_db = Arc::new(RocksDbTable::with_db(
+            db.clone(),
+            format!("{shardstate_db_cf}{}", Self::ORDER_CF_SUFFIX),
+            true,
+        )?);
+        let order = Arc::new(Self::load_insertion_order(&shardstate_db, &order_db)?);
         let ss_db = Arc::new(Self {
-            shardstate_db: Arc::new(RocksDbTable::with_db(db.clone(), shardstate_db_cf, true)?),
+            shardstate_db,
+            order_db,
+            order,
             dynamic_boc_db: Arc::new(dynamic_boc_db),
             storer: sender,
             bounded_read_gate: std::sync::RwLock::new(()),
@@ -321,6 +509,7 @@ impl ShardStateDb {
         if progress_barrier.is_some() {
             gc_resolver.require_durable_progress();
         }
+        gc_resolver.attach_insertion_order(self.order.clone());
         if self.gc_resolver.set(gc_resolver.clone()).is_err() {
             log::error!(target: TARGET, "INTERNAL ERROR: Attempt to set GC resolver twice");
             return;
@@ -393,7 +582,6 @@ impl ShardStateDb {
                         }
                         epoch
                     };
-                    let interval_ms = (run_gc_interval * 1000) / (to_delete.len() + 1) as u64;
                     while let Some(id) = to_delete.pop() {
                         if !wait_queue(&self.in_queue, &self.stop, self.config.states_db_queue_len)
                             .await
@@ -443,18 +631,9 @@ impl ShardStateDb {
                             let elapsed = now.elapsed();
                             metrics::histogram!("rtos_node_db_shardstate_gc_seconds")
                                 .record(elapsed);
-                            let elapsed = elapsed.as_millis() as u64;
-                            if elapsed > interval_ms {
-                                log::debug!(
-                                    target: TARGET,
-                                    "ShardStateDb GC: deleting state {} was slower then given \
-                                    interval, TIME {} ms, slot {} ms",
-                                    id, elapsed, interval_ms,
-                                );
-                                if check_and_stop(&self.stop) {
-                                    return;
-                                }
-                            } else if !sleep_nicely(&self.stop, interval_ms - elapsed).await {
+                            // Like the reference collector, the next state goes
+                            // as soon as this one is done.
+                            if check_and_stop(&self.stop) {
                                 return;
                             }
                         }
@@ -489,34 +668,52 @@ impl ShardStateDb {
 
                 log::debug!(target: TARGET, "ShardStateDb GC: collecting states to delete");
 
+                // States go oldest stored first, and the pass stops at the
+                // oldest one the policy keeps: a later state is never
+                // collected while an earlier one is kept.
+                let prefix = self.collectable_prefix(gc_resolver.as_ref());
                 let mut kept = 0;
-                self.shardstate_db
-                    .for_each(&mut |_key, value| {
-                        if check_and_stop(&self.stop) {
-                            return Ok(false);
-                        }
-                        let entry = DbEntry::deserialize(value)?;
-                        let time = UnixTime::now();
-                        match gc_resolver.allow_state_gc(&entry.block_id, entry.save_utime, time) {
-                            Ok(true) => {
-                                log::debug!(
-                                target: TARGET, "ShardStateDb GC: delete  id {}", entry.block_id);
-                                to_delete.push(entry.block_id);
-                            }
-                            Ok(false) => {
+                for id in prefix {
+                    if check_and_stop(&self.stop) {
+                        return;
+                    }
+                    let save_utime = match self.shardstate_db.try_get(&id) {
+                        Ok(Some(value)) => match DbEntry::deserialize(&value) {
+                            Ok(entry) => entry.save_utime,
+                            Err(e) => {
+                                log::warn!(target: TARGET, "ShardStateDb GC: index of {id}: {e}");
                                 kept += 1;
-                                log::debug!(
-                                target: TARGET, "ShardStateDb GC: keep  id {}", entry.block_id);
+                                continue;
                             }
-                            Err(e) => log::warn!(
-                                target: TARGET,
-                                "ShardStateDb  allow_state_gc  id {}  root_cell_id {:x}  error {}",
-                                entry.block_id, entry.cell_id, e
-                            ),
+                        },
+                        Ok(None) => continue,
+                        Err(e) => {
+                            log::warn!(target: TARGET, "ShardStateDb GC: index of {id}: {e}");
+                            kept += 1;
+                            continue;
                         }
-                        Ok(true)
-                    })
-                    .expect("Can't return error");
+                    };
+                    match gc_resolver.allow_state_gc(&id, save_utime, UnixTime::now()) {
+                        Ok(true) => {
+                            log::debug!(target: TARGET, "ShardStateDb GC: delete  id {}", id);
+                            to_delete.push(id);
+                        }
+                        Ok(false) => {
+                            // Held by a reader or repair custody: retried on a
+                            // later pass, the order of the rest is unchanged.
+                            kept += 1;
+                            log::debug!(target: TARGET, "ShardStateDb GC: keep  id {}", id);
+                        }
+                        Err(e) => {
+                            kept += 1;
+                            log::warn!(
+                                target: TARGET,
+                                "ShardStateDb  allow_state_gc  id {}  error {}",
+                                id, e
+                            )
+                        }
+                    }
+                }
 
                 if check_and_stop(&self.stop) {
                     return;
@@ -528,10 +725,8 @@ impl ShardStateDb {
                     to_delete.len(), kept
                 );
 
-                // Sort ids by decreasing seqno. This way differences between
-                // states will be smaller, so each delete operation will be faster
-                // (last in the vector - the earliest state - will be deleted first)
-                to_delete.sort_by_key(|b| std::cmp::Reverse(b.seq_no()));
+                // Deleted from the end of the vector: oldest stored first.
+                to_delete.reverse();
             }
         });
         tasks.gc = Some(state_task_join(gc));
@@ -894,6 +1089,10 @@ impl ShardStateDb {
                                 root.repr_hash().clone(),
                                 UnixTime::now(),
                             );
+                            let new_seq = match &existing_index {
+                                Some(_) => None,
+                                None => Some(self.order.reserve()?),
+                            };
                             let result = self.dynamic_boc_db.save_boc_bounded(
                                 &root,
                                 limits,
@@ -905,9 +1104,20 @@ impl ShardStateDb {
                                         batch,
                                         id.key(),
                                         &entry.serialize(),
-                                    )
+                                    )?;
+                                    if let Some(seq) = new_seq {
+                                        self.order_db.put_in_batch(
+                                            batch,
+                                            &InsertionOrder::seq_key(seq),
+                                            &id.serialize(),
+                                        )?;
+                                    }
+                                    Ok(())
                                 },
                             );
+                            if let (Ok(_), Some(seq)) = (&result, new_seq) {
+                                self.order.insert(seq, id.clone())?;
+                            }
                             if let Err(error) = &result {
                                 if error
                                 .downcast_ref::<crate::dynamic_boc_rc_db::BoundedStateWriteFailure>(
@@ -1026,7 +1236,20 @@ impl ShardStateDb {
         }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id.clone(), save_utime);
-        let index_result = self.shardstate_db.put(id, &db_entry.serialize());
+        let seq = self.order.reserve()?;
+        let index_result = (|| {
+            let mut batch = rocksdb::WriteBatch::default();
+            self.shardstate_db.put_in_batch(&mut batch, id.key(), &db_entry.serialize())?;
+            self.order_db.put_in_batch(
+                &mut batch,
+                &InsertionOrder::seq_key(seq),
+                &id.serialize(),
+            )?;
+            self.shardstate_db.physical_db().write_batch(batch)
+        })();
+        if index_result.is_ok() {
+            self.order.insert(seq, id.clone())?;
+        }
         #[cfg(test)]
         self.ordinary_index_attempts.fetch_add(1, Ordering::SeqCst);
         index_result?;
@@ -1074,9 +1297,14 @@ impl ShardStateDb {
                 }
             };
             ss_db.dynamic_boc_db.delete_boc(&db_entry.cell_id, &check_stop, |batch| {
-                shardstate_db.add_delete_to_batch(batch, &id_for_batch)
+                shardstate_db.add_delete_to_batch(batch, &id_for_batch)?;
+                if let Some(seq) = ss_db.order.seq_of(&id_for_batch) {
+                    ss_db.order_db.add_raw_to_batch(batch, &InsertionOrder::seq_key(seq), None)?;
+                }
+                Ok(())
             })
         })?;
+        self.order.remove(id);
 
         log::trace!(target: TARGET, "ShardStateDb::delete_internal  DONE  id {}", id);
         Ok(())
@@ -1184,6 +1412,179 @@ mod bounded_read_tests {
         let error = states.get_detached(&id, &Budget, |_| Ok(())).err().unwrap();
         assert!(error.downcast_ref::<crate::bounded_cell::InvalidBoundedState>().is_some());
         states.stop().await.unwrap();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod insertion_order_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, OnceLock};
+
+    /// States below `threshold` are eligible; like the node resolver, one is
+    /// gone only once it lies in the collectable prefix.
+    struct Below {
+        threshold: AtomicU32,
+        order: OnceLock<Arc<dyn StateInsertionOrder>>,
+        pinned: AtomicBool,
+    }
+    impl Below {
+        fn new(threshold: u32) -> Arc<Self> {
+            Arc::new(Self {
+                threshold: AtomicU32::new(threshold),
+                order: OnceLock::new(),
+                pinned: AtomicBool::new(false),
+            })
+        }
+    }
+    impl AllowStateGcResolver for Below {
+        fn allow_state_gc(&self, id: &BlockIdExt, _: u64, _: u64) -> Result<bool> {
+            Ok(self.state_gc_eligible(id)?
+                && !(self.pinned.load(Ordering::SeqCst) && id.seq_no() == 1)
+                && self.order.get().is_none_or(|order| order.in_collectable_prefix(id)))
+        }
+        fn state_gc_eligible(&self, id: &BlockIdExt) -> Result<bool> {
+            Ok(id.seq_no() < self.threshold.load(Ordering::SeqCst))
+        }
+        fn attach_insertion_order(&self, order: Arc<dyn StateInsertionOrder>) {
+            let _ = self.order.set(order);
+        }
+    }
+
+    /// Stops the states and waits until the database itself is released, so
+    /// a reopen sees what was written.
+    async fn close(states: Arc<ShardStateDb>) -> Result<()> {
+        let db = states.shardstate_db.physical_db().clone();
+        states.stop().await?;
+        drop(states);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&db) > 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| error!("state database not released"))?;
+        Ok(())
+    }
+
+    fn open(dir: &std::path::Path) -> Result<Arc<ShardStateDb>> {
+        let db = crate::db::node::open_node_db(
+            dir,
+            &CellsDbConfig::default(),
+            crate::db::rocksdb::AccessType::ReadWrite,
+        )?;
+        ShardStateDb::new(
+            db,
+            "order_states",
+            crate::db::node::CELLS_CF_NAME,
+            crate::db::node::CELLSCOUNTERS_CF_NAME,
+            CellsDbConfig::default(),
+            #[cfg(feature = "telemetry")]
+            Arc::new(crate::StorageTelemetry::default()),
+            Arc::new(crate::StorageAlloc::default()),
+        )
+    }
+
+    fn state(seq_no: u32) -> Result<(BlockIdExt, Cell)> {
+        let root = rtos_block::BuilderData::with_raw(vec![seq_no as u8, 0x5a], 16)?.into_cell()?;
+        let id = BlockIdExt::with_params(
+            rtos_block::ShardIdent::masterchain(),
+            seq_no,
+            root.repr_hash().clone(),
+            UInt256::from([seq_no as u8; 32]),
+        );
+        Ok((id, root))
+    }
+
+    /// The pass stops at the oldest kept state: a later eligible state stays
+    /// stored and readable, and the store order survives a reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_follows_store_order_and_stops_at_the_oldest_kept_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (a, b, c) = (state(1)?, state(5)?, state(2)?);
+        {
+            let states = open(dir.path())?;
+            for (id, root) in [&a, &b, &c] {
+                states.clone().put_internal(id, root.clone())?;
+            }
+            assert_eq!(states.states_in_store_order(), vec![a.0.clone(), b.0.clone(), c.0.clone()]);
+            let policy = Below::new(3);
+            policy.attach_insertion_order(states.insertion_order());
+            assert!(states.gc_resolver.set(policy.clone()).is_ok());
+            // Before any pass nothing is collectable: every state reads.
+            assert!(states.get(&c.0).is_ok());
+            assert_eq!(states.collectable_prefix(policy.as_ref()), vec![a.0.clone()]);
+            // C is eligible but behind the kept B: it stays readable.
+            assert!(!policy.allow_state_gc(&c.0, 0, 0)?);
+            assert!(states.get(&c.0).is_ok());
+            assert!(policy.allow_state_gc(&a.0, 0, 0)?);
+            states.clone().delete_internal(&a.0)?;
+            assert!(!states.contains_state_record(&a.0)?);
+            assert_eq!(states.states_in_store_order(), vec![b.0.clone(), c.0.clone()]);
+            states.shardstate_db.sync_wal()?;
+            close(states).await?;
+        }
+        // Reopened: the order of the remaining states is the stored one.
+        let states = open(dir.path())?;
+        assert!(states.contains_state_record(&b.0)?, "index survives the reopen");
+        assert_eq!(states.states_in_store_order(), vec![b.0.clone(), c.0.clone()]);
+        let policy = Below::new(10);
+        policy.attach_insertion_order(states.insertion_order());
+        assert_eq!(states.collectable_prefix(policy.as_ref()), vec![b.0.clone(), c.0.clone()]);
+        states.stop().await?;
+        Ok(())
+    }
+
+    /// The running collector deletes oldest first, never past a kept state,
+    /// and retries a pinned one without reordering the rest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn running_collector_deletes_only_the_collectable_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let states = open(dir.path())?;
+        let (a, b, c) = (state(1)?, state(5)?, state(2)?);
+        for (id, root) in [&a, &b, &c] {
+            states.clone().put_internal(id, root.clone())?;
+        }
+        let policy = Below::new(3);
+        policy.pinned.store(true, Ordering::SeqCst);
+        states.clone().start_gc(policy.clone(), Arc::new(AtomicU32::new(1)));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(states.contains_state_record(&a.0)?, "a pinned state waits");
+        policy.pinned.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!states.contains_state_record(&a.0)?);
+        assert!(states.contains_state_record(&b.0)?);
+        assert!(states.contains_state_record(&c.0)?, "never collected past a kept state");
+        policy.threshold.store(10, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!states.contains_state_record(&b.0)?);
+        assert!(!states.contains_state_record(&c.0)?);
+        states.stop().await?;
+        Ok(())
+    }
+
+    /// An indexed state without an order record (written before the order
+    /// existed) is appended by save time; a stale order record is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn order_is_reconciled_with_the_index_on_open() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (a, b) = (state(7)?, state(3)?);
+        {
+            let states = open(dir.path())?;
+            states.clone().put_internal(&a.0, a.1.clone())?;
+            states.clone().put_internal(&b.0, b.1.clone())?;
+            // Lose the order record of A, and leave one for an unknown state.
+            let seq = states.order.seq_of(&a.0).unwrap();
+            states.order_db.delete_raw(&InsertionOrder::seq_key(seq))?;
+            let ghost = state(9)?.0;
+            states.order_db.put_raw(&InsertionOrder::seq_key(1000), &ghost.serialize())?;
+            states.shardstate_db.sync_wal()?;
+            close(states).await?;
+        }
+        let states = open(dir.path())?;
+        assert_eq!(states.states_in_store_order(), vec![b.0.clone(), a.0.clone()]);
+        assert!(states.order_db.try_get_raw(&InsertionOrder::seq_key(1000))?.is_none());
+        states.stop().await?;
         Ok(())
     }
 }

@@ -768,11 +768,7 @@ impl Engine {
         });
 
         let archives_life_time_hours = general_config.gc_archives_life_time_hours();
-        let cells_lifetime_sec = if general_config.archival_mode().is_none() {
-            general_config.cells_gc_config().cells_lifetime_sec
-        } else {
-            u64::MAX
-        };
+        let state_ttl = general_config.state_ttl();
         let enable_shard_state_persistent_gc = general_config.enable_shard_state_persistent_gc();
         let skip_saving_persistent_states = general_config.skip_saving_persistent_states();
         let pss_cells_cache_max_count = general_config.pss_cells_cache_max_count();
@@ -783,7 +779,8 @@ impl Engine {
         let cells_db_config = general_config.cells_db_config().clone();
         let db_config = InternalDbConfig {
             db_directory: general_config.internal_db_path().to_string(),
-            cells_gc_interval_sec: general_config.cells_gc_config().gc_interval_sec,
+            // The reference collector retries a kept state every second.
+            cells_gc_interval_sec: 1,
             cells_db_config: cells_db_config.clone(),
             archival_mode: general_config.archival_mode().cloned(),
         };
@@ -949,7 +946,7 @@ impl Engine {
                     pss_cells_cache_max_count,
                     pss_prev_part_max_size,
                     states_cache_mode,
-                    cells_lifetime_sec,
+                    state_ttl,
                     stopper.clone(),
                     cells_db_config.states_db_queue_len + 10,
                     #[cfg(feature = "telemetry")]
@@ -2860,7 +2857,58 @@ impl Engine {
         })
     }
 
-    #[allow(dead_code)]
+    /// `-T/--truncate-db N`, as the reference applies it at startup: block N
+    /// stays the top masterchain block. A request above the latest applied
+    /// block does nothing; at the latest applied block nothing is deleted but
+    /// the successor links of the top and of its shard tops are cleared;
+    /// below it every newer block goes and the cursors move back to N. A GC
+    /// floor above N refuses the request before anything changes.
+    pub async fn truncate_database_to_top(&self, mc_seq_no: u32) -> Result<()> {
+        log::warn!("Requested truncate to {mc_seq_no}");
+        let mut head = self
+            .load_last_applied_mc_block_id()?
+            .ok_or_else(|| error!("Cannot truncate: no masterchain block was applied"))?
+            .deref()
+            .clone();
+        // The latest applied block, walking forward as the reference does.
+        loop {
+            let Some(handle) = self.load_block_handle(&head)? else {
+                fail!("Cannot truncate: no handle for {head}");
+            };
+            if !handle.has_next1() {
+                break;
+            }
+            let Ok(next) = self.load_block_next1(&head) else {
+                break;
+            };
+            match self.load_block_handle(&next)? {
+                Some(next_handle) if next_handle.is_applied() && next_handle.has_saved_state() => {
+                    head = next
+                }
+                _ => break,
+            }
+        }
+        log::info!("latest applied block = {head}");
+        if mc_seq_no > head.seq_no() {
+            return Ok(());
+        }
+        // The reference asserts the GC block lies at or below N; refused
+        // here before any write.
+        self.db().check_truncation_above_cleanup_floor(mc_seq_no)?;
+        if self.load_last_applied_mc_block_id()?.as_deref() != Some(&head) {
+            self.save_last_applied_mc_block_id(&head)?;
+        }
+        if mc_seq_no < head.seq_no() {
+            let next_seq_no = mc_seq_no
+                .checked_add(1)
+                .ok_or_else(|| error!("Truncation seqno {mc_seq_no} overflows"))?;
+            self.truncate_database(next_seq_no).await
+        } else {
+            log::warn!("Clearing 'next' for mc seqno {head}");
+            self.db().clear_successor_links(&head).await
+        }
+    }
+
     pub async fn truncate_database(&self, mc_seq_no: u32) -> Result<()> {
         log::warn!("Truncate database at master block seqno {}", mc_seq_no);
         let mc_state = self.load_last_applied_mc_state().await?;
@@ -2887,7 +2935,9 @@ impl Engine {
             .await
             .map_err(|err| error!("no previous block state present for {}", err))?;
 
-        self.db().truncate_database(&block_id).await?;
+        // The cursors move to the new top first and durably: N stays, so they
+        // are valid whatever an interrupted truncation leaves above it, and a
+        // restart with the same request finishes the deletion.
         self.save_last_applied_mc_block_id(&prev_block_id)?;
 
         if let Some(block_id) = self.load_pss_keeper_mc_block_id()? {
@@ -2910,6 +2960,12 @@ impl Engine {
                 self.save_archives_gc_mc_block_id(&prev_block_id)?;
             }
         }
+        self.db().sync_node_state().await?;
+        #[cfg(test)]
+        if TRUNCATION_CRASH_BEFORE_DELETE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            fail!("injected crash after the truncation cursors were made durable");
+        }
+        self.db().truncate_database(&block_id).await?;
         #[cfg(test)]
         TRUNCATION_HELD_AFTER_HEAD_REWRITES.store(
             self.shard_states_keeper().truncation_active(),
@@ -2952,6 +3008,35 @@ pub(crate) static TRUNCATION_LOADED_PREVIOUS_STATE: std::sync::atomic::AtomicBoo
 #[cfg(test)]
 pub(crate) static TRUNCATION_HELD_AFTER_HEAD_REWRITES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Ends the next truncation as a crash would, after its cursors are durable
+/// and before any block is deleted (tests only).
+#[cfg(test)]
+pub(crate) static TRUNCATION_CRASH_BEFORE_DELETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The reference startup checks of its GC block, and its first value. After
+/// a cold boot the floor starts at the boot block; at a warm start without a
+/// persisted floor, at the init block. Either way the floor's state must be
+/// present, and the floor must not lie above the masterchain head the node
+/// restarts from. A failure stops the node; nothing is replaced.
+fn establish_gc_floor(engine: &Arc<Engine>, head: &BlockIdExt, cold: bool) -> Result<()> {
+    let keeper = engine.shard_states_keeper();
+    if keeper.cleanup_floor_unset() {
+        let seed = if cold { head.clone() } else { engine.init_mc_block_id().clone() };
+        keeper
+            .seed_cleanup_floor(&seed, keeper.cleanup_floor_epoch())
+            .map_err(|e| error!("Cannot start: the GC floor cannot start at {seed}: {e}"))?;
+    }
+    let Some((floor, _)) = keeper.cleanup_floor() else {
+        fail!("Cannot start: the GC floor is not in custody");
+    };
+    if floor.seq_no() > head.seq_no() {
+        fail!("Cannot start: GC floor {floor} lies above the masterchain head {head}");
+    }
+    log::info!("gc_block_id = {floor}");
+    Ok(())
+}
 
 pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<bool> {
     let zero_id = engine.zerostate_id();
@@ -3060,6 +3145,7 @@ async fn boot(
             (id, true)
         }
     };
+    establish_gc_floor(engine, &last_applied_mc_block, cold)?;
 
     let shard_client_mc_block = match engine.load_shard_client_mc_block_id() {
         Ok(Some(id)) => id.deref().clone(),
@@ -3159,7 +3245,7 @@ pub async fn run(
         "Engine startup",
         async move {
             if let Some(mc_seq_no) = truncate_db {
-                engine.truncate_database(mc_seq_no).await?;
+                engine.truncate_database_to_top(mc_seq_no).await?;
             }
             #[cfg(feature = "telemetry")]
             telemetry_logger(engine.clone())?;

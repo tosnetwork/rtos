@@ -124,7 +124,7 @@ async fn test_snapshot_cache_and_merge_require_authenticated_state_identity() ->
         0,
         0,
         ShardStatesCacheMode::Moderate,
-        u64::MAX,
+        crate::config::DEFAULT_STATE_TTL_SEC,
         stopper.clone(),
         100,
         #[cfg(feature = "telemetry")]
@@ -238,7 +238,7 @@ fn floor_keeper(db: Arc<InternalDb>, stopper: Arc<Stopper>) -> Result<Arc<ShardS
         0,
         0,
         ShardStatesCacheMode::Moderate,
-        3600,
+        3600.0,
         stopper,
         100,
         #[cfg(feature = "telemetry")]
@@ -248,8 +248,7 @@ fn floor_keeper(db: Arc<InternalDb>, stopper: Arc<Stopper>) -> Result<Arc<ShardS
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor() -> Result<()> {
-    use crate::collator_test_bundle::create_block_handle_storage;
+async fn test_cleanup_floor_custody_restores_and_refuses_a_missing_floor() -> Result<()> {
     use consensus_common::validator_cleanup::{decode_checkpoint, encode_checkpoint, GC_FLOOR_KEY};
     let id = BlockIdExt::with_params(
         ShardIdent::masterchain(),
@@ -271,19 +270,7 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
     assert!(keeper.cleanup_floor_unset());
     assert!(keeper.cleanup_floor().is_none());
     assert!(keeper.pin_cleanup_candidate(&id).is_err(), "no physical state, no pin");
-    let handles = create_block_handle_storage(None)?;
-    let handle =
-        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
-    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
-    header.set_seq_no(42);
-    let state = ShardStateStuff::from_state(
-        id.clone(),
-        header,
-        #[cfg(feature = "telemetry")]
-        &keeper.telemetry,
-        &keeper.allocated,
-    )?;
-    keeper.store_state(&handle, state, None, true).await?;
+    store_mc_state(&keeper, &id, None).await?;
     let guard = wait_pin(&keeper, &id).await?;
     keeper.adopt_cleanup_floor(&id, guard, keeper.cleanup_floor_epoch())?;
     assert_eq!(keeper.cleanup_floor().map(|(floor, _)| floor), Some(id.clone()));
@@ -292,8 +279,8 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
 
-    // A persisted floor whose state is gone stays Missing: cleanup is
-    // disabled, the key is kept, and no replacement is ever adopted.
+    // A persisted floor whose state is gone stops the node, as the
+    // reference's startup check does; the key is kept and nothing replaces it.
     let dir = tempfile::tempdir()?;
     let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
     engine.db.write_validator_state_batch_sync(
@@ -301,31 +288,15 @@ async fn test_cleanup_floor_custody_restores_and_never_replaces_a_missing_floor(
         &[],
     )?;
     let stopper = Arc::new(Stopper::new());
-    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
-    assert!(keeper.cleanup_floor().is_none());
-    assert!(!keeper.cleanup_floor_unset(), "a missing floor is not a first run");
-    let mut header = ShardStateUnsplit::with_ident(ShardIdent::masterchain());
-    header.set_seq_no(42);
-    let state = ShardStateStuff::from_state(
-        id.clone(),
-        header,
-        #[cfg(feature = "telemetry")]
-        &keeper.telemetry,
-        &keeper.allocated,
-    )?;
-    let handles = create_block_handle_storage(None)?;
-    let handle =
-        handles.create_handle(id.clone(), storage::types::BlockMeta::default(), None)?.unwrap();
-    keeper.store_state(&handle, state, None, true).await?;
-    let guard = wait_pin(&keeper, &id).await?;
-    assert!(
-        keeper.adopt_cleanup_floor(&id, guard, keeper.cleanup_floor_epoch()).is_err(),
-        "never replaced"
-    );
+    let error = match floor_keeper(engine.db.clone(), stopper.clone()) {
+        Ok(_) => panic!("a floor without state must refuse the keeper"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("has no state"), "{error}");
     assert_eq!(floor_key(&engine.db)?, Some(id.clone()), "the key is retained");
-    // A missing floor still bounds truncation.
-    assert!(keeper.begin_truncation(41).is_err(), "never below a missing floor");
-    drop(keeper.begin_truncation(42)?);
+    // A malformed key refuses the keeper too.
+    engine.db.write_validator_state_batch_sync(&[(GC_FLOOR_KEY.to_owned(), vec![0xff; 7])], &[])?;
+    assert!(floor_keeper(engine.db.clone(), stopper.clone()).is_err());
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())
@@ -545,6 +516,9 @@ impl crate::validator::validator_cleanup_gc::CleanupFloorSource for DbFloorSourc
     fn keeper(&self) -> Arc<ShardStatesKeeper> {
         self.keeper.clone()
     }
+    fn init_block_id(&self) -> BlockIdExt {
+        driver_mc(100, 1)
+    }
 }
 
 /// Stores a synthetic masterchain state with a handle in the real handle DB.
@@ -666,8 +640,8 @@ async fn test_cleanup_floor_driver_advances_one_verified_step_on_real_storage() 
     assert_eq!(durable_floor(&engine.db)?, Some(successor.clone()));
     let (_, pinned) = source.keeper.cleanup_floor().unwrap();
     assert_eq!(pinned.block_id(), &successor);
-    // No next1 from S: the next call errs and the floor stays S.
-    assert!(maintain_cleanup_floor(&source).await.is_err());
+    // No next1 from S: like the reference, no successor means no step.
+    maintain_cleanup_floor(&source).await?;
     assert_eq!(current(&source), Some(successor.clone()));
     assert_eq!(durable_floor(&engine.db)?, Some(successor));
     stopper.set_stop();
@@ -1001,5 +975,147 @@ async fn disk_full_incarnation_is_refused_then_advances_past_any_applied_value()
     assert!(next > floor && next <= first + 3, "{first} -> {in_process:?} -> {next}");
     engine.db.stop_states_db().await.unwrap();
     eprintln!("ENOSPC-CASE V4 first={first} in_process={in_process:?} next={next}");
+    Ok(())
+}
+
+/// One call runs the floor forward as far as it may go (the reference tries
+/// again after each durable step), and a second driver waits for the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cleanup_floor_driver_catches_up_under_one_owner() -> Result<()> {
+    use crate::validator::validator_cleanup_gc::maintain_cleanup_floor;
+    let (floor, first, second) = (driver_mc(100, 1), driver_mc(101, 2), driver_mc(102, 3));
+    let dir = tempfile::tempdir()?;
+    let (engine, stopper, source) =
+        driver_fixture(dir.path(), &first, Some(&floor), 1, 1950).await?;
+    let first_handle =
+        engine.db.load_block_handle(&first)?.ok_or_else(|| error!("no handle for {first}"))?;
+    store_driver_state(&source.keeper, &engine.db, &second, Some(&first), 1, 0).await?;
+    engine.db.store_block_next1(&first_handle, &second, None)?;
+    wait_pin(&source.keeper, &second).await?;
+    let source = Arc::new(source);
+    let held = source.keeper.floor_owner().lock().await;
+    let driver = {
+        let source = source.clone();
+        tokio::spawn(async move { maintain_cleanup_floor(source.as_ref()).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(source.keeper.cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+    assert!(!driver.is_finished(), "a second driver waits for the owner");
+    drop(held);
+    driver.await.map_err(|e| error!("{e}"))??;
+    assert_eq!(source.keeper.cleanup_floor().map(|(id, _)| id), Some(second.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(second));
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+/// A floor never persisted starts at the given block, which must have its
+/// state; once set, seeding changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_gc_floor_seed_requires_the_state_and_happens_once() -> Result<()> {
+    let (init, other) = (driver_mc(7, 1), driver_mc(9, 2));
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    assert!(keeper.seed_cleanup_floor(&init, keeper.cleanup_floor_epoch()).is_err());
+    assert!(keeper.cleanup_floor_unset(), "a failed seed leaves no floor");
+    assert_eq!(durable_floor(&engine.db)?, None);
+    store_driver_state(&keeper, &engine.db, &init, None, 1, 0).await?;
+    store_driver_state(&keeper, &engine.db, &other, None, 1, 0).await?;
+    wait_pin(&keeper, &init).await?;
+    wait_pin(&keeper, &other).await?;
+    keeper.seed_cleanup_floor(&init, keeper.cleanup_floor_epoch())?;
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(init.clone()));
+    assert_eq!(durable_floor(&engine.db)?, Some(init.clone()));
+    keeper.seed_cleanup_floor(&other, keeper.cleanup_floor_epoch())?;
+    assert_eq!(durable_floor(&engine.db)?, Some(init), "seeding never replaces a floor");
+    assert_eq!(keeper.cleanup_state_ttl(), 3600.0);
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+/// State GC follows the published floor in store order: below the floor a
+/// state goes, but not past an older state the floor keeps, which stays
+/// readable; the floor itself and newer states stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_state_gc_follows_the_floor_in_store_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    engine.db.adjust_states_gc_interval(1);
+    let (old, newer, held, floor) =
+        (driver_mc(50, 1), driver_mc(150, 2), driver_mc(60, 3), driver_mc(100, 4));
+    for id in [&old, &newer, &held, &floor] {
+        store_driver_state(&keeper, &engine.db, id, None, 1, 0).await?;
+        wait_pin(&keeper, id).await?;
+    }
+    keeper.seed_cleanup_floor(&floor, keeper.cleanup_floor_epoch())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while engine.db.test_contains_dynamic_state_record(&old)? {
+        assert!(std::time::Instant::now() < deadline, "the oldest eligible state is collected");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(engine.db.test_contains_dynamic_state_record(&newer)?);
+    assert!(engine.db.test_contains_dynamic_state_record(&floor)?);
+    assert!(
+        engine.db.test_contains_dynamic_state_record(&held)?,
+        "an eligible state behind a kept older one is not collected"
+    );
+    assert!(engine.db.load_shard_state_dynamic(&held).is_ok(), "and it stays readable");
+    assert!(engine.db.load_shard_state_dynamic(&old).is_err());
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    Ok(())
+}
+
+/// A floor write that committed but did not report success, followed by a
+/// crash: the next start restores the committed floor and publishes it to
+/// state GC; a crash before the write keeps the previous floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_floor_adoption_crash_cuts_restart_on_the_durable_floor() -> Result<()> {
+    let (floor, successor) = (driver_mc(42, 2), driver_mc(43, 3));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_str().unwrap().to_owned();
+    {
+        let engine = TestEngine::new_db_dir(&path, None).await?;
+        let stopper = Arc::new(Stopper::new());
+        let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+        store_mc_state(&keeper, &floor, None).await?;
+        store_mc_state(&keeper, &successor, Some(&floor)).await?;
+        keeper.adopt_cleanup_floor(
+            &floor,
+            wait_pin(&keeper, &floor).await?,
+            keeper.cleanup_floor_epoch(),
+        )?;
+        keeper.fail_floor_write_after_commit.store(true, std::sync::atomic::Ordering::Release);
+        assert!(keeper
+            .adopt_cleanup_floor(
+                &successor,
+                wait_pin(&keeper, &successor).await?,
+                keeper.cleanup_floor_epoch()
+            )
+            .is_err());
+        assert_eq!(
+            keeper.gc_resolver.published_floor().map(|f| f.seqno()),
+            Some(42),
+            "an uncertain write never publishes its floor"
+        );
+        stopper.set_stop();
+        engine.db.stop_states_db().await.unwrap();
+    }
+    {
+        let engine = TestEngine::new_db_dir(&path, None).await?;
+        let stopper = Arc::new(Stopper::new());
+        let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+        assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
+        assert_eq!(keeper.gc_resolver.published_floor().map(|f| f.seqno()), Some(43));
+        stopper.set_stop();
+        engine.db.stop_states_db().await.unwrap();
+    }
     Ok(())
 }

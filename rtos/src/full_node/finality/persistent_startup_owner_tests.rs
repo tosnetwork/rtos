@@ -47,11 +47,7 @@ async fn failed_startup(mode: u8) {
     let stopper = Arc::new(Stopper::new());
     let opened = Engine::new(
         config,
-        EngineFlags {
-            initial_sync_disabled: true,
-            force_check_db: mode == 2,
-            truncate_db: if mode == 1 { Some(u32::MAX) } else { None },
-        },
+        EngineFlags { initial_sync_disabled: true, force_check_db: mode == 2, truncate_db: None },
         stopper.clone(),
     )
     .await;
@@ -83,7 +79,6 @@ async fn failed_startup(mode: u8) {
     let error = error.expect("controlled real startup failure must not return an Engine");
     match mode {
         0 => assert!(format!("{error:#}").contains("Wrong database version"), "{error:#}"),
-        1 => assert!(format!("{error:#}").contains("4294967295"), "{error:#}"),
         2 => assert!(
             error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
             "expected actual restoring marker IO failure: {error:#}"
@@ -112,9 +107,42 @@ async fn failed_startup(mode: u8) {
 async fn persistent_startup_owner_unsupported_version_releases_actual_db() {
     failed_startup(0).await;
 }
+/// A truncation request above the head no longer fails the database open:
+/// like the reference, the request runs after construction and does nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_startup_owner_missing_truncate_block_releases_actual_db() {
-    failed_startup(1).await;
+async fn persistent_startup_truncation_above_the_head_does_not_fail_construction() {
+    let Fixture { dir, engine, target, .. } = fixture(true).await;
+    close(engine).await;
+    let config = TonNodeConfig::from_file(
+        dir.path().to_str().unwrap(),
+        "config.json",
+        None,
+        "config.json",
+        None,
+    )
+    .await
+    .unwrap();
+    let stopper = Arc::new(Stopper::new());
+    let engine = Engine::new(
+        config,
+        EngineFlags {
+            initial_sync_disabled: true,
+            force_check_db: false,
+            truncate_db: Some(u32::MAX),
+        },
+        stopper,
+    )
+    .await
+    .expect("a truncation request is not applied by the database open");
+    let run = std::panic::AssertUnwindSafe(async {
+        engine.truncate_database_to_top(u32::MAX).await.unwrap();
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(target.id()));
+        assert!(engine.load_block_handle(target.id()).unwrap().is_some());
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_startup_owner_restoring_marker_error_releases_actual_db() {
@@ -190,4 +218,88 @@ async fn engine_truncation_completes_at_the_floor_and_refuses_below_it() {
         close(engine).await;
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
+}
+
+/// `-T N` keeps N as the top: above the head nothing changes; at the head
+/// nothing is deleted and the successor links are cleared; below the head
+/// the newer blocks go and the cursors move to N. A GC floor above N refuses
+/// the request before any change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_truncation_keeps_the_requested_block_as_top() {
+    use consensus_common::validator_cleanup::{encode_checkpoint, GC_FLOOR_KEY};
+    let Fixture { dir, engine, parent, target, .. } = fixture(false).await;
+    // A floor at the head refuses truncating below it, before any change.
+    engine
+        .db()
+        .write_validator_state_batch_sync(
+            &[(GC_FLOOR_KEY.to_owned(), encode_checkpoint(target.id()))],
+            &[],
+        )
+        .unwrap();
+    close(engine).await;
+    let engine = open_engine(dir.path()).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        let error =
+            engine.truncate_database_to_top(parent.id().seq_no()).await.unwrap_err().to_string();
+        assert!(error.contains("below the cleanup floor"), "{error}");
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(target.id()));
+        assert!(engine.load_block_handle(target.id()).unwrap().is_some());
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let engine = open_engine(dir.path()).await;
+    engine.db().write_validator_state_batch_sync(&[], &[GC_FLOOR_KEY.to_owned()]).unwrap();
+    close(engine).await;
+    let engine = open_engine(dir.path()).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        let top = target.id().seq_no();
+        engine.truncate_database_to_top(top + 5).await.unwrap();
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(target.id()));
+        engine.truncate_database_to_top(top).await.unwrap();
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(target.id()));
+        let handle = engine.load_block_handle(target.id()).unwrap().unwrap();
+        assert!(!handle.has_next1(), "the top keeps no successor");
+        assert!(engine.load_block_handle(parent.id()).unwrap().is_some());
+        engine.truncate_database_to_top(parent.id().seq_no()).await.unwrap();
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(parent.id()));
+        assert!(engine.load_block_handle(target.id()).unwrap().is_none(), "newer blocks go");
+        assert!(engine.load_block_handle(parent.id()).unwrap().is_some(), "N itself stays");
+        let shard_client = engine.load_shard_client_mc_block_id().unwrap();
+        assert!(shard_client.is_none_or(|id| id.seq_no() <= parent.id().seq_no()));
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+/// A truncation that stops after its cursors became durable and before any
+/// deletion leaves a database that starts at N, and the same request on the
+/// next start finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_truncation_interrupted_before_deletion_is_finished_on_restart() {
+    let Fixture { dir, engine, parent, target, .. } = fixture(false).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        crate::engine::TRUNCATION_CRASH_BEFORE_DELETE
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(engine.truncate_database_to_top(parent.id().seq_no()).await.is_err());
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let engine = open_engine(dir.path()).await;
+    let run = std::panic::AssertUnwindSafe(async {
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(parent.id()));
+        assert!(engine.load_block_handle(target.id()).unwrap().is_some(), "nothing deleted yet");
+        engine.truncate_database_to_top(parent.id().seq_no()).await.unwrap();
+        assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(parent.id()));
+        assert!(engine.load_block_handle(target.id()).unwrap().is_none());
+    })
+    .catch_unwind()
+    .await;
+    close(engine).await;
+    run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

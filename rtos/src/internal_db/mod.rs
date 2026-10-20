@@ -375,7 +375,9 @@ impl InternalDb {
         restore_db_enabled: bool,
         force_check_db: bool,
         allow_update: bool,
-        truncate_db: Option<u32>,
+        // A requested truncation runs once the engine is up, after the
+        // startup checks, as in the reference; the database open ignores it.
+        _truncate_db: Option<u32>,
         check_stop: &(dyn Fn() -> Result<()> + Sync),
         is_broken: Option<&AtomicBool>,
         monitor_min_split: Arc<AtomicU8>,
@@ -414,15 +416,6 @@ impl InternalDb {
                         CURRENT_DB_VERSION
                     )
                 }
-            } else if let Some(mc_seqno) = truncate_db {
-                let (id, _) = db
-                    .lookup_block_by_seqno(&AccountIdPrefixFull::any_masterchain(), mc_seqno)
-                    .await?
-                    .ok_or_else(|| {
-                        error!("there is no block with seqno {} in masterchain", mc_seqno)
-                    })?;
-                log::info!("Truncating database at block {}", id);
-                db.truncate_database(&id).await?;
             } else {
                 log::info!("DB VERSION {}", version);
                 // TODO correct workchain id needed here, but it will be known later
@@ -2646,6 +2639,41 @@ impl InternalDb {
         Ok(())
     }
 
+    /// Makes every queued node-state and handle write durable.
+    pub async fn sync_node_state(&self) -> Result<()> {
+        self.block_handle_storage.sync_pending().await
+    }
+
+    /// Clears the successor links of masterchain block `mc_block_id` and of
+    /// the shard tops it references, deleting nothing else: a truncation to
+    /// the block that already is the top.
+    pub async fn clear_successor_links(&self, mc_block_id: &BlockIdExt) -> Result<()> {
+        let handle = self
+            .load_block_handle(mc_block_id)?
+            .ok_or_else(|| error!("there is no handle for block {}", mc_block_id))?;
+        let block = self.load_block_data(&handle).await?;
+        let mut ids = vec![mc_block_id.clone()];
+        ids.extend(block.shard_hashes()?.top_blocks_all()?);
+        for id in &ids {
+            let protection = self.repair_leases.protection();
+            let Some(_deletion) = protection.try_deletion() else {
+                fail!("Successor cleanup conflicts with repair custody for {}", id);
+            };
+            if protection.artifact(id) || protection.state(id) {
+                fail!("Successor cleanup conflicts with repair custody for {}", id);
+            }
+            self.next1_block_db.delete(id)?;
+            self.next2_block_db.delete(id)?;
+            if let Some(handle) = self.load_block_handle(id)? {
+                handle.reset_next1();
+                handle.reset_next2();
+                self.store_block_handle(&handle, None)?;
+            }
+        }
+        self.block_handle_storage.sync_pending().await?;
+        Ok(())
+    }
+
     pub fn create_fast_cell_storage(
         &self,
         index: Vec<(UInt256, u16)>,
@@ -2720,6 +2748,10 @@ mod node_db_recovery_tests;
 
 #[cfg(test)]
 mod durability_tests;
+
+#[cfg(test)]
+#[path = "tests/startup_floor_tests.rs"]
+mod startup_floor_tests;
 
 // The pinned DB slice is checked before deserialization; no attacker-sized Vec.
 fn validate_repair_linkage(bytes: &[u8], expected: &BlockIdExt) -> Result<()> {

@@ -12,7 +12,7 @@ async fn floor_child() -> Result<()> {
     let db = Arc::new(open_db(&root).await?);
     let keeper = crate::shard_states_keeper::ShardStatesKeeper::new(
         db.clone(), false, true, 0, 0, crate::config::ShardStatesCacheMode::Moderate,
-        3600, Arc::new(crate::engine::Stopper::new()), 100,
+        3600.0, Arc::new(crate::engine::Stopper::new()), 100,
         #[cfg(feature = "telemetry")]
         crate::collator_test_bundle::create_engine_telemetry(),
         crate::collator_test_bundle::create_engine_allocated(),
