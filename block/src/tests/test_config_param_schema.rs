@@ -143,6 +143,19 @@ fn config_param_schema_matches_reference_verdicts() {
     assert!(header.starts_with("# reference_commit=881240331ee48a291b96d73f8b8b93bae005ace0"));
     let mut mismatches = Vec::new();
     let mut counts = BTreeMap::new();
+    // These two schema definitions changed after the legacy reference. Keep
+    // the original corpus intact and bind the new C++ verdict to its inputs.
+    let refreshed = include_str!("data/config-param-schema-43-47.tsv");
+    assert!(refreshed.starts_with("# reference_commit=1181c08ed4c2d88425e6ee66efff6d696714495d "));
+    let mut refreshed: BTreeMap<_, _> = refreshed
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(columns.len(), 3);
+            (columns[0], (columns[1], columns[2]))
+        })
+        .collect();
     for line in lines {
         let f: Vec<_> = line.split('\t').collect();
         assert_eq!(f.len(), 9, "{line}");
@@ -156,7 +169,15 @@ fn config_param_schema_matches_reference_verdicts() {
             mparams: root_ref(&roots, f[6]),
         };
         assert_eq!(fingerprint(&case), f[7], "fingerprint of {}", case.id);
-        let expected = match f[8] {
+        let reference = if case.kind == 'p' && matches!(case.index, 43 | 47) {
+            let (fingerprint, verdict) =
+                refreshed.remove(case.id.as_str()).expect("missing refreshed verdict");
+            assert_eq!(fingerprint, f[7], "refreshed fingerprint {}", case.id);
+            verdict
+        } else {
+            f[8]
+        };
+        let expected = match reference {
             "1" => true,
             "0" => false,
             other => panic!("{}: unusable reference verdict {other}", case.id),
@@ -169,6 +190,37 @@ fn config_param_schema_matches_reference_verdicts() {
     println!("cases by kind and verdict: {counts:?}");
     assert!(counts.values().sum::<usize>() > 1000);
     assert!(mismatches.is_empty(), "{} mismatches: {:#?}", mismatches.len(), mismatches);
+    assert!(refreshed.is_empty(), "unused refreshed verdicts");
+}
+
+/// Export existing corpus inputs only; expectations are filled by the C++ CLI.
+#[test]
+#[ignore]
+fn export_existing_schema_43_47_contexts() {
+    let out = std::env::var("RTOS_CFG_CORPUS_OUT").expect("RTOS_CFG_CORPUS_OUT");
+    let tree = read_single_root_boc(decompress(CORPUS_BOC)).unwrap();
+    let mut roots = Vec::new();
+    index_leaves(&tree, INDEX_DEPTH, &mut roots);
+    let text = String::from_utf8(decompress(CORPUS_TSV)).unwrap();
+    let mut contexts = String::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let f: Vec<_> = line.split('\t').collect();
+        if f[1] != "p" || !matches!(f[2], "43" | "47") {
+            continue;
+        }
+        let cell = root_ref(&roots, f[5]).unwrap();
+        let stored = storable(&cell);
+        let boc = crate::base64_encode(crate::write_boc(&stored).unwrap());
+        contexts.push_str(&format!(
+            "{}\t{}\t{{\"type\":\"ConfigParam\",\"n\":{},\"boc\":\"{}\",\"proof_child\":{}}}\n",
+            f[0],
+            f[7],
+            f[2],
+            boc,
+            cell.level() != 0
+        ));
+    }
+    std::fs::write(format!("{out}/schema-43-47-contexts.tsv"), contexts).unwrap();
 }
 
 #[test]

@@ -19,9 +19,9 @@ pub(crate) const PARAM_VISIT_BUDGET: u32 = 1024;
 pub(crate) const CONFIG_SHAPE_VISIT_BUDGET: u32 = 10000;
 
 /// Every parameter index the schema defines.
-pub const SCHEMA_CONFIG_PARAMS: [u32; 50] = [
+pub const SCHEMA_CONFIG_PARAMS: [u32; 49] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 43, 44, 45, 47, 48, 71, 72, 73, 79, 81, 82, 83,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 43, 44, 45, 48, 71, 72, 73, 79, 81, 82, 83,
 ];
 
 #[derive(Clone, Copy)]
@@ -486,8 +486,6 @@ impl Walker {
             44 => tag(slice, 8, 0) && self.hashmap_e(slice, 288, Leaf::Empty) && skip(slice, 32),
             // precompiled_contracts_config#c0 list:(HashmapE 256 PrecompiledSmc)
             45 => tag(slice, 8, 0xc0) && self.hashmap_e(slice, 256, Leaf::PrecompiledSmc),
-            // validator_controller_policy_v1#_ controller_codes:(HashmapE 256 True)
-            47 => self.hashmap_e(slice, 256, Leaf::Empty),
             // auth_policy_v1#a1 network_tag:bits256 policy_sequence:uint64 retired:uint16
             //   retire_at:(HashmapE 8 uint32) policy_spec_hash:bits256
             48 => {
@@ -632,6 +630,7 @@ fn consensus_config(slice: &mut SliceData) -> bool {
 // size_limits_config#01 (160 bits), size_limits_config_v2#02 (360 bits),
 // size_limits_config_v3#03 360 bits, max_transaction_library_loads:(Maybe uint32),
 //   max_total_msg_bits:uint32 max_total_msg_cells:uint32
+//   out_msg_queue_size_hard_limit:uint32 out_msg_queue_size_soft_limit:uint32
 fn size_limits_config(slice: &mut SliceData) -> bool {
     match uint(slice, 8) {
         Some(1) => skip(slice, 160),
@@ -645,7 +644,7 @@ fn size_limits_config(slice: &mut SliceData) -> bool {
                 None => return false,
                 _ => {}
             }
-            skip(slice, 64)
+            skip(slice, 128)
         }
         _ => false,
     }
