@@ -9,11 +9,12 @@ The provisional `rtos_executor --example codec_conformance` target adds codec
 adapters for BOCs, variable integers, configuration, validators, messages,
 transactions, accounts, storage, currencies, addresses, block headers,
 masterchain state extras and the generated unsplit shard state schema. It
-still refuses `Block` and `ShardState`.
-The full 5040-case codec run currently has 4948 equal and 92 refused, with zero
+also validates the generated and handwritten `ShardState` profiles. It
+still refuses `Block`.
+The full 5040-case codec run currently has 4973 equal and 67 refused, with zero
 mismatches or skips; this is incomplete codec coverage. All 5040 frozen effects
 were also checked against the clean pinned C++ build, without changing fixtures.
-An additional75 C++ controls in `executor/src/tests/data/conformance/codec`
+An additional115 C++ controls in `executor/src/tests/data/conformance/codec`
 cover StateInit, MessageRelaxed, strict encoding, masterchain/shard state
 structure, augmented dictionaries and typed-reference budgets.
 They all match; run them alongside the original codec suite. Account storage
@@ -24,6 +25,15 @@ state-schema inputs to `RTOS_CODEC_CONTEXTS_OUT`. Fill effects only with the
 clean pinned C++ CLI. These generated schema validators do not perform the
 handwritten augmentation arithmetic; McStateExtra's handwritten validator
 delegates to the generated validator in C++ as well.
+ShardState's handwritten profile checks account depth/balance and queue minimum
+emitted LT, including root-extra copies, after validating referenced children.
+Post-order arithmetic tasks do not charge a second cell visit. Extra-currency
+references survive encoding and failed additions reject rather than retaining a
+stale sum. Empty-side currency merges preserve the other dictionary's original
+labels, following the C++ combine strategy. Generated checks retain their
+independent structural rules. The 40
+handwritten-state controls also pin signed sequence numbers, split-state profile
+differences, explicit emitted LT zero and reference-budget boundaries.
 The codec writer's decimal context parser also preserves the C++ RefInt parser's
 five balanced base-2^52 limb capacity and syntax, before applying the independent
 VarUInteger byte bound. Parse refusal differs from a valid integer outside the

@@ -8,6 +8,7 @@
 //! visit budget only bounds their total number.
 
 use crate::{Cell, CellType, SliceData, VarUIntegerCodec, VarUIntegerEncoding};
+use tlb::AugKind;
 
 #[path = "tlb_schema.rs"]
 mod tlb;
@@ -43,6 +44,8 @@ enum Leaf {
 
 #[derive(Clone, Copy)]
 enum Node {
+    HandwrittenAugHashmap(usize, AugKind),
+    CheckAugmentation(usize, AugKind),
     GeneratedAugHashmap(usize, TlbType, TlbType),
     Typed(TlbType, TlbProfile),
     Param(u32),
@@ -95,6 +98,12 @@ fn visit_all(root: Cell, node: Node, budget: u32) -> bool {
     let mut walker = Walker { pending: vec![(root, node)] };
     let mut remaining = budget;
     while let Some((cell, node)) = walker.pending.pop() {
+        if let Node::CheckAugmentation(n, kind) = node {
+            if !tlb::check_augmented_cell(cell, n, kind).unwrap_or(false) {
+                return false;
+            }
+            continue;
+        }
         remaining = match remaining.checked_sub(1) {
             Some(value) => value,
             None => return false,
@@ -284,6 +293,8 @@ impl Walker {
 
     fn node(&mut self, node: Node, slice: &mut SliceData) -> bool {
         match node {
+            Node::HandwrittenAugHashmap(n, kind) => self.handwritten_aug_hashmap(slice, n, kind),
+            Node::CheckAugmentation(..) => unreachable!("augmentation checks are post-order tasks"),
             Node::GeneratedAugHashmap(n, value, extra) => {
                 self.generated_aug_hashmap(slice, n, value, extra)
             }

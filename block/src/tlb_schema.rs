@@ -3,6 +3,10 @@
 //! Typed references join the parent walker's shared visit budget.
 use super::*;
 
+#[path = "tlb_augmentation.rs"]
+mod augmentation;
+pub(super) use augmentation::{check_augmented_cell, AugKind};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlbProfile {
     Generated,
@@ -26,6 +30,7 @@ pub enum TlbType {
     BlockInfo,
     McStateExtra,
     ShardStateUnsplit,
+    ShardState,
     // Internal referenced schema types.
     #[doc(hidden)]
     ExtraCurrencyValue,
@@ -249,20 +254,22 @@ impl Walker {
     ) -> bool {
         use TlbType::*;
         match kind {
-            ShardStateUnsplit => {
-                tag(slice, 32, 0x9023afe2)
-                    && skip(slice, 32)
-                    && shard_ident(slice)
-                    && skip(slice, 192)
-                    && self
-                        .push_ref(slice, Node::Typed(OutMsgQueueInfoSchema, TlbProfile::Generated))
-                    && skip(slice, 1)
-                    && self.push_ref(slice, Node::Typed(ShardAccountsSchema, TlbProfile::Generated))
-                    && self.push_ref(slice, Node::Typed(ShardStateAux, TlbProfile::Generated))
-                    && self.maybe_ref(slice, Node::Typed(McStateExtra, TlbProfile::Generated))
+            ShardStateUnsplit => self.shard_state_unsplit(slice, TlbProfile::Generated),
+            ShardState => {
+                if profile == TlbProfile::Generated && slice.get_int(32).ok() == Some(0x5f327da5) {
+                    skip(slice, 32)
+                        && self.push_ref(slice, Node::Typed(ShardStateUnsplit, profile))
+                        && self.push_ref(slice, Node::Typed(ShardStateUnsplit, profile))
+                } else {
+                    self.shard_state_unsplit(slice, profile)
+                }
             }
             ShardAccountsSchema => {
-                self.generated_aug_hashmap_e(slice, 256, ShardAccount, DepthBalance)
+                if profile == TlbProfile::Generated {
+                    self.generated_aug_hashmap_e(slice, 256, ShardAccount, DepthBalance)
+                } else {
+                    self.handwritten_aug_hashmap_e(slice, 256, AugKind::Accounts)
+                }
             }
             DepthBalance => {
                 matches!(uint(slice, 5), Some(depth) if depth <= 30)
@@ -280,8 +287,11 @@ impl Walker {
                     && self.hashmap(slice, 256, Leaf::Empty)
             }
             OutMsgQueueInfoSchema => {
-                self.generated_aug_hashmap_e(slice, 352, EnqueuedMsg, Bits(64))
-                    && self.hashmap_e(slice, 96, Leaf::Bits(320))
+                (if profile == TlbProfile::Generated {
+                    self.generated_aug_hashmap_e(slice, 352, EnqueuedMsg, Bits(64))
+                } else {
+                    self.handwritten_aug_hashmap_e(slice, 352, AugKind::OutQueue)
+                }) && self.hashmap_e(slice, 96, Leaf::Bits(320))
                     && maybe(slice, |s| {
                         tag(s, 4, 0)
                             && self.generated_aug_hashmap_e(s, 256, DispatchQueueEntry, Bits(64))
@@ -505,6 +515,23 @@ impl Walker {
     fn credit_phase(&mut self, slice: &mut SliceData, profile: TlbProfile) -> bool {
         maybe(slice, |s| var(s, 16, profile, false))
             && self.typed(TlbType::CurrencyCollection, profile, slice)
+    }
+
+    fn shard_state_unsplit(&mut self, slice: &mut SliceData, profile: TlbProfile) -> bool {
+        use TlbType::*;
+        if !tag(slice, 32, 0x9023afe2) || !skip(slice, 32) || !shard_ident(slice) {
+            return false;
+        }
+        let Some(seqno) = uint(slice, 32) else {
+            return false;
+        };
+        (profile == TlbProfile::Generated || (seqno as u32 as i32) >= -1)
+            && skip(slice, 160)
+            && self.push_ref(slice, Node::Typed(OutMsgQueueInfoSchema, profile))
+            && skip(slice, 1)
+            && self.push_ref(slice, Node::Typed(ShardAccountsSchema, profile))
+            && self.push_ref(slice, Node::Typed(ShardStateAux, profile))
+            && self.maybe_ref(slice, Node::Typed(McStateExtra, profile))
     }
 
     fn block_info(&mut self, slice: &mut SliceData, profile: TlbProfile) -> bool {

@@ -277,6 +277,7 @@ fn run_codec(ctx: &Value) -> Result<Value> {
         "BlockInfo" => Some(TlbType::BlockInfo),
         "McStateExtra" => Some(TlbType::McStateExtra),
         "ShardStateUnsplit" => Some(TlbType::ShardStateUnsplit),
+        "ShardState" => Some(TlbType::ShardState),
         _ => None,
     };
     if let Some(typed) = typed {
