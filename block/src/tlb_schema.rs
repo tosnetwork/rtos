@@ -39,6 +39,8 @@ pub enum TlbType {
     #[doc(hidden)]
     ExtraCurrencyValue,
     #[doc(hidden)]
+    Anything,
+    #[doc(hidden)]
     MessageRef,
     #[doc(hidden)]
     TransactionAux,
@@ -373,6 +375,11 @@ impl Walker {
                                     && skip(s, 64)
                             })))
             }
+            Anything => {
+                skip(slice, slice.remaining_bits())
+                    && (0..slice.remaining_references())
+                        .all(|_| slice.checked_drain_reference().is_ok())
+            }
             Bits(bits) => skip(slice, bits),
             CurrencyPair => {
                 self.typed(CurrencyCollection, profile, slice)
@@ -552,7 +559,15 @@ impl Walker {
                     None => false,
                 };
                 init && match bool_bit(slice) {
-                    Some(true) => slice.checked_drain_reference().is_ok(),
+                    Some(true) => {
+                        // The handwritten Message validator checks the body
+                        // selector/reference shape without validating ^Any.
+                        if profile == TlbProfile::Handwritten {
+                            slice.checked_drain_reference().is_ok()
+                        } else {
+                            self.push_ref(slice, Node::Typed(Anything, profile))
+                        }
+                    }
                     Some(false) => {
                         let bits = slice.remaining_bits();
                         skip(slice, bits)

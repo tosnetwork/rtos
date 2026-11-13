@@ -386,10 +386,14 @@ impl MerkleUpdate {
                 if depth > depth_limit {
                     return Err(MerkleApplyLimitExceeded("check depth").into());
                 }
-                if seen.get(cell.repr_hash(), budget)?.is_some() {
+                if !crate::merkle_apply_budget::visit_at_merkle_depth(
+                    &mut seen,
+                    cell.repr_hash(),
+                    merkle_depth,
+                    budget,
+                )? {
                     continue;
                 }
-                seen.insert(cell.repr_hash().clone(), (), budget)?;
                 if is_old {
                     known.insert(cell.hash(merkle_depth as usize).clone(), (), budget)?;
                 }
@@ -472,10 +476,14 @@ impl MerkleUpdate {
             if depth > depth_limit {
                 return Err(MerkleApplyLimitExceeded("parent depth").into());
             }
-            if seen.get(cell.repr_hash(), budget)?.is_some() {
+            if !crate::merkle_apply_budget::visit_at_merkle_depth(
+                &mut seen,
+                cell.repr_hash(),
+                md,
+                budget,
+            )? {
                 continue;
             }
-            seen.insert(cell.repr_hash().clone(), (), budget)?;
             let hash = cell.hash(md as usize);
             if known.get(hash, budget)?.is_some() {
                 retained.insert(hash.clone(), cell.clone(), budget)?;

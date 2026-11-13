@@ -1907,8 +1907,13 @@ impl Cell {
 
             let mut hasher = Sha256::new();
             let mut cur_depth: u16 = 0;
-            let cur_level_mask =
-                if is_pruned { level_mask } else { LevelMask::with_level(i as u8) };
+            let cur_level_mask = if is_pruned {
+                level_mask
+            } else {
+                // DataCell hashes the actual mask restricted to this level;
+                // sparse masks must not acquire nonexistent intermediate bits.
+                LevelMask::with_mask(level_mask.mask() & LevelMask::with_level(i as u8).mask())
+            };
             hasher.update([calc_d1(cur_level_mask, false, cell_type, refs_count), d2]);
 
             if i == 0 {
@@ -1925,8 +1930,10 @@ impl Cell {
                 cur_depth = max(cur_depth, child_depth + 1);
                 if cur_depth > max_depth {
                     return Err(CellDepthLimitExceeded {
-                        depth: cur_depth, limit: max_depth.min(MAX_DEPTH),
-                    }.into());
+                        depth: cur_depth,
+                        limit: max_depth.min(MAX_DEPTH),
+                    }
+                    .into());
                 }
                 hasher.update(child_depth.to_be_bytes());
                 child_hashes.push(child_hash);

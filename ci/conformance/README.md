@@ -18,10 +18,20 @@ The full 5040-case codec run currently has 5040 equal, with zero refusals,
 mismatches or skips. This covers the frozen codec vectors, not every possible
 Block construction or production validation path. All 5040 frozen effects
 were also checked against the clean pinned C++ build, without changing fixtures.
-An additional253 C++ controls in `executor/src/tests/data/conformance/codec`
+An additional300 C++ controls in `executor/src/tests/data/conformance/codec`
 cover StateInit, MessageRelaxed, strict encoding, masterchain/shard state
 structure, augmented dictionaries and typed-reference budgets.
-They all match; run them alongside the original codec suite. Account storage
+They all match; run them alongside the original codec suite. The added47
+controls pin sparse-mask hashes and Message body references. Generated Message
+validates and charges the right-hand `^Any` body reference; its handwritten
+validator retains the separate reference-shape-only rule. Untyped `^Cell`
+fields, including StateInit code and IHR proofs, remain unvisited.
+Native cell hash descriptors use the actual mask restricted to each hash level,
+matching C++ for sparse masks. Bounded Merkle check/retention walks distinguish
+visits at different Merkle depths, using a charged fixed32-byte bitmap per
+representation hash. Both shared-reference orders now agree with ordinary apply;
+the old fixture's traversal-order mutation rejection is no longer a valid
+negative control after these corrections. Account storage
 facts preserve the original slice and reference order, after native structural,
 address and logical-time checks, without canonicalizing its encoding.
 The ignored example test `export_constructed_state_codec_contexts` writes new

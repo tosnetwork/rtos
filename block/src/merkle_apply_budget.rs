@@ -155,6 +155,30 @@ impl<V> BudgetMap<V> {
     }
 }
 
+/// A reference can be reached at several Merkle depths. Keep the full u8
+/// depth domain in a fixed-size, budget-charged value rather than dropping a
+/// second visit solely because the representation hash was already seen.
+pub(crate) fn visit_at_merkle_depth(
+    seen: &mut BudgetMap<[u64; 4]>,
+    hash: &UInt256,
+    depth: u8,
+    budget: &dyn MerkleApplyBudget,
+) -> Result<bool> {
+    let word = usize::from(depth) / 64;
+    let bit = 1u64 << (depth % 64);
+    if let Some(depths) = seen.get_mut(hash, budget)? {
+        if depths[word] & bit != 0 {
+            return Ok(false);
+        }
+        depths[word] |= bit;
+    } else {
+        let mut depths = [0; 4];
+        depths[word] = bit;
+        seen.insert(hash.clone(), depths, budget)?;
+    }
+    Ok(true)
+}
+
 pub struct BudgetStack<T> {
     values: Vec<T>,
     limit: usize,
