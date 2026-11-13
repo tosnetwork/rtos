@@ -15,6 +15,9 @@ pub use auth_policy::*;
 pub mod types;
 pub use types::*;
 
+pub mod varuint;
+pub use varuint::*;
+
 pub mod cell;
 pub use cell::*;
 
