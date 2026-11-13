@@ -82,12 +82,6 @@ fn stack_value(cell: Cell, depth: usize, budget: &mut usize) -> Result<StackItem
 }
 fn run_txn(ctx: &Value) -> Result<Value> {
     let config = ConfigParams::with_root(boc(&ctx["config"])?)?;
-    // A decodable BOC with an invalid chain configuration is a transaction
-    // setup error, as in the C++ emulator, rather than a refused harness input.
-    let config = match BlockchainConfig::with_config(config) {
-        Ok(config) => config,
-        Err(_) => return Ok(json!({"outcome":"error"})),
-    };
     let shard = boc(&ctx["shard_account"])?;
     let now = ctx["now"]
         .as_u64()
@@ -125,6 +119,12 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(StackItem::None);
+    // Validate the complete protocol context before classifying a chain
+    // configuration failure as a transaction setup error.
+    let config = match BlockchainConfig::with_config(config) {
+        Ok(config) => config,
+        Err(_) => return Ok(json!({"outcome":"error"})),
+    };
     let threshold = config.size_limits_config().acc_state_cells_for_storage_dict;
     let exec: Box<dyn TransactionExecutor> = if msg.is_some() {
         Box::new(OrdinaryTransactionExecutor::new(config))
@@ -330,6 +330,35 @@ mod tests {
                 "{}",
                 row["metadata"]["fixture_id"]
             );
+        }
+    }
+    #[test]
+    fn malformed_fields_refuse_before_configuration_setup() {
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../src/tests/data/conformance/txn/fixtures/config43-queue-wire.blobs.json"
+        ))
+        .unwrap();
+        let row: Value =
+            include_str!("../src/tests/data/conformance/txn/fixtures/config43-queue-wire.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|r| r["metadata"]["fixture_id"] == "trailing-bit")
+                .unwrap();
+        let context = resolve(row["context"].clone(), &blobs);
+        assert_eq!(run_txn(&context).unwrap(), json!({"outcome":"error"}));
+        for (field, value) in [
+            ("message", json!("AA==")),
+            ("shard_account", json!("AA==")),
+            ("now", json!(0)),
+            ("lt", json!(0)),
+            ("rand_seed", json!("wrong")),
+            ("libraries", json!("AA==")),
+            ("prev_blocks", json!("AA==")),
+            ("tick_tock", json!("invalid")),
+        ] {
+            let mut invalid = context.clone();
+            invalid[field] = value;
+            assert!(run_txn(&invalid).is_err(), "did not refuse invalid {field}");
         }
     }
 }
