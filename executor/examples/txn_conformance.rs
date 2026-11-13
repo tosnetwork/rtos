@@ -80,7 +80,19 @@ fn stack_value(cell: Cell, depth: usize, budget: &mut usize) -> Result<StackItem
     ensure!(cs.is_empty_cell(), "trailing previous-block value data");
     Ok(value)
 }
-fn run_txn(ctx: &Value) -> Result<Value> {
+pub(crate) enum Outcome {
+    Accepted { transaction: Cell, shard_account: Cell, account_hash: UInt256 },
+    Rejected(i32),
+    Error,
+}
+
+pub(crate) fn execute_context(ctx: &Value) -> Result<Outcome> {
+    execute_with_history(ctx, None)
+}
+
+// Block replay already has a checked native history tuple; it need not round-trip
+// through the external BOC protocol to pass that value to the same executor.
+pub(crate) fn execute_with_history(ctx: &Value, history: Option<StackItem>) -> Result<Outcome> {
     let config = ConfigParams::with_root(boc(&ctx["config"])?)?;
     let shard = boc(&ctx["shard_account"])?;
     let now = ctx["now"]
@@ -119,11 +131,12 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(StackItem::None);
+    let prev_blocks = history.unwrap_or(prev_blocks);
     // Validate the complete protocol context before classifying a chain
     // configuration failure as a transaction setup error.
     let config = match BlockchainConfig::with_config(config) {
         Ok(config) => config,
-        Err(_) => return Ok(json!({"outcome":"error"})),
+        Err(_) => return Ok(Outcome::Error),
     };
     let threshold = config.size_limits_config().acc_state_cells_for_storage_dict;
     let version = config.block_version();
@@ -142,7 +155,7 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         ..Default::default()
     };
     // Valid BOCs which the emulator cannot execute produce an error effect.
-    let execute = || -> Result<Value> {
+    let execute = || -> Result<Outcome> {
         let mut shard = ShardAccount::construct_from_cell(shard)?;
         let old_hash = shard.account_hash();
         let mut account = shard.read_account()?;
@@ -155,10 +168,8 @@ fn run_txn(ctx: &Value) -> Result<Value> {
                         .downcast_ref::<ExecutorError>()
                         .and_then(ExecutorError::external_rejection_code)
                     {
-                        Some(code) => {
-                            json!({"outcome":"rejected", "vm_exit_code":code})
-                        }
-                        _ => json!({"outcome":"error"}),
+                        Some(code) => Outcome::Rejected(code),
+                        _ => Outcome::Error,
                     },
                 )
             }
@@ -172,12 +183,24 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         let tx = tx.serialize()?;
         shard.set_last_trans_hash(tx.repr_hash().clone());
         shard.set_last_trans_lt(tx_lt);
-        Ok(json!({"outcome":"accepted", "transaction_hash":format!("{:X}",tx.repr_hash()),
-            "account_hash":format!("{:X}",shard.account_hash()),
-            "shard_account_hash":format!("{:X}",shard.serialize()?.repr_hash())}))
+        let account_hash = shard.account_hash().clone();
+        Ok(Outcome::Accepted { transaction: tx, shard_account: shard.serialize()?, account_hash })
     };
-    Ok(execute().unwrap_or_else(|_| json!({"outcome":"error"})))
+    Ok(execute().unwrap_or(Outcome::Error))
 }
+
+fn run_txn(ctx: &Value) -> Result<Value> {
+    Ok(match execute_context(ctx)? {
+        Outcome::Accepted { transaction, shard_account, account_hash } => json!({
+            "outcome":"accepted", "transaction_hash":format!("{:X}",transaction.repr_hash()),
+            "account_hash":format!("{:X}",account_hash),
+            "shard_account_hash":format!("{:X}",shard_account.repr_hash()),
+        }),
+        Outcome::Rejected(code) => json!({"outcome":"rejected", "vm_exit_code":code}),
+        Outcome::Error => json!({"outcome":"error"}),
+    })
+}
+
 fn main() -> Result<()> {
     let harness = std::env::args().nth(1).unwrap_or_default();
     if harness == "--info" {

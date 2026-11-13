@@ -1,8 +1,9 @@
 # Shared conformance target
 
 The target executes contexts from the TOS conformance suite and emits the effects of
-RTOS. It never reads fixture expectations. The current target provides `vm`; other
-harnesses return `harness_error` and must not be counted as passing.
+RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`
+and `block`; unsupported harnesses return `harness_error` and must not be counted
+as passing.
 
 The suite source and frozen vectors are pinned by `REFERENCE` to a TOS commit.
 Each fixture retains its own reference-build provenance. Running frozen vectors
@@ -126,3 +127,31 @@ after recounting. Hash storage is enabled from11 and excludes masterchain.
 `Account::finalize_storage_stat` is shared by emulator, conformance, collator
 and validator. The controls also check that repeated finalization is idempotent.
 Snapshots/cache views are in-memory only and retain at most four input roots.
+
+## Block target
+
+Build `cargo build -p rtos_executor --example block_conformance --locked` and run
+the shared runner against `$TOS_REFERENCE/test/conformance/vectors/block`.
+`block_conformance block` accepts one context per line, limited to 16 MiB.
+It validates and applies the native Merkle update, derives configuration and
+previous-block history from the supplied chain state, and re-executes every
+transaction in account/LT order through the transaction target's executor path.
+It checks transaction and account hashes and each final ShardAccount against the
+applied state. Shard contexts must supply the referenced masterchain block and
+state together; block identity includes its original file hash. Split/merge
+blocks are rejected, as in the reference. Execution is capped at 4096 transactions.
+
+The frozen block fixtures are negative controls. Also run the positive REL-02
+corpus, using the pinned reference exporter and the independent chain checker:
+
+```sh
+python3 "$TOS_REFERENCE/test/conformance/migrate/block_chain.py" chain \
+  "$TOS_BUILD/test/conformance/conformance-block-export" \
+  "$CARGO_TARGET_DIR/debug/examples/block_conformance" \
+  "$TOS_REFERENCE/test/rel02/corpus"
+```
+
+The checker compares all accepted effects with hashes decoded from the on-chain
+blocks and transactions in the manifest. Retain exported contexts and results
+outside Git. Passing this boundary does not qualify full validator validation,
+archive replay, networking or the remaining conformance harnesses.

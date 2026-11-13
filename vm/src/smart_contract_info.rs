@@ -359,7 +359,9 @@ impl SmartContractInfo {
         StackItem::tuple(tuple)
     }
 
-    fn get_method_prev_blocks_info(
+    /// Checked history tuple shared by getter and block replay contexts.
+    /// An unavailable history returns null; dictionary traversal errors propagate.
+    pub fn get_method_prev_blocks_info(
         state: &ShardStateUnsplit,
         current: &BlockIdExt,
     ) -> Result<StackItem> {

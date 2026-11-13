@@ -170,6 +170,12 @@ impl Serializable for MerkleUpdate {
 }
 
 impl MerkleUpdate {
+    /// Validate that the new skeleton's pruned branches are supplied by the old
+    /// skeleton, without requiring the complete previous state.
+    pub fn validate(&self) -> Result<()> {
+        self.check(&self.old.clone().virtualize(self.old.level()), None).map(|_| ())
+    }
+
     /// Creating of a Merkle update
     pub fn create(old: &Cell, new: &Cell) -> Result<MerkleUpdate> {
         if old.repr_hash() == new.repr_hash() {
