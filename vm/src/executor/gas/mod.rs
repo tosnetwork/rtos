@@ -19,6 +19,7 @@ use crate::{
         StackItem,
     },
 };
+use num::Signed;
 use rtos_block::{fail, ExceptionCode, Status};
 
 pub mod gas_state;
@@ -43,7 +44,9 @@ pub fn execute_accept(engine: &mut Engine) -> Status {
 pub fn execute_setgaslimit(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("SETGASLIMIT"))?;
     fetch_stack(engine, 1)?;
-    let gas_limit = engine.cmd.var(0).as_integer()?.take_value_of(|x| i64::from_int(x).ok())?;
+    let gas_limit = engine.cmd.var(0).as_integer()?.take_value_of(|x| {
+        Some(if x.is_positive() { i64::from_int(x).unwrap_or(i64::MAX) } else { 0 })
+    })?;
     setgaslimit(engine, gas_limit)
 }
 
