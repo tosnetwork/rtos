@@ -1045,6 +1045,20 @@ fn serialize_limits(limits: &SizeLimitsConfig) -> Result<Value> {
     if limits.max_total_msg_cells != defaults.max_total_msg_cells {
         serialize_field(&mut map, "max_total_msg_cells", limits.max_total_msg_cells);
     }
+    if limits.out_msg_queue_size_hard_limit != defaults.out_msg_queue_size_hard_limit {
+        serialize_field(
+            &mut map,
+            "out_msg_queue_size_hard_limit",
+            limits.out_msg_queue_size_hard_limit,
+        );
+    }
+    if limits.out_msg_queue_size_soft_limit != defaults.out_msg_queue_size_soft_limit {
+        serialize_field(
+            &mut map,
+            "out_msg_queue_size_soft_limit",
+            limits.out_msg_queue_size_soft_limit,
+        );
+    }
     Ok(map.into())
 }
 

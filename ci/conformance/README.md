@@ -84,3 +84,12 @@ contract accepts; two exercise acceptance and rejection with a 2^62+1 fallback
 budget. They cover the upstream `495113c8` external admission and credit-only
 initialization fix. They do not qualify fallback budgets above signed i64 range;
 those require additional reference investigation.
+
+`config43-queue-wire` adds seven C++ transaction controls for the complete CP43
+v3 queue-limit tail: default, zero, maximum and custom values, plus truncated,
+trailing-bit and trailing-reference records. Invalid chain configuration returns
+transaction `error`; malformed protocol inputs still refuse. The old 14
+`size-limits.tsv` hashes remain unchanged: their v3 rows describe truncated
+prefixes and are now explicitly checked as invalid. Queue limits round-trip in
+BOC and JSON; collator/validator queue enforcement requires separate integration
+and is not qualified by these transaction tests.

@@ -82,7 +82,12 @@ fn stack_value(cell: Cell, depth: usize, budget: &mut usize) -> Result<StackItem
 }
 fn run_txn(ctx: &Value) -> Result<Value> {
     let config = ConfigParams::with_root(boc(&ctx["config"])?)?;
-    let config = BlockchainConfig::with_config(config)?;
+    // A decodable BOC with an invalid chain configuration is a transaction
+    // setup error, as in the C++ emulator, rather than a refused harness input.
+    let config = match BlockchainConfig::with_config(config) {
+        Ok(config) => config,
+        Err(_) => return Ok(json!({"outcome":"error"})),
+    };
     let shard = boc(&ctx["shard_account"])?;
     let now = ctx["now"]
         .as_u64()
@@ -302,6 +307,25 @@ mod tests {
             let row: Value = serde_json::from_str(line).unwrap();
             assert_eq!(
                 run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+    #[test]
+    fn config43_requires_complete_queue_fields() {
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../src/tests/data/conformance/txn/fixtures/config43-queue-wire.blobs.json"
+        ))
+        .unwrap();
+        for line in
+            include_str!("../src/tests/data/conformance/txn/fixtures/config43-queue-wire.jsonl")
+                .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&resolve(row["context"].clone(), &blobs)).unwrap(),
                 row["effects"],
                 "{}",
                 row["metadata"]["fixture_id"]

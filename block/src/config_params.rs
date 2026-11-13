@@ -783,7 +783,7 @@ impl ConfigParamEnum {
             37 => read_config!(ConfigParam37, ConfigParam37,                cell),
             39 => read_config!(ConfigParam39, ConfigParam39,                cell),
             40 => read_config!(ConfigParam40, MisbehaviourPunishmentConfig, cell),
-            43 => read_config!(ConfigParam43, SizeLimitsConfig,             cell),
+            43 => Ok(ConfigParamEnum::ConfigParam43(SizeLimitsConfig::construct_from_full_cell(cell)?)),
             44 => read_config!(ConfigParam44, SuspendedAddressList,         cell),
             45 => read_config!(ConfigParam45, PrecompiledContractsList,     cell),
             47 => read_config!(ConfigParam47, ValidatorControllerPolicy,    cell),
@@ -3628,6 +3628,8 @@ pub struct SizeLimitsConfig {
     pub max_transaction_library_loads: Option<u32>,
     pub max_total_msg_bits: u32,
     pub max_total_msg_cells: u32,
+    pub out_msg_queue_size_hard_limit: u32,
+    pub out_msg_queue_size_soft_limit: u32,
 }
 
 impl Default for SizeLimitsConfig {
@@ -3649,6 +3651,8 @@ impl Default for SizeLimitsConfig {
             max_transaction_library_loads: None,
             max_total_msg_bits: MAX_MSG_BITS * 5 / 2,
             max_total_msg_cells: MAX_MSG_CELLS * 5 / 2,
+            out_msg_queue_size_hard_limit: 18000,
+            out_msg_queue_size_soft_limit: 12000,
         }
     }
 }
@@ -3663,6 +3667,8 @@ impl SizeLimitsConfig {
         self.max_transaction_library_loads != default.max_transaction_library_loads
             || self.max_total_msg_bits != default.max_total_msg_bits
             || self.max_total_msg_cells != default.max_total_msg_cells
+            || self.out_msg_queue_size_hard_limit != default.out_msg_queue_size_hard_limit
+            || self.out_msg_queue_size_soft_limit != default.out_msg_queue_size_soft_limit
     }
 }
 
@@ -3693,6 +3699,8 @@ impl Serializable for SizeLimitsConfig {
             }
             self.max_total_msg_bits.write_to(cell)?;
             self.max_total_msg_cells.write_to(cell)?;
+            self.out_msg_queue_size_hard_limit.write_to(cell)?;
+            self.out_msg_queue_size_soft_limit.write_to(cell)?;
         }
         Ok(())
     }
@@ -3731,6 +3739,8 @@ impl Deserializable for SizeLimitsConfig {
             };
             self.max_total_msg_bits.read_from(slice)?;
             self.max_total_msg_cells.read_from(slice)?;
+            self.out_msg_queue_size_hard_limit.read_from(slice)?;
+            self.out_msg_queue_size_soft_limit.read_from(slice)?;
         }
         Ok(())
     }

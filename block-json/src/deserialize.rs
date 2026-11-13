@@ -994,6 +994,10 @@ impl StateParser {
                     .unwrap_or(defaults.max_total_msg_bits),
                 max_total_msg_cells: optional_u32("max_total_msg_cells")?
                     .unwrap_or(defaults.max_total_msg_cells),
+                out_msg_queue_size_hard_limit: optional_u32("out_msg_queue_size_hard_limit")?
+                    .unwrap_or(defaults.out_msg_queue_size_hard_limit),
+                out_msg_queue_size_soft_limit: optional_u32("out_msg_queue_size_soft_limit")?
+                    .unwrap_or(defaults.out_msg_queue_size_soft_limit),
             }))
         })?;
 

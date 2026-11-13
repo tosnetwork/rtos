@@ -973,6 +973,8 @@ fn test_size_limits_v3_json() {
             max_transaction_library_loads: loads,
             max_total_msg_bits: 2000,
             max_total_msg_cells: 0,
+            out_msg_queue_size_hard_limit: 123,
+            out_msg_queue_size_soft_limit: u32::MAX,
             ..Default::default()
         };
         let mut cp = prepare_config_params();
@@ -980,8 +982,13 @@ fn test_size_limits_v3_json() {
         let json: Value = serde_json::from_str(&serialize_config_param(&cp, 43).unwrap()).unwrap();
         let parse = |v: &Value| parse_config_with_mandatory_params(v.as_object().unwrap(), &[43]);
         assert_eq!(cp.config(43).unwrap(), parse(&json).unwrap().config(43).unwrap());
-        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
-        {
+        for field in [
+            "max_transaction_library_loads",
+            "max_total_msg_bits",
+            "max_total_msg_cells",
+            "out_msg_queue_size_hard_limit",
+            "out_msg_queue_size_soft_limit",
+        ] {
             for invalid in
                 [serde_json::json!(-1), serde_json::json!(4294967296u64), serde_json::json!(true)]
             {
@@ -991,11 +998,18 @@ fn test_size_limits_v3_json() {
             }
         }
         let mut absent = json.clone();
-        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
-        {
+        for field in [
+            "max_transaction_library_loads",
+            "max_total_msg_bits",
+            "max_total_msg_cells",
+            "out_msg_queue_size_hard_limit",
+            "out_msg_queue_size_soft_limit",
+        ] {
             absent["p43"].as_object_mut().unwrap().remove(field);
         }
         let decoded = parse(&absent).unwrap().size_limits_config().unwrap();
+        assert_eq!(decoded.out_msg_queue_size_hard_limit, 18000);
+        assert_eq!(decoded.out_msg_queue_size_soft_limit, 12000);
         assert_eq!(decoded.max_transaction_library_loads, None);
         assert_eq!(decoded.max_total_msg_bits, rtos_block::MAX_MSG_BITS * 5 / 2);
         assert_eq!(decoded.max_total_msg_cells, rtos_block::MAX_MSG_CELLS * 5 / 2);
