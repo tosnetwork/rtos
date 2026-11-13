@@ -144,12 +144,17 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         let mut tx = match result {
             Ok(tx) => tx,
             Err(err) => {
-                return Ok(match err.downcast_ref::<ExecutorError>() {
-                    Some(ExecutorError::NoAcceptError(code, _)) => {
-                        json!({"outcome":"rejected", "vm_exit_code":code})
-                    }
-                    _ => json!({"outcome":"error"}),
-                })
+                return Ok(
+                    match err
+                        .downcast_ref::<ExecutorError>()
+                        .and_then(ExecutorError::external_rejection_code)
+                    {
+                        Some(code) => {
+                            json!({"outcome":"rejected", "vm_exit_code":code})
+                        }
+                        _ => json!({"outcome":"error"}),
+                    },
+                )
             }
         };
         let changed = account.precalc_storage_stat()?.is_some_and(|s| s.is_changed());
@@ -208,22 +213,23 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn resolve(value: Value, blobs: &Value) -> Value {
+        match value {
+            Value::Object(map) if map.len() == 1 && map.contains_key("blob") => {
+                blobs[map["blob"].as_str().unwrap()].clone()
+            }
+            Value::Object(map) => {
+                Value::Object(map.into_iter().map(|(k, v)| (k, resolve(v, blobs))).collect())
+            }
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(|v| resolve(v, blobs)).collect())
+            }
+            v => v,
+        }
+    }
+
     #[test]
     fn seeded_storage_matches_reference_for_existing_and_new_accounts() {
-        fn resolve(value: Value, blobs: &Value) -> Value {
-            match value {
-                Value::Object(map) if map.len() == 1 && map.contains_key("blob") => {
-                    blobs[map["blob"].as_str().unwrap()].clone()
-                }
-                Value::Object(map) => {
-                    Value::Object(map.into_iter().map(|(k, v)| (k, resolve(v, blobs))).collect())
-                }
-                Value::Array(items) => {
-                    Value::Array(items.into_iter().map(|v| resolve(v, blobs)).collect())
-                }
-                v => v,
-            }
-        }
         let blobs: Value = serde_json::from_str(include_str!(
             "../src/tests/data/conformance/txn/fixtures/seeded-storage-usage.blobs.json"
         ))
@@ -260,6 +266,26 @@ mod tests {
             }
             assert_eq!(
                 run_txn(&context).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+    #[test]
+    fn external_rejection_precedes_gas_field_serialization() {
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../src/tests/data/conformance/txn/fixtures/external-rejection-order.blobs.json"
+        ))
+        .unwrap();
+        for line in include_str!(
+            "../src/tests/data/conformance/txn/fixtures/external-rejection-order.jsonl"
+        )
+        .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&resolve(row["context"].clone(), &blobs)).unwrap(),
                 row["effects"],
                 "{}",
                 row["metadata"]["fixture_id"]

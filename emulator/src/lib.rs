@@ -503,7 +503,10 @@ impl Emulator {
                 })
             }
             Err(err) => {
-                if let Some(ExecutorError::NoAcceptError(vm_exit_code, _)) = err.downcast_ref() {
+                if let Some(vm_exit_code) = err
+                    .downcast_ref::<ExecutorError>()
+                    .and_then(ExecutorError::external_rejection_code)
+                {
                     json!({
                         "success": false,
                         "error": "External message not accepted by smart contract",

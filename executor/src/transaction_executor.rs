@@ -505,16 +505,23 @@ pub trait TransactionExecutor {
             }
         }
 
-        // The initial limit and credit are the compute phase fields; a value
-        // wider than its field leaves the transaction unserializable.
-        vm_phase.gas_credit = match u32::try_from(gas.get_gas_credit()) {
-            Ok(0) => None,
-            Ok(value) => Some(value.try_into()?),
-            Err(_) => fail!("gas credit {} does not fit VarUInteger 3", gas.get_gas_credit()),
+        let initial_credit = gas.get_gas_credit();
+        let initial_limit = gas.get_gas_limit();
+        // External rejection precedes serialization of the initial gas fields.
+        let serialize_limits = |phase: &mut TrComputePhaseVm| -> Result<()> {
+            phase.gas_credit = match u32::try_from(initial_credit) {
+                Ok(0) => None,
+                Ok(value) => Some(value.try_into()?),
+                Err(_) => fail!("gas credit {} does not fit VarUInteger 3", initial_credit),
+            };
+            phase.gas_limit = u64::try_from(initial_limit)
+                .map_err(|_| error!("gas limit {} does not fit VarUInteger 7", initial_limit))?
+                .try_into()?;
+            Ok(())
         };
-        vm_phase.gas_limit = u64::try_from(gas.get_gas_limit())
-            .map_err(|_| error!("gas limit {} does not fit VarUInteger 7", gas.get_gas_limit()))?
-            .try_into()?;
+        if !is_external {
+            serialize_limits(&mut vm_phase)?;
+        }
 
         let code = if let Some(code) = result_acc.get_code() {
             code
@@ -633,6 +640,9 @@ pub trait TransactionExecutor {
         let gas = vm.get_gas();
         let credit = gas.get_gas_credit();
         //for external messages gas will not be exacted if VM throws the exception and gas_credit != 0
+        if is_external && credit != 0 {
+            fail!(ExecutorError::NoAcceptError(vm_phase.exit_code, raw_exit_arg));
+        }
         if let Some(precompiled) = precompiled.as_ref() {
             vm_phase.gas_used = precompiled.gas_usage.try_into()?;
             vm_phase.vm_steps = 0;
@@ -642,9 +652,6 @@ pub trait TransactionExecutor {
             vm_phase.vm_steps = vm.steps();
         }
         if credit != 0 {
-            if is_external {
-                fail!(ExecutorError::NoAcceptError(vm_phase.exit_code, raw_exit_arg))
-            }
             vm_phase.gas_fees = Coins::zero();
         } else {
             // credit == 0 means contract accepted
@@ -652,6 +659,10 @@ pub trait TransactionExecutor {
                 if is_special { 0 } else { gas_config.calc_gas_fee(vm_phase.gas_used.as_u64()) };
             vm_phase.gas_fees = gas_fees.try_into()?;
         };
+
+        if is_external {
+            serialize_limits(&mut vm_phase)?;
+        }
 
         log::debug!(
             target: "executor",
