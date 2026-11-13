@@ -2,7 +2,7 @@
 
 The target executes contexts from the TOS conformance suite and emits the effects of
 RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`,
-`block` and `get_method`; unsupported harnesses return `harness_error` and must not
+`block`, `get_method` and `fee`; unsupported harnesses return `harness_error` and must not
 be counted as passing.
 
 The suite source and frozen vectors are pinned by `REFERENCE` to a TOS commit.
@@ -201,3 +201,33 @@ The node's optional-code c7 helper and initial-c7 responses preserve this absenc
 A pruned Account is an incomplete context and refuses after configuration has
 been checked. Its separate protocol test is outside the shared fixture corpus;
 refusals must not be counted as executed conformance successes.
+
+## Fee target
+
+Build `cargo build -p rtos_executor --example fee_conformance --locked`, then run
+the shared runner against `$TOS_REFERENCE/test/conformance/vectors/fee` and
+`executor/src/tests/data/conformance/fee`. This target calls native storage,
+gas-purchase and message-price arithmetic; it does not implement its own fee
+formulas. Amount/price inputs use full unsigned decimal strings, fractions use
+u32 as in the C++ calculation constructor, and storage vectors have at most64
+periods. Line inputs remain limited to16MiB.
+
+Native `MsgPrices` preserves both C++ profiles: scalar node fees wrap at64 bits,
+whereas RefInt256 fees preserve signed scalar conversions. Wire configuration
+fractions remain u16. Node fee callers use the scalar profile and VM forward-fee
+opcodes use the wide profile. Checked Coins helpers preserve negative-fee errors
+and handle large intermediate products without integer overflow. Exact gas
+thresholds retain their sign; the existing nonnegative purchase threshold view
+remains valid for nonnegative balances. Invalid gas quotients follow the
+reference's signed-minimum conversion, including reachable zero-price cases.
+
+Explicit storage calculations can return a null fee; this is an effect, not a
+protocol refusal. Chain history loading still validates strictly increasing
+price periods before computation, while the explicit-vector harness follows the
+reference calculation's own ordering/early-return behavior. Transaction and VM
+storage fee paths use their respective reference scalar conversions.
+
+The seven additional C++ fee controls cover signed storage products, null fees,
+raw special-account history handling, gas and forward-fee widths. Three C++ VM
+controls in `vm/tests/data/conformance/vm` cover signed storage prices on valid
+VM operands. Existing shared expectations remain unchanged.
