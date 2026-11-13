@@ -26,7 +26,8 @@ python3 "$TOS_REFERENCE/test/conformance/runner/conformance.py" run \
 one context JSON object per input line and writes one effects JSON object per
 output line. A refused context emits `harness_error`. Stdout is reserved for this
 protocol. Contexts are limited to 16 MiB; initial values are limited to depth 32
-and 255 tuple or stack entries. Final stack rendering has the reference's depth
+and 255 tuple or stack entries. Integer text is limited to 255 characters and
+uses decimal digits with an optional leading minus, as in the reference parser. Final stack rendering has the reference's depth
 512 and shared budget of 2^20 visited values.
 
 The VM context initializes c3 according to the reference flags: without bit 0 it

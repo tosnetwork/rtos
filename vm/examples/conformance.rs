@@ -31,7 +31,21 @@ fn parse_item(v: &Value, depth: usize) -> Result<StackItem> {
     Ok(match string(&v["type"])? {
         "null" => StackItem::None,
         "nan" => StackItem::nan(),
-        "int" => StackItem::big_int(string(&v["value"])?)?,
+        "int" => {
+            let text = string(&v["value"])?;
+            ensure!(text.len() <= 255, "integer text too long");
+            // The reference decimal parser returns zero for an empty string.
+            if text.is_empty() {
+                StackItem::int(0)
+            } else {
+                let digits = text.strip_prefix('-').unwrap_or(text);
+                ensure!(
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+                    "invalid decimal integer"
+                );
+                StackItem::big_int(text)?
+            }
+        }
         "cell" => StackItem::cell(boc(&v["boc"])?),
         "slice" => StackItem::slice(SliceData::load_cell(boc(&v["boc"])?)?),
         "tuple" => {
@@ -242,4 +256,21 @@ fn main() -> Result<()> {
         ensure!(size <= 16 << 20, "context too large");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_context_refuses_nondecimal_and_oversized_text() {
+        for text in ["0x123", "+1", "1_0", "NaN", "-", " 1", "1 "] {
+            assert!(
+                parse_item(&json!({"type": "int", "value": text}), 0).is_err(),
+                "accepted {text}"
+            );
+        }
+        assert!(parse_item(&json!({"type": "int", "value": "0".repeat(256)}), 0).is_err());
+        assert!(parse_item(&json!({"type": "int", "value": "9".repeat(78)}), 0).is_err());
+    }
 }
