@@ -164,12 +164,7 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         engine.cc.stack.push(boolean!(false));
         return Ok(());
     };
-    engine.checked_signatures_count = engine.checked_signatures_count.saturating_add(1);
-    if engine.checked_signatures_count > Gas::check_signature_threshold() {
-        engine.try_use_gas(Gas::check_signature_price())?;
-    } else {
-        engine.use_free_gas(Gas::check_signature_price());
-    }
+    engine.register_signature_call();
     let result = engine.modifiers.chksig_always_succeed
         || (!is_identity_pub_key
             && pub_key.verify(&data, &signature[..ED25519_SIGNATURE_LENGTH].try_into()?));

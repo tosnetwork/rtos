@@ -39,3 +39,15 @@ Only a line reporting zero mismatches, refusals and skips proves agreement for
 the vectors executed. Do not use a VM-only result to claim transaction, block,
 replay, network or release qualification. Keep mismatching fixtures unchanged
 and fix the target; expectations come from the recorded C++ reference.
+
+The older inline PQ test families can be refreshed from these same frozen C++
+effects, after checking the source context, with:
+
+```sh
+python3 ci/conformance/refresh_pq_effects.py "$TOS_REFERENCE"
+```
+
+This checks the exact clean reference commit, operand stack, version and gas
+context before writing any family. It preserves all cases, including signature
+override cases, and records the source fixture digests in each legacy data file.
+It does not execute RTOS or generate expectations from RTOS output.

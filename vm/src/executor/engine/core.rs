@@ -111,6 +111,7 @@ pub struct Engine {
     pub(in crate::executor) libraries: Vec<HashmapE>, // 256 bit dictionaries
     pub(in crate::executor) modifiers: BehaviorModifiers,
     pub(in crate::executor) checked_signatures_count: usize,
+    slh_attempts: usize,
     /// GETEXTRABALANCE calls so far; the first few calls have capped cell-load gas. Shared with
     /// non-isolated child VMs and reset on isolated entry, like the signature-check counter.
     pub(in crate::executor) get_extra_balance_counter: usize,
@@ -233,6 +234,7 @@ impl Engine {
             libraries: Vec::new(),
             modifiers: BehaviorModifiers::default(),
             checked_signatures_count: 0,
+            slh_attempts: 0,
             get_extra_balance_counter: 0,
             visited_cells: HashSet::new(),
             loaded_libraries: HashSet::new(),
@@ -257,6 +259,25 @@ impl Engine {
             dispatched: None,
             base_charged: false,
         }
+    }
+
+    pub(in crate::executor) fn register_signature_call(&mut self) {
+        if self.block_version >= 4 {
+            self.checked_signatures_count = self.checked_signatures_count.saturating_add(1);
+            if self.checked_signatures_count > Gas::check_signature_threshold() {
+                self.use_gas(Gas::check_signature_price());
+            } else {
+                self.use_free_gas(Gas::check_signature_price());
+            }
+        }
+    }
+
+    pub(in crate::executor) fn register_slh_attempt(&mut self) -> Status {
+        if self.slh_attempts >= 1 {
+            fail!(ExceptionCode::RangeCheckError, "SLH-DSA verification limit reached");
+        }
+        self.slh_attempts += 1;
+        Ok(())
     }
 
     /// Limit distinct library lookup attempts, including missing libraries.
@@ -1059,6 +1080,7 @@ impl Engine {
             max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,
+            slh_attempts: self.slh_attempts,
             get_extra_balance_counter: self.get_extra_balance_counter,
             visited_cells,
             cstate: None,
@@ -1113,6 +1135,7 @@ impl Engine {
         self.loaded_libraries = std::mem::take(&mut child.loaded_libraries);
         self.free_gas_consumed = child.free_gas_consumed;
         self.checked_signatures_count = child.checked_signatures_count;
+        self.slh_attempts = child.slh_attempts;
         self.get_extra_balance_counter = child.get_extra_balance_counter;
         log::debug!(
             target: "tvm",
