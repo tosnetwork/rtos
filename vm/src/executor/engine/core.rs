@@ -119,6 +119,7 @@ pub struct Engine {
     // visited cell with HashMap<UInt256, SliceData>
     visited_cells: HashSet<UInt256>,
     loaded_libraries: HashSet<UInt256>,
+    missing_library: Option<UInt256>,
     max_library_loads: Option<u32>,
     cstate: Option<(Cell, Cell)>,
     time: u64,
@@ -242,6 +243,7 @@ impl Engine {
             get_extra_balance_counter: 0,
             visited_cells: HashSet::new(),
             loaded_libraries: HashSet::new(),
+            missing_library: None,
             max_library_loads: None,
             cstate: None,
             time: 0,
@@ -815,7 +817,13 @@ impl Engine {
                 return Ok(lib);
             }
         }
+        self.missing_library = Some(UInt256::construct_from(&mut hash.clone())?);
         fail!(ExceptionCode::CellUnderflow, "Libraries do not contain code with hash {:x}", hash)
+    }
+
+    /// Most recent library lookup which exhausted the configured collections.
+    pub fn missing_library(&self) -> Option<&UInt256> {
+        self.missing_library.as_ref()
     }
 
     /// Loads cell to slice checking in precashed map
@@ -1082,6 +1090,7 @@ impl Engine {
             ctrls,
             libraries: std::mem::take(&mut self.libraries),
             loaded_libraries: std::mem::take(&mut self.loaded_libraries),
+            missing_library: None,
             max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,

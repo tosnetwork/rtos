@@ -23,6 +23,19 @@ use crate::{
 use rtos_block::{Cell, ExceptionCode, SliceData};
 
 #[test]
+fn missing_library_records_last_failed_lookup() {
+    let mut engine =
+        Engine::with_capabilities(0).setup(Default::default(), None, None, None, vec![]).unwrap();
+    assert!(engine.missing_library().is_none());
+    for bytes in [vec![0x80], vec![0xc0]] {
+        let cell = SliceData::new(bytes).into_cell().unwrap();
+        let error = engine.load_hashed_cell(cell.as_library_cell(), true).unwrap_err();
+        assert_eq!(crate::error::tvm_exception_code(&error), Some(ExceptionCode::CellUnderflow));
+        assert_eq!(engine.missing_library(), Some(cell.repr_hash()));
+    }
+}
+
+#[test]
 fn test_swap_with_any() {
     let mut engine =
         Engine::with_capabilities(0).setup(Default::default(), None, None, None, vec![]).unwrap();

@@ -4,6 +4,24 @@ use rtos_block::{
     read_single_root_boc_file, ConfigParam8, ConfigParamEnum, CurrencyCollection, IBitstring,
     ShardAccounts, StateInit,
 };
+
+#[test]
+fn getter_version16_import_slot_is_present_and_null() {
+    for (version, length) in [(15, 18), (16, 19), (17, 19)] {
+        let mut info = SmartContractInfo::default();
+        let mut param = ConfigParam8::default();
+        param.global_version.version = version;
+        info.config_params.set_config(ConfigParamEnum::ConfigParam8(param)).unwrap();
+        info.incoming_storage_stats =
+            Some(IncomingStorageStats { hash: UInt256::default(), cells: 7, bits: 9 });
+        let outer = info.as_get_method_data_item().unwrap().as_tuple_mut().unwrap();
+        let fields = outer[0].as_tuple().unwrap();
+        assert_eq!(fields.len(), length, "version {version}");
+        if version >= 16 {
+            assert!(fields[18].is_null());
+        }
+    }
+}
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

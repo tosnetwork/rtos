@@ -449,9 +449,9 @@ impl SmartContractInfo {
     }
 
     /// Node getter context follows the lite-server profile. It has no
-    /// authenticated message import and does not include the incoming storage
-    /// slot used by the transaction context. Historical tuple lengths remain observable.
-    fn as_get_method_data_item(&self) -> Result<StackItem> {
+    /// authenticated message import; from version16 the incoming storage slot
+    /// is present and null. Historical tuple lengths remain observable.
+    pub fn as_get_method_data_item(&self) -> Result<StackItem> {
         let version = self.config_params.global_version();
         let mut outer = self.as_temp_data_item().as_tuple_mut()?;
         let mut fields = outer.remove(0).as_tuple_mut()?;
@@ -461,10 +461,17 @@ impl SmartContractInfo {
             14
         } else if version < 11 {
             17
-        } else {
+        } else if version < 16 {
             18
+        } else {
+            19
         };
         fields.truncate(length);
+        if version >= 16 {
+            // A getter never has authenticated message import statistics,
+            // including when this helper is used with a transaction profile.
+            fields[18] = StackItem::None;
+        }
         if version >= 6 {
             // A configured zero cost is an integer, distinct from no entry.
             let precompiled = self.get_method_precompiled()?;
