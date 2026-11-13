@@ -452,6 +452,10 @@ impl AccountStorage {
         }
     }
 
+    pub(crate) fn balance(&self) -> &CurrencyCollection {
+        &self.balance
+    }
+
     fn calc_storage_used(&self) -> Result<StorageUsed> {
         let root_cell = self.serialize()?;
         let mut calc = StorageUsageCalc::with_limits(0, 0);
@@ -591,6 +595,42 @@ impl AccountStuff {
             self.storage_info.storage_extra.dict_hash = None;
             Ok(None)
         }
+    }
+
+    fn finalize_storage_stat(&mut self, version: u32, min_cells: u32) -> Result<Option<Cell>> {
+        self.storage_stat.configure_version(version);
+        let roots_changed = self.storage_stat.roots_changed(&self.storage);
+        let store_hash = version >= 11 && !self.addr.is_masterchain();
+        // CPP uses this fixed26-cell trigger independently of the configured
+        // threshold for storing the resulting dictionary hash.
+        let force_recount = store_hash
+            && self.storage_info.dict_hash().is_none()
+            && self.storage_info.used.cells() > 25;
+        if force_recount {
+            self.storage_stat.recount();
+        }
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        if roots_changed || force_recount {
+            self.storage_info.storage_extra.dict_hash =
+                if store_hash && self.storage_info.used.cells() >= u64::from(min_cells) {
+                    Some(
+                        self.storage_stat
+                            .calc_dict()?
+                            .map_or_else(UInt256::default, |root| root.repr_hash().clone()),
+                    )
+                } else {
+                    None
+                };
+        } else if !store_hash {
+            self.storage_info.storage_extra.dict_hash = None;
+        }
+        let dict = if self.storage_info.dict_hash().is_some() {
+            self.storage_stat.dict_root().cloned()
+        } else {
+            None
+        };
+        self.storage_stat.prepare_transaction(&self.storage, &self.storage_info.used)?;
+        Ok(dict)
     }
 
     fn calc_and_check_storage_stat_dict(
@@ -924,6 +964,33 @@ impl Account {
         }
     }
 
+    /// Snapshot input usage and roots before execution mutates the account.
+    /// Execution limits use the currency-free view; finalization selects the
+    /// versioned billing view. This cache state is not serialized.
+    pub fn prepare_storage_stat_for_transaction(&mut self) -> Result<()> {
+        if let Some(stuff) = self.stuff_mut() {
+            stuff.storage_stat.configure_version(10);
+            stuff.storage_stat.prepare_transaction(&stuff.storage, &stuff.storage_info.used)?;
+        }
+        Ok(())
+    }
+
+    /// Select a storage-stat view (pre10 billing includes currency roots).
+    /// State-size checks always select the currency-free view.
+    pub fn configure_storage_stat_version(&mut self, version: u32) {
+        if let Some(stuff) = self.stuff_mut() {
+            stuff.storage_stat.configure_version(version);
+        }
+    }
+
+    /// Finalize usage and optional dictionary hash with the chain version's rules.
+    pub fn finalize_storage_stat(&mut self, version: u32, min_cells: u32) -> Result<Option<Cell>> {
+        self.stuff_mut()
+            .map(|stuff| stuff.finalize_storage_stat(version, min_cells))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn calc_and_check_storage_stat_dict(
         &mut self,
         dict_hash_min_cells: u32,
@@ -996,7 +1063,9 @@ impl Account {
 
     /// Storage roots (code/data/library) counted by the storage stat.
     pub fn storage_roots(&self) -> StorageRoots {
-        AccountStorageStat::get_roots(self.state_init())
+        self.stuff()
+            .map(|stuff| stuff.storage_stat.roots_for_storage(&stuff.storage))
+            .unwrap_or_default()
     }
 
     pub fn state_init_mut(&mut self) -> Option<&mut StateInit> {

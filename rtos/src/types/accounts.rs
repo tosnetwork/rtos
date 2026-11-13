@@ -37,6 +37,7 @@ pub struct ShardAccountStuff {
     original_root: Cell,
     lt_compatible: bool,
     dict_hash_min_cells: u32,
+    block_version: u32,
 }
 
 impl ShardAccountStuff {
@@ -48,6 +49,7 @@ impl ShardAccountStuff {
         full_collated_data: bool,
         lt_compatible: bool,
         dict_hash_min_cells: u32,
+        block_version: u32,
     ) -> Result<Self> {
         let mut account = shard_acc.read_account()?;
         let account_hash = shard_acc.account_hash();
@@ -76,6 +78,8 @@ impl ShardAccountStuff {
             }
             account.import_storage_stat_dict(dict.clone())?;
         }
+        account.prepare_storage_stat_for_transaction()?;
+        account.configure_storage_stat_version(block_version);
         let orig_libs = account.libraries();
         Ok(Self {
             account_id,
@@ -92,6 +96,7 @@ impl ShardAccountStuff {
             has_root_change: false,
             lt_compatible,
             dict_hash_min_cells,
+            block_version,
         })
     }
 
@@ -148,19 +153,21 @@ impl ShardAccountStuff {
     pub fn add_transaction(
         &mut self,
         transaction: &mut Transaction,
-        account: Account,
+        mut account: Account,
     ) -> Result<()> {
         transaction.set_prev_trans_hash(self.shard_acc.last_trans_hash().clone());
         transaction.set_prev_trans_lt(self.shard_acc.last_trans_lt());
         // log::trace!("{} {}", self.collated_block_descr, debug_transaction(transaction.clone())?);
         let old_roots = self.account.storage_roots();
+        account.configure_storage_stat_version(self.block_version);
         self.account = account;
 
         let tc = time_checker!(
             || format!("account {:x} calc_storage_stat_dict", self.account_id),
             STAT_UPDATE_THRESHOLD
         );
-        self.storage_dict = self.account.calc_storage_stat_dict(self.dict_hash_min_cells)?;
+        self.storage_dict =
+            self.account.finalize_storage_stat(self.block_version, self.dict_hash_min_cells)?;
         drop(tc);
 
         // Roots the executor's stat ran over

@@ -126,6 +126,7 @@ fn run_txn(ctx: &Value) -> Result<Value> {
         Err(_) => return Ok(json!({"outcome":"error"})),
     };
     let threshold = config.size_limits_config().acc_state_cells_for_storage_dict;
+    let version = config.block_version();
     let exec: Box<dyn TransactionExecutor> = if msg.is_some() {
         Box::new(OrdinaryTransactionExecutor::new(config))
     } else {
@@ -162,13 +163,7 @@ fn run_txn(ctx: &Value) -> Result<Value> {
                 )
             }
         };
-        let changed = account.precalc_storage_stat()?.is_some_and(|s| s.is_changed());
-        let needs_dict = account.get_addr().is_some_and(|a| !a.is_masterchain())
-            && account.dict_hash().is_none()
-            && account.storage_info().is_some_and(|s| s.used().cells() >= threshold as u64);
-        if changed || needs_dict {
-            account.calc_storage_stat_dict(threshold)?;
-        }
+        account.finalize_storage_stat(version, threshold)?;
         tx.set_prev_trans_hash(shard.last_trans_hash().clone());
         tx.set_prev_trans_lt(shard.last_trans_lt());
         shard.write_account(&account)?;
@@ -414,6 +409,50 @@ mod tests {
                 .lines()
         {
             let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+    #[test]
+    fn storage_finalization_rules_match_reference() {
+        for line in include_str!(
+            "../src/tests/data/conformance/txn/fixtures/storage-finalization-rules.jsonl"
+        )
+        .lines()
+        .chain(
+            include_str!(
+                "../src/tests/data/conformance/txn/fixtures/storage-hash-version-boundary.jsonl"
+            )
+            .lines(),
+        ) {
+            let row: Value = serde_json::from_str(line).unwrap();
+            // Finalization is shared by several consumers and must be idempotent.
+            let context = &row["context"];
+            let config = BlockchainConfig::with_config(
+                ConfigParams::with_root(boc(&context["config"]).unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut account =
+                ShardAccount::construct_from_cell(boc(&context["shard_account"]).unwrap())
+                    .unwrap()
+                    .read_account()
+                    .unwrap();
+            account.prepare_storage_stat_for_transaction().unwrap();
+            let version = config.block_version();
+            let threshold = config.size_limits_config().acc_state_cells_for_storage_dict;
+            let first_dict = account.finalize_storage_stat(version, threshold).unwrap();
+            let first = account.serialize().unwrap();
+            assert_eq!(first_dict, account.finalize_storage_stat(version, threshold).unwrap());
+            assert_eq!(
+                first,
+                account.serialize().unwrap(),
+                "non-idempotent {}",
+                row["metadata"]["fixture_id"]
+            );
             assert_eq!(
                 run_txn(&row["context"]).unwrap(),
                 row["effects"],

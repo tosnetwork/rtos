@@ -2595,6 +2595,8 @@ pub(super) fn check_account_size_limits(
         };
     let acc_id = acc.get_id().cloned().unwrap_or_default();
     let _tc = time_checker!(|| format!("account {:x} precalc_storage_stat", acc_id), 100);
+    // State-size limits exclude currency dictionaries even before version10.
+    acc.configure_storage_stat_version(10);
     let Some(stat) = acc.precalc_storage_stat()? else {
         return Ok(true);
     };

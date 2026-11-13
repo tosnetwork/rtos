@@ -51,11 +51,12 @@ impl Deserializable for StorageStatCellInfo {
 }
 
 define_HashmapE!(StorageStatDict, 256, StorageStatCellInfo);
-pub type StorageRoots = SmallVec<[Cell; 3]>;
+pub type StorageRoots = SmallVec<[Cell; 4]>;
 
 #[derive(Clone, Debug, PartialEq)]
 struct SeededStorageUsage {
     roots: StorageRoots,
+    extra_currency_root: Option<Cell>,
     used: StorageUsed,
     root_bits: u64,
 }
@@ -72,8 +73,9 @@ struct SeededStorageUsage {
 /// `cache` into `dict` via hashmap_multiset. After a flush `cache` is NOT cleared — the entries
 /// are kept (with `ref_count_diff = 0`) as a hot L1 over `dict` for subsequent operations.
 ///
-/// Decoded original accounts may also carry supplied usage independently of subtree totals.
-/// This survives previews and is released when changed roots are finalized.
+/// Input transaction snapshots carry supplied usage independently of subtree totals.
+/// They survive previews/view switches and are replaced after finalization. Decoder-only
+/// malformed-usage seeds retain the same carry behavior outside transaction execution.
 ///
 /// Three meaningful initial states from constructors:
 /// - empty: `Default` / `empty()` / `new(_, used)` with `used.cells == 0` — everything zero.
@@ -84,12 +86,16 @@ struct SeededStorageUsage {
 ///   is empty. This is the cheap path; used by `Account::import_storage_stat_dict` when the
 ///   engine-level LRU (`Engine::storage_dicts_cache`) has the dict for this `dict_hash`.
 ///
-/// Invariants: `roots` mirrors `get_roots(storage.state_init())`; root changes go through
+/// Invariants: `roots` mirrors the selected accounting view (code/data/library,
+/// plus the currency root only for pre10 serialization); root changes go through
 /// `replace_roots`, which produces an incremental diff via `add_cell`/`remove_cell`. The
 /// `(dict empty && cache empty)` combination is treated as "seeded or freshly empty" and lets
 /// `replace_roots` reset roots/totals before rebuilding incrementally.
 #[derive(Default, Clone, PartialEq)]
 pub struct AccountStorageStat {
+    // Legacy (<10) serialization includes the currency root. Size-limit
+    // checks use the code/data/library view even for those versions.
+    include_extra_currencies: bool,
     dict: StorageStatDict,
     roots: StorageRoots,
     total_cells: u64,
@@ -141,6 +147,7 @@ impl AccountStorageStat {
             return Self::empty();
         };
         Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::new(),
             roots: Self::get_roots(storage.state_init()),
             total_cells,
@@ -161,6 +168,7 @@ impl AccountStorageStat {
             if used.cells() == 0 || used.bits() < root_bits {
                 stat.seeded_usage = Some(SeededStorageUsage {
                     roots: Self::get_roots(storage.state_init()),
+                    extra_currency_root: storage.balance().other.root().cloned(),
                     used: used.clone(),
                     root_bits,
                 });
@@ -174,13 +182,14 @@ impl AccountStorageStat {
     }
 
     pub(crate) fn finish_usage_update(&mut self) {
-        if self.seeded_usage.as_ref().is_some_and(|seed| seed.roots != self.roots) {
+        if self.seeded_usage.as_ref().is_some_and(|seed| self.seed_roots(seed) != self.roots) {
             self.seeded_usage = None;
         }
     }
 
     fn empty() -> Self {
         Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::new(),
             roots: StorageRoots::new(),
             total_cells: 0,
@@ -206,6 +215,7 @@ impl AccountStorageStat {
             )
         };
         Ok(Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::with_hashmap(Some(dict)),
             roots: Self::get_roots(storage.state_init()),
             total_cells,
@@ -298,12 +308,12 @@ impl AccountStorageStat {
     }
 
     pub fn calc_stat(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
-        let roots = Self::get_roots(storage.state_init());
+        let roots = self.roots_for_storage(storage);
         self.replace_roots(roots.clone())?;
 
         let cell = storage.serialize()?;
         if let Some(seed) = &self.seeded_usage {
-            if roots == seed.roots {
+            if roots == self.seed_roots(seed) {
                 let root_bits = cell.bit_length() as u64;
                 let bits = if root_bits >= seed.root_bits {
                     seed.used.bits().checked_add(root_bits - seed.root_bits)
@@ -318,6 +328,66 @@ impl AccountStorageStat {
             self.total_cells + 1,
             self.total_bits + cell.bit_length() as u64,
         )
+    }
+
+    pub(crate) fn configure_version(&mut self, version: u32) {
+        let legacy = version < 10;
+        if self.include_extra_currencies != legacy {
+            let seed = self.seeded_usage.take();
+            *self = Self::empty();
+            self.include_extra_currencies = legacy;
+            self.seeded_usage = seed;
+        }
+    }
+
+    pub(crate) fn prepare_transaction(
+        &mut self,
+        storage: &AccountStorage,
+        used: &StorageUsed,
+    ) -> Result<()> {
+        self.seeded_usage = Some(SeededStorageUsage {
+            roots: Self::get_roots(storage.state_init()),
+            extra_currency_root: storage.balance().other.root().cloned(),
+            used: used.clone(),
+            root_bits: storage.serialize()?.bit_length() as u64,
+        });
+        Ok(())
+    }
+
+    fn seed_roots(&self, seed: &SeededStorageUsage) -> StorageRoots {
+        let mut roots = StorageRoots::new();
+        if self.include_extra_currencies {
+            roots.extend(seed.extra_currency_root.iter().cloned());
+        }
+        roots.extend(seed.roots.iter().cloned());
+        roots
+    }
+
+    pub(crate) fn roots_changed(&self, storage: &AccountStorage) -> bool {
+        self.seeded_usage
+            .as_ref()
+            .is_none_or(|seed| self.seed_roots(seed) != self.roots_for_storage(storage))
+    }
+
+    pub(crate) fn recount(&mut self) {
+        let legacy = self.include_extra_currencies;
+        *self = Self::empty();
+        self.include_extra_currencies = legacy;
+    }
+
+    pub(crate) fn dict_root(&self) -> Option<&Cell> {
+        self.dict.root()
+    }
+
+    pub(crate) fn roots_for_storage(&self, storage: &AccountStorage) -> StorageRoots {
+        let mut roots = StorageRoots::new();
+        if self.include_extra_currencies {
+            if let Some(root) = storage.balance().other.root() {
+                roots.push(root.clone());
+            }
+        }
+        roots.extend(Self::get_roots(storage.state_init()));
+        roots
     }
 
     pub fn get_roots(storage: Option<&StateInit>) -> StorageRoots {

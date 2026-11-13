@@ -49,6 +49,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
             fail!("Tick Tock transaction must not have input message")
         }
         crate::check_account_extra_currencies(account)?;
+        account.prepare_storage_stat_for_transaction()?;
         let stored_address = account
             .get_addr()
             .cloned()

@@ -114,3 +114,15 @@ The transaction fee helper returns a checked result: flat-only fees keep unsigne
 prices; variable fees add the signed64 flat price. Negative fees fail rather than
 enter unsigned Coins. Both compute paths and the BlockchainConfig wrapper use
 the checked result; standalone VM fee opcodes keep their own reference semantics.
+
+`storage-finalization-rules` and `storage-hash-version-boundary` add21 C++
+controls for forced recounts, masterchain hash removal, and version9/10/11
+currency-count/hash gates. Before execution, snapshot the input account's usage
+and roots. Size limits use code/data/library roots; pre10 billing additionally
+counts the currency root. Finalization preserves supplied usage only when the
+selected roots are unchanged, forces a recount above25 stored cells without a
+hash when hash storage is enabled, and applies the configured hash threshold
+after recounting. Hash storage is enabled from11 and excludes masterchain.
+`Account::finalize_storage_stat` is shared by emulator, conformance, collator
+and validator. The controls also check that repeated finalization is idempotent.
+Snapshots/cache views are in-memory only and retain at most four input roots.

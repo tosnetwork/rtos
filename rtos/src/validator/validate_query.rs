@@ -5500,7 +5500,6 @@ impl ValidateQuery {
                 old_hash
             )
         }
-        #[cfg(test)]
         let block_version = config.block_version();
         let dict_hash_min_cells = config.size_limits_config().acc_state_cells_for_storage_dict;
         let params = ExecuteParams {
@@ -5642,23 +5641,8 @@ impl ValidateQuery {
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
-                // For an account whose storage roots are unchanged we can just update `used` info
-                // without dictionary reconstruction — UNLESS the account is large enough to need a
-                // dict but still has none.
-                let stat_changed =
-                    account.precalc_storage_stat()?.is_some_and(|stat| stat.is_changed());
-                let needs_initial_dict = !base.shard().is_masterchain()
-                    && account.dict_hash().is_none()
-                    && account
-                        .storage_info()
-                        .is_some_and(|info| info.used().cells() >= dict_hash_min_cells as u64);
-                if stat_changed || needs_initial_dict {
-                    *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
-                }
-                #[cfg(test)]
-                if block_version < 12 {
-                    account.del_storage_stat();
-                }
+                *storage_dict =
+                    account.finalize_storage_stat(block_version, dict_hash_min_cells)?;
                 *account_root = account.serialize()?;
                 let new_hash = account_root.repr_hash().clone();
                 if state_update.new_hash != new_hash {

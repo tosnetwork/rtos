@@ -95,6 +95,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         let mut now = Instant::now();
 
         crate::check_account_extra_currencies(account)?;
+        account.prepare_storage_stat_for_transaction()?;
         let in_msg_cell =
             in_msg_cell.ok_or_else(|| error!("Ordinary transaction must have input message"))?;
         let in_msg_hash = in_msg_cell.repr_hash();
