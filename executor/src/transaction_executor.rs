@@ -537,7 +537,7 @@ pub trait TransactionExecutor {
                 vm_phase.exit_arg = None;
                 vm_phase.success = false;
                 vm_phase.gas_fees =
-                    Coins::try_from(if is_special { 0 } else { gas_config.calc_gas_fee(0) })?;
+                    Coins::try_from(if is_special { 0 } else { gas_config.calc_gas_fee(0)? })?;
                 if !acc_balance.coins.sub(&vm_phase.gas_fees)? {
                     log::debug!(
                         target: "executor",
@@ -693,7 +693,7 @@ pub trait TransactionExecutor {
         } else {
             // credit == 0 means contract accepted
             let gas_fees =
-                if is_special { 0 } else { gas_config.calc_gas_fee(vm_phase.gas_used.as_u64()) };
+                if is_special { 0 } else { gas_config.calc_gas_fee(vm_phase.gas_used.as_u64())? };
             vm_phase.gas_fees = gas_fees.try_into()?;
         };
 

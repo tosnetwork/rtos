@@ -107,3 +107,10 @@ currency-width and other transaction differences.
 precompiled costs apply to ordinary transactions, while tick/tock uses normal
 VM gas and steps. The optional global precompiled-list record still decodes;
 tick/tock skips only the contract lookup and cost override.
+
+`signed-flat-gas-fee` contains12 C++ controls around the31-gas ACCEPT execution
+cost, flat limits0/31/32 and flat prices on both sides of the signed64 boundary.
+The transaction fee helper returns a checked result: flat-only fees keep unsigned
+prices; variable fees add the signed64 flat price. Negative fees fail rather than
+enter unsigned Coins. Both compute paths and the BlockchainConfig wrapper use
+the checked result; standalone VM fee opcodes keep their own reference semantics.
