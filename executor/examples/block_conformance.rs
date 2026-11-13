@@ -8,8 +8,8 @@ use anyhow::{anyhow, bail, ensure, Result};
 use rtos_block::{
     base64_decode, base64_encode, read_single_root_boc, write_boc, AccountId, Block, BlockError,
     BlockIdExt, Cell, CellType, Deserializable, ExceptionCode, HashmapAugType, HashmapType,
-    Serializable, ShardAccount, ShardAccounts, ShardStateUnsplit, Transaction, TransactionDescr,
-    UInt256, LT_ALIGN,
+    KeyExtBlkRef, Serializable, ShardAccount, ShardAccounts, ShardStateUnsplit, Transaction,
+    TransactionDescr, UInt256, LT_ALIGN,
 };
 use rtos_vm::{smart_contract_info::SmartContractInfo, stack::StackItem};
 use serde_json::{json, Value};
@@ -123,6 +123,19 @@ fn apply(
         );
         let custom =
             config_state.read_custom()?.ok_or_else(|| anyhow!("missing masterchain extra"))?;
+        // ConfigInfo::unpack checks the zero-state record even when the
+        // recent/century tuple never looks that far back.
+        if config_state.seq_no() != 0 {
+            let mut zero = custom
+                .prev_blocks
+                .get_as_slice(&0)?
+                .ok_or_else(|| anyhow!("missing zero-state reference"))?;
+            let entry = KeyExtBlkRef::construct_from(&mut zero)?;
+            ensure!(
+                entry.blk_ref.seq_no == 0 && zero.is_empty_cell(),
+                "invalid zero-state reference"
+            );
+        }
         custom.config.get_global_version()?;
         custom.config.workchains()?;
         custom.config.fundamental_smc_addr()?;

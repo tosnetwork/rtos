@@ -155,3 +155,10 @@ The checker compares all accepted effects with hashes decoded from the on-chain
 blocks and transactions in the manifest. Retain exported contexts and results
 outside Git. Passing this boundary does not qualify full validator validation,
 archive replay, networking or the remaining conformance harnesses.
+
+Also pass `executor/src/tests/data/conformance/block/fixtures` to the runner.
+These C++ checked controls cover a shared cell reached at two Merkle depths and
+a zero-state history record with an incorrect sequence number. The first uses
+a synthetic non-ShardState previous root: successful update validation and
+application must reach `prev_state_malformed`. The second must fail configuration
+extraction before any transaction, even when the account-block dictionary is empty.

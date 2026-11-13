@@ -594,3 +594,33 @@ fn test_apply_lazy_unchecked_lazy_loading() {
     let after = factory.loader_calls.load(AtomicOrdering::SeqCst);
     assert_eq!(before, after, "repr_hash/repr_depth/level_mask must not trigger loader",);
 }
+#[test]
+fn shared_cell_at_distinct_merkle_depths() -> crate::Result<()> {
+    use crate::{BuilderData, Cell, MerkleProof, MerkleUpdate, Serializable};
+    let pruned = MerkleUpdate::make_pruned_branch_cell(&Cell::default(), 0)?.into_cell()?;
+    let mut builder = BuilderData::new();
+    builder.checked_append_reference(pruned)?;
+    let shared = builder.into_cell()?;
+    let proof = |cell: &Cell| {
+        MerkleProof { hash: cell.hash(0).clone(), depth: cell.depth(0), proof: cell.clone() }
+            .serialize()
+    };
+    let mut builder = BuilderData::new();
+    builder.checked_append_reference(shared.clone())?;
+    builder.checked_append_reference(proof(&shared)?)?;
+    let old = builder.into_cell()?;
+    let new = proof(&MerkleUpdate::make_pruned_branch_cell(&shared, 1)?.into_cell()?)?;
+    let update = MerkleUpdate {
+        old_hash: old.hash(0).clone(),
+        new_hash: new.hash(0).clone(),
+        old_depth: old.depth(0),
+        new_depth: new.depth(0),
+        old: old.clone(),
+        new,
+    };
+    update.validate()?;
+    let level = old.level();
+    let (applied, _) = update.apply_for(&old.virtualize(level))?;
+    assert_eq!(applied.hash(0), &update.new_hash);
+    Ok(())
+}
