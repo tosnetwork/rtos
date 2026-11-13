@@ -51,3 +51,19 @@ This checks the exact clean reference commit, operand stack, version and gas
 context before writing any family. It preserves all cases, including signature
 override cases, and records the source fixture digests in each legacy data file.
 It does not execute RTOS or generate expectations from RTOS output.
+
+## Transaction target
+
+Build `cargo build -p rtos_executor --example txn_conformance --locked`, then run
+`conformance.py run --target target/debug/examples/txn_conformance "$TOS_REFERENCE/test/conformance/vectors/txn"`.
+This separate target advertises `txn` and executes each input with fresh executor
+state. It accepts the configuration dictionary, complete ShardAccount, inbound
+message or tick/tock, explicit time/LT/seed, libraries and serialized previous-block
+tuple. Accepted effects include the transaction, Account and ShardAccount hashes;
+external rejection includes its VM exit code; execution errors return `error`.
+
+Serialized previous-block values are bounded to depth 512 and 2^20 visited values.
+Continuation values in that optional input are currently refused explicitly.
+A refused input remains a refusal in the runner and does not grant qualification.
+The first baseline and any remaining differences are recorded in memo; adding the
+entry point alone does not prove transaction, block or replay agreement.
