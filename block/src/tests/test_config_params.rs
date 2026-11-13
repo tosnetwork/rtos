@@ -17,6 +17,39 @@ use crate::{
 };
 use rand::Rng;
 
+#[test]
+fn fee_arithmetic_signed_gas_amount_cannot_be_coins() {
+    let prices = GasLimitsPrices { gas_price: 1 << 16, ..Default::default() };
+    assert!(prices.calc_gas_fee(1 << 63).is_err());
+}
+
+#[test]
+fn fee_arithmetic_zero_price_preserves_invalid_quotient_sentinel() {
+    let prices = GasLimitsPrices { flat_gas_price: 1 << 63, ..Default::default() };
+    assert_eq!(prices.gas_bought_for(99, 0, 1 << 63).unwrap(), 1 << 63);
+}
+
+#[test]
+fn fee_arithmetic_node_forward_fee_wraps_at_u64() {
+    let prices = MsgForwardPrices { lump_price: 1, bit_price: u64::MAX, ..Default::default() };
+    assert_eq!(prices.calc_fwd_fee(1 << 16, 0), 0);
+}
+
+#[test]
+fn fee_arithmetic_parts_of_maximum_coins_do_not_overflow() {
+    let prices = MsgForwardPrices {
+        first_frac: u16::MAX,
+        next_frac: u16::MAX,
+        ihr_price_factor: u32::MAX,
+        ..Default::default()
+    };
+    let fee = Coins::try_from((1u128 << 120) - 1).unwrap();
+    let expected = fee.as_u128() - (1u128 << 104);
+    assert_eq!(prices.mine_fee_checked(&fee).unwrap().as_u128(), expected);
+    assert_eq!(prices.next_fee_checked(&fee).unwrap().as_u128(), expected);
+    assert!(prices.ihr_fee_checked(&fee).is_err());
+}
+
 fn get_config_param0() -> ConfigParam0 {
     ConfigParam0 { config_addr: AccountId::from([1; 32]) }
 }

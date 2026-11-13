@@ -2340,31 +2340,7 @@ fn gas_bought_for(
     gas_limit: u64,
     max_gas_threshold: u128,
 ) -> Result<u64> {
-    if value >= max_gas_threshold {
-        return Ok(gas_limit);
-    }
-    let value = i128::try_from(value).map_err(|_| error!("gas value {value} out of range"))?;
-    let flat_price = i128::from(gas_info.flat_gas_price as i64);
-    if value < flat_price {
-        return Ok(0);
-    }
-    let price = i128::from(gas_info.gas_price);
-    if price == 0 {
-        // A zero price makes the threshold the flat price, decided above.
-        fail!("gas price is zero")
-    }
-    // The reference subtracts by adding the 64-bit negation of the signed
-    // flat price, which leaves -2^63 unchanged. Below the threshold the value
-    // is under 2^111, so the shift fits.
-    let rest = value + i128::from((gas_info.flat_gas_price as i64).wrapping_neg());
-    let shifted =
-        rest.checked_mul(1 << 16).ok_or_else(|| error!("gas bought for {value} does not fit"))?;
-    let mut quotient = shifted / price;
-    if shifted % price != 0 && (shifted < 0) != (price < 0) {
-        quotient -= 1;
-    }
-    let quotient = i64::try_from(quotient).unwrap_or(i64::MIN);
-    Ok((quotient as u64).wrapping_add(gas_info.flat_gas_limit))
+    gas_info.gas_bought_for(value, gas_limit, max_gas_threshold)
 }
 
 fn check_deploy_state_init(

@@ -372,10 +372,11 @@ fn calc_forward_prices(engine: &mut Engine, name: &'static str, simple: bool) ->
     let index = if is_masterchain { 4 } else { 5 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
     let prices = MsgForwardPrices::construct_from(&mut slice.clone())?;
+    let prices = rtos_block::MsgPrices::from(&prices);
     let fwd_fee = if simple {
-        prices.calc_fwd_fee_simple(bits, cells)
+        prices.compute_fwd_fees_simple256(cells, bits)
     } else {
-        prices.calc_fwd_fee(bits, cells)
+        prices.compute_fwd_fees256(cells, bits)
     };
     engine.cc.stack.push(StackItem::int(fwd_fee));
     Ok(())
