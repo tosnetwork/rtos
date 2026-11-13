@@ -461,4 +461,74 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn storage_recount_uses_input_usage_after_a_rolled_back_preview() {
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../src/tests/data/conformance/txn/fixtures/seeded-storage-usage.blobs.json"
+        ))
+        .unwrap();
+        let row: Value =
+            include_str!("../src/tests/data/conformance/txn/fixtures/seeded-storage-usage.jsonl")
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|r| r["metadata"]["fixture_id"] == "existing-unchanged-usage")
+                .unwrap();
+        let context = resolve(row["context"].clone(), &blobs);
+        let mut account =
+            ShardAccount::construct_from_cell(boc(&context["shard_account"]).unwrap())
+                .unwrap()
+                .read_account()
+                .unwrap();
+        let id = account.get_id().unwrap().clone();
+        account.set_addr(rtos_block::MsgAddressInt::with_params(0, id).unwrap());
+        assert!(!account.get_addr().unwrap().is_masterchain());
+        assert!(account.dict_hash().is_none());
+        let used = account.storage_info().unwrap().used().clone();
+        assert!(used.cells() <= 25);
+        let before = account.serialize().unwrap();
+        let data = account.state_init().unwrap().data.clone();
+        account.prepare_storage_stat_for_transaction().unwrap();
+        let mut chain = Cell::default();
+        for _ in 0..30 {
+            let mut builder = rtos_block::BuilderData::new();
+            builder.checked_append_reference(chain).unwrap();
+            chain = builder.into_cell().unwrap();
+        }
+        account.state_init_mut().unwrap().data = Some(chain);
+        account.precalc_storage_stat().unwrap();
+        assert!(account.storage_info().unwrap().used().cells() > 25);
+        account.state_init_mut().unwrap().data = data;
+        account.finalize_storage_stat(16, 26).unwrap();
+        assert_eq!(account.storage_info().unwrap().used(), &used);
+        assert_eq!(account.serialize().unwrap(), before);
+    }
+    #[test]
+    fn storage_recount_uses_input_usage_after_a_smaller_preview() {
+        let row: Value = include_str!(
+            "../src/tests/data/conformance/txn/fixtures/storage-finalization-rules.jsonl"
+        )
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|r| r["metadata"]["fixture_id"] == "transaction-rejections-00064")
+        .unwrap();
+        let mut account =
+            ShardAccount::construct_from_cell(boc(&row["context"]["shard_account"]).unwrap())
+                .unwrap()
+                .read_account()
+                .unwrap();
+        assert!(!account.get_addr().unwrap().is_masterchain());
+        assert!(account.dict_hash().is_none());
+        assert!(account.storage_info().unwrap().used().cells() > 25);
+        account.prepare_storage_stat_for_transaction().unwrap();
+        let mut control = account.clone();
+        control.finalize_storage_stat(16, 26).unwrap();
+        let data = account.state_init().unwrap().data.clone();
+        account.state_init_mut().unwrap().data =
+            Some(rtos_block::BuilderData::with_raw(vec![0xa5], 8).unwrap().into_cell().unwrap());
+        account.precalc_storage_stat().unwrap();
+        assert!(account.storage_info().unwrap().used().cells() <= 25);
+        account.state_init_mut().unwrap().data = data;
+        account.finalize_storage_stat(16, 26).unwrap();
+        assert_eq!(account.serialize().unwrap(), control.serialize().unwrap());
+    }
 }

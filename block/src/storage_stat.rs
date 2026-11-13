@@ -363,6 +363,10 @@ impl AccountStorageStat {
         roots
     }
 
+    pub(crate) fn input_usage(&self) -> Option<&StorageUsed> {
+        self.seeded_usage.as_ref().map(|seed| &seed.used)
+    }
+
     pub(crate) fn roots_changed(&self, storage: &AccountStorage) -> bool {
         self.seeded_usage
             .as_ref()

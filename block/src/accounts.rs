@@ -605,7 +605,7 @@ impl AccountStuff {
         // threshold for storing the resulting dictionary hash.
         let force_recount = store_hash
             && self.storage_info.dict_hash().is_none()
-            && self.storage_info.used.cells() > 25;
+            && self.storage_stat.input_usage().is_some_and(|used| used.cells() > 25);
         if force_recount {
             self.storage_stat.recount();
         }
