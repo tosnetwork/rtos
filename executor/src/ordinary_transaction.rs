@@ -529,16 +529,22 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
                 account.set_addr(account_address);
             }
         }
+        // Before version 13 a self-hash frozen state is physically uninit,
+        // while the transaction still reports its logical frozen end status.
+        let mut end_status = account.status();
         if let Some(hash) = account.frozen_hash() {
             if account_id.contains_bytes(hash.as_slice()) {
                 account.uninit_account();
+                if self.config.block_version() >= 13 {
+                    end_status = account.status();
+                }
             }
         }
-        tr.set_end_status(account.status());
+        tr.set_end_status(end_status);
         log::debug!(target: "executor", "set balance {}", acc_balance.coins);
         account.set_balance(acc_balance);
         log::debug!(target: "executor", "add messages {}, start_lt {}", out_msgs.len(), lt);
-        crate::transaction_executor::normalize_account_special(account);
+        crate::transaction_executor::normalize_account_state_options(account);
         let lt = self.add_messages(&mut tr, out_msgs, lt)?;
         log::debug!(target: "executor", "set end_lt {}", lt);
         account.set_last_tr_time(lt);

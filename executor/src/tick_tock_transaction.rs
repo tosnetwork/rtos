@@ -203,7 +203,7 @@ impl TransactionExecutor for TickTockTransactionExecutor {
         }
         account.set_balance(acc_balance);
         tr.set_end_status(account.status());
-        crate::transaction_executor::normalize_account_special(account);
+        crate::transaction_executor::normalize_account_state_options(account);
         let lt = self.add_messages(&mut tr, out_msgs, lt)?;
         account.set_last_tr_time(lt);
         tr.write_description(&TransactionDescr::TickTock(description))?;

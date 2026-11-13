@@ -131,9 +131,12 @@ fn decode_action(slice: &mut SliceData, version: u32) -> Result<OutAction> {
     }
 }
 
-// Committed account state omits the special tuple when both flags are unset.
-pub(crate) fn normalize_account_special(account: &mut Account) {
+// Committed and frozen account states omit explicit zero-valued options.
+pub(crate) fn normalize_account_state_options(account: &mut Account) {
     if let Some(state) = account.state_init_mut() {
+        if state.fixed_prefix_length().is_some_and(|n| n.as_u32() == 0) {
+            state.fixed_prefix_length = None;
+        }
         if state.special.as_ref().is_some_and(|flags| !flags.tick && !flags.tock) {
             state.special = None;
         }
@@ -337,6 +340,7 @@ pub trait TransactionExecutor {
                 log::debug!(target: "executor", "due payment {} have to freeze", fee);
                 acc.set_due_payment(Some(fee));
                 if acc.status() == AccountStatus::AccStateActive {
+                    normalize_account_state_options(acc);
                     acc.try_freeze()?;
                     Ok(TrStoragePhase::with_params(
                         storage_fees_collected,
@@ -542,6 +546,20 @@ pub trait TransactionExecutor {
                     );
                     fail!("can't sub funds: from acc_balance")
                 }
+                // A null code cell still used the inbound state to initialize
+                // the VM. Activation follows the same version gate as execution.
+                vm_phase.msg_state_used = use_msg_state;
+                vm_phase.account_activated = use_msg_state && self.config().block_version() < 14;
+                if use_msg_state && !vm_phase.account_activated {
+                    result_acc = acc.clone();
+                }
+                if vm_phase.account_activated {
+                    if let Some(state) = result_acc.state_init_mut() {
+                        if state.fixed_prefix_length().is_some_and(|n| n.as_u32() == 0) {
+                            state.fixed_prefix_length = None;
+                        }
+                    }
+                }
                 *acc = result_acc;
                 return Ok((TrComputePhase::Vm(vm_phase), None, None));
             }
@@ -640,6 +658,14 @@ pub trait TransactionExecutor {
             }
         };
         log::debug!(target: "executor", "VM terminated with exit code {}", vm_phase.exit_code);
+
+        // Unknown-precompiled fallback exhaustion is an execution setup
+        // failure in the reference, before external acceptance classification.
+        if precompiled.is_some() && vm_phase.exit_code == !(ExceptionCode::OutOfGas as i32) {
+            fail!(ExecutorError::TrExecutorError(
+                "precompiled contract exhausted gas in TVM".to_string()
+            ));
+        }
 
         // calc gas fees
         let gas = vm.get_gas();

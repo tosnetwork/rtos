@@ -93,3 +93,12 @@ transaction `error`; malformed protocol inputs still refuse. The old 14
 prefixes and are now explicitly checked as invalid. Queue limits round-trip in
 BOC and JSON; collator/validator queue enforcement requires separate integration
 and is not qualified by these transaction tests.
+
+`compute-finalization` contains eight pinned C++ controls for null-code state
+usage and the version14 activation boundary, plus precompiled OOG classification
+and an ordinary-OOG control. `storage-option-finalization` contains19 C++ controls
+for zero-valued account options, freezing/successors and the version13 distinction
+between physical uninit storage and logical frozen transaction status. StateInit
+message hashing keeps its original encoding; account options normalize when the
+account is committed or frozen. These controls do not qualify the remaining
+currency-width and other transaction differences.

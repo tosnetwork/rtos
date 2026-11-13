@@ -361,4 +361,35 @@ mod tests {
             assert!(run_txn(&invalid).is_err(), "did not refuse invalid {field}");
         }
     }
+    #[test]
+    fn compute_finalization_matches_reference() {
+        for line in
+            include_str!("../src/tests/data/conformance/txn/fixtures/compute-finalization.jsonl")
+                .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+    #[test]
+    fn storage_option_finalization_matches_reference() {
+        for line in include_str!(
+            "../src/tests/data/conformance/txn/fixtures/storage-option-finalization.jsonl"
+        )
+        .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
 }
