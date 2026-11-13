@@ -150,7 +150,7 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         fail!(ExceptionCode::CellUnderflow)
     }
     let key = engine.cmd.var(0).as_integer()?.as_vec(ED25519_PUBLIC_KEY_LENGTH * 8, false, true)?;
-    engine.register_signature_call();
+    engine.register_signature_call()?;
     let rejected_key = engine.block_version() >= TVM_VERSION_14
         && (key.as_slice() == ED25519_IDENTITY_PUBLIC_KEY || key.iter().all(|b| *b == 0));
     let signature: [u8; ED25519_SIGNATURE_LENGTH] =

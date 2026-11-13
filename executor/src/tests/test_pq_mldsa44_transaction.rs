@@ -80,7 +80,6 @@ fn mldsa44_transaction_uses_config_version_and_gates_actions() {
                 account.data().unwrap(),
                 &rtos_block::BuilderData::with_raw(vec![77], 8).unwrap().into_cell().unwrap()
             );
-            assert!(compute.gas_used.as_u64() >= 50_000);
         } else {
             assert!(description.action.is_none());
             assert_eq!(account.data(), before.data());

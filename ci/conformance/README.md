@@ -67,3 +67,12 @@ Continuation values in that optional input are currently refused explicitly.
 A refused input remains a refusal in the runner and does not grant qualification.
 The first baseline and any remaining differences are recorded in memo; adding the
 entry point alone does not prove transaction, block or replay agreement.
+
+The additional VM regression corpus in `vm/tests/data/conformance` records five
+shared-signature gas boundaries filled by a clean C++ reference at `REFERENCE`.
+Its contexts derive from `rtos-pq-mldsa44/eleven-paid-calls`: the eleventh key is
+an empty cell and the gas limits straddle the first paid call. The fixture and
+blob files are standard shared-runner inputs; they are also executed by the
+VM example's native test. Run them alongside the main frozen VM corpus. Refill
+only with the C++ `conformance.py regenerate --reference` command, preserving
+its recorded provenance; never fill expectations from the Rust target.

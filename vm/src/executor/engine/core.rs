@@ -265,15 +265,16 @@ impl Engine {
         }
     }
 
-    pub(in crate::executor) fn register_signature_call(&mut self) {
+    pub(in crate::executor) fn register_signature_call(&mut self) -> Status {
         if self.block_version >= 4 {
             self.checked_signatures_count = self.checked_signatures_count.saturating_add(1);
             if self.checked_signatures_count > Gas::check_signature_threshold() {
-                self.use_gas(Gas::check_signature_price());
+                self.try_use_gas(Gas::check_signature_price())?;
             } else {
                 self.use_free_gas(Gas::check_signature_price());
             }
         }
+        Ok(())
     }
 
     pub(in crate::executor) fn register_slh_attempt(&mut self) -> Status {

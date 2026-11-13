@@ -33,7 +33,7 @@ pub(super) fn execute_pq_suite(engine: &mut Engine) -> Status {
             let signature = read_bytes_priced(engine, signature, SIGNATURE_BYTES, 0)?;
             let context = read_bytes_priced(engine, context, MAX_CONTEXT_BYTES, 0)?;
             let message = read_bytes_priced(engine, message, MAX_MESSAGE_BYTES, 0)?;
-            engine.register_signature_call();
+            engine.register_signature_call()?;
             match rtos_pq_crypto::verify(&message, &context, &signature, &key) {
                 Ok(valid) => valid,
                 Err(rtos_pq_crypto::VerifyError::Backend(_)) => {

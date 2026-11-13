@@ -84,7 +84,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     let signature = read_bytes(engine, signature, SIGNATURE_BYTES)?;
     let context = read_bytes(engine, context, MAX_CONTEXT_BYTES)?;
     let message = read_bytes(engine, message, MAX_MESSAGE_BYTES)?;
-    engine.register_signature_call();
+    engine.register_signature_call()?;
     if key.len() != PUBLIC_KEY_BYTES || signature.len() != SIGNATURE_BYTES {
         fail!(ExceptionCode::CellUnderflow, "incorrect ML-DSA-44 input length");
     }

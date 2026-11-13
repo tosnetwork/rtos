@@ -263,6 +263,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn signature_gas_boundary_matches_reference() {
+        fn resolve(value: Value, blobs: &Value) -> Value {
+            match value {
+                Value::Object(map) if map.len() == 1 && map.contains_key("blob") => {
+                    blobs[map["blob"].as_str().unwrap()].clone()
+                }
+                Value::Object(map) => Value::Object(
+                    map.into_iter().map(|(key, value)| (key, resolve(value, blobs))).collect(),
+                ),
+                Value::Array(items) => {
+                    Value::Array(items.into_iter().map(|value| resolve(value, blobs)).collect())
+                }
+                value => value,
+            }
+        }
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../tests/data/conformance/vm/fixtures/signature-gas-boundary.blobs.json"
+        ))
+        .unwrap();
+        for line in
+            include_str!("../tests/data/conformance/vm/fixtures/signature-gas-boundary.jsonl")
+                .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            let context = resolve(row["context"].clone(), &blobs);
+            assert_eq!(
+                run_vm(&context).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+
+    #[test]
     fn integer_context_refuses_nondecimal_and_oversized_text() {
         for text in ["0x123", "+1", "1_0", "NaN", "-", " 1", "1 "] {
             assert!(
