@@ -14,7 +14,7 @@ still refuses `Block`.
 The full 5040-case codec run currently has 4973 equal and 67 refused, with zero
 mismatches or skips; this is incomplete codec coverage. All 5040 frozen effects
 were also checked against the clean pinned C++ build, without changing fixtures.
-An additional115 C++ controls in `executor/src/tests/data/conformance/codec`
+An additional253 C++ controls in `executor/src/tests/data/conformance/codec`
 cover StateInit, MessageRelaxed, strict encoding, masterchain/shard state
 structure, augmented dictionaries and typed-reference budgets.
 They all match; run them alongside the original codec suite. Account storage
@@ -29,11 +29,15 @@ ShardState's handwritten profile checks account depth/balance and queue minimum
 emitted LT, including root-extra copies, after validating referenced children.
 Post-order arithmetic tasks do not charge a second cell visit. Extra-currency
 references survive encoding and failed additions reject rather than retaining a
-stale sum. Empty-side currency merges preserve the other dictionary's original
-labels, following the C++ combine strategy. Generated checks retain their
+stale sum. Currency trie merges preserve untouched subtrees and rebuild common
+paths using the C++ combine strategy, including when both dictionaries are
+nonempty. Generated checks retain their
 independent structural rules. The 40
 handwritten-state controls also pin signed sequence numbers, split-state profile
 differences, explicit emitted LT zero and reference-budget boundaries.
+Another138 review controls cover subtree-label preservation and ShardIdent's
+distinct profiles: generated depth is at most60; handwritten depth uses all
+six bits and checks the workchain sentinel and low-prefix alignment instead.
 The codec writer's decimal context parser also preserves the C++ RefInt parser's
 five balanced base-2^52 limb capacity and syntax, before applying the independent
 VarUInteger byte bound. Parse refusal differs from a valid integer outside the

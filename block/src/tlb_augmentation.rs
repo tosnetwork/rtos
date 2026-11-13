@@ -7,6 +7,9 @@ use crate::{
     Serializable, ShardAccount,
 };
 
+#[path = "tlb_currency_merge.rs"]
+mod currency_merge;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AugKind {
     Accounts,
@@ -147,25 +150,22 @@ pub(crate) fn check_augmented_cell(cell: Cell, n: usize, kind: AugKind) -> Resul
             AugKind::Accounts => {
                 let mut value = DepthBalanceInfo::construct_from(&mut left.clone())?;
                 let mut rhs = DepthBalanceInfo::construct_from(&mut right.clone())?;
-                // CPP dictionary combine returns the other root unchanged
-                // when one side is empty. The ordinary arithmetic API inserts
-                // right-hand entries, which would canonicalize their labels.
-                let right_root = if value.balance().other.is_empty() {
-                    let mut balance = rhs.balance().clone();
-                    let root = std::mem::take(&mut balance.other);
-                    rhs.set_balance(balance);
-                    Some(root)
-                } else {
-                    None
-                };
+                let mut left_balance = value.balance().clone();
+                let mut right_balance = rhs.balance().clone();
+                let left_other = std::mem::take(&mut left_balance.other);
+                let right_other = std::mem::take(&mut right_balance.other);
+                value.set_balance(left_balance);
+                rhs.set_balance(right_balance);
                 if !value.calc(&rhs)? {
                     return Ok(false);
                 }
-                if let Some(root) = right_root {
-                    let mut balance = value.balance().clone();
-                    balance.other = root;
-                    value.set_balance(balance);
-                }
+                let root = currency_merge::combine(
+                    left_other.root().cloned(),
+                    right_other.root().cloned(),
+                )?;
+                let mut balance = value.balance().clone();
+                balance.other = crate::ExtraCurrencyCollection::with_hashmap(root);
+                value.set_balance(balance);
                 encoded_slice(&value)?
             }
             AugKind::OutQueue => {

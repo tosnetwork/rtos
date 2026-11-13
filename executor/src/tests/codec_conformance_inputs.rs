@@ -406,3 +406,30 @@ fn export_handwritten_state_contexts() {
     }
     std::fs::write(path, rows.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
 }
+
+#[test]
+#[ignore]
+fn export_shard_ident_profile_contexts() {
+    let root = state(cell(&zeros(67), &[]), cell(&zeros(11), &[]), None, 0);
+    let refs = (0..root.references_count()).map(|i| root.reference(i).unwrap()).collect::<Vec<_>>();
+    let original = bits_text(&root).unwrap();
+    let mut rows = Vec::new();
+    for depth in [0u8, 1, 2, 59, 60, 61, 62, 63] {
+        let pow = 1u64 << (63 - depth);
+        let mut prefixes = vec![0, 1, 1u64 << 63, u64::MAX, pow, pow - 1];
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        for workchain in [0i32, -1, i32::MIN] {
+            for prefix in &prefixes {
+                let mut bits = original.clone();
+                bits.replace_range(66..72, &format!("{depth:06b}"));
+                bits.replace_range(72..104, &format!("{:032b}", workchain as u32));
+                bits.replace_range(104..168, &format!("{prefix:064b}"));
+                let root = cell(&bits, &refs);
+                rows.push(json!({"fixture_id":format!("depth{depth}-wc{workchain}-prefix{prefix:016x}"),"context":{"type":"ShardState","boc":rtos_block::base64_encode(rtos_block::write_boc(&root).unwrap())}}));
+            }
+        }
+    }
+    let path = std::env::var("RTOS_CODEC_CONTEXTS_OUT").expect("RTOS_CODEC_CONTEXTS_OUT");
+    std::fs::write(path, rows.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+}

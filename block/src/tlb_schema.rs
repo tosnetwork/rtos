@@ -188,8 +188,22 @@ fn bounce_phase(slice: &mut SliceData, profile: TlbProfile) -> bool {
         None => false,
     }
 }
-fn shard_ident(slice: &mut SliceData) -> bool {
-    tag(slice, 2, 0) && matches!(uint(slice, 6), Some(bits) if bits <= 60) && skip(slice, 96)
+fn shard_ident(slice: &mut SliceData, profile: TlbProfile) -> bool {
+    if !tag(slice, 2, 0) {
+        return false;
+    }
+    let Some(bits) = uint(slice, 6) else {
+        return false;
+    };
+    if profile == TlbProfile::Generated {
+        return bits <= 60 && skip(slice, 96);
+    }
+    // The handwritten validator accepts all six-bit depths, but checks the
+    // workchain sentinel and low-prefix alignment instead of the schema bound.
+    let (Some(workchain), Some(prefix)) = (uint(slice, 32), uint(slice, 64)) else {
+        return false;
+    };
+    workchain != 0x8000_0000 && prefix & ((1u64 << (63 - bits)) - 1) == 0
 }
 fn intermediate_address(slice: &mut SliceData) -> bool {
     match bool_bit(slice) {
@@ -519,7 +533,7 @@ impl Walker {
 
     fn shard_state_unsplit(&mut self, slice: &mut SliceData, profile: TlbProfile) -> bool {
         use TlbType::*;
-        if !tag(slice, 32, 0x9023afe2) || !skip(slice, 32) || !shard_ident(slice) {
+        if !tag(slice, 32, 0x9023afe2) || !skip(slice, 32) || !shard_ident(slice, profile) {
             return false;
         }
         let Some(seqno) = uint(slice, 32) else {
@@ -553,7 +567,7 @@ impl Walker {
         flags <= 1
             && seqno > 0
             && vert_seqno >= u64::from(vert_incr)
-            && shard_ident(slice)
+            && shard_ident(slice, TlbProfile::Generated)
             && skip(slice, 32 + 128 + 128)
             && (flags == 0 || (tag(slice, 8, 0xc4) && skip(slice, 96)))
             && (!not_master || self.push_ref(slice, Node::Typed(ExtBlkRef, profile)))
