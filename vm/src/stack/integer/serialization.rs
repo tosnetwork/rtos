@@ -29,6 +29,9 @@ impl IntegerData {
             //   a range check exception is usually generated
             fail!(ExceptionCode::RangeCheckError, "{} is not fit in {} bits", self, bits)
         }
+        if bits == 0 {
+            return Ok(Vec::new());
+        }
         let mut value = self.take_value_of(|x| x.to_bigint())?;
         if big_endian {
             let excess_bits = calc_excess_bits(bits);

@@ -901,8 +901,12 @@ where
     let block_version = engine.block_version();
     let v0 = engine.cc.stack.get_mut(0).withdraw();
     let v0 = v0.as_integer()?;
+    let shift = v0.as_integer_value(0..=1023);
+    if shift.is_err() && (!T::quiet() || block_version < 13) {
+        fail!(ExceptionCode::RangeCheckError);
+    }
     let v1 = engine.cc.stack.get_mut(1).as_integer_mut()?;
-    *v1 = match v0.as_integer_value(0..=1023) {
+    *v1 = match shift {
         Ok(shift) => {
             if RIGHT {
                 v1.shr::<T>(shift)?
@@ -910,14 +914,7 @@ where
                 v1.shl::<T>(shift)?
             }
         }
-        Err(err) => {
-            debug_assert_eq!(tvm_exception_code(&err).unwrap(), ExceptionCode::RangeCheckError);
-            if !T::quiet() || block_version < 14 {
-                return Err(err);
-            } else {
-                IntegerData::nan()
-            }
-        }
+        Err(_) => IntegerData::nan(),
     };
     engine.cc.stack.drop(0)?;
     Ok(())

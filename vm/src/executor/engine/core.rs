@@ -178,7 +178,11 @@ impl EngineTraceInfo<'_> {
 
 impl GasConsumer for Engine {
     fn finalize_cell(&mut self, builder: BuilderData) -> Result<Cell> {
-        self.use_gas(Gas::finalize_price());
+        if self.block_version >= 4 {
+            self.try_use_gas(Gas::finalize_price())?;
+        } else {
+            self.use_gas(Gas::finalize_price());
+        }
         builder
             .finalize(1024)
             .map_err(|err| error!(ExceptionCode::CellOverflow, "finalize cell error: {:?}", err))
@@ -1782,7 +1786,11 @@ impl Engine {
                 t1_items.len()
             ),
         }
-        self.use_gas(Gas::tuple_gas_price(t1_items.len()));
+        if self.block_version >= 4 {
+            self.try_use_gas(Gas::tuple_gas_price(t1_items.len()))?;
+        } else {
+            self.use_gas(Gas::tuple_gas_price(t1_items.len()));
+        }
         *t1 = StackItem::tuple(t1_items);
         self.use_gas(Gas::tuple_gas_price(tuple.len()));
         *self.ctrl_mut(7)? = StackItem::tuple(tuple);
