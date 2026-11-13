@@ -459,13 +459,23 @@ pub(super) fn execute_setlibcode(engine: &mut Engine) -> Status {
     add_action(engine, ACTION_CHANGE_LIB, Some(cell), suffix)
 }
 
+fn reserve_amount(item: &StackItem) -> Result<u128> {
+    let amount = item.as_integer()?;
+    amount.take_value_of(|_| Some(()))?;
+    amount.check_neg()?;
+    if !amount.ufits_in(120)? {
+        fail!(ExceptionCode::CellOverflow, "reserve amount does not fit Grams");
+    }
+    item.as_coins()
+}
+
 /// RAWRESERVE (x y - )
 pub(super) fn execute_rawreserve(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("RAWRESERVE"))?;
     fetch_stack(engine, 2)?;
     let y = engine.cmd.var(0).as_integer_value(0..=0b0001_1111)?;
     let mut suffix = BuilderData::with_raw(vec![y], 8)?;
-    let x = engine.cmd.var(1).as_coins()?;
+    let x = reserve_amount(engine.cmd.var(1))?;
     suffix.append_builder(&serialize_currency_collection(x, None)?)?;
     add_action(engine, ACTION_RESERVE, None, suffix)
 }
@@ -477,7 +487,7 @@ pub(super) fn execute_rawreservex(engine: &mut Engine) -> Status {
     let y = engine.cmd.var(0).as_integer_value(0..=0b0001_1111)?;
     let mut suffix = BuilderData::with_raw(vec![y], 8)?;
     let other = engine.cmd.var(1).as_dict()?;
-    let x = engine.cmd.var(2).as_coins()?;
+    let x = reserve_amount(engine.cmd.var(2))?;
     suffix.append_builder(&serialize_currency_collection(x, other.cloned())?)?;
     add_action(engine, ACTION_RESERVE, None, suffix)
 }

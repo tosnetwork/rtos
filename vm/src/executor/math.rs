@@ -534,6 +534,12 @@ where
     }
 
     fetch_stack(engine, n)?;
+    if (mode.mul_by_shift() || mode.div_by_shift())
+        && !engine.cmd.has_length()
+        && (!T::quiet() || engine.block_version() < 13)
+    {
+        engine.cmd.var(0).as_integer_value(0..=256usize)?;
+    }
     for i in 0..n {
         engine.cmd.var(i).as_integer()?;
     }
@@ -560,7 +566,7 @@ where
                         tvm_exception_code(&err).unwrap(),
                         ExceptionCode::RangeCheckError
                     );
-                    if !T::quiet() || engine.block_version() < 14 {
+                    if !T::quiet() || engine.block_version() < 13 {
                         return Err(err);
                     } else {
                         if mode.need_quotient() {
