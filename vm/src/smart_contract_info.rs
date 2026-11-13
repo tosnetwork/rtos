@@ -749,7 +749,10 @@ fn run_smc_method_with_seed(
     seed: [u8; 32],
     mc_block_id: Option<&BlockIdExt>,
 ) -> Result<SmcMethodResult> {
-    let code = account.get_code().ok_or_else(|| error!("Account has no code"))?;
+    if !account.is_active() {
+        fail!("Getter account is not active");
+    }
+    let code = account.get_code();
     let data = account.get_data().unwrap_or_default();
     let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone())?;
     let current = mc_block_id.cloned().unwrap_or_else(|| {
@@ -815,8 +818,8 @@ fn run_smc_method_with_seed(
     }
 
     let caps = smc_info.config_params.capabilities();
-    let mut vm =
-        Engine::with_capabilities(caps).setup_checked(code, ctrls, stack, gas, libraries)?;
+    let mut vm = Engine::with_capabilities(caps)
+        .setup_with_optional_code(code, ctrls, stack, gas, libraries)?;
 
     let block_version = smc_info.config_params.get_global_version()?.version;
     vm.set_block_version(block_version);

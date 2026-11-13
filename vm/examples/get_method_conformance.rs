@@ -105,13 +105,14 @@ fn run_getter(ctx: &Value) -> Result<Value> {
     if info.config_params.global_version() < 15 {
         libraries.push(account.libraries().inner());
     }
-    let mut vm = Engine::with_capabilities(info.config_params.capabilities()).setup_checked(
-        account.get_code().unwrap_or_default(),
-        controls,
-        Stack::with_storage(storage),
-        Gas::new(gas, 0, gas, 10),
-        libraries,
-    )?;
+    let mut vm = Engine::with_capabilities(info.config_params.capabilities())
+        .setup_with_optional_code(
+            account.get_code(),
+            controls,
+            Stack::with_storage(storage),
+            Gas::new(gas, 0, gas, 10),
+            libraries,
+        )?;
     vm.set_block_version(info.config_params.global_version());
     let result = vm.execute();
     let exit = match &result {

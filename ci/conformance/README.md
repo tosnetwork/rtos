@@ -187,3 +187,10 @@ Malformed protocol inputs refuse; unavailable configuration and inactive account
 states produce their reference outcome classes. Only executed frozen cases with
 zero differences/refusals/skips prove this getter boundary, not whole RPC or
 validator qualification.
+
+Run `vm/tests/data/conformance/get_method` alongside the frozen corpus. Its seven
+clean-C++ controls cover absent, uninitialized, frozen and malformed accounts,
+an active account without code, and configuration failure before account-state
+classification. An absent code root returns fatal(-13) without execution or gas;
+an ordinary empty code cell remains an executable program. The optional-code VM
+setup is shared by the node getter and this target.

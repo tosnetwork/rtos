@@ -36,6 +36,30 @@ fn missing_library_records_last_failed_lookup() {
 }
 
 #[test]
+fn absent_code_is_not_an_empty_program() {
+    use crate::{
+        executor::gas::gas_state::Gas,
+        stack::{savelist::SaveList, Stack},
+    };
+    for (code, exit, gas_used) in [(None, -13, 0), (Some(Cell::default()), 0, 5)] {
+        let mut vm = Engine::with_capabilities(0)
+            .setup_with_optional_code(
+                code,
+                SaveList::new(),
+                Stack::with_storage(vec![StackItem::int(12345)]),
+                Gas::new(1000, 0, 1000, 10),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(vm.execute().unwrap(), exit);
+        assert_eq!(vm.gas_used(), gas_used);
+        assert_eq!(vm.stack().depth(), 1);
+        assert_eq!(vm.stack().get(0).unwrap().as_integer().unwrap().to_string(), "12345");
+        assert_eq!(vm.is_committed_state(), exit == 0);
+    }
+}
+
+#[test]
 fn test_swap_with_any() {
     let mut engine =
         Engine::with_capabilities(0).setup(Default::default(), None, None, None, vec![]).unwrap();

@@ -120,6 +120,7 @@ pub struct Engine {
     visited_cells: HashSet<UInt256>,
     loaded_libraries: HashSet<UInt256>,
     missing_library: Option<UInt256>,
+    code_missing: bool,
     max_library_loads: Option<u32>,
     cstate: Option<(Cell, Cell)>,
     time: u64,
@@ -244,6 +245,7 @@ impl Engine {
             visited_cells: HashSet::new(),
             loaded_libraries: HashSet::new(),
             missing_library: None,
+            code_missing: false,
             max_library_loads: None,
             cstate: None,
             time: 0,
@@ -633,6 +635,11 @@ impl Engine {
         }
     }
     pub fn execute(&mut self) -> Result<i32> {
+        if self.code_missing {
+            // VmState::run returns fatal without executing an uninitialized VM;
+            // RTOS reports the already-complemented external exit code.
+            return Ok(!(ExceptionCode::FatalError as i32));
+        }
         self.trace_info(EngineTraceInfoType::Start, 0, None);
         let result = loop {
             if let Some(result) = self.seek_next_cmd()? {
@@ -1023,6 +1030,22 @@ impl Engine {
         )
     }
 
+    /// Set up a node getter, preserving an absent code root as distinct from
+    /// an ordinary empty code cell. All other setup semantics are shared.
+    pub fn setup_with_optional_code(
+        self,
+        code: Option<Cell>,
+        ctrls: SaveList,
+        stack: Stack,
+        gas: Gas,
+        libraries: Vec<HashmapE>,
+    ) -> Result<Self> {
+        let missing = code.is_none();
+        let mut vm = self.setup_checked(code.unwrap_or_default(), ctrls, stack, gas, libraries)?;
+        vm.code_missing = missing;
+        Ok(vm)
+    }
+
     pub fn setup_checked(
         mut self,
         code: Cell,
@@ -1031,6 +1054,7 @@ impl Engine {
         gas: Gas,
         libraries: Vec<HashmapE>,
     ) -> Result<Self> {
+        self.code_missing = false;
         self.libraries = libraries;
         let slice = self.resolve_init_code_cell(code)?;
         *self.cc.code_mut() = slice.clone();
@@ -1091,6 +1115,7 @@ impl Engine {
             libraries: std::mem::take(&mut self.libraries),
             loaded_libraries: std::mem::take(&mut self.loaded_libraries),
             missing_library: None,
+            code_missing: false,
             max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,
