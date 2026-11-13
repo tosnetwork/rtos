@@ -538,6 +538,7 @@ impl TransactionExecutor for OrdinaryTransactionExecutor {
         log::debug!(target: "executor", "set balance {}", acc_balance.coins);
         account.set_balance(acc_balance);
         log::debug!(target: "executor", "add messages {}, start_lt {}", out_msgs.len(), lt);
+        crate::transaction_executor::normalize_account_special(account);
         let lt = self.add_messages(&mut tr, out_msgs, lt)?;
         log::debug!(target: "executor", "set end_lt {}", lt);
         account.set_last_tr_time(lt);

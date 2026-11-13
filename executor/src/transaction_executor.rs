@@ -131,6 +131,15 @@ fn decode_action(slice: &mut SliceData, version: u32) -> Result<OutAction> {
     }
 }
 
+// Committed account state omits the special tuple when both flags are unset.
+pub(crate) fn normalize_account_special(account: &mut Account) {
+    if let Some(state) = account.state_init_mut() {
+        if state.special.as_ref().is_some_and(|flags| !flags.tick && !flags.tock) {
+            state.special = None;
+        }
+    }
+}
+
 pub(crate) const MAX_ACTIONS: usize = 255;
 
 /// Cell visits of a reference validation of one currency value or action.
@@ -475,7 +484,9 @@ pub trait TransactionExecutor {
                 *acc = result_acc;
                 return Ok((TrComputePhase::skipped(reason), None, None));
             }
-        };
+        } else if !acc.is_active() {
+            return Ok((TrComputePhase::skipped(ComputeSkipReason::NoState), None, None));
+        }
 
         // Match the reference's address-normalization point, including tick/tock
         // transactions with no inbound message. A later precompiled-cost check
