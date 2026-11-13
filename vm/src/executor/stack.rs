@@ -236,7 +236,7 @@ pub(super) fn execute_popctrx(engine: &mut Engine) -> Status {
     if !SaveList::REGS.contains(&creg) {
         fail!(ExceptionCode::RangeCheckError)
     }
-    swap(engine, var!(0), ctrl!(creg))
+    swap(engine, var!(1), ctrl!(creg))
 }
 
 // (x - ), c[0].savelist[i] = c[i], c[i] = x,

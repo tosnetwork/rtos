@@ -269,7 +269,7 @@ fn pfxdictget(engine: &mut Engine, name: &'static str, how: u8) -> Status {
         } else {
             Ok(())
         }
-    } else if how.bit(RET) || get_cont {
+    } else if how.bit(RET) || how.bit(SWITCH) {
         engine.cc.stack.push(engine.cmd.pop_var()?);
         if how.bit(RET) {
             engine.cc.stack.push(boolean!(false));

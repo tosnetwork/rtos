@@ -292,8 +292,12 @@ fn calc_gas_fee(engine: &mut Engine, name: &'static str, simple: bool) -> Status
     let index = if is_masterchain { 2 } else { 3 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
     let prices = GasLimitsPrices::construct_from(&mut slice.clone())?;
-    let gas_fee = if simple { prices.calc_gas_fee_simple(gas) } else { prices.calc_gas_fee(gas) };
-    engine.cc.stack.push(StackItem::int(gas_fee));
+    // The reference VM converts the uint64 configuration prices to signed integers.
+    let variable_gas = if simple { gas } else { gas.saturating_sub(prices.flat_gas_limit) };
+    let product = i128::from(prices.gas_price as i64) * i128::from(variable_gas);
+    let variable_fee = (product + 0xffff) >> 16;
+    let flat_fee = if simple { 0 } else { i128::from(prices.flat_gas_price as i64) };
+    engine.cc.stack.push(StackItem::int(variable_fee + flat_fee));
     Ok(())
 }
 
