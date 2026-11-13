@@ -1733,9 +1733,11 @@ impl GasLimitsPrices {
         u128::try_from(fee).map_err(|_| error!("negative transaction gas fee {fee}"))
     }
 
-    /// Exact ComputePhaseConfig fee, before the Coins serialization boundary.
+    /// Mathematical ComputePhaseConfig fee, before the Coins boundary.
     /// Its scalar multiplication and flat-price addition use signed64 values;
     /// a flat-only result retains the unsigned configuration price.
+    /// This does not emulate the pinned RefInt backend's shared add_tiny
+    /// signed-limb overflow at extreme flat prices; see the conformance scope.
     pub fn compute_gas_price(&self, gas_used: u64) -> i128 {
         if gas_used <= self.flat_gas_limit {
             return i128::from(self.flat_gas_price);
@@ -1788,6 +1790,8 @@ impl GasLimitsPrices {
 
     /// Shared gas-purchase calculation. The caller supplies the selected limit
     /// and its nonnegative threshold view (including temporary gas overrides).
+    /// Defined arithmetic is retained at the known RefInt add_tiny overflow
+    /// boundary, rather than simulating compiler-dependent signed overflow.
     pub fn gas_bought_for(
         &self,
         value: u128,

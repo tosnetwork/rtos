@@ -231,3 +231,15 @@ The seven additional C++ fee controls cover signed storage products, null fees,
 raw special-account history handling, gas and forward-fee widths. Three C++ VM
 controls in `vm/tests/data/conformance/vm` cover signed storage prices on valid
 VM operands. Existing shared expectations remain unchanged.
+
+Fee qualification is limited to the executed frozen corpus and added controls.
+An additional750-case deterministic boundary probe found22gas differences
+(14fee,8purchase) caused by a signed-limb overflow path shared by pinned TOS and
+current TON (`RefInt` scalar add/subtract through `BigInt::add_tiny`). For example,
+gas price0, limit1, flat limit0, flat price9223372036854775807 and balance1 yield
+C++ fee-9223372036854775809 versus the Rust mathematical9223372036854775807.
+The prior native implementation already had this discrepancy. The evidence is
+recorded in memo; deployment/fork reachability and UBSan confirmation are not
+claimed. Under the workspace upstream-first rule, this batch neither changes
+the shared C++ path nor emulates its undefined overflow in Rust. It must not be
+described as equivalence for arbitrary accepted u64 gas contexts.
