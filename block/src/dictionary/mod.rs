@@ -89,6 +89,14 @@ pub struct LabelReader {
 }
 
 impl LabelReader {
+    fn ensure_readable(cursor: &SliceData) -> Result<()> {
+        // A pruned branch commits to unknown contents. Its payload is not an
+        // HmLabel and must never produce an apparent dictionary miss.
+        if cursor.cell_opt().is_some_and(Cell::is_pruned) {
+            fail!(ExceptionCode::PrunedCellAccess)
+        }
+        Ok(())
+    }
     pub fn with_cell(cell: &Cell) -> Result<Self> {
         Self::with_gas_consumer(cell, &mut 0)
     }
@@ -196,6 +204,7 @@ impl LabelReader {
         max: &mut usize,
         mut key: BuilderData,
     ) -> Result<BuilderData> {
+        Self::ensure_readable(cursor)?;
         if !cursor.get_next_bit()? {
             key.append_bytestring(&Self::get_label_short(cursor, max)?)?;
         } else if !cursor.get_next_bit()? {
@@ -206,6 +215,7 @@ impl LabelReader {
         Ok(key)
     }
     pub fn read_label_length(cursor: &mut SliceData, max: usize) -> Result<usize> {
+        Self::ensure_readable(cursor)?;
         if !cursor.get_next_bit()? {
             Self::get_label_short_length(cursor, max)
         } else if !cursor.get_next_bit()? {
@@ -225,6 +235,7 @@ impl LabelReader {
     /// node with fewer bits (an empty cell included) is a cell underflow, as is
     /// a label whose bits are missing; a null root is handled by the callers.
     pub fn read_label(cursor: &mut SliceData, mut max: usize) -> Result<SliceData> {
+        Self::ensure_readable(cursor)?;
         if !cursor.get_next_bit()? {
             Self::get_label_short(cursor, &mut max)
         } else if !cursor.get_next_bit()? {
@@ -652,13 +663,25 @@ pub trait HashmapType {
 
     /// Ordinary hashmap traversal with admission before each label allocation.
     /// The callback admits variable-width value decoding independently.
-    fn iterate_slices_bounded<F>(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget,
-        mut visitor: F) -> Result<bool>
-    where F: FnMut(SliceData, SliceData) -> Result<bool> {
+    fn iterate_slices_bounded<F>(
+        &self,
+        budget: &dyn crate::config_read_budget::ConfigReadBudget,
+        mut visitor: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(SliceData, SliceData) -> Result<bool>,
+    {
         if let Some(root) = self.data() {
-            iterate_internal_bounded::<Self,_>(LabelReader::with_cell(root)?, BuilderData::default(),
-                self.bit_len(), &mut |key,value| visitor(SliceData::load_bitstring(key)?,value), budget)
-        } else { Ok(true) }
+            iterate_internal_bounded::<Self, _>(
+                LabelReader::with_cell(root)?,
+                BuilderData::default(),
+                self.bit_len(),
+                &mut |key, value| visitor(SliceData::load_bitstring(key)?, value),
+                budget,
+            )
+        } else {
+            Ok(true)
+        }
     }
 
     /// returns count of objects in tree - don't use it - try is_empty()
@@ -1305,7 +1328,10 @@ where
     T: HashmapType + ?Sized,
 {
     budget.step()?;
-    let max = (bit_len + 1).checked_next_power_of_two().ok_or_else(|| crate::error!("Dictionary key overflow"))? - 1;
+    let max = (bit_len + 1)
+        .checked_next_power_of_two()
+        .ok_or_else(|| crate::error!("Dictionary key overflow"))?
+        - 1;
     budget.workspace(max / 8 + 1)?;
     if !cursor.already_read() {
         key = cursor.get_label_raw(&mut bit_len, key)?;
@@ -1317,8 +1343,13 @@ where
         for i in 0..2 {
             let mut key = key.clone();
             key.append_bit_bool(i != 0)?;
-            if !iterate_internal_bounded::<T, F>(cursor.next_reader::<T>(i, &mut 0)?, key, bit_len, found, budget)?
-            {
+            if !iterate_internal_bounded::<T, F>(
+                cursor.next_reader::<T>(i, &mut 0)?,
+                key,
+                bit_len,
+                found,
+                budget,
+            )? {
                 return Ok(false);
             }
         }
