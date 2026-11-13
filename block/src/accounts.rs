@@ -1438,6 +1438,42 @@ pub struct ShardAccount {
 }
 
 impl ShardAccount {
+    /// Unpacks the node's account storage view for an expected address. The
+    /// returned slice is the original encoding, including its reference order.
+    /// A nonexisting account has no storage slice.
+    pub fn unpack_storage_slice(
+        root: Cell,
+        workchain: i8,
+        address: &AccountId,
+    ) -> Result<Option<SliceData>> {
+        use crate::config_param_schema::{tlb_type_is_valid, TlbProfile, TlbType};
+        // Account::unpack validates a ShardAccount slice with 1024 reference
+        // visits; the standalone-cell validator also charges its root.
+        if !tlb_type_is_valid(TlbType::ShardAccount, TlbProfile::Handwritten, root.clone(), 1025) {
+            fail!("invalid ShardAccount storage view");
+        }
+        let shard = Self::construct_from_full_cell(root)?;
+        let account = shard.read_account()?;
+        let Some(account_address) = account.get_addr() else { return Ok(None) };
+        if !matches!(account_address, MsgAddressInt::AddrStd(_)) {
+            fail!("account storage requires a standard address");
+        }
+        let (actual_workchain, actual_address) = account_address.extract_std_address(true)?;
+        if actual_workchain != i32::from(workchain) || actual_address != *address {
+            fail!("account storage address differs");
+        }
+        if account.last_tr_time().unwrap_or(0).max(1) <= shard.last_trans_lt() {
+            fail!("account storage logical time does not follow ShardAccount");
+        }
+        let mut slice = SliceData::load_cell(shard.account_cell())?;
+        if !slice.get_next_bit()? {
+            fail!("account storage is missing");
+        }
+        MsgAddressInt::construct_from(&mut slice)?;
+        StorageInfo::construct_from(&mut slice)?;
+        Ok(Some(slice))
+    }
+
     pub fn with_account_root(
         account_root: Cell,
         last_trans_hash: UInt256,

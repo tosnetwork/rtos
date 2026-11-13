@@ -7,7 +7,11 @@
 //! does not depend on visit order because every check must pass and the
 //! visit budget only bounds their total number.
 
-use crate::{Cell, CellType, SliceData};
+use crate::{Cell, CellType, SliceData, VarUIntegerCodec, VarUIntegerEncoding};
+
+#[path = "tlb_schema.rs"]
+mod tlb;
+pub use tlb::{tlb_type_is_valid, TlbProfile, TlbType};
 
 /// Reference visits allowed when checking one configuration parameter.
 pub(crate) const PARAM_VISIT_BUDGET: u32 = 1024;
@@ -22,6 +26,7 @@ pub const SCHEMA_CONFIG_PARAMS: [u32; 50] = [
 
 #[derive(Clone, Copy)]
 enum Leaf {
+    Typed(TlbType, TlbProfile),
     /// `True` or `Unit`: no data.
     Empty,
     /// A fixed-width integer or bit string.
@@ -38,7 +43,11 @@ enum Leaf {
 
 #[derive(Clone, Copy)]
 enum Node {
+    GeneratedAugHashmap(usize, TlbType, TlbType),
+    Typed(TlbType, TlbProfile),
     Param(u32),
+    ConfigParams,
+    ValidatorDescr,
     Hashmap(usize, Leaf),
     ConfigProposalSetup,
     ValidatorTempKey,
@@ -53,13 +62,33 @@ struct Walker {
 
 /// Checks a referenced parameter value as the schema type of `index`.
 pub fn config_param_is_valid(index: u32, cell: Cell) -> bool {
-    visit_all(cell, Node::Param(index), PARAM_VISIT_BUDGET)
+    config_param_is_valid_with_budget(index, cell, PARAM_VISIT_BUDGET)
+}
+
+/// The generated parameter validator with an explicit reference-visit budget.
+pub fn config_param_is_valid_with_budget(index: u32, cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::Param(index), budget)
+}
+
+/// Structural `ValidatorDescr` validation, independent of consensus policy.
+pub fn validator_descr_is_valid_with_budget(cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::ValidatorDescr, budget)
+}
+
+/// Checks a complete `ConfigParams` cell, including its dictionary reference.
+pub fn config_params_is_valid_with_budget(cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::ConfigParams, budget)
 }
 
 /// Checks a `Hashmap 32 ^Cell` root as the `config` field of `ConfigParams`;
 /// the values are references that are not visited.
 pub(crate) fn config_dictionary_shape_is_valid(root: Cell) -> bool {
-    visit_all(root, Node::Hashmap(32, Leaf::AnyRef), CONFIG_SHAPE_VISIT_BUDGET)
+    config_dictionary_shape_is_valid_with_budget(root, CONFIG_SHAPE_VISIT_BUDGET)
+}
+
+/// Checks dictionary structure without following the untyped value references.
+pub fn config_dictionary_shape_is_valid_with_budget(root: Cell, budget: u32) -> bool {
+    visit_all(root, Node::Hashmap(32, Leaf::AnyRef), budget)
 }
 
 fn visit_all(root: Cell, node: Node, budget: u32) -> bool {
@@ -102,16 +131,7 @@ fn leq_width(bound: usize) -> usize {
 
 /// `VarUInteger n`: `len:(#< n) value:(uint (len * 8))`, any encoding length.
 fn var_uinteger(slice: &mut SliceData, n: usize) -> bool {
-    let Some(bound) = n.checked_sub(1) else {
-        return false;
-    };
-    let Some(len) = uint(slice, leq_width(bound)) else {
-        return false;
-    };
-    match usize::try_from(len).ok().filter(|len| *len < n).and_then(|len| len.checked_mul(8)) {
-        Some(bits) => skip(slice, bits),
-        None => false,
-    }
+    VarUIntegerCodec::new(n).is_some_and(|codec| codec.skip(slice, VarUIntegerEncoding::Structural))
 }
 
 fn tomis(slice: &mut SliceData) -> bool {
@@ -227,6 +247,7 @@ impl Walker {
 
     fn leaf(&mut self, slice: &mut SliceData, leaf: Leaf) -> bool {
         match leaf {
+            Leaf::Typed(kind, profile) => self.typed(kind, profile, slice),
             Leaf::Empty => true,
             Leaf::Bits(bits) => skip(slice, bits),
             Leaf::AnyRef => slice.checked_drain_reference().is_ok(),
@@ -263,7 +284,15 @@ impl Walker {
 
     fn node(&mut self, node: Node, slice: &mut SliceData) -> bool {
         match node {
+            Node::GeneratedAugHashmap(n, value, extra) => {
+                self.generated_aug_hashmap(slice, n, value, extra)
+            }
+            Node::Typed(kind, profile) => self.typed(kind, profile, slice),
             Node::Param(index) => self.param(index, slice),
+            Node::ConfigParams => {
+                skip(slice, 256) && self.push_ref(slice, Node::Hashmap(32, Leaf::AnyRef))
+            }
+            Node::ValidatorDescr => validator_descr(slice),
             Node::Hashmap(n, leaf) => self.hashmap(slice, n, leaf),
             // cfg_vote_cfg#36 min_tot_rounds:(## 8) max_tot_rounds:(## 8)
             //   { min_tot_rounds <= max_tot_rounds } min_wins:uint8 max_losses:uint8
