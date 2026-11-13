@@ -60,7 +60,8 @@ enum Node {
 }
 
 struct Walker {
-    pending: Vec<(Cell, Node)>,
+    pending: Vec<(Cell, Node, bool)>,
+    weak: bool,
 }
 
 /// Checks a referenced parameter value as the schema type of `index`.
@@ -95,9 +96,10 @@ pub fn config_dictionary_shape_is_valid_with_budget(root: Cell, budget: u32) -> 
 }
 
 fn visit_all(root: Cell, node: Node, budget: u32) -> bool {
-    let mut walker = Walker { pending: vec![(root, node)] };
+    let mut walker = Walker { pending: vec![(root, node, false)], weak: false };
     let mut remaining = budget;
-    while let Some((cell, node)) = walker.pending.pop() {
+    while let Some((cell, node, weak)) = walker.pending.pop() {
+        walker.weak = weak;
         if let Node::CheckAugmentation(n, kind) = node {
             if !tlb::check_augmented_cell(cell, n, kind).unwrap_or(false) {
                 return false;
@@ -108,7 +110,11 @@ fn visit_all(root: Cell, node: Node, budget: u32) -> bool {
             Some(value) => value,
             None => return false,
         };
-        if cell.cell_type() != CellType::Ordinary {
+        if weak && cell.cell_type() == CellType::PrunedBranch {
+            continue;
+        }
+        let special = matches!(node, Node::Typed(TlbType::MerkleStateUpdate, _));
+        if (cell.cell_type() != CellType::Ordinary) != special {
             return false;
         }
         let Ok(mut slice) = SliceData::load_cell(cell) else {
@@ -212,7 +218,7 @@ impl Walker {
     fn push_ref(&mut self, slice: &mut SliceData, node: Node) -> bool {
         match slice.checked_drain_reference() {
             Ok(cell) => {
-                self.pending.push((cell, node));
+                self.pending.push((cell, node, self.weak));
                 true
             }
             Err(_) => false,

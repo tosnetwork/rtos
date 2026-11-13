@@ -7,6 +7,9 @@ use super::*;
 mod augmentation;
 pub(super) use augmentation::{check_augmented_cell, AugKind};
 
+#[path = "tlb_block_schema.rs"]
+mod block_schema;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TlbProfile {
     Generated,
@@ -31,6 +34,7 @@ pub enum TlbType {
     McStateExtra,
     ShardStateUnsplit,
     ShardState,
+    Block,
     // Internal referenced schema types.
     #[doc(hidden)]
     ExtraCurrencyValue,
@@ -82,6 +86,36 @@ pub enum TlbType {
     MsgEnvelope,
     #[doc(hidden)]
     DispatchQueueEntry,
+    #[doc(hidden)]
+    MerkleStateUpdate,
+    #[doc(hidden)]
+    ValueFlow,
+    #[doc(hidden)]
+    CurrencyQuad,
+    #[doc(hidden)]
+    BlockExtra,
+    #[doc(hidden)]
+    InMsgDescr,
+    #[doc(hidden)]
+    OutMsgDescr,
+    #[doc(hidden)]
+    InMsg,
+    #[doc(hidden)]
+    OutMsg,
+    #[doc(hidden)]
+    ImportFees,
+    #[doc(hidden)]
+    AccountBlock,
+    #[doc(hidden)]
+    TransactionRef,
+    #[doc(hidden)]
+    McBlockExtra,
+    #[doc(hidden)]
+    McBlockExtraAux,
+    #[doc(hidden)]
+    SignaturePair,
+    #[doc(hidden)]
+    ShardAccountBlocks,
 }
 
 /// Checks the whole cell, following typed references with the supplied budget.
@@ -243,7 +277,7 @@ impl Walker {
         }
     }
 
-    fn generated_aug_hashmap_e(
+    pub(super) fn generated_aug_hashmap_e(
         &mut self,
         slice: &mut SliceData,
         n: usize,
@@ -268,6 +302,11 @@ impl Walker {
     ) -> bool {
         use TlbType::*;
         match kind {
+            Block | MerkleStateUpdate | ValueFlow | CurrencyQuad | BlockExtra | InMsgDescr
+            | OutMsgDescr | InMsg | OutMsg | ImportFees | AccountBlock | TransactionRef
+            | McBlockExtra | McBlockExtraAux | SignaturePair | ShardAccountBlocks => {
+                self.block_schema(kind, slice)
+            }
             ShardStateUnsplit => self.shard_state_unsplit(slice, TlbProfile::Generated),
             ShardState => {
                 if profile == TlbProfile::Generated && slice.get_int(32).ok() == Some(0x5f327da5) {

@@ -10,9 +10,13 @@ adapters for BOCs, variable integers, configuration, validators, messages,
 transactions, accounts, storage, currencies, addresses, block headers,
 masterchain state extras and the generated unsplit shard state schema. It
 also validates the generated and handwritten `ShardState` profiles. It
-still refuses `Block`.
-The full 5040-case codec run currently has 4973 equal and 67 refused, with zero
-mismatches or skips; this is incomplete codec coverage. All 5040 frozen effects
+also validates the generated `Block` schema, its nested message and account
+dictionaries, value flow and masterchain extra. MERKLE_UPDATE is special and
+explicitly enables weak validation of its two state references; pruned cells
+consume a visit and are accepted only within that weak subtree.
+The full 5040-case codec run currently has 5040 equal, with zero refusals,
+mismatches or skips. This covers the frozen codec vectors, not every possible
+Block construction or production validation path. All 5040 frozen effects
 were also checked against the clean pinned C++ build, without changing fixtures.
 An additional253 C++ controls in `executor/src/tests/data/conformance/codec`
 cover StateInit, MessageRelaxed, strict encoding, masterchain/shard state

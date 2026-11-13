@@ -278,12 +278,14 @@ fn run_codec(ctx: &Value) -> Result<Value> {
         "McStateExtra" => Some(TlbType::McStateExtra),
         "ShardStateUnsplit" => Some(TlbType::ShardStateUnsplit),
         "ShardState" => Some(TlbType::ShardState),
+        "Block" => Some(TlbType::Block),
         _ => None,
     };
     if let Some(typed) = typed {
         let gen =
             schema::tlb_type_is_valid(typed, TlbProfile::Generated, cell.clone(), budget as u32);
-        let generated_only = matches!(kind, "MessageRelaxed" | "BlockInfo" | "ShardStateUnsplit");
+        let generated_only =
+            matches!(kind, "MessageRelaxed" | "BlockInfo" | "ShardStateUnsplit" | "Block");
         let handwritten = generated_only
             || schema::tlb_type_is_valid(
                 typed,

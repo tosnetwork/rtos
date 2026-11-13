@@ -108,7 +108,7 @@ impl Walker {
         };
         // LIFO: all references pushed below are checked before this task.
         // This task is not a new cell visit and must not consume budget.
-        self.pending.push((cell, Node::CheckAugmentation(n, kind)));
+        self.pending.push((cell, Node::CheckAugmentation(n, kind), self.weak));
         let (value, extra) = kind.types();
         if rest == 0 {
             self.typed(extra, TlbProfile::Handwritten, slice)
