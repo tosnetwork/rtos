@@ -237,11 +237,9 @@ fn set_index(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     } else {
         unreachable!("internal error in set_index, how = {}", how)
     };
-    let mut tuple = if how.bit(QUIET) && engine.cmd.var(params - 1).is_null() {
-        vec![]
-    } else {
-        engine.cmd.var_mut(params - 1).as_tuple_mut()?
-    };
+    let null_tuple = how.bit(QUIET) && engine.cmd.var(params - 1).is_null();
+    let mut tuple =
+        if null_tuple { vec![] } else { engine.cmd.var_mut(params - 1).as_tuple_mut()? };
     let var = engine.cmd.var_mut(params - 2).withdraw();
     let len = tuple.len();
     if n < len {
@@ -256,7 +254,11 @@ fn set_index(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     } else {
         fail!(ExceptionCode::RangeCheckError, "set_index failed {} >= {}", n, len)
     }
-    engine.cc.stack.push_tuple(tuple);
+    if null_tuple && tuple.is_empty() {
+        engine.cc.stack.push_null();
+    } else {
+        engine.cc.stack.push_tuple(tuple);
+    }
     Ok(())
 }
 

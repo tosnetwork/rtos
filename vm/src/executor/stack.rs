@@ -391,6 +391,9 @@ pub(super) fn execute_pushint_big(engine: &mut Engine) -> Status {
     engine
         .load_instruction(Instruction::new("PUSHINT").set_opts(InstructionOptions::BigInteger))?;
     let num = engine.cmd.biginteger_mut();
+    if !num.fits_in(257)? {
+        fail!(ExceptionCode::IntegerOverflow, "integer constant exceeds 257 signed bits");
+    }
     engine.cc.stack.push(StackItem::int(num.withdraw()));
     Ok(())
 }
@@ -783,7 +786,7 @@ pub(super) fn execute_xcpu2(engine: &mut Engine) -> Status {
     let ra = engine.cmd.sregs3().ra;
     let rb = engine.cmd.sregs3().rb;
     let rc = engine.cmd.sregs3().rc;
-    if engine.cc.stack.depth() <= cmp::max(1, cmp::max(ra, cmp::max(rb, rc))) {
+    if engine.cc.stack.depth() <= cmp::max(ra, cmp::max(rb, rc)) {
         fail!(ExceptionCode::StackUnderflow);
     }
     engine.cc.stack.swap(0, ra)?;

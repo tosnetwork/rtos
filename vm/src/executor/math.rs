@@ -454,7 +454,7 @@ where
 {
     unary::<T>(engine, "BITSIZE", |x| {
         if x.is_nan() {
-            on_nan_parameter!(T)?;
+            T::on_range_check_error(file!(), line!())?;
             Ok(IntegerData::nan())
         } else if x.is_zero() {
             Ok(IntegerData::zero())
@@ -838,16 +838,16 @@ pub(super) fn execute_pow2<T>(engine: &mut Engine) -> Status
 where
     T: OperationBehavior,
 {
-    unary::<T>(engine, "POW2", |x| match x.as_integer_value(0..=1023) {
-        Ok(shift) => IntegerData::one().shl::<T>(shift),
-        Err(exception) => match tvm_exception_code(&exception) {
-            Some(ExceptionCode::IntegerOverflow) => {
-                on_integer_overflow!(T)?;
-                Ok(IntegerData::nan())
-            }
-            _ => Err(exception),
-        },
-    })
+    engine.load_instruction(Instruction::new("POW2").set_name_prefix(T::name_prefix()))?;
+    fetch_stack(engine, 1)?;
+    let x = engine.cmd.var(0).as_integer()?;
+    let result = match x.as_integer_value(0..=1023) {
+        Ok(shift) => IntegerData::one().shl::<T>(shift)?,
+        Err(_) if T::quiet() && engine.block_version() >= 13 => IntegerData::nan(),
+        Err(err) => return Err(err),
+    };
+    engine.cc.stack.push(StackItem::integer(result));
+    Ok(())
 }
 
 // (x - sign(x))

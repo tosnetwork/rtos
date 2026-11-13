@@ -22,9 +22,9 @@ use crate::{
 };
 use num::{bigint::Sign, BigInt};
 use rtos_block::{
-    fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, IBitstring, MsgAddressInt,
-    MsgForwardPrices, Result, SizeLimitsConfig, SliceData, Status, ACTION_CHANGE_LIB,
-    ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE,
+    error, fail, BuilderData, Cell, Deserializable, ExceptionCode, GasConsumer, IBitstring,
+    MsgAddressInt, MsgForwardPrices, Result, SizeLimitsConfig, SliceData, Status,
+    ACTION_CHANGE_LIB, ACTION_RESERVE, ACTION_SEND_MSG, ACTION_SET_CODE,
 };
 
 fn get_bigint(slice: &SliceData) -> BigInt {
@@ -553,7 +553,7 @@ where
     fetch_stack(engine, 1)?;
     let mut slice = engine.cmd.var(0).as_slice()?.clone();
     let result = match parse_address(&mut slice) {
-        Ok(addr) => match op(addr, engine) {
+        Ok(addr) if slice.is_empty_cell() => match op(addr, engine) {
             Ok(mut stack) => {
                 stack.drain(..).for_each(|var| {
                     engine.cc.stack.push(var);
@@ -562,6 +562,7 @@ where
             }
             Err(err) => Some(err),
         },
+        Ok(_) => Some(error!(ExceptionCode::CellUnderflow, "trailing address data")),
         Err(err) => Some(err),
     };
     if T::quiet() {

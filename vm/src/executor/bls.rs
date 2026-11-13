@@ -109,7 +109,8 @@ pub(super) fn execute_bls_aggregate(engine: &mut Engine) -> Status {
         signs_refs.push(sign.as_slice().try_into()?);
     }
 
-    let res = aggregate_pure_bls_signatures(&signs_refs)?;
+    let res = aggregate_pure_bls_signatures(&signs_refs)
+        .map_err(|err| error!(ExceptionCode::UnknownError, "{}", err))?;
     engine
         .cc
         .stack

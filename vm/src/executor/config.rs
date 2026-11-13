@@ -29,8 +29,15 @@ use rtos_block::{
 fn execute_config_param(engine: &mut Engine, name: &'static str, opt: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 1)?;
-    let index: i32 = engine.cmd.var(0).as_integer_value(i32::MIN..=i32::MAX)?;
-    if let Some(value) = engine.get_config_param(index)? {
+    let index = engine.cmd.var(0).as_integer()?.as_integer_value(i32::MIN..=i32::MAX).ok();
+    let value = if let Some(index) = index {
+        engine.get_config_param(index)?
+    } else {
+        // The configuration root is checked even when the integer is not a key.
+        engine.smci_param(9)?.as_dict()?;
+        None
+    };
+    if let Some(value) = value {
         engine.cc.stack.push(StackItem::Cell(value));
         if !opt {
             engine.cc.stack.push(boolean!(true));

@@ -25,9 +25,15 @@ use rtos_block::{fail, sha512_digest, ExceptionCode, Sha256, Status};
 pub(crate) fn execute_addrand(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ADDRAND"))?;
     fetch_stack(engine, 1)?;
+    let input = engine.cmd.var(0).as_integer()?;
+    input.take_value_of(|_| Some(()))?;
+    if !input.ufits_in(256)? {
+        fail!(ExceptionCode::RangeCheckError, "mixed seed is out of range");
+    }
+    let input = input.as_u256()?;
     let mut hasher = Sha256::new();
     hasher.update(engine.rand()?.as_u256()?);
-    hasher.update(engine.cmd.var(0).as_integer()?.as_u256()?);
+    hasher.update(input);
     let sha256 = hasher.finalize();
     engine.set_rand(IntegerData::from_u256(sha256)?)?;
     Ok(())
@@ -37,9 +43,11 @@ pub(crate) fn execute_addrand(engine: &mut Engine) -> Status {
 pub(crate) fn execute_rand(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("RAND"))?;
     fetch_stack(engine, 1)?;
+    let input = engine.cmd.var(0).as_integer()?;
+    input.take_value_of(|_| Some(()))?;
     let sha512 = sha512_digest(engine.rand()?.as_u256()?);
     let value = IntegerData::from_unsigned_bytes_be(&sha512[32..]);
-    let rand = value.mul_shr256::<Signaling>(engine.cmd.var(0).as_integer()?)?;
+    let rand = value.mul_shr256::<Signaling>(input)?;
     engine.cc.stack.push(StackItem::integer(rand));
     engine.set_rand(IntegerData::from_u256(&sha512[..32])?)?;
     Ok(())
