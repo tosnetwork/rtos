@@ -392,4 +392,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn tick_tock_ignores_precompiled_cost_overrides() {
+        for line in
+            include_str!("../src/tests/data/conformance/txn/fixtures/tick-precompiled-scope.jsonl")
+                .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
 }

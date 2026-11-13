@@ -102,3 +102,8 @@ between physical uninit storage and logical frozen transaction status. StateInit
 message hashing keeps its original encoding; account options normalize when the
 account is committed or frozen. These controls do not qualify the remaining
 currency-width and other transaction differences.
+
+`tick-precompiled-scope` contains12 pinned C++ controls proving that configured
+precompiled costs apply to ordinary transactions, while tick/tock uses normal
+VM gas and steps. The optional global precompiled-list record still decodes;
+tick/tock skips only the contract lookup and cost override.

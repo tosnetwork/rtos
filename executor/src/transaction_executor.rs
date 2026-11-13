@@ -572,7 +572,13 @@ pub trait TransactionExecutor {
 
         let code_hash = code.repr_hash();
         let precompiled = self.config().raw_config().precompiled_contracts_list()?;
-        let precompiled = if let Some(list) = precompiled { list.get(&code_hash)? } else { None };
+        // The reference applies configured precompiled costs only to ordinary
+        // transactions; tick/tock executes the account's code at normal VM cost.
+        let precompiled = if let Some(list) = precompiled.filter(|_| is_ordinary) {
+            list.get(&code_hash)?
+        } else {
+            None
+        };
         if let Some(precompiled) = precompiled.as_ref() {
             // Upstream 495113c8: external credit has no limit until ACCEPT;
             // admission depends on the gas the account can purchase.
