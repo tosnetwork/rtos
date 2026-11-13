@@ -38,7 +38,7 @@ To exercise active signing, build both programs with the explicit isolated
 signing feature and use the frozen `8f083dc` C++ snapshot:
 
 ```sh
-cargo +1.91.1 build -p rtos --bin rtos --bin interop_validator_prepare \
+cargo +1.100.0 build -p rtos --bin rtos --bin interop_validator_prepare \
   --features isolated-consensus-signing --locked
 "$CPP_PYTHON" ci/interop/mixed_bootstrap.py \
   --snapshot "$CPP_SNAPSHOT" --rust-node "$RUST_NODE" \
@@ -106,8 +106,8 @@ that Rust process. Node initialization remains the operator's responsibility.
 Build the node and the independent BOC checker first:
 
 ```sh
-cargo +1.91.1 build -p rtos --bin rtos --locked
-cargo +1.91.1 build -p rtos_api --example interop_block_check --locked
+cargo +1.100.0 build -p rtos --bin rtos --locked
+cargo +1.100.0 build -p rtos_api --example interop_block_check --locked
 python3 ci/interop/local_compare.py \
   --global-config /data/tos-global.json \
   --cpp-rpc http://127.0.0.1:8015/jsonRPC \
