@@ -76,3 +76,11 @@ blob files are standard shared-runner inputs; they are also executed by the
 VM example's native test. Run them alongside the main frozen VM corpus. Refill
 only with the C++ `conformance.py regenerate --reference` command, preserving
 its recorded provenance; never fill expectations from the Rust target.
+
+The transaction corpus in `executor/src/tests/data/conformance/txn/fixtures` also
+includes five `precompiled-external-admission` contexts checked against the frozen
+C++ reference. Three preserve original gas-credit field-width errors after the
+contract accepts; two exercise acceptance and rejection with a 2^62+1 fallback
+budget. They cover the upstream `495113c8` external admission and credit-only
+initialization fix. They do not qualify fallback budgets above signed i64 range;
+those require additional reference investigation.

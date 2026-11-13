@@ -292,4 +292,20 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn external_precompiled_admission_uses_purchasable_gas() {
+        for line in include_str!(
+            "../src/tests/data/conformance/txn/fixtures/precompiled-external-admission.jsonl"
+        )
+        .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                run_txn(&row["context"]).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
 }

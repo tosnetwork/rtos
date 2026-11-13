@@ -556,7 +556,11 @@ pub trait TransactionExecutor {
         let precompiled = self.config().raw_config().precompiled_contracts_list()?;
         let precompiled = if let Some(list) = precompiled { list.get(&code_hash)? } else { None };
         if let Some(precompiled) = precompiled.as_ref() {
-            if gas.get_gas_limit() < precompiled.gas_usage as i64 {
+            // Upstream 495113c8: external credit has no limit until ACCEPT;
+            // admission depends on the gas the account can purchase.
+            let available =
+                if is_external { gas.get_gas_max() } else { gas.get_gas_limit() } as u64;
+            if precompiled.gas_usage > available {
                 log::debug!(target: "executor", "skip computing phase no gas for precompiled contract");
                 return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None, None));
             }
@@ -570,9 +574,10 @@ pub trait TransactionExecutor {
             );
             let gas_limit =
                 if is_special { gas_config.special_gas_limit } else { gas_config.gas_limit };
+            // The fallback starts unaccepted externals on credit alone.
             let gas_credit = if gas.get_gas_credit() != 0 { gas_limit } else { 0 };
             gas = Gas::new(
-                gas_limit as i64,
+                if gas_credit != 0 { 0 } else { gas_limit as i64 },
                 gas_credit as i64,
                 gas_limit as i64,
                 gas_config.get_real_gas_price() as i64,
