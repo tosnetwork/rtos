@@ -5,6 +5,36 @@ RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`,
 `block`, `get_method` and `fee`; unsupported harnesses return `harness_error` and must not
 be counted as passing.
 
+The provisional `rtos_executor --example codec_conformance` target adds codec
+adapters for BOCs, variable integers, configuration, validators, messages,
+transactions, accounts, storage, currencies, addresses, block headers,
+masterchain state extras and the generated unsplit shard state schema. It
+still refuses `Block` and `ShardState`.
+The full 5040-case codec run currently has 4948 equal and 92 refused, with zero
+mismatches or skips; this is incomplete codec coverage. All 5040 frozen effects
+were also checked against the clean pinned C++ build, without changing fixtures.
+An additional75 C++ controls in `executor/src/tests/data/conformance/codec`
+cover StateInit, MessageRelaxed, strict encoding, masterchain/shard state
+structure, augmented dictionaries and typed-reference budgets.
+They all match; run them alongside the original codec suite. Account storage
+facts preserve the original slice and reference order, after native structural,
+address and logical-time checks, without canonicalizing its encoding.
+The ignored example test `export_constructed_state_codec_contexts` writes new
+state-schema inputs to `RTOS_CODEC_CONTEXTS_OUT`. Fill effects only with the
+clean pinned C++ CLI. These generated schema validators do not perform the
+handwritten augmentation arithmetic; McStateExtra's handwritten validator
+delegates to the generated validator in C++ as well.
+
+The native configuration schema now requires both queue-limit fields in CP43 v3
+and rejects CP47, which the pinned C++ schema does not define. The older compressed
+native corpus stays intact. Its 390 CP43/47 inputs use separately refreshed C++
+verdicts, tied to their original input fingerprints; 11 verdicts changed. To
+reproduce, export with the ignored `export_existing_schema_43_47_contexts` test
+and `RTOS_CFG_CORPUS_OUT` pointing outside Git, then use
+`ci/conformance/refresh_config_schema.py --help`. Keep raw contexts and effects on
+retained storage. The script checks the clean reference commit against `REFERENCE`
+and never uses Rust effects to fill expectations.
+
 The suite source and frozen vectors are pinned by `REFERENCE` to a TOS commit.
 Each fixture retains its own reference-build provenance. Running frozen vectors
 is distinct from regenerating them against a newer C++ baseline.
