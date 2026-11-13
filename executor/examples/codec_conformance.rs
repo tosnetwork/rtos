@@ -80,6 +80,25 @@ fn canonical(facts: &mut Value, codec: VarUIntegerCodec, value: Option<&BigInt>)
     }
     Ok(())
 }
+fn decimal_integer(text: &str) -> Result<BigInt> {
+    // RefInt's decimal parser accepts an empty string as zero. Its physical
+    // capacity is five balanced base-2^52 limbs, wider than a VM integer.
+    if text.is_empty() {
+        return Ok(BigInt::from(0));
+    }
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    ensure!(
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        "value: decimal integer required"
+    );
+    let value: BigInt = text.parse()?;
+    let half = BigInt::from(1) << 51usize;
+    let places: BigInt = (0..5).map(|i| BigInt::from(1) << (52 * i)).sum();
+    let min = -&half * &places;
+    let max = (&half - 1) * places;
+    ensure!(value >= min && value <= max, "value: decimal integer required");
+    Ok(value)
+}
 fn run_varuint(ctx: &Value) -> Result<Value> {
     let n = usize::try_from(int(ctx, "n", None)?)?;
     let codec = VarUIntegerCodec::new(n).ok_or_else(|| anyhow!("n must be within 1..32"))?;
@@ -87,7 +106,7 @@ fn run_varuint(ctx: &Value) -> Result<Value> {
     if op == "write" {
         let text = text(ctx, "value")?;
         ensure!(text.len() <= 90, "value: too long");
-        let value: BigInt = text.parse()?;
+        let value = decimal_integer(text)?;
         let Some(builder) = codec.write(&value)? else {
             return Ok(rejected("range", &[], json!({})));
         };
@@ -385,3 +404,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[path = "../src/tests/codec_conformance_inputs.rs"]
 mod fixture_inputs;
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_protocol_matches_cpp() {
+        let rows: Vec<_> =
+            include_str!("../src/tests/data/codec-decimal-reference.jsonl").lines().collect();
+        assert_eq!(rows.len(), 15);
+        for line in rows {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["reference_commit"], "1181c08ed4c2d88425e6ee66efff6d696714495d");
+            assert_eq!(row["reference_dirty"], false);
+            let actual = run_codec(&row["context"])
+                .unwrap_or_else(|e| json!({"harness_error":e.to_string()}));
+            assert_eq!(actual, row["effects"], "{}", row["context"]);
+        }
+    }
+}

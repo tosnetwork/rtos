@@ -24,6 +24,13 @@ state-schema inputs to `RTOS_CODEC_CONTEXTS_OUT`. Fill effects only with the
 clean pinned C++ CLI. These generated schema validators do not perform the
 handwritten augmentation arithmetic; McStateExtra's handwritten validator
 delegates to the generated validator in C++ as well.
+The codec writer's decimal context parser also preserves the C++ RefInt parser's
+five balanced base-2^52 limb capacity and syntax, before applying the independent
+VarUInteger byte bound. Parse refusal differs from a valid integer outside the
+encoding range. Fifteen clean-C++ protocol records in
+`executor/src/tests/data/codec-decimal-reference.jsonl` pin those boundaries,
+including empty text and malformed syntax; the example test checks the actual
+responses. Expected protocol refusals are not counted as passing shared fixtures.
 
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed
