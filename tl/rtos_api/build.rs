@@ -38,16 +38,38 @@ fn main() {
     files.sort();
 
     let mut input = String::new();
+    let mut domains = String::from("&[\n");
     for file in files {
         if !input.is_empty() {
             input += "---types---\n";
         }
+        let start = input.len();
         fs::File::open(&file)
             .unwrap_or_else(|_| {
                 panic!("Unable to open file for reading: {}", file.to_string_lossy())
             })
             .read_to_string(&mut input)
             .unwrap_or_else(|_| panic!("Unable to read file contents: {}", file.to_string_lossy()));
+        let schema = match file.file_name().unwrap().to_str().unwrap() {
+            "lite_api.tl" => "lite_api",
+            "ton_api.tl" => "tos_api",
+            "tonlib_api.tl" => "toslib_api",
+            _ => unreachable!(),
+        };
+        let mut function = false;
+        for rtos_tl_codegen::parser::Matched(item, _) in
+            rtos_tl_codegen::parser::parse_string(&input[start..]).expect("parse schema domains")
+        {
+            use rtos_tl_codegen::parser::{Delimiter, Item};
+            match item {
+                Item::Delimiter(delimiter) => function = delimiter == Delimiter::Functions,
+                Item::Constructor(constructor) => {
+                    if let Some(id) = constructor.tl_id {
+                        domains += &format!("({id}, {schema:?}, {function}),\n");
+                    }
+                }
+            }
+        }
         println!("cargo:rerun-if-changed={}", file.to_string_lossy());
     }
 
@@ -73,6 +95,8 @@ fn main() {
     // Otherwise a shared target can reuse this build script's fingerprint in
     // another worktree whose ignored src/ton directory has never been generated.
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+    domains += "]";
+    fs::write(out_dir.join("schema_domains.rs"), domains).expect("write schema domains");
     let generated = out_dir.join("ton");
     rtos_tl_codegen::generate_code_for(config, &input, &generated);
     // A path module preserves the generated root's inner attributes and its

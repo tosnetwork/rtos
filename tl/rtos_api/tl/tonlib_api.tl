@@ -387,3 +387,7 @@ raw.getAccountMetaByBlock block_root_hash:int256 account_id:int256 = raw.ShardAc
 raw.getAppliedShardsInfo = raw.AppliedShardsInfo;
 raw.getShardAccountState account_address:accountAddress = raw.ShardAccountState;
 raw.getShardAccountMeta account_address:accountAddress = raw.ShardAccountMeta;
+
+---types---
+// Current target record; the original one-field legacy record remains explicit.
+raw.extMessageInfoV2#28cf2fe3 hash:bytes hash_norm:bytes = raw.ExtMessageInfo;

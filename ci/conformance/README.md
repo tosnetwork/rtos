@@ -60,6 +60,19 @@ encoding range. Fifteen clean-C++ protocol records in
 including empty text and malformed syntax; the example test checks the actual
 responses. Expected protocol refusals are not counted as passing shared fixtures.
 
+The `rtos_api --example tl_conformance` target provides the TL wire harness.
+It checks the root schema and object/function domain from build-generated native
+schema metadata, then uses the T0 generated decoder and serializer. It reads no
+fixture effects. The pinned174 original TL cases and56 added schema/domain
+controls agree with clean CPP1181. Explicit target declarations retain the CPP
+constructor IDs while referencing the existing native tonNode types. Changed
+layouts have separate T0 types, including normalized raw message hashes; legacy
+structs remain available through Legacy, and obsolete layouts are rejected by T0.
+This is frozen-vector agreement, not arbitrary TL input or whole-node qualification.
+The focused wire-profile tests pass. The broader API library run retains the
+same sorted-size-list test failure reproduced at unchanged6fb1a144; its full
+library result is6passed/1failed/1ignored and is not reported as green.
+
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed
 native corpus stays intact. Its 390 CP43/47 inputs use separately refreshed C++

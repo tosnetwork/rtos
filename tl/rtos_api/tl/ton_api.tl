@@ -1179,3 +1179,58 @@ consensus.stats.events id:int256 events:(vector consensus.stats.timestampedEvent
 consensus.simplex.stats.voted vote:consensus.simplex.UnsignedVote = consensus.stats.Event;
 consensus.simplex.stats.certObserved vote:consensus.simplex.UnsignedVote = consensus.stats.Event;
 consensus.simplex.stats.voteReceived sender_idx:int vote:consensus.simplex.UnsignedVote = consensus.stats.Event;
+
+// Generated-schema additions ported from clean TOS1181. Explicit IDs retain
+// the target namespace CRC while the native API keeps its historical tonNode names.
+
+---types---
+engine.validator.collatorNodeWhitelist#e324f031 enabled:Bool adnl_ids:(vector int256) = engine.validator.CollatorNodeWhitelist;
+engine.validator.collatorsList#eb17eafc shards:(vector engine.validator.collatorsList.shard) = engine.validator.CollatorsList;
+engine.validator.collatorsList.collator#d11f938e adnl_id:int256 = engine.validator.collatorsList.Collator;
+engine.validator.collatorsList.shard#485c4d7d shard_id:tonNode.shardId collators:(vector engine.validator.collatorsList.collator) self_collate:Bool select_mode:string = engine.validator.collatorsList.Shard;
+engine.validator.configProposalDetail#5c2b3739 flags:# block:tonNode.blockIdExt meta:flags.0?engine.validator.configProposalMeta value:flags.1?bytes = engine.validator.ConfigProposalDetail;
+engine.validator.configProposalMeta#1bad0e80 flags:# hash:int256 expires:int critical:Bool param_id:int param_hash:flags.0?int256 has_value:Bool vset_id:int256 voters:(vector int) weight_remaining:long rounds_remaining:int wins:int losses:int = engine.validator.ConfigProposalMeta;
+engine.validator.configProposals#f4beb3ff block:tonNode.blockIdExt proposals:(vector engine.validator.configProposalMeta) = engine.validator.ConfigProposals;
+engine.validator.electionParticipant#b22e2334 id:int256 stake:bytes max_factor:int adnl:int256 key_id:int256 = engine.validator.ElectionParticipant;
+engine.validator.electorState#c1e08ae5 block:tonNode.blockIdExt elect_at:int elect_close:int min_stake:bytes total_stake:bytes failed:Bool finished:Bool participants:(vector engine.validator.electionParticipant) past_elections:(vector engine.validator.pastElection) returned:(vector engine.validator.returnedStake) = engine.validator.ElectorState;
+engine.validator.frozenStake#b375613b id:int256 owner:int256 weight:long stake:bytes banned:Bool = engine.validator.FrozenStake;
+engine.validator.pastElection#6f0d48d9 election_id:int unfreeze_at:int stake_held:int vset_hash:int256 total_stake:bytes bonuses:bytes frozen:(vector engine.validator.frozenStake) = engine.validator.PastElection;
+engine.validator.returnedStake#ffcf1839 wallet:int256 amount:bytes = engine.validator.ReturnedStake;
+engine.validator.shardBlockVerifierConfig.shard#a41a2d18 shard_id:tonNode.shardId trusted_nodes:(vector int256) required_confirms:int = engine.validator.shardBlockVerifierConfig.Shard;
+---functions---
+engine.validator.addCollator#6ffb5781 adnl_id:int256 shard:tonNode.shardId = engine.validator.Success;
+engine.validator.addQuicAddr#dbb8eac6 ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
+engine.validator.clearCollatorsList#c6f4b24e = engine.validator.Success;
+engine.validator.collatorNodeSetWhitelistEnabled#f7e24955 enabled:Bool = engine.validator.Success;
+engine.validator.collatorNodeSetWhitelistedValidator#15cd0649 adnl_id:int256 add:Bool = engine.validator.Success;
+engine.validator.createPqStakeAuthorization#ebb6ddd4 election_date:int max_factor:int adnl_addr:int256 src_addr:int256 = engine.validator.PqStakeAuthorization;
+engine.validator.delCollator#e0d59ac5 adnl_id:int256 shard:tonNode.shardId = engine.validator.Success;
+engine.validator.getConfigProposal#e57f583d flags:# block:flags.0?tonNode.blockIdExt hash:int256 = engine.validator.ConfigProposalDetail;
+engine.validator.getConfigProposals#6e80ea19 flags:# block:flags.0?tonNode.blockIdExt = engine.validator.ConfigProposals;
+engine.validator.getElectorState#cf280039 flags:# block:flags.0?tonNode.blockIdExt wallets:(vector int256) = engine.validator.ElectorState;
+engine.validator.showCollatorNodeWhitelist#8060d7f9 = engine.validator.CollatorNodeWhitelist;
+engine.validator.showCollatorsList#2fc05215 = engine.validator.CollatorsList;
+
+---types---
+engine.validator.pqStakeAuthorization#c4eeeadb validator_id:int256 key_id:int256 algorithm_id:int public_key:bytes signature:bytes = engine.validator.PqStakeAuthorization;
+
+---types---
+// Current target layouts have distinct native types; legacy structs stay intact.
+adnl.stats.localIdT0#ee13ee74 short_id:int256 current_decrypt:(vector adnl.stats.ipPackets) packets_recent:adnl.stats.localIdPackets peers:(vector adnl.stats.peerPair) = adnl.stats.LocalIdT0;
+engine.collator#4204c255 adnl_id:int256 shard:tonNode.shardId = engine.Collator;
+engine.validator.collatorOptionsT0#043e2881 deferring_enabled:Bool defer_messages_after:int defer_out_queue_size_limit:long dispatch_phase_2_max_total:int dispatch_phase_3_max_total:int dispatch_phase_2_max_per_initiator:int dispatch_phase_3_max_per_initiator:int whitelist:(vector string) prioritylist:(vector string) force_full_collated_data:Bool ignore_collated_data_limits:Bool = engine.validator.CollatorOptionsT0;
+engine.validator.configT0#5abd3e2b out_port:int addrs:(vector engine.Addr) adnl:(vector engine.adnl) dht:(vector engine.dht) validators:(vector engine.validator) collators:(vector engine.collator) fullnode:int256 fullnodeslaves:(vector engine.validator.fullNodeSlave) fullnodemasters:(vector engine.validator.fullNodeMaster) fullnodeconfig:engine.validator.fullNodeConfig extraconfig:engine.validator.extraConfigT0 liteservers:(vector engine.liteServer) control:(vector engine.controlInterface) shards_to_monitor:(vector tonNode.shardId) gc:engine.gc = engine.validator.ConfigT0;
+engine.validator.extMessagePoolConfig#4f5143c7 max_mempool_messages:int num_regular_checkers:int num_priority_checkers:int max_admission_waiters:int max_ext_msg_per_addr:int max_ext_msg_per_addr_time_window:double local_ls_message_priority:int = engine.validator.ExtMessagePoolConfig;
+engine.validator.extraConfigT0#c1d8d09b state_serializer_enabled:Bool fast_sync_member_certificates:(vector engine.validator.fastSyncMemberCertificate) collator_node_whitelist:engine.validator.collatorNodeWhitelist fast_sync_overlay_clients:(vector engine.validator.fastSyncOverlayClient) ext_message_pool_config:engine.validator.extMessagePoolConfig pq_consensus:engine.validator.pqConsensus = engine.validator.ExtraConfigT0;
+engine.validator.fastSyncMemberCertificate#d4ea9e1f adnl_id:int256 certificate:overlay.MemberCertificate = engine.validator.FastSyncMemberCertificate;
+engine.validator.fastSyncOverlayClient#5326e875 adnl_id:int256 slot:int = engine.validator.FastSyncOverlayClient;
+engine.validator.overlayStatsT0#857eb803 overlay_id:int256 overlay_id_full:PublicKey adnl_id:int256 scope:string nodes:(vector engine.validator.overlayStatsNodeT0) stats:(vector engine.validator.oneStat) total_traffic:engine.validator.overlayStatsTraffic total_traffic_responses:engine.validator.overlayStatsTraffic broadcasts:(vector engine.validator.overlayStatsBroadcasts) extra:string = engine.validator.OverlayStatsT0;
+engine.validator.overlayStatsBroadcasts#4500a07e source:int256 ts_start:double ts_end:double count:long total_size:long total_out_traffic:long = engine.validator.OverlayStatsBroadcasts;
+engine.validator.overlayStatsNodeT0#d9a5aaa3 adnl_id:int256 ip_addr:string is_neighbour:Bool is_alive:Bool node_flags:int bdcst_errors:int fec_bdcst_errors:int last_in_query:int last_out_query:int traffic:engine.validator.overlayStatsTraffic traffic_responses:engine.validator.overlayStatsTraffic last_ping_at:double last_ping_time:double = engine.validator.OverlayStatsNodeT0;
+engine.validator.pqConsensus#e1fb5bca validator_id:int256 consensus_key_file:string keys:(vector engine.validator.pqConsensusKey) = engine.validator.PqConsensus;
+engine.validator.pqConsensusKey#16ea71fc consensus_key_file:string valid_from:int expire_at:int = engine.validator.PqConsensusKey;
+liteserver.descT0#ed630375 id:PublicKey ip:int port:int hostname:string = liteserver.DescT0;
+liteserver.descV2T0#fbf56136 id:PublicKey ip:int port:int hostname:string slices:(vector liteserver.descV2.Slice) = liteserver.DescV2T0;
+
+---types---
+engine.quicAddr#580bca07 ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.Addr;

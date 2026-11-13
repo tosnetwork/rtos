@@ -28,6 +28,7 @@ pub enum WireProfile {
 // against the fixed reference schema before inclusion. Differing layouts are
 // deliberately excluded below instead of disguising them as an ID change.
 const CONSTRUCTORS: &[(u32, u32)] = &[
+    (0x88c9550b, 0x0d788eda), // liteserver.descV2.sliceSimple
     (0x7079c751, 0x8f2f8967), // liteServer.accountState
     (0x098fe72d, 0xdbd35e42), // liteServer.allShardsInfo
     (0xa574ed6c, 0x8890f1c9), // liteServer.blockData
@@ -165,8 +166,21 @@ const CONSTRUCTORS: &[(u32, u32)] = &[
 ];
 
 // These carriers never existed in the historical generated network domain.
-const TARGET_ONLY: &[u32] =
-    &[0x535666d0, 0x590da166, 0x5e6f085d, 0x8f4731ef, 0xfb759362, 0xf9f0b390];
+const TARGET_ONLY: &[u32] = &[
+    0x535666d0, 0x590da166, 0x5e6f085d, 0x8f4731ef, 0xfb759362, 0xf9f0b390, 0xe324f031, 0xeb17eafc,
+    0xd11f938e, 0x485c4d7d, 0x5c2b3739, 0x1bad0e80, 0xf4beb3ff, 0xb22e2334, 0xc1e08ae5, 0xb375613b,
+    0x6f0d48d9, 0xffcf1839, 0xa41a2d18, 0x6ffb5781, 0xdbb8eac6, 0xc6f4b24e, 0xf7e24955, 0x15cd0649,
+    0xebb6ddd4, 0xe0d59ac5, 0xe57f583d, 0x6e80ea19, 0xcf280039, 0x8060d7f9, 0x2fc05215, 0xc4eeeadb,
+    0xee13ee74, 0x4204c255, 0x043e2881, 0x5abd3e2b, 0x4f5143c7, 0xc1d8d09b, 0xd4ea9e1f, 0x5326e875,
+    0x857eb803, 0x4500a07e, 0xd9a5aaa3, 0xe1fb5bca, 0x16ea71fc, 0xed630375, 0xfbf56136, 0x580bca07,
+    0x28cf2fe3,
+];
+
+// Replaced target layouts have separate native types, not ID-only translations.
+const REPLACED_LEGACY_LAYOUTS: &[u32] = &[
+    0x1cf255fe, 0x90eb94e8, 0xc54f971a, 0x51301646, 0x6fb4f54b, 0xd1c744d2, 0xc449a474, 0x4b0f1c8b,
+    0x34197fae,
+];
 
 const UNSUPPORTED: &[u32] = &[
     0xc85af8a4, // consensus.simplex.db.cert
@@ -181,12 +195,26 @@ const UNSUPPORTED: &[u32] = &[
 ];
 
 impl WireProfile {
+    /// Whether a boxed constructor belongs to the named generated schema domain.
+    /// This checks only the root; nested fields still use their generated types.
+    pub fn constructor_in_schema(self, id: u32, schema: &str, function: bool) -> bool {
+        let Ok(id) = self.decode_constructor(id) else {
+            return false;
+        };
+        const DOMAINS: &[(u32, &str, bool)] =
+            include!(concat!(env!("OUT_DIR"), "/schema_domains.rs"));
+        DOMAINS.contains(&(id, schema, function))
+    }
+
     pub(crate) fn encode_constructor(self, id: u32) -> Result<u32> {
         if self == Self::Legacy {
             if TARGET_ONLY.contains(&id) {
                 fail!("Target-only constructor {id:08x} has no legacy wire codec");
             }
             return Ok(id);
+        }
+        if REPLACED_LEGACY_LAYOUTS.contains(&id) {
+            fail!("Legacy constructor {id:08x} has a different target layout");
         }
         if UNSUPPORTED.contains(&id) {
             fail!("Constructor {id:08x} has no target wire codec");
@@ -200,6 +228,9 @@ impl WireProfile {
                 fail!("Target-only constructor {id:08x} has no legacy wire codec");
             }
             return Ok(id);
+        }
+        if REPLACED_LEGACY_LAYOUTS.contains(&id) {
+            fail!("Legacy constructor {id:08x} has a different target layout");
         }
         if UNSUPPORTED.contains(&id) {
             fail!("Constructor {id:08x} has no target wire codec");
