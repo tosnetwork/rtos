@@ -1,9 +1,9 @@
 # Shared conformance target
 
 The target executes contexts from the TOS conformance suite and emits the effects of
-RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`
-and `block`; unsupported harnesses return `harness_error` and must not be counted
-as passing.
+RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`,
+`block` and `get_method`; unsupported harnesses return `harness_error` and must not
+be counted as passing.
 
 The suite source and frozen vectors are pinned by `REFERENCE` to a TOS commit.
 Each fixture retains its own reference-build provenance. Running frozen vectors
@@ -162,3 +162,28 @@ a zero-state history record with an incorrect sequence number. The first uses
 a synthetic non-ShardState previous root: successful update validation and
 application must reach `prev_state_malformed`. The second must fail configuration
 extraction before any transaction, even when the account-block dictionary is empty.
+
+## Getter target
+
+Build `cargo build -p rtos_vm --example get_method_conformance --locked`, then run
+the shared runner with that target against
+`$TOS_REFERENCE/test/conformance/vectors/get_method`. Its `get_method` line protocol
+accepts the account, masterchain snapshot and block identity, explicit time/LT,
+seed, signed64 method ID, arguments and gas limit. It uses the node getter's c7
+helper and native VM, rather than libemulator's different getter profile. Library
+selection uses global dictionaries first and excludes account libraries from15.
+Missing-library hashes come from actual failed native VM lookups.
+
+From version16 the node getter c7 has19 fields, with its last field always null;
+it has no authenticated incoming-message statistics. The shared frozen fixtures
+remain unchanged. The legacy getter TSVs retain their older snapshot hashes;
+`python3 ci/conformance/refresh_getter_shape.py "$TOS_REFERENCE"` updates only the
+scalar shape probes and the final null field of legacy c7 expectations, using
+the pinned C++ effects. It never executes Rust to derive expected values.
+
+Inputs remain limited to16MiB per line,255 initial arguments and depth32; output
+uses the VM target's canonical stack renderer with depth512 and2^20 visited values.
+Malformed protocol inputs refuse; unavailable configuration and inactive account
+states produce their reference outcome classes. Only executed frozen cases with
+zero differences/refusals/skips prove this getter boundary, not whole RPC or
+validator qualification.

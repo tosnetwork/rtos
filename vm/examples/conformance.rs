@@ -26,7 +26,7 @@ fn integer(v: &Value) -> Result<i64> {
 fn array(v: &Value) -> Result<&Vec<Value>> {
     v.as_array().ok_or_else(|| anyhow!("expected array"))
 }
-fn parse_item(v: &Value, depth: usize) -> Result<StackItem> {
+pub(crate) fn parse_item(v: &Value, depth: usize) -> Result<StackItem> {
     ensure!(depth <= 32, "stack item nesting too deep");
     Ok(match string(&v["type"])? {
         "null" => StackItem::None,
@@ -59,7 +59,7 @@ fn parse_item(v: &Value, depth: usize) -> Result<StackItem> {
 fn hash(cell: &Cell) -> String {
     format!("{:X}", cell.repr_hash())
 }
-fn render(item: &StackItem, depth: usize, budget: &mut usize) -> Result<String> {
+pub(crate) fn render(item: &StackItem, depth: usize, budget: &mut usize) -> Result<String> {
     ensure!(depth <= 512, "final stack value nested too deep");
     *budget = budget.checked_sub(1).ok_or_else(|| anyhow!("final stack value too large"))?;
     Ok(match item {
