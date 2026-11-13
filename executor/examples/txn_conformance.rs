@@ -203,3 +203,67 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_storage_matches_reference_for_existing_and_new_accounts() {
+        fn resolve(value: Value, blobs: &Value) -> Value {
+            match value {
+                Value::Object(map) if map.len() == 1 && map.contains_key("blob") => {
+                    blobs[map["blob"].as_str().unwrap()].clone()
+                }
+                Value::Object(map) => {
+                    Value::Object(map.into_iter().map(|(k, v)| (k, resolve(v, blobs))).collect())
+                }
+                Value::Array(items) => {
+                    Value::Array(items.into_iter().map(|v| resolve(v, blobs)).collect())
+                }
+                v => v,
+            }
+        }
+        let blobs: Value = serde_json::from_str(include_str!(
+            "../src/tests/data/conformance/txn/fixtures/seeded-storage-usage.blobs.json"
+        ))
+        .unwrap();
+        for line in
+            include_str!("../src/tests/data/conformance/txn/fixtures/seeded-storage-usage.jsonl")
+                .lines()
+        {
+            let row: Value = serde_json::from_str(line).unwrap();
+            let context = resolve(row["context"].clone(), &blobs);
+            if row["metadata"]["fixture_id"] == "existing-unchanged-usage" {
+                let shard =
+                    ShardAccount::construct_from_cell(boc(&context["shard_account"]).unwrap())
+                        .unwrap();
+                let mut account = shard.read_account().unwrap();
+                assert!(account.calc_and_check_storage_stat_dict(u32::MAX).is_err());
+                let mut preview = shard.read_account().unwrap();
+                let used = preview.storage_info().unwrap().used().clone();
+                let original_data = preview.state_init().unwrap().data.clone();
+                let changed = rtos_block::BuilderData::with_raw(vec![0xa5, 0x5a], 16)
+                    .unwrap()
+                    .into_cell()
+                    .unwrap();
+                preview.state_init_mut().unwrap().data = Some(changed.clone());
+                preview.precalc_storage_stat().unwrap();
+                preview.state_init_mut().unwrap().data = original_data.clone();
+                preview.precalc_storage_stat().unwrap();
+                assert_eq!(preview.storage_info().unwrap().used(), &used);
+                preview.state_init_mut().unwrap().data = Some(changed);
+                preview.calc_storage_stat_dict(u32::MAX).unwrap();
+                preview.state_init_mut().unwrap().data = original_data;
+                preview.precalc_storage_stat().unwrap();
+                assert!(preview.storage_info().unwrap().used().cells() > 0);
+            }
+            assert_eq!(
+                run_txn(&context).unwrap(),
+                row["effects"],
+                "{}",
+                row["metadata"]["fixture_id"]
+            );
+        }
+    }
+}

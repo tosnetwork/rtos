@@ -72,6 +72,9 @@ struct SeededStorageUsage {
 /// `cache` into `dict` via hashmap_multiset. After a flush `cache` is NOT cleared — the entries
 /// are kept (with `ref_count_diff = 0`) as a hot L1 over `dict` for subsequent operations.
 ///
+/// Decoded original accounts may also carry supplied usage independently of subtree totals.
+/// This survives previews and is released when changed roots are finalized.
+///
 /// Three meaningful initial states from constructors:
 /// - empty: `Default` / `empty()` / `new(_, used)` with `used.cells == 0` — everything zero.
 /// - seeded: `new(storage, used)` with non-empty used — totals trusted from `used`, but `dict`
@@ -125,6 +128,9 @@ impl std::fmt::Debug for AccountStorageStat {
 
 impl AccountStorageStat {
     pub fn new(storage: &AccountStorage, used: &StorageUsed) -> Self {
+        if used.cells() == 0 {
+            return Self::empty();
+        }
         let Ok(storage_cell) = storage.write_to_new_cell() else {
             return Self::empty();
         };
@@ -132,15 +138,7 @@ impl AccountStorageStat {
         let (Some(total_cells), Some(total_bits)) =
             (used.cells().checked_sub(1), used.bits().checked_sub(storage_root_bits))
         else {
-            let mut stat = Self::empty();
-            // Keep supplied usage even when it cannot seed child totals. Unchanged
-            // references carry that usage; actual subtree counts remain separate.
-            stat.seeded_usage = Some(SeededStorageUsage {
-                roots: Self::get_roots(storage.state_init()),
-                used: used.clone(),
-                root_bits: storage_root_bits,
-            });
-            return stat;
+            return Self::empty();
         };
         Self {
             dict: StorageStatDict::new(),
@@ -151,6 +149,33 @@ impl AccountStorageStat {
             dict_updated: false,
             seeded_usage: None,
             hint: Default::default(),
+        }
+    }
+
+    /// Only a decoded original account may carry supplied usage. Fresh
+    /// constructors must count their new storage, even when initialized to zero.
+    pub(crate) fn from_account_usage(storage: &AccountStorage, used: &StorageUsed) -> Self {
+        let mut stat = Self::new(storage, used);
+        if let Ok(cell) = storage.write_to_new_cell() {
+            let root_bits = cell.length_in_bits() as u64;
+            if used.cells() == 0 || used.bits() < root_bits {
+                stat.seeded_usage = Some(SeededStorageUsage {
+                    roots: Self::get_roots(storage.state_init()),
+                    used: used.clone(),
+                    root_bits,
+                });
+            }
+        }
+        stat
+    }
+
+    pub(crate) fn clear_usage_seed(&mut self) {
+        self.seeded_usage = None;
+    }
+
+    pub(crate) fn finish_usage_update(&mut self) {
+        if self.seeded_usage.as_ref().is_some_and(|seed| seed.roots != self.roots) {
+            self.seeded_usage = None;
         }
     }
 
@@ -289,7 +314,6 @@ impl AccountStorageStat {
                 return StorageUsed::with_values_checked(seed.used.cells(), bits);
             }
         }
-        self.seeded_usage = None;
         StorageUsed::with_values_checked(
             self.total_cells + 1,
             self.total_bits + cell.bit_length() as u64,

@@ -579,6 +579,7 @@ impl AccountStuff {
     }
     fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
         self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        self.storage_stat.finish_usage_update();
         if self.storage_info.used.cells.as_u64() >= dict_hash_min_cells as u64
             && !self.addr.is_masterchain()
         {
@@ -598,6 +599,7 @@ impl AccountStuff {
     ) -> Result<Option<Cell>> {
         let dict_hash = self.storage_info.dict_hash().cloned();
         let used = self.storage_info.used.clone();
+        self.storage_stat.clear_usage_seed();
         let result = self.calc_storage_stat_dict(dict_hash_min_cells)?;
         if dict_hash.as_ref() != self.storage_info.dict_hash() {
             fail!(
@@ -1247,7 +1249,7 @@ impl Account {
         let balance = Deserializable::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let storage_stat = AccountStorageStat::from_account_usage(&storage, &storage_info.used);
         Ok(Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat }))
     }
 
@@ -1258,7 +1260,7 @@ impl Account {
         let balance = CurrencyCollection::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let storage_stat = AccountStorageStat::from_account_usage(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Ok(Account::with_stuff(stuff))
     }
