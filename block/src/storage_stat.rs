@@ -53,6 +53,13 @@ impl Deserializable for StorageStatCellInfo {
 define_HashmapE!(StorageStatDict, 256, StorageStatCellInfo);
 pub type StorageRoots = SmallVec<[Cell; 3]>;
 
+#[derive(Clone, Debug, PartialEq)]
+struct SeededStorageUsage {
+    roots: StorageRoots,
+    used: StorageUsed,
+    root_bits: u64,
+}
+
 /// Per-account storage statistics over the `code`/`data`/`library` subtrees of `StateInit`.
 /// Counts total cells/bits (excluding the `AccountStorage` root itself) and tracks per-cell
 /// refcount + merkle depth. The dictionary form is serializable, its repr_hash lands in
@@ -86,6 +93,7 @@ pub struct AccountStorageStat {
     total_bits: u64,
     cache: ahash::AHashMap<UInt256, StorageStatCellInfo>,
     dict_updated: bool,
+    seeded_usage: Option<SeededStorageUsage>,
     // Hashes of cells that existed in the previous state — lets the incremental recalc survive a
     // pruned (collated-data) proof of that state.
     //
@@ -117,9 +125,6 @@ impl std::fmt::Debug for AccountStorageStat {
 
 impl AccountStorageStat {
     pub fn new(storage: &AccountStorage, used: &StorageUsed) -> Self {
-        if used.cells() == 0 {
-            return Self::empty();
-        }
         let Ok(storage_cell) = storage.write_to_new_cell() else {
             return Self::empty();
         };
@@ -127,7 +132,15 @@ impl AccountStorageStat {
         let (Some(total_cells), Some(total_bits)) =
             (used.cells().checked_sub(1), used.bits().checked_sub(storage_root_bits))
         else {
-            return Self::empty();
+            let mut stat = Self::empty();
+            // Keep supplied usage even when it cannot seed child totals. Unchanged
+            // references carry that usage; actual subtree counts remain separate.
+            stat.seeded_usage = Some(SeededStorageUsage {
+                roots: Self::get_roots(storage.state_init()),
+                used: used.clone(),
+                root_bits: storage_root_bits,
+            });
+            return stat;
         };
         Self {
             dict: StorageStatDict::new(),
@@ -136,6 +149,7 @@ impl AccountStorageStat {
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            seeded_usage: None,
             hint: Default::default(),
         }
     }
@@ -148,6 +162,7 @@ impl AccountStorageStat {
             total_bits: 0,
             cache: Default::default(),
             dict_updated: true,
+            seeded_usage: None,
             hint: Default::default(),
         }
     }
@@ -172,6 +187,7 @@ impl AccountStorageStat {
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            seeded_usage: None,
             hint: Default::default(),
         })
     }
@@ -257,9 +273,23 @@ impl AccountStorageStat {
     }
 
     pub fn calc_stat(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
-        self.replace_roots(Self::get_roots(storage.state_init()))?;
+        let roots = Self::get_roots(storage.state_init());
+        self.replace_roots(roots.clone())?;
 
         let cell = storage.serialize()?;
+        if let Some(seed) = &self.seeded_usage {
+            if roots == seed.roots {
+                let root_bits = cell.bit_length() as u64;
+                let bits = if root_bits >= seed.root_bits {
+                    seed.used.bits().checked_add(root_bits - seed.root_bits)
+                } else {
+                    seed.used.bits().checked_sub(seed.root_bits - root_bits)
+                }
+                .ok_or_else(|| error!("storage usage bit count out of range"))?;
+                return StorageUsed::with_values_checked(seed.used.cells(), bits);
+            }
+        }
+        self.seeded_usage = None;
         StorageUsed::with_values_checked(
             self.total_cells + 1,
             self.total_bits + cell.bit_length() as u64,
