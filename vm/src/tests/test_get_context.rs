@@ -22,6 +22,48 @@ fn getter_version16_import_slot_is_present_and_null() {
         }
     }
 }
+
+#[test]
+fn node_getter_without_code_does_not_read_precompiled_dictionary() {
+    let ctx = include_str!(
+        "../../tests/data/conformance/get_method/fixtures/review-account-boundary.jsonl"
+    )
+    .lines()
+    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+    .find(|record| record["metadata"]["fixture_id"] == "no-code-pruned-precompiled")
+    .unwrap()["context"]
+        .clone();
+    let cell = |key: &str| {
+        read_single_root_boc(rtos_block::base64_decode(ctx[key].as_str().unwrap()).unwrap())
+            .unwrap()
+    };
+    let account = Account::construct_from_full_cell(cell("account")).unwrap();
+    assert!(account.get_code().is_none());
+    let id = &ctx["mc_block"];
+    let id = BlockIdExt::with_params(
+        rtos_block::ShardIdent::masterchain(),
+        id["seqno"].as_u64().unwrap() as u32,
+        id["root_hash"].as_str().unwrap().parse().unwrap(),
+        id["file_hash"].as_str().unwrap().parse().unwrap(),
+    );
+    let result = run_smc_method_with_seed(
+        &account,
+        cell("mc_state"),
+        ctx["method_id"].as_str().unwrap().parse().unwrap(),
+        Vec::new(),
+        ctx["now"].as_u64().unwrap() as u32,
+        ctx["lt"].as_u64().unwrap(),
+        [0; 32],
+        Some(&id),
+    )
+    .unwrap();
+    assert_eq!((result.exit_code, result.gas_used), (-13, 0));
+    assert!(!result.code_present);
+    let outer = result.initial_c7(true).unwrap().as_tuple_mut().unwrap();
+    let fields = outer[0].as_tuple().unwrap();
+    assert!(fields[10].is_null());
+    assert!(fields[16].is_null());
+}
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

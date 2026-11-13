@@ -86,6 +86,8 @@ pub struct SmcMethodResult {
     pub gas_used: i64,
     pub stack: Vec<StackItem>,
     pub smc_info: SmartContractInfo,
+    /// Preserve absence for initial-c7 responses after a null-code VM run.
+    pub code_present: bool,
 }
 
 impl SmcMethodResult {
@@ -100,7 +102,9 @@ impl SmcMethodResult {
         full: bool,
         rng: &mut R,
     ) -> Result<StackItem> {
-        let mut context = self.smc_info.as_get_method_data_item()?;
+        let mut context = self.smc_info.as_get_method_data_item_with_code(
+            self.code_present.then_some(&self.smc_info.mycode),
+        )?;
         if full {
             return Ok(context);
         }
@@ -422,7 +426,7 @@ impl SmartContractInfo {
         Ok(StackItem::tuple(fields))
     }
 
-    fn get_method_precompiled(&self) -> Result<Option<rtos_block::PrecompiledSmc>> {
+    fn get_method_precompiled(&self, code: &Cell) -> Result<Option<rtos_block::PrecompiledSmc>> {
         let Some(param) = self.config_params.config_params.get(45u32.write_to_bitstring()?)? else {
             return Ok(None);
         };
@@ -440,7 +444,7 @@ impl SmartContractInfo {
         {
             return Ok(None);
         }
-        let Some(mut entry) = list.get(self.mycode.repr_hash().write_to_bitstring()?)? else {
+        let Some(mut entry) = list.get(code.repr_hash().write_to_bitstring()?)? else {
             return Ok(None);
         };
         Ok(rtos_block::PrecompiledSmc::construct_from(&mut entry)
@@ -452,6 +456,12 @@ impl SmartContractInfo {
     /// authenticated message import; from version16 the incoming storage slot
     /// is present and null. Historical tuple lengths remain observable.
     pub fn as_get_method_data_item(&self) -> Result<StackItem> {
+        self.as_get_method_data_item_with_code(Some(&self.mycode))
+    }
+
+    /// Getter profile with the account's actual optional code root. No-code
+    /// accounts must not look up a precompiled entry for an empty-cell hash.
+    pub fn as_get_method_data_item_with_code(&self, code: Option<&Cell>) -> Result<StackItem> {
         let version = self.config_params.global_version();
         let mut outer = self.as_temp_data_item().as_tuple_mut()?;
         let mut fields = outer.remove(0).as_tuple_mut()?;
@@ -467,6 +477,9 @@ impl SmartContractInfo {
             19
         };
         fields.truncate(length);
+        if version >= 4 {
+            fields[10] = code.map_or(StackItem::None, |cell| StackItem::cell(cell.clone()));
+        }
         if version >= 16 {
             // A getter never has authenticated message import statistics,
             // including when this helper is used with a transaction profile.
@@ -474,7 +487,8 @@ impl SmartContractInfo {
         }
         if version >= 6 {
             // A configured zero cost is an integer, distinct from no entry.
-            let precompiled = self.get_method_precompiled()?;
+            let precompiled =
+                code.map(|cell| self.get_method_precompiled(cell)).transpose()?.flatten();
             fields[16] = precompiled
                 .map(|contract| StackItem::int(contract.gas_usage))
                 .unwrap_or(StackItem::None);
@@ -805,7 +819,7 @@ fn run_smc_method_with_seed(
     let stack = Stack::with_storage(storage);
 
     let mut ctrls = SaveList::new();
-    ctrls.put(7, smc_info.as_get_method_data_item()?)?;
+    ctrls.put(7, smc_info.as_get_method_data_item_with_code(code.as_ref())?)?;
     ctrls.put(4, StackItem::Cell(data))?;
 
     let gas = Gas::new(1000000, 0, 1000000, 1000000);
@@ -818,6 +832,7 @@ fn run_smc_method_with_seed(
     }
 
     let caps = smc_info.config_params.capabilities();
+    let code_present = code.is_some();
     let mut vm = Engine::with_capabilities(caps)
         .setup_with_optional_code(code, ctrls, stack, gas, libraries)?;
 
@@ -839,7 +854,7 @@ fn run_smc_method_with_seed(
     log::debug!("run_smc_method: result_stack_depth={}\n", stack.len());
     log::debug!("run_smc_method: result_stack dump: [ {} ]\n", render_stack(&stack));
 
-    Ok(SmcMethodResult { exit_code, gas_used: vm.gas_used(), stack, smc_info })
+    Ok(SmcMethodResult { exit_code, gas_used: vm.gas_used(), stack, smc_info, code_present })
 }
 
 #[cfg(test)]

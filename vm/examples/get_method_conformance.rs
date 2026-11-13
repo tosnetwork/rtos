@@ -6,8 +6,9 @@ mod shared;
 
 use anyhow::{anyhow, ensure, Result};
 use rtos_block::{
-    base64_decode, read_single_root_boc, Account, BlockIdExt, Cell, ConfigParams, Deserializable,
-    ExceptionCode, HashmapAugType, KeyExtBlkRef, ShardIdent, ShardStateUnsplit, UInt256,
+    base64_decode, read_single_root_boc, Account, BlockError, BlockIdExt, Cell, ConfigParams,
+    Deserializable, ExceptionCode, HashmapAugType, KeyExtBlkRef, ShardIdent, ShardStateUnsplit,
+    SliceData, UInt256,
 };
 use rtos_vm::{
     error::{tvm_exception_code, tvm_exception_or_custom_code},
@@ -82,8 +83,24 @@ fn run_getter(ctx: &Value) -> Result<Value> {
         Ok(result) => result,
         Err(_) => return Ok(json!({"outcome":"context_unavailable"})),
     };
+    ensure!(!account_root.is_pruned(), "account root is pruned");
+    let standard = SliceData::load_cell(account_root.clone())?.get_next_bit().unwrap_or(false);
+    if !standard {
+        return Ok(json!({"outcome":"no_state"}));
+    }
     let account = match Account::construct_from_full_cell(account_root) {
         Ok(account) if account.is_active() => account,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<ExceptionCode>(),
+                Some(ExceptionCode::PrunedCellAccess)
+            ) || matches!(
+                error.downcast_ref::<BlockError>(),
+                Some(BlockError::PrunedCellAccess(_))
+            ) =>
+        {
+            return Err(error)
+        }
         _ => return Ok(json!({"outcome":"no_state"})),
     };
     let mut info = SmartContractInfo::with_params(Some(&account), None, None)?;
@@ -97,7 +114,7 @@ fn run_getter(ctx: &Value) -> Result<Value> {
     } else {
         StackItem::None
     });
-    let c7 = info.as_get_method_data_item()?;
+    let c7 = info.as_get_method_data_item_with_code(account.get_code().as_ref())?;
     let mut controls = SaveList::new();
     controls.put(7, c7)?;
     controls.put(4, StackItem::cell(account.get_data().unwrap_or_default()))?;
@@ -165,4 +182,30 @@ fn main() -> Result<()> {
         ensure!(size <= 16 << 20, "context too large");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pruned_account_refuses_after_configuration_is_checked() {
+        let record: Value =
+            serde_json::from_str(include_str!("../tests/data/getter-protocol/pruned-account.json"))
+                .unwrap();
+        assert!(record["reference_effect"].get("harness_error").is_some());
+        let mut ctx = record["context"].clone();
+        assert!(run_getter(&ctx).is_err(), "unknown account is not no_state");
+        let invalid_config: Value = serde_json::from_str(
+            include_str!(
+                "../tests/data/conformance/get_method/fixtures/account-availability.jsonl"
+            )
+            .lines()
+            .last()
+            .unwrap(),
+        )
+        .unwrap();
+        ctx["mc_state"] = invalid_config["context"]["mc_state"].clone();
+        assert_eq!(run_getter(&ctx).unwrap(), json!({"outcome":"context_unavailable"}));
+    }
 }

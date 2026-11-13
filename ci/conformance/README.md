@@ -194,3 +194,10 @@ an active account without code, and configuration failure before account-state
 classification. An absent code root returns fatal(-13) without execution or gas;
 an ordinary empty code cell remains an executable program. The optional-code VM
 setup is shared by the node getter and this target.
+
+Two review controls also require the standard C++ Account constructor tag and
+skip precompiled lookup when code is absent, even with a pruned CP45 dictionary.
+The node's optional-code c7 helper and initial-c7 responses preserve this absence.
+A pruned Account is an incomplete context and refuses after configuration has
+been checked. Its separate protocol test is outside the shared fixture corpus;
+refusals must not be counted as executed conformance successes.
