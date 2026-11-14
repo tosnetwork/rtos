@@ -166,7 +166,7 @@ pub struct ExplicitSessionOptions {
     pub max_deps: u32,
     pub max_serialized_block_size: u32,
     pub block_hash_covers_data: bool,
-    pub max_block_height_coeff: u32,
+    pub max_block_height_coeff: u64,
     pub debug_disable_db: bool,
     pub round_candidates: u32,
     pub next_candidate_delay: f64,
@@ -186,11 +186,10 @@ impl ExplicitSessionOptions {
             idle_timeout: f64::from(config.consensus_timeout_ms) * 0.001,
             max_deps: config.catchain_max_deps,
             max_serialized_block_size: 16 * 1024,
-            block_hash_covers_data: true,
+            block_hash_covers_data: config.proto_version >= 2,
             // The reference commits the low uint32 word of this uint64 product.
-            max_block_height_coeff: (u64::from(config.catchain_max_blocks_coeff)
-                * u64::from(catchain.mc_catchain_lifetime.max(catchain.shard_catchain_lifetime)))
-                as u32,
+            max_block_height_coeff: u64::from(config.catchain_max_blocks_coeff)
+                * u64::from(catchain.mc_catchain_lifetime.max(catchain.shard_catchain_lifetime)),
             debug_disable_db: false,
             round_candidates: config.round_candidates,
             next_candidate_delay: f64::from(config.next_candidate_delay_ms) * 0.001,

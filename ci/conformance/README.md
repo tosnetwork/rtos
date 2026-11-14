@@ -88,8 +88,8 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
-weight, validator-set, protocol-version, session and vote APIs.
-The first189 frozen controls agree with clean CPP1181; the remaining79 consensus
+weight, validator-set, protocol-version, session, vote and structural proof APIs.
+The first208 frozen controls agree with clean CPP1181; the remaining60 consensus
 contexts explicitly refuse as unsupported operations and are not passes. Run
 the whole consensus directory so those gaps remain visible. The raw numeric
 `quorum_weight_reached` predicate matches C++ even for total0 or signed weight
@@ -108,8 +108,22 @@ while retaining raw wire coordinates at the structural boundary. Node finality
 keeps its membership, admitted-block and canonical candidate checks.
 Additional787 session/vote/version probes match C++, and the earlier2138 weight
 and set probes still agree (12 mutual protocol errors remain separately reported).
-Finality and proof operations still need adapters; this does not qualify a
+Finality and proof-link verification still need adapters; this does not qualify a
 running consensus network or proof acceptance.
+The native proof envelope keeps signatures opaque until header and state-update
+checks finish. Its shard unpacker uses the C++ unpack profile (depth at most60),
+which differs from the handwritten validator profile above. Structural header
+reading validates inline fields and reference shape while leaving previous-block
+references opaque; the existing full reader still traverses those references.
+Key-block contexts derive validator subsets and both session identities through
+native APIs. Supplied key blocks are test anchors, not authenticated chain state.
+Another25 clean-C++ controls cover pruned roots, previous references, shard
+alignment, trailing data, reserved fields and versioned governing options.
+Together the original268 and added49 contexts yield257 equal, zero mismatches
+and60 explicit unsupported refusals. Param29 options expose the full uint64
+height-coefficient product while committing its low32 wire bits; the block-hash
+flag follows the version2 boundary. A separate raw probe pins a product above
+uint32; it is outside the shared fixture schema and is not counted in257.
 Session JSON retains the two double tokens until binary64 conversion, preserving
 correct rounding, negative zero and C++'s finite saturation on overflow. The API
 package's dev-only serde_json features enable precise float parsing and borrowed

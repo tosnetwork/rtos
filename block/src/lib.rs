@@ -93,6 +93,8 @@ pub use merkle_update::*;
 
 pub mod quorum;
 pub use quorum::*;
+pub mod proof;
+pub use proof::*;
 pub mod simplex_protocol;
 pub use simplex_protocol::SimplexProtocolVersion;
 

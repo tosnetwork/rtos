@@ -418,6 +418,11 @@ impl BlockInfo {
         self.master_ref.as_ref().map(|mr| mr.read_struct()).transpose()
     }
 
+    /// Presence of the wire master reference, without traversing its cell.
+    pub fn not_master(&self) -> bool {
+        self.master_ref.is_some()
+    }
+
     pub fn write_master_ref(&mut self, value: Option<&BlkMasterInfo>) -> Result<()> {
         self.master_ref = value.map(ChildCell::with_struct).transpose()?;
         Ok(())
@@ -500,6 +505,25 @@ impl BlockInfo {
     }
 
     pub fn read_from_ex(&mut self, slice: &mut SliceData) -> Result<()> {
+        self.read_from_ex_mode(slice, true)
+    }
+
+    /// Read only the header's inline fields and reference shape. Referenced
+    /// previous blocks remain opaque until an explicit read_prev_* operation.
+    pub fn construct_header_from_cell(cell: Cell) -> Result<Self> {
+        if cell.cell_type() == crate::CellType::PrunedBranch {
+            fail!(BlockError::PrunedCellAccess("block info is pruned".into()));
+        }
+        let mut slice = SliceData::load_cell(cell)?;
+        let mut info = Self::default();
+        info.read_from_ex_mode(&mut slice, false)?;
+        if info.flags > 1 || slice.remaining_bits() != 0 || slice.remaining_references() != 0 {
+            fail!("cannot unpack block header");
+        }
+        Ok(info)
+    }
+
+    fn read_from_ex_mode(&mut self, slice: &mut SliceData, read_previous: bool) -> Result<()> {
         let tag = slice.get_next_u32()?;
         if tag != BLOCK_INFO_TAG_1 {
             fail!(BlockError::InvalidConstructorTag { t: tag, s: "BlockInfo".to_string() })
@@ -520,7 +544,11 @@ impl BlockInfo {
         let seq_no = slice.get_next_u32()?;
         self.set_seq_no(seq_no)?;
         let vert_seq_no = slice.get_next_u32()?;
-        self.shard.read_from(slice)?;
+        if !read_previous {
+            self.shard = crate::proof::unpack_shard_ident(slice)?;
+        } else {
+            self.shard.read_from(slice)?;
+        }
         self.gen_utime = slice.get_next_u32()?;
         self.start_lt = slice.get_next_u64()?;
         self.end_lt = slice.get_next_u64()?;
@@ -535,6 +563,22 @@ impl BlockInfo {
 
         self.master_ref =
             if not_master { Some(Deserializable::construct_from(slice)?) } else { None };
+
+        if !read_previous {
+            self.after_merge = after_merge;
+            self.prev_ref = ChildCell::with_cell(slice.checked_drain_reference()?);
+            if vert_seq_no < vert_seqno_incr {
+                fail!("invalid vertical sequence number in block header");
+            }
+            self.vert_seqno_incr = vert_seqno_incr;
+            self.vert_seq_no = vert_seq_no;
+            self.prev_vert_ref = if vert_seqno_incr == 0 {
+                None
+            } else {
+                Some(ChildCell::with_cell(slice.checked_drain_reference()?))
+            };
+            return Ok(());
+        }
 
         let mut prev_ref =
             if after_merge { BlkPrevInfo::default_blocks() } else { BlkPrevInfo::default_block() };
@@ -1028,9 +1072,22 @@ impl fmt::Display for ValueFlow {
 impl ValueFlow {
     /// Same full dictionary shape/value validation, without constructing BigInts
     /// whose numeric results are discarded by read_in_full_depth.
-    pub fn read_in_full_depth_bounded(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<()> {
-        for collection in [&self.from_prev_blk, &self.to_next_blk, &self.imported, &self.exported,
-            &self.fees_collected, &self.fees_imported, &self.recovered, &self.created, &self.minted, &self.burned] {
+    pub fn read_in_full_depth_bounded(
+        &self,
+        budget: &dyn crate::config_read_budget::ConfigReadBudget,
+    ) -> Result<()> {
+        for collection in [
+            &self.from_prev_blk,
+            &self.to_next_blk,
+            &self.imported,
+            &self.exported,
+            &self.fees_collected,
+            &self.fees_imported,
+            &self.recovered,
+            &self.created,
+            &self.minted,
+            &self.burned,
+        ] {
             let dict = crate::HashmapE::with_hashmap(32, collection.other.root().cloned());
             crate::HashmapType::iterate_slices_bounded(&dict, budget, |_, mut value| {
                 // VarUInteger32's decoder checks len<32 then reads exactly len
