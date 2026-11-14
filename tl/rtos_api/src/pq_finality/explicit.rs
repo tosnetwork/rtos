@@ -83,8 +83,17 @@ impl ExplicitPqFinalityContext {
         block: ExplicitFinalityBlock,
         expected_session: UInt256,
     ) -> Result<Self> {
-        if validators.is_empty() || validators.len() > 1024 || block.shard == 0 {
-            fail!("explicit context requires 1..1024 validators and a nonzero shard");
+        Self::with_member_limit(validators, catchain_seqno, block, expected_session, 1024)
+    }
+    fn with_member_limit(
+        validators: Vec<ValidatorDescr>,
+        catchain_seqno: u32,
+        block: ExplicitFinalityBlock,
+        expected_session: UInt256,
+        max_members: usize,
+    ) -> Result<Self> {
+        if validators.is_empty() || validators.len() > max_members || block.shard == 0 {
+            fail!("explicit context requires 1..{} validators and a nonzero shard", max_members);
         }
         let mut ids = HashSet::new();
         let mut keys = HashSet::new();
