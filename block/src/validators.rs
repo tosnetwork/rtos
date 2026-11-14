@@ -157,6 +157,15 @@ pub fn derive_consensus_key_id(algorithm_id: u16, public_key: &[u8]) -> UInt256 
     UInt256::from(sha256_digest(&preimage))
 }
 
+/// Admitted-suite derivation, matching C++ derive_key_id. The raw commitment
+/// above remains available for decoding and diagnosing unadmitted descriptors.
+pub fn try_derive_consensus_key_id(algorithm_id: u16, public_key: &[u8]) -> Option<UInt256> {
+    if algorithm_id != MLDSA44_ALGORITHM_ID || public_key.len() != MLDSA44_PUBLIC_KEY_BYTES {
+        return None;
+    }
+    Some(derive_consensus_key_id(algorithm_id, public_key))
+}
+
 /// The post-quantum consensus key a validator currently holds.
 ///
 /// This describes a key and nothing else. The validator that holds it is named by

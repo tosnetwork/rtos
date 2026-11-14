@@ -87,6 +87,25 @@ The focused wire-profile and native string tests pass. The broader API library's
 previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
+The `rtos_api --example crypto_conformance` target calls existing native
+Ed25519, ML-DSA-44, SLH-DSA-SHA2-128s, padded Falcon-512, LMS, SHA-256,
+Poseidon2, quorum, session identity and PQBytes APIs. Of9508 frozen crypto
+contexts,9445 agree and63 remain explicit unsupported operations, not passes.
+All9508 frozen effects were independently checked against clean CPP1181.
+Four added clean-C++ controls pin full uint64 member weights: the structural
+TL long commits their original64 bits, while governing ValidatorSet construction
+still rejects an overweight set. Native session encoding no longer mistakes
+that structural field for an admission check. The admitted-suite key-ID helper
+requires ML-DSA-44 and its exact key length before using the existing commitment;
+the raw helper retains its diagnostic contract. The four frozen ML-DSA authority
+domains are shared native constants, without granting key authorization.
+A separate204-input probe gives189 equal effects and15 mutual protocol errors;
+those errors are not passing shared fixtures. Adapters apply bounded byte edits
+before native calls and reject edits naming an unread input. Remaining crypto
+operations are signature-carrier fetching, config43, validator-set unpacking,
+elector preimages and expected-block Simplex signing. This is corpus agreement,
+not arbitrary-input, network or production runtime qualification.
+
 The provisional `rtos_api --example consensus_conformance` target calls native
 weight, validator-set, protocol-version, session, vote, explicit finality, structural
 proof and key-block proof-link APIs. All268 original consensus contexts agree

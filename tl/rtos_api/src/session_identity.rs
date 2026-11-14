@@ -31,7 +31,9 @@ pub fn session_members(
     validators
         .iter()
         .map(|v| {
-            let weight = i64::try_from(v.weight)?;
+            // TL long carries all 64 wire bits, including weights outside the
+            // admitted signed range. Governing-set validation is independent.
+            let weight = v.weight as i64;
             let adnl = v.adnl_addr.clone().unwrap_or_default();
             Ok(match &v.key {
                 ValidatorKey::Ed25519(_) => {
