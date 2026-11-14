@@ -174,6 +174,17 @@ impl Decoder {
         self.may_decode
     }
     pub fn try_decode(&mut self) -> std::result::Result<&[u8], Refusal> {
+        self.try_decode_with_encoder(true)
+    }
+
+    /// Decode, optionally retaining the solved RaptorQ intermediate symbols for
+    /// subsequent repair generation. Receive-only callers should pass `false`.
+    /// This preserves the algorithm's retry/readiness rules, including cached
+    /// repair recovery not becoming ready again after a successful solve.
+    pub fn try_decode_with_encoder(
+        &mut self,
+        need_encoder: bool,
+    ) -> std::result::Result<&[u8], Refusal> {
         if !self.may_decode {
             return Err(Refusal("need_more_symbols"));
         }
@@ -194,14 +205,21 @@ impl Decoder {
                 self.result = Some(data);
             } else {
                 self.may_decode = false;
-                let (mut data, regenerator) = raptorq::decode_ordered(&p.config(), &self.packets)
-                    .ok_or(Refusal("unclassified"))?;
-                self.regenerator = Some(regenerator);
+                let (mut data, regenerator) =
+                    raptorq::decode_ordered_with_encoder(&p.config(), &self.packets, need_encoder)
+                        .ok_or(Refusal("unclassified"))?;
+                self.regenerator = regenerator;
                 data.truncate(p.data_size);
                 self.result = Some(data);
             }
         }
         Ok(self.result.as_deref().unwrap())
+    }
+
+    /// Consume a successfully decoded receiver, moving its result without a
+    /// full-data clone and releasing all retained packet and solver state.
+    pub fn into_decoded_data(self) -> std::result::Result<Vec<u8>, Refusal> {
+        self.result.ok_or(Refusal("need_more_symbols"))
     }
 
     pub fn take_encoder(&mut self) -> Result<Encoder> {
