@@ -16,7 +16,22 @@ cases. The observer-budget control/mixed pair pauses two active successor
 members while both retired observers remain responsive; it requires a bounded
 stall, same-PID recovery, and native/Rust successor role evidence. It shares the
 original240-second rotation deadline and requires all four authenticated signers
-in both epochs. This does not inject invalid old-group votes. Other entries
+in both epochs. This does not inject invalid old-group votes. Eight packet cases cover partition,
+loss, reorder and duplicate for retained2/joining5; each uses12 seconds of declared
+impairment and the existing180-second recovery budget after rotation. Supply
+`--socket-mark-library` and `--socket-mark-build-record` for packet selections.
+The build JSON names `source`, `library`, and `source_meta`/`library_meta` objects
+with `bytes` and `sha256`; both paths and content must match the current fixture
+source and supplied library before any suite directory is created. The suite
+hashes that C source, library and record along with its other inputs.
+
+Packet completion additionally requires native netem counters demonstrating
+traffic effects (drops for partition/loss, traffic with zero drops for reorder),
+a fresh surviving quorum, restored own vote and both chain creators, unchanged
+process identity, and retained queue removal in a fresh namespace. The saved
+statistics must match the semantic receipt. Native driver checks still verify
+actual block/state/certificate content. The generic rotation control dependency
+is not a native run of every individual packet impairment. Other entries
 remain `unintegrated`; selecting any of them refuses the entire suite before
 creating runtime directories. An omitted selection means the entire catalog,
 so `run` currently requires an explicit supported selection.

@@ -15,17 +15,28 @@ from scenario_matrix import (
     matrix_commands,
 )
 from scenario_observer import OBSERVER_PLAN, check_observer_result
+from scenario_packet import (
+    PACKETS,
+    check_packet_cleanup,
+    check_packet_result,
+    packet_arguments,
+    packet_artifacts,
+)
 
-ROTATIONS = frozenset(
-    f"{family}-{mode}"
-    for family in (
-        "rotation",
-        "exact-weight",
-        "necessary-low-weight",
-        "observer-budget",
+ROTATIONS = (
+    frozenset(
+        f"{family}-{mode}"
+        for family in (
+            "rotation",
+            "exact-weight",
+            "necessary-low-weight",
+            "observer-budget",
+        )
+        for mode in ("control", "mixed")
     )
-    for mode in ("control", "mixed")
-) | {"restart-member2", "restart-member5"}
+    | {"restart-member2", "restart-member5"}
+    | set(PACKETS)
+)
 
 
 def digest(path):
@@ -144,6 +155,10 @@ def check_result(name, result):
         check_observer_result(result.get("observer_budget"), mixed)
     elif result.get("observer_budget") is not None:
         raise ValueError("Unexpected observer budget receipt")
+    if name in PACKETS:
+        check_packet_result(name, result.get("network_fault"))
+    elif result.get("network_fault") is not None:
+        raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
     if name.startswith("restart-member"):
         member = int(name[-1])
@@ -204,6 +219,8 @@ def execute(args, names, catalog):
         catalog,
         *source.glob("*.py"),
     ]
+    if any(name in PACKETS for name in names):
+        inputs.extend(packet_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -268,6 +285,8 @@ def execute(args, names, catalog):
                     ]
                 if name.startswith("restart-member"):
                     run += ["--interrupt-rust-member", name[-1]]
+            if name in PACKETS:
+                run += packet_arguments(name, args.socket_mark_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -290,6 +309,8 @@ def execute(args, names, catalog):
                 check_matrix_result(name, result, profile)
             else:
                 check_result(name, result)
+                if name in PACKETS:
+                    check_packet_cleanup(case / "runtime", result["network_fault"])
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

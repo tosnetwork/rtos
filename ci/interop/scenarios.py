@@ -93,6 +93,8 @@ def main():
         "block-checker",
         "cpp-python",
         "output",
+        "socket-mark-library",
+        "socket-mark-build-record",
     ):
         parser.add_argument("--" + option, type=absolute_input_path)
     parser.add_argument("--rust-revision")

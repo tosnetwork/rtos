@@ -224,7 +224,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-loss-member2",
@@ -233,7 +233,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-reorder-member2",
@@ -242,7 +242,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-duplicate-member2",
@@ -251,7 +251,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "partition-restart-member2",
@@ -278,7 +278,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-loss-member5",
@@ -287,7 +287,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-reorder-member5",
@@ -296,7 +296,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-duplicate-member5",
@@ -305,7 +305,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "partition-restart-member5",

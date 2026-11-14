@@ -43,7 +43,7 @@ class ExecutionTest(unittest.TestCase):
         with patch("scenario_execution.subprocess.run") as run:
             with self.assertRaisesRegex(ValueError, "not integrated"):
                 execute(
-                    SimpleNamespace(), ["rotation-control", "packet-loss-member2"], None
+                    SimpleNamespace(), ["rotation-control", "publication-io"], None
                 )
             run.assert_not_called()
 
