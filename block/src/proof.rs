@@ -25,6 +25,18 @@ impl Block {
 }
 
 impl crate::ConfigParams {
+    /// Required current set for a structural proof. Prefer35 over34 without
+    /// reading an unused fallback, preserving pruned availability errors.
+    pub fn proof_validator_set(&self) -> Result<crate::ValidatorSet> {
+        let cell = match self.proof_config_param_cell(35)? {
+            Some(cell) => cell,
+            None => self
+                .proof_config_param_cell(34)?
+                .ok_or_else(|| crate::error!("missing proof validator set"))?,
+        };
+        crate::ValidatorSet::construct_from_full_cell(cell)
+    }
+
     /// Fetch a parameter from a proof, preserving unavailable dictionary paths
     /// and values as pruned-cell errors rather than interpreting special bytes.
     pub fn proof_config_param_cell(&self, index: u32) -> Result<Option<Cell>> {

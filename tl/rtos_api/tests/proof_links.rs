@@ -9,12 +9,31 @@ use rtos_block::*;
 use serde_json::Value;
 
 fn context(name: &str) -> Value {
-    include_str!("data/conformance/consensus/fixtures/proof-link-boundaries.jsonl")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|row| row["metadata"]["fixture_id"] == name)
-        .unwrap()["context"]
-        .clone()
+    let mut context =
+        include_str!("data/conformance/consensus/fixtures/proof-link-boundaries.jsonl")
+            .lines()
+            .chain(
+                include_str!(
+                    "data/conformance/consensus/fixtures/proof-validator-boundaries.jsonl"
+                )
+                .lines(),
+            )
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| row["metadata"]["fixture_id"] == name)
+            .unwrap()["context"]
+            .clone();
+    if ["key_block_proof", "block_proof"].iter().any(|name| context[name].is_object()) {
+        let blobs: Value = serde_json::from_str(include_str!(
+            "data/conformance/consensus/fixtures/proof-validator-boundaries.blobs.json"
+        ))
+        .unwrap();
+        for name in ["key_block_proof", "block_proof"] {
+            if let Some(key) = context[name].get("blob").and_then(Value::as_str) {
+                context[name] = blobs[key].clone();
+            }
+        }
+    }
+    context
 }
 fn block(value: &Value) -> ExplicitFinalityBlock {
     ExplicitFinalityBlock {
@@ -47,6 +66,42 @@ fn verify(ctx: &Value) -> Result<ProofLinkInfo> {
         &destination,
         certificate.as_ref(),
     )
+}
+
+#[test]
+fn selected_validator_set_pruning_keeps_the_availability_error() {
+    for name in ["proof_link-prefer35-pruned97", "proof_link-without35-pruned89"] {
+        let error = verify(&context(name)).unwrap_err();
+        assert_eq!(error.downcast_ref::<ProofLinkRefusal>().unwrap().0, "proof_malformed");
+    }
+}
+
+#[test]
+fn unused_pruned_validator_fallback_stays_opaque() {
+    assert!(verify(&context("proof_link-prefer35-pruned89")).unwrap().verified_weight > 0);
+}
+
+#[test]
+fn proof_member_count_is_independent_of_the_explicit_context_limit() {
+    for name in ["governing-1024", "governing-1025"] {
+        let error = verify(&context(name)).unwrap_err();
+        assert_eq!(error.downcast_ref::<FinalityRefusal>().unwrap().0, "session_mismatch");
+    }
+    let ctx = context("governing-1025");
+    let source = envelope(&ctx, "key_block_proof");
+    let cfg = Block::construct_from_full_cell(source.virtual_root().unwrap())
+        .unwrap()
+        .read_key_block_config()
+        .unwrap();
+    let set = cfg.validator_set().unwrap();
+    assert_eq!(set.total(), 1025);
+    assert!(ExplicitPqFinalityContext::new(
+        set.list().to_vec(),
+        0,
+        block(&ctx["block"]),
+        UInt256::default()
+    )
+    .is_err());
 }
 
 #[test]

@@ -118,11 +118,12 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
     let config = key_block
         .read_key_block_config()
         .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
+    let set = config
+        .proof_validator_set()
+        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let (catchain, consensus) = config
         .legacy_proof_consensus_parameters()
         .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
-    let set =
-        config.validator_set().map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let (validators, hash) = set
         .calc_subset(
             &catchain,

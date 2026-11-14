@@ -102,14 +102,7 @@ pub fn verify_key_block_proof_link(
     };
     // Load only the fields reached at this stage. Param29/30 availability must
     // not preempt the header validator-set hash check or a legacy certificate.
-    let present = config
-        .config_present(35)
-        .and_then(|temporary| if temporary { Ok(true) } else { config.config_present(34) })
-        .map_err(|e| classify(e, "config_unavailable"))?;
-    if !present {
-        return Err(reject("config_unavailable"));
-    }
-    let set = config.validator_set().map_err(|e| classify(e, "config_unavailable"))?;
+    let set = config.proof_validator_set().map_err(|e| classify(e, "config_unavailable"))?;
     let catchain =
         config.legacy_proof_catchain_config().map_err(|e| classify(e, "config_unavailable"))?;
     let (nodes, hash) = set
@@ -152,7 +145,7 @@ pub fn verify_key_block_proof_link(
             &nodes,
         )?;
         expected_session_id = identity.session_id;
-        let context = ExplicitPqFinalityContext::new(
+        let context = ExplicitPqFinalityContext::for_proof_link(
             nodes,
             info.gen_catchain_seqno(),
             to.clone(),

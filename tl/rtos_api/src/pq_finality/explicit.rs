@@ -85,6 +85,22 @@ impl ExplicitPqFinalityContext {
     ) -> Result<Self> {
         Self::with_member_limit(validators, catchain_seqno, block, expected_session, 1024)
     }
+    // Governing proof sets use the wire's uint16 count. The explicit JSON
+    // evidence interface retains its separate1024-member bound above.
+    pub(crate) fn for_proof_link(
+        validators: Vec<ValidatorDescr>,
+        catchain_seqno: u32,
+        block: ExplicitFinalityBlock,
+        expected_session: UInt256,
+    ) -> Result<Self> {
+        Self::with_member_limit(
+            validators,
+            catchain_seqno,
+            block,
+            expected_session,
+            usize::from(u16::MAX),
+        )
+    }
     fn with_member_limit(
         validators: Vec<ValidatorDescr>,
         catchain_seqno: u32,
