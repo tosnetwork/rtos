@@ -12,7 +12,11 @@ This inventory does not prove every parameter combination is represented.
 The `rotation_v1` adapter runs rotation, exact-weight, necessary-low-weight
 control/mixed pairs and member2/member5 original-database restart. The `matrix_v1` adapter adds all five four-member compositions, three/six-member
 healthy and threshold control/mixed cases, and six-member low-weight-majority
-cases. Other entries
+cases. The observer-budget control/mixed pair pauses two active successor
+members while both retired observers remain responsive; it requires a bounded
+stall, same-PID recovery, and native/Rust successor role evidence. It shares the
+original240-second rotation deadline and requires all four authenticated signers
+in both epochs. This does not inject invalid old-group votes. Other entries
 remain `unintegrated`; selecting any of them refuses the entire suite before
 creating runtime directories. An omitted selection means the entire catalog,
 so `run` currently requires an explicit supported selection.

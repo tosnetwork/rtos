@@ -197,7 +197,7 @@
       "driver": "rotation_fixture.py",
       "scope": "Retired observers cannot replace paused active quorum",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "observer-budget-mixed",
@@ -206,7 +206,7 @@
       "depends_on": [
         "observer-budget-control"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "restart-member2",

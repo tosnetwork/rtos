@@ -14,10 +14,16 @@ from scenario_matrix import (
     make_matrix_profile,
     matrix_commands,
 )
+from scenario_observer import OBSERVER_PLAN, check_observer_result
 
 ROTATIONS = frozenset(
     f"{family}-{mode}"
-    for family in ("rotation", "exact-weight", "necessary-low-weight")
+    for family in (
+        "rotation",
+        "exact-weight",
+        "necessary-low-weight",
+        "observer-budget",
+    )
     for mode in ("control", "mixed")
 ) | {"restart-member2", "restart-member5"}
 
@@ -66,6 +72,11 @@ def make_profile(name, template, now):
             initial_weights={"0": 29, "1": 11, "2": 10, "3": 10},
             initial_probe_pause=[1],
         )
+    if name.startswith("observer-budget-"):
+        profile["observer_budget"] = {
+            key: value.copy() if isinstance(value, list) else value
+            for key, value in OBSERVER_PLAN.items()
+        }
     return profile
 
 
@@ -93,7 +104,7 @@ def check_result(name, result):
     weighted = name.startswith(("exact-weight-", "necessary-low-weight-"))
     kinds = (
         ("mc_creators", "wc_creators", "mc_signers")
-        if weighted
+        if weighted or name.startswith("observer-budget-")
         else ("mc_creators", "wc_creators")
     )
     for phase in ("before", "after"):
@@ -129,6 +140,10 @@ def check_result(name, result):
             raise ValueError(
                 "Weighted recovery assertion differs from declared scenario"
             )
+    if name.startswith("observer-budget-"):
+        check_observer_result(result.get("observer_budget"), mixed)
+    elif result.get("observer_budget") is not None:
+        raise ValueError("Unexpected observer budget receipt")
     recovery = result.get("recovery")
     if name.startswith("restart-member"):
         member = int(name[-1])
