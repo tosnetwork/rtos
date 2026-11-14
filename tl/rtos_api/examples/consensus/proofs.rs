@@ -26,6 +26,9 @@ pub(super) fn proof_error(error: &anyhow::Error, fallback: &'static str) -> &'st
     if matches!(
         error.downcast_ref::<rtos_block::BlockError>(),
         Some(rtos_block::BlockError::PrunedCellAccess(_))
+    ) || matches!(
+        error.downcast_ref::<rtos_block::ExceptionCode>(),
+        Some(rtos_block::ExceptionCode::PrunedCellAccess)
     ) {
         "proof_malformed"
     } else {
@@ -113,14 +116,15 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
     let (key_block, _) = header(&key_proof, &from)?;
     let (_, info) = header(&proof, &to)?;
     let extra = rtos_block::BlockExtra::construct_from_full_cell(key_block.extra_cell())
-        .map_err(|_| domain_error("config_unavailable"))?;
+        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let custom = extra.custom_cell().ok_or_else(|| domain_error("config_unavailable"))?;
     let config = rtos_block::McBlockExtra::config_from_key_block_cell(custom)
-        .map_err(|_| domain_error("config_unavailable"))?;
+        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let (catchain, consensus) = config
         .legacy_proof_consensus_parameters()
         .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
-    let set = config.validator_set().map_err(|_| domain_error("config_unavailable"))?;
+    let set =
+        config.validator_set().map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let (validators, hash) = set
         .calc_subset(
             &catchain,
@@ -128,15 +132,18 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
             to.shard().workchain_id(),
             info.gen_catchain_seqno(),
         )
-        .map_err(|_| domain_error("no_validator_set"))?;
+        .map_err(|e| domain_error(proof_error(&e, "no_validator_set")))?;
     if validators.is_empty() {
         return Err(domain_error("no_validator_set"));
     }
     let total = rtos_block::checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
     let options = ExplicitSessionOptions::from_config(&consensus, &catchain);
+    config
+        .proof_config_param_cell(30)
+        .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?;
     let selected = config
         .selected_simplex_config(true)
-        .map_err(|_| domain_error("consensus_config_unavailable"))?
+        .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?
         .ok_or_else(|| domain_error("consensus_config_unavailable"))?;
     let coordinates = SessionCoordinates {
         shard: to.shard(),
@@ -160,7 +167,10 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         coordinates,
         &validators,
     )
-    .map_err(|_| domain_error("consensus_config_unavailable"))?;
+    .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?;
+    config
+        .proof_config_param_cell(19)
+        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let config_global_id = match config.config(19)? {
         Some(ConfigParamEnum::ConfigParam19(v)) => Some(v as i32),
         _ => None,

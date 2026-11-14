@@ -6,23 +6,26 @@ use crate::{
 };
 
 impl crate::ConfigParams {
+    /// Fetch a parameter from a proof, preserving unavailable dictionary paths
+    /// and values as pruned-cell errors rather than interpreting special bytes.
+    pub fn proof_config_param_cell(&self, index: u32) -> Result<Option<Cell>> {
+        let cell = self
+            .config_params
+            .get(index.write_to_bitstring()?)?
+            .map(|value| value.reference(0))
+            .transpose()?;
+        if cell.as_ref().is_some_and(|cell| cell.cell_type() == crate::CellType::PrunedBranch) {
+            fail!(crate::BlockError::PrunedCellAccess("proof config is pruned".into()));
+        }
+        Ok(cell)
+    }
+
     /// Legacy key-proof configuration profile. Missing or non-unpackable
     /// Param28/29 uses the C++ factory defaults; unavailable proof cells remain
     /// errors. Strict node configuration accessors are independent.
     pub fn legacy_proof_consensus_parameters(
         &self,
     ) -> Result<(crate::CatchainConfig, crate::ConsensusConfig)> {
-        let cell = |index: u32| -> Result<Option<Cell>> {
-            let cell = self
-                .config_params
-                .get(index.write_to_bitstring()?)?
-                .map(|value| value.reference(0))
-                .transpose()?;
-            if cell.as_ref().is_some_and(|cell| cell.cell_type() == crate::CellType::PrunedBranch) {
-                fail!(crate::BlockError::PrunedCellAccess("legacy proof config is pruned".into()));
-            }
-            Ok(cell)
-        };
         let mut catchain = crate::CatchainConfig {
             mc_catchain_lifetime: 200,
             shard_catchain_lifetime: 200,
@@ -30,7 +33,7 @@ impl crate::ConfigParams {
             shard_validators_num: 7,
             ..Default::default()
         };
-        if let Some(cell) = cell(28)? {
+        if let Some(cell) = self.proof_config_param_cell(28)? {
             // Load outside the optional decoder: a pruned cell is unavailable,
             // not an ordinary malformed configuration eligible for fallback.
             let mut slice = SliceData::load_cell(cell.clone())?;
@@ -54,7 +57,7 @@ impl crate::ConfigParams {
             max_collated_bytes: 4 << 20,
             ..Default::default()
         };
-        if let Some(cell) = cell(29)? {
+        if let Some(cell) = self.proof_config_param_cell(29)? {
             SliceData::load_cell(cell.clone())?;
             if let Ok(value) = crate::ConsensusConfig::construct_from_full_cell(cell) {
                 consensus = value;

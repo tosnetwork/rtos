@@ -339,6 +339,7 @@ fn main() -> Result<()> {
         })()
         .unwrap_or_else(|e| match e.downcast_ref::<proofs::ProofRefusal>() {
             Some(error) => refused(error.0),
+            None if proofs::proof_error(&e, "") == "proof_malformed" => refused("proof_malformed"),
             None => json!({"harness_error":e.to_string()}),
         });
         serde_json::to_writer(&mut output, &effect)?;

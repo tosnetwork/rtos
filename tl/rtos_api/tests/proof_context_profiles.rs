@@ -8,6 +8,9 @@ use rtos_block::*;
 fn context(name: &str) -> serde_json::Value {
     include_str!("data/conformance/consensus/fixtures/proof-config-profiles.jsonl")
         .lines()
+        .chain(
+            include_str!("data/conformance/consensus/fixtures/pruned-config-paths.jsonl").lines(),
+        )
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|row| row["metadata"]["fixture_id"] == name)
         .unwrap()["context"]
@@ -80,6 +83,19 @@ fn unavailable_proof_parameters_are_not_default_configuration() {
         cfg.config_params.set_builder(index.write_to_bitstring().unwrap(), &value).unwrap();
         assert!(cfg.legacy_proof_consensus_parameters().is_err());
     }
+}
+
+#[test]
+fn metadata_and_dictionary_paths_preserve_unavailable_proof_cells() {
+    let ctx = context("pruned-65");
+    let cfg = config(&block(&ctx, "key_block_proof").0);
+    let error = cfg.proof_config_param_cell(19).unwrap_err();
+    assert!(matches!(error.downcast_ref::<BlockError>(), Some(BlockError::PrunedCellAccess(_))));
+    // A pruned dictionary edge is unavailable, rather than an absent parameter.
+    let ctx = context("pruned-57");
+    let cfg = config(&block(&ctx, "key_block_proof").0);
+    let error = cfg.proof_config_param_cell(19).unwrap_err();
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
 }
 
 /// Input-only exporter; all effects must be filled with clean pinned C++.
