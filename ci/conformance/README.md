@@ -39,6 +39,26 @@ baseline is separate and is not upgraded or qualified by a fixture run.
 Whole-history native state replay, runtime integration, resource qualification,
 GitHub CI outcomes and independent/external reviews remain separate gates.
 
+For sequential state replay, build `rtos_executor --example stateful_block_replay`
+with `cargo build --locked -j32`. Feed JSONL on stdin: initial
+`{"zerostate":"/path/to/state.boc"}` records followed by
+`{"block":"/path/to/original.boc","root_hash":"UPPERCASE_HEX","file_hash":"UPPERCASE_HEX"}`.
+The hashes must come from the archive identity. Supply blocks in dependency
+order; all zerostates must precede them. No intermediate state input is allowed.
+The tool checks archive identity, consecutive predecessor identity, native state
+updates and transaction/account roots using the block boundary. It emits each
+block's effects and exits nonzero at the first error, including empty replay.
+Compare emitted roots and counts with the pinned reference replay separately.
+
+The initial epoch-6 qualification covers MC 1–2000 and 2033 associated shard
+blocks, with 4124 transactions, all matching the reference. Bootstrap states and
+raw blocks were read from the recorded archive; C++ provided only selection/order
+and comparison results, never intermediate Rust states. This is an offline
+interval tool: it retains replayed master contexts in memory, refuses split/merge,
+and does not verify block signatures, shard-top commitments, or every validator
+rule. Full archive indexing, bounded history retention and mismatch continuation
+remain work before using it for whole-history qualification.
+
 
 The target executes contexts from the TOS conformance suite and emits the effects of
 RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`,

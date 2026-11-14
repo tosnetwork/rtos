@@ -15,9 +15,9 @@ use rtos_vm::{smart_contract_info::SmartContractInfo, stack::StackItem};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 
-struct Original {
-    root: Cell,
-    bytes: Vec<u8>,
+pub(crate) struct Original {
+    pub(crate) root: Cell,
+    pub(crate) bytes: Vec<u8>,
 }
 fn original(ctx: &Value, name: &str) -> Result<Original> {
     let bytes = base64_decode(ctx[name].as_str().ok_or_else(|| anyhow!("missing BOC {name}"))?)?;
@@ -46,7 +46,7 @@ fn absent() -> Result<Cell> {
     ShardAccount::default().serialize()
 }
 
-fn apply(
+pub(crate) fn apply(
     input: &Original,
     previous: &Cell,
     master: Option<(&Original, &Cell)>,
