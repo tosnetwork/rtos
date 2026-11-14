@@ -22,6 +22,9 @@ pub(super) fn run(v: &Value) -> Result<Value> {
             "left_fec_symbols_count":helper.remaining().context("FEC counters overflow")?}),
         );
     }
+    if v["op"] == "rldp2_send" {
+        return send(v);
+    }
     if v["op"] == "rldp2_receive" {
         return receive(v);
     }
@@ -77,7 +80,7 @@ fn receive(v: &Value) -> Result<Value> {
     let mut events = Vec::new();
     for (index, packet) in raw.iter().enumerate() {
         connection.receive_raw(packet);
-        let output = connection.run();
+        let output = connection.run()?;
         let mut complete = Vec::new();
         for packet in output.packets {
             let value: MessagePart =
@@ -99,5 +102,37 @@ fn receive(v: &Value) -> Result<Value> {
     }
     Ok(
         json!({"outcome":"transfers","events":events,"inbound_transfers":connection.inbound_transfer_count(),"completed_transfers":connection.completed_transfer_count()}),
+    )
+}
+
+fn send(v: &Value) -> Result<Value> {
+    use adnl::rldp2::connection::Connection;
+    use rtos_api::{ton::rldp2::MessagePart, WireProfile};
+    let id: [u8; 32] = super::bytes(v, "transfer_id", 32)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("32byte id required"))?;
+    ensure!(id != [0; 32], "nonzero transfer id required");
+    let data = super::bytes(v, "data", 4 << 20)?;
+    ensure!(!data.is_empty(), "at least one data byte required");
+    let mut connection = Connection::new([0; 32]);
+    connection.send(id, data, None)?;
+    let output = connection.run()?;
+    let mut packets = Vec::new();
+    for raw in output.packets {
+        let parsed: MessagePart = WireProfile::T0.deserialize_value_bounded(&raw, raw.len())?;
+        let entry = if let MessagePart::Rldp2_MessagePart(part) = parsed {
+            let part = part.0;
+            let fec_wire = WireProfile::T0.serialize(&part.fec_type)?;
+            let constructor = i32::from_le_bytes(fec_wire[..4].try_into()?);
+            json!({"type":"part","fec_type":constructor,"part":part.part,"total_size":part.total_size.to_string(),"seqno":part.seqno,
+                "fec":{"data_size":part.fec_type.data_size(),"symbol_size":part.fec_type.symbol_size(),"symbols_count":part.fec_type.symbols_count()},
+                "symbol_sha256":hex::encode(rtos_block::sha256_digest(&part.data)),"sha256":hex::encode(rtos_block::sha256_digest(&raw))})
+        } else {
+            json!({"type":"other","sha256":hex::encode(rtos_block::sha256_digest(&raw))})
+        };
+        packets.push(entry);
+    }
+    Ok(
+        json!({"outcome":"sent","packets":packets,"outbound_transfers":connection.outbound_transfer_count()}),
     )
 }

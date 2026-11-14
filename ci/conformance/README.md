@@ -128,9 +128,9 @@ not arbitrary-input, network or production runtime qualification.
 The provisional `adnl --example net_conformance` target connects native wire-key,
 signing, verification, deterministic encryption/decryption, shared-secret,
 ADNL-ID text, RaptorQ/Online/RoundRobin codecs and peer FEC-type operations.
-At the 2026-11-14 RLDP2 receive checkpoint,629 of1245 original network contexts
-agree and616 remain explicitly unsupported. Added90 clean-C++ controls give
-719equal/616unsupported/0diff across1335 contexts. The Rust runner exits1 for that
+At the 2026-11-14 RLDP2 connection checkpoint,633 of1245 original network contexts
+agree and612 remain explicitly unsupported. Added93 clean-C++ controls give
+726equal/612unsupported/0diff across1338 contexts. The Rust runner exits1 for that
 partial support; unsupported operations are not passing cases. A separate
 262-coordinate probe and78wire/identity probes retain their earlier key-checkpoint
 scope, independently from the shared corpus.
@@ -159,8 +159,8 @@ Peer FEC types use bounded typed T0 decoding and validate signed fields, the
 TOS-specific768-byte floor, size/count consistency and constructor in that order.
 Type acceptance is separate from decoder capacity: zero-size peer data is valid,
 while a type above56403source symbols cannot create a decoder. Local codec
-configuration bounds remain independent. These APIs do not admit an RLDP transfer;
-The explicit native RLDP2 receive connection now admits raw packets; outbound,
+configuration bounds remain independent. Peer-type validity alone does not admit an RLDP transfer. The explicit native
+RLDP2 connection now admits raw receive packets and schedules outbound packets;
 ADNL packet/preauth and overlay contexts remain unconnected.
 RLDP2 FEC demand and checked reservation/solver-cost queries are connected to
 native helpers; the FEC-demand helper is also used by the existing native sender.
@@ -179,6 +179,17 @@ clock epoch. An indexed four-ary timer heap preserves CPP timeout tie ordering. 
 connection API; existing asynchronous RldpNode integration and actual Rust allocator
 peak/whole-process memory qualification remain open. Cost equality alone does not
 prove actual Rust decoder/solver heap fits the CPP-derived reservation formula.
+Outbound state uses native part/ACK/loss/RTT/bandwidth/BBR/pacer state with one fixed
+clock sample per run, rather than deriving a packet count from fixture size. It
+retains partial transfers, accepts typed raw confirm/complete packets, releases
+in-flight counts and reports completion/timeout. Inbound/outbound deadlines share
+one indexed heap; random transfer IDs are returned internally to bind their timers.
+Connection runs return errors from local outbound encoding to the caller. Native
+paired-connection tests exercise real ACK progression, delivery, completion echoes,
+bidirectional same-ID ownership and mixed timer ordering. GSL-enabled reference
+loss quantiles are matched by a native probability recurrence; no runtime GSL
+library is added. Randomized BBR phase sequences, actual socket transport and
+production runtime/heap bounds remain outside this checkpoint's qualification.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
 weight, validator-set, protocol-version, session, vote, explicit finality, structural

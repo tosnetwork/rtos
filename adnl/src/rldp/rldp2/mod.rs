@@ -3,6 +3,7 @@
 //! RLDP2 framing and receiver admission primitives.
 pub mod budget;
 pub mod connection;
+pub mod outbound;
 mod timer;
 pub const PART_SIZE: u64 = super::Constraints::SLICE as u64;
 pub const SYMBOL_SIZE: u64 = super::Constraints::SYMBOL as u64;

@@ -248,11 +248,21 @@ impl OutboundConnection {
     /// supply a nonzero id when it needs to bind a response to a local request.
     pub fn send(
         &mut self,
-        mut id: TransferId,
+        id: TransferId,
         data: Vec<u8>,
         now: f64,
         deadline: Option<f64>,
     ) -> Result<bool> {
+        Ok(self.send_with_id(id, data, now, deadline)?.is_some())
+    }
+    /// Returns the actual generated transfer ID so the owning connection can manage a shared timer heap.
+    pub fn send_with_id(
+        &mut self,
+        mut id: TransferId,
+        data: Vec<u8>,
+        now: f64,
+        deadline: Option<f64>,
+    ) -> Result<Option<TransferId>> {
         ensure!(
             now.is_finite() && now >= 0.0 && deadline.is_none_or(|d| d.is_finite() && d > 0.0),
             "invalid monotonic deadline"
@@ -261,17 +271,17 @@ impl OutboundConnection {
         if id == [0; 32] {
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id);
         } else if self.transfers.contains_key(&id) {
-            return Ok(false);
+            return Ok(None);
         }
         if self.transfers.len() >= MAX_OUTBOUND_TRANSFERS {
-            return Ok(false);
+            return Ok(None);
         }
         self.transfers.insert(id, Transfer { data, parts: BTreeMap::new(), next_part: 0 });
         if let Some(deadline) = deadline {
             self.deadlines.insert(id, deadline);
         }
         self.started += 1;
-        Ok(true)
+        Ok(Some(id))
     }
     pub fn remove(&mut self, id: TransferId) -> bool {
         let Some(transfer) = self.transfers.remove(&id) else {

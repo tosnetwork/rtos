@@ -1,6 +1,7 @@
 // Copyright 2017-2020 Telegram Systems LLP
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! Owned RLDP2 connection state. Times are monotonic seconds since connection creation.
+use super::outbound::OutboundConnection;
 use super::timer::TimerHeap;
 use super::{
     budget::{self, InboundBudget, Kind, PeerId, Reservation},
@@ -28,6 +29,7 @@ pub struct Events {
     pub received: Vec<(TransferId, Result<Vec<u8>, Refusal>)>,
     pub parts: Vec<(TransferId, u32, u64)>,
     pub packets: Vec<Vec<u8>>,
+    pub sent: Vec<(TransferId, Result<(), String>)>,
     pub wakeup: Option<f64>,
 }
 #[derive(Default)]
@@ -172,6 +174,7 @@ pub struct Connection {
     budget: Arc<InboundBudget>,
     default_mtu: u64,
     inbound: BTreeMap<TransferId, Inbound>,
+    outbound: OutboundConnection,
     limits: BTreeMap<TransferId, Limit>,
     outstanding: usize,
     timers: TimerHeap<(TransferId, bool)>,
@@ -190,6 +193,7 @@ impl Connection {
             budget,
             default_mtu: DEFAULT_MTU,
             inbound: BTreeMap::new(),
+            outbound: OutboundConnection::new(),
             limits: BTreeMap::new(),
             outstanding: 0,
             timers: TimerHeap::default(),
@@ -207,6 +211,36 @@ impl Connection {
     }
     pub fn inbound_transfer_count(&self) -> usize {
         self.inbound.len()
+    }
+    pub fn outbound_transfer_count(&self) -> usize {
+        self.outbound.transfer_count()
+    }
+    pub fn send(
+        &mut self,
+        id: TransferId,
+        data: Vec<u8>,
+        deadline: Option<f64>,
+    ) -> anyhow::Result<bool> {
+        self.send_at(id, data, self.now(), deadline)
+    }
+    pub fn send_at(
+        &mut self,
+        id: TransferId,
+        data: Vec<u8>,
+        now: f64,
+        deadline: Option<f64>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            deadline.is_none_or(|at| at.is_finite() && at > 0.0),
+            "invalid monotonic deadline"
+        );
+        let Some(id) = self.outbound.send_with_id(id, data, now, None)? else {
+            return Ok(false);
+        };
+        if let Some(at) = deadline {
+            assert!(self.timers.insert((id, false), at));
+        }
+        Ok(true)
     }
     pub fn completed_transfer_count(&self) -> usize {
         self.completed.len()
@@ -272,8 +306,26 @@ impl Connection {
         };
         match message {
             MessagePart::Rldp2_MessagePart(part) => self.receive_part(part.0, now),
-            // Outbound handling is connected when the native sender is integrated.
-            MessagePart::Rldp2_Complete(_) | MessagePart::Rldp2_Confirm(_) => {}
+            MessagePart::Rldp2_Complete(message) => {
+                let id = *message.transfer_id.as_array();
+                let before = self.outbound.transfer_count();
+                self.outbound.on_complete(id, message.part);
+                if self.outbound.transfer_count() < before {
+                    self.timers.erase(&(id, false));
+                }
+            }
+            MessagePart::Rldp2_Confirm(message) => {
+                if let Err(error) = self.outbound.on_confirm(
+                    *message.transfer_id.as_array(),
+                    message.part,
+                    message.max_seqno as u32,
+                    message.received_mask as u32,
+                    message.received_count as u32,
+                    now,
+                ) {
+                    log::error!("RLDP2 outbound confirmation: {error}");
+                }
+            }
         }
     }
     fn receive_part(&mut self, packet: rtos_api::RldpChunk, now: f64) {
@@ -390,12 +442,15 @@ impl Connection {
             assert!(self.timers.insert((id, true), now + 10.0));
         }
     }
-    pub fn run(&mut self) -> Events {
+    pub fn run(&mut self) -> anyhow::Result<Events> {
         self.run_at(self.now())
     }
     /// Drive timers using the same monotonic epoch as `receive_raw_at`.
-    pub fn run_at(&mut self, now: f64) -> Events {
-        let mut wakeup = None;
+    pub fn run_at(&mut self, now: f64) -> anyhow::Result<Events> {
+        let outbound = self.outbound.run(now)?;
+        self.pending.packets.extend(outbound.packets);
+        self.pending.sent.extend(outbound.completed);
+        let mut wakeup = outbound.wakeup;
         for (id, inbound) in &mut self.inbound {
             for (index, part) in &mut inbound.parts {
                 if part.receiver.ack_at.is_some_and(|at| at <= now) {
@@ -422,16 +477,20 @@ impl Connection {
             }
         }
         // The same indexed four-ary heap as CPP preserves equal-deadline callback order.
-        while let Some(((id, _), _)) = self.timers.pop_due(now) {
-            self.complete(id, now);
-            self.pending.received.push((id, Err(Refusal("unclassified"))));
-            self.drop_limit(&id);
+        while let Some(((id, inbound), _)) = self.timers.pop_due(now) {
+            if inbound {
+                self.complete(id, now);
+                self.pending.received.push((id, Err(Refusal("unclassified"))));
+                self.drop_limit(&id);
+            } else if self.outbound.remove(id) {
+                self.pending.sent.push((id, Err("timeout".into())));
+            }
         }
         if let Some((at, _)) = self.timers.peek() {
             relax(&mut wakeup, at);
         }
         let mut events = std::mem::take(&mut self.pending);
         events.wakeup = wakeup;
-        events
+        Ok(events)
     }
 }

@@ -58,12 +58,12 @@ fn budget_is_held_before_decode_and_released_on_finish_error_and_drop() {
         Usage { decoders: 1, bytes: budget::decoder_reservation_bytes(769, 768, 2).unwrap() }
     );
     c.receive_raw_at(&source([2; 32], 769, 1), 1.1);
-    let e = c.run_at(1.1);
+    let e = c.run_at(1.1).unwrap();
     assert_eq!(e.received.len(), 1);
     assert_eq!(e.received[0].1.as_ref().unwrap(), &vec![7; 769]);
     assert_eq!(b.usage(), Usage::default());
     c.receive_raw_at(&packet([3; 32], 769, 0, 0, vec![0; 767]), 2.0);
-    assert_eq!(c.run_at(2.0).received[0].1.as_ref().unwrap_err().0, "symbol_length");
+    assert_eq!(c.run_at(2.0).unwrap().received[0].1.as_ref().unwrap_err().0, "symbol_length");
     assert_eq!(b.usage(), Usage::default());
     c.receive_raw_at(&source([4; 32], 769, 0), 3.0);
     assert_eq!(b.usage().decoders, 1);
@@ -84,7 +84,7 @@ fn local_request_replaces_unsolicited_owner_and_is_the_only_reserve_authority() 
     assert_eq!(b.usage().decoders, 1);
     assert_eq!(b.unsolicited_usage(), Usage::default());
     c.receive_raw_at(&source([2; 32], 769, 0), 2.1);
-    assert_eq!(c.run_at(2.1).received.len(), 1);
+    assert_eq!(c.run_at(2.1).unwrap().received.len(), 1);
     assert_eq!(c.outstanding_requests(), 0);
     let tight = InboundBudget::new(15, 8 << 20);
     let mut c = Connection::with_budget([1; 32], tight.clone());
@@ -101,15 +101,15 @@ fn ack_history_suppresses_duplicates_and_old_symbols_and_repeats_on_timer() {
     let mut c = Connection::with_budget([1; 32], b.clone());
     c.receive_raw_at(&source([2; 32], 769, 32), 1.0);
     c.receive_raw_at(&source([2; 32], 769, 0), 1.0); // outside32 history, cannot complete source data
-    let e = c.run_at(1.002);
+    let e = c.run_at(1.002).unwrap();
     assert!(e.received.is_empty());
     assert_eq!(e.packets.len(), 1);
     let MessagePart::Rldp2_Confirm(ack) = decode(&e.packets[0]) else { panic!() };
     assert_eq!((ack.max_seqno, ack.received_mask, ack.received_count), (33, 1, 1));
-    assert!(c.run_at(1.003).packets.is_empty());
-    assert_eq!(c.run_at(1.005).packets.len(), 1);
+    assert!(c.run_at(1.003).unwrap().packets.is_empty());
+    assert_eq!(c.run_at(1.005).unwrap().packets.len(), 1);
     c.receive_raw_at(&source([2; 32], 769, 32), 1.006);
-    let e = c.run_at(1.010);
+    let e = c.run_at(1.010).unwrap();
     assert_eq!(e.packets.len(), 1); // duplicate does not restart ack cadence
     let MessagePart::Rldp2_Confirm(ack) = decode(&e.packets[0]) else { panic!() };
     assert_eq!(ack.received_count, 1);
@@ -122,7 +122,7 @@ fn completion_cache_precedes_field_validation_and_has_a_hard_cap() {
         let mut id = [0; 32];
         id[..4].copy_from_slice(&i.to_le_bytes());
         c.receive_raw_at(&source(id, 1, 0), 1.0);
-        c.run_at(1.0);
+        c.run_at(1.0).unwrap();
     }
     assert_eq!(c.completed_transfer_count(), 2048);
     let mut id = [0; 32];
@@ -136,7 +136,7 @@ fn completion_cache_precedes_field_validation_and_has_a_hard_cap() {
     bad.seqno = -1;
     bad.data.clear();
     c.receive_raw_at(&frame(bad), 1.1);
-    let e = c.run_at(1.1);
+    let e = c.run_at(1.1).unwrap();
     assert_eq!(
         e.packets,
         vec![WireProfile::T0
@@ -144,7 +144,7 @@ fn completion_cache_precedes_field_validation_and_has_a_hard_cap() {
             .unwrap()]
     );
     c.receive_raw_at(&source([0; 32], 1, 0), 1.1);
-    assert_eq!(c.run_at(1.1).received.len(), 1); // oldest evicted, reassembles
+    assert_eq!(c.run_at(1.1).unwrap().received.len(), 1); // oldest evicted, reassembles
 }
 #[test]
 fn timeout_releases_request_decoder_and_remembers_id_without_idle_cache_gc() {
@@ -152,13 +152,13 @@ fn timeout_releases_request_decoder_and_remembers_id_without_idle_cache_gc() {
     let mut c = Connection::with_budget([1; 32], b.clone());
     assert!(c.set_receive_limits([2; 32], 2.0, 769));
     c.receive_raw_at(&source([2; 32], 769, 0), 1.0);
-    assert!(c.run_at(1.999).received.is_empty());
+    assert!(c.run_at(1.999).unwrap().received.is_empty());
     assert_eq!(b.usage().decoders, 1);
-    let e = c.run_at(2.0);
+    let e = c.run_at(2.0).unwrap();
     assert_eq!(e.received[0].1.as_ref().unwrap_err().0, "unclassified");
     assert_eq!(b.usage(), Usage::default());
     assert_eq!(c.outstanding_requests(), 0);
-    c.run_at(100.0);
+    c.run_at(100.0).unwrap();
     assert_eq!(c.completed_transfer_count(), 1); // CPP expires cache only on completion and keeps128
 }
 #[test]
@@ -189,7 +189,7 @@ fn repair_only_transfer_decodes_in_real_connection_without_a_regenerator() {
     for id in 4..14 {
         let (_, symbol) = enc.symbol(id).unwrap();
         c.receive_raw_at(&packet([2; 32], 3000, 0, id as i32, symbol), 1.0);
-        received.extend(c.run_at(1.0).received);
+        received.extend(c.run_at(1.0).unwrap().received);
         if !received.is_empty() {
             break;
         }
@@ -235,7 +235,7 @@ fn active_transfer_cap_refuses_new_owner_and_timeout_recovers_all_credit() {
     c.receive_raw_at(&source([255; 32], 769, 0), 1.0);
     assert_eq!(c.inbound_transfer_count(), 256);
     assert_eq!(b.usage().decoders, 256);
-    let e = c.run_at(10.0);
+    let e = c.run_at(10.0).unwrap();
     assert_eq!(e.received.len(), 256);
     assert_eq!(c.inbound_transfer_count(), 0);
     assert_eq!(c.outstanding_requests(), 0);
@@ -250,11 +250,11 @@ fn equal_request_deadlines_follow_cpp_four_ary_heap_order() {
     for i in 1..=6 {
         assert!(c.set_receive_limits([i; 32], 5.0, 769));
     }
-    assert!(c.run_at(4.999).received.is_empty());
-    let events = c.run_at(5.0);
+    assert!(c.run_at(4.999).unwrap().received.is_empty());
+    let events = c.run_at(5.0).unwrap();
     let order: Vec<_> = events.received.iter().map(|(id, _)| id[0]).collect();
     // Independently queried from unchanged td::KHeap<double,4>.
     assert_eq!(order, vec![6, 1, 4, 3, 2, 5]);
     assert_eq!(c.outstanding_requests(), 0);
-    assert!(c.run_at(6.0).received.is_empty());
+    assert!(c.run_at(6.0).unwrap().received.is_empty());
 }
