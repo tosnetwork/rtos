@@ -7,11 +7,13 @@ use raptorq::{
     SourceBlockEncoder,
 };
 use std::collections::HashSet;
+mod online;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     RaptorQ,
     RoundRobin,
+    Online,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,17 +45,22 @@ pub struct Encoder {
     parameters: Parameters,
     data: Vec<u8>,
     engine: Option<SourceBlockEncoder>,
+    online: Option<online::Encoder>,
 }
 impl Encoder {
     pub fn new(algorithm: Algorithm, data: Vec<u8>, symbol_size: u32) -> Result<Self> {
         let parameters = Parameters::new(data.len(), symbol_size)?;
-        Ok(Self { algorithm, parameters, data, engine: None })
+        Ok(Self { algorithm, parameters, data, engine: None, online: None })
     }
     pub fn parameters(&self) -> Parameters {
         self.parameters
     }
     pub fn symbol(&mut self, mut id: u32) -> Result<(u32, Vec<u8>)> {
         let p = self.parameters;
+        if self.algorithm == Algorithm::Online {
+            let engine = self.online.get_or_insert_with(|| online::Encoder::new(&self.data, p));
+            return Ok((id, engine.symbol(id)));
+        }
         if self.algorithm == Algorithm::RoundRobin {
             id %= p.symbols_count;
         } else {
@@ -97,6 +104,7 @@ pub struct Decoder {
     may_decode: bool,
     result: Option<Vec<u8>>,
     regenerator: Option<SourceBlockEncoder>,
+    online: Option<online::Decoder>,
 }
 impl Decoder {
     pub fn new(algorithm: Algorithm, parameters: Parameters) -> Result<Self> {
@@ -111,12 +119,18 @@ impl Decoder {
             may_decode: false,
             result: None,
             regenerator: None,
+            online: (algorithm == Algorithm::Online).then(|| online::Decoder::new(p)),
         })
     }
     pub fn add_symbol(&mut self, mut id: u32, data: Vec<u8>) -> std::result::Result<(), Refusal> {
         let p = self.parameters;
         if data.len() != p.symbol_size as usize {
             return Err(Refusal("symbol_length"));
+        }
+        if let Some(online) = &mut self.online {
+            online.add_symbol(id, data);
+            self.may_decode = online.is_ready();
+            return Ok(());
         }
         if self.algorithm == Algorithm::RaptorQ {
             if id >= 1 << 24 {
@@ -154,7 +168,9 @@ impl Decoder {
         }
         if self.result.is_none() {
             let p = self.parameters;
-            if self.sources == p.symbols_count {
+            if let Some(online) = &self.online {
+                self.result = Some(online.data(p.data_size));
+            } else if self.sources == p.symbols_count {
                 let mut data = vec![0; p.data_size];
                 for packet in &self.packets {
                     let id = packet.payload_id().encoding_symbol_id();
@@ -181,7 +197,12 @@ impl Decoder {
 
     pub fn take_encoder(&mut self) -> Result<Encoder> {
         let data = self.result.as_ref().ok_or_else(|| anyhow::anyhow!("decode first"))?;
-        let mut encoder = Encoder::new(self.algorithm, data.clone(), self.parameters.symbol_size)?;
+        let algorithm = if self.algorithm == Algorithm::Online {
+            Algorithm::RoundRobin
+        } else {
+            self.algorithm
+        };
+        let mut encoder = Encoder::new(algorithm, data.clone(), self.parameters.symbol_size)?;
         encoder.engine = self.regenerator.take();
         Ok(encoder)
     }

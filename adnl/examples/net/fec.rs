@@ -32,7 +32,7 @@ pub(super) fn run(v: &Value) -> Result<Value> {
     let algorithm = match v["algorithm"].as_str() {
         Some("raptorq") => Algorithm::RaptorQ,
         Some("round_robin") => Algorithm::RoundRobin,
-        Some("online") => bail!("unsupported net operation"),
+        Some("online") => Algorithm::Online,
         _ => bail!("unknown FEC algorithm"),
     };
     let size = uint(&v["symbol_size"])?;
