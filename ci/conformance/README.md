@@ -594,9 +594,10 @@ The latest TOS5af405d channel harness routes through the peer table. Its destina
 lookup is shared with the Rust socket receive pipeline: local identities take
 precedence over inbound channel registrations, before any decryption. An unknown
 destination is refused by that lookup. The standalone Channel API retains its
-channel-only namespace. The latest corpus has1245 equal effects and45 unsupported
-broadcast contexts, with zero mismatches; unsupported contexts are not passes.
-An additional640 channel contexts match the latest C++ actor harness. Native
+channel-only namespace. The latest corpus now has1273 equal effects,3 FEC mismatches
+and14 unsupported two-step/Plumtree contexts; this is not a passing whole-net run.
+The earlier640 additional channel comparisons against the latest C++ actor harness
+retain their ebe81eb9 source scope. Native
 checks cover registry precedence, unknown/short destinations, four channel tests
 and12 actual node lifecycle tests. This does not qualify the separate channel
 crypto/parser API as fully installed in the asynchronous peer/channel lifecycle.
@@ -607,7 +608,28 @@ the default uses system wall time. Transport deadlines and rate-limit windows
 retain monotonic time. Real UDP tests cover ordinary/FEC delivery at equal clocks,
 rejection at21seconds skew, a certificate valid at the supplied historical time
 and an expired certificate. This clock boundary prepares the broadcast adapter;
-it does not yet execute the45 additional broadcast conformance contexts.
+the clock increment alone did not qualify the45 additional broadcast contexts.
+
+The broadcast adapter now runs fixed-member OverlayNode instances with a recording
+network edge after native authorization/construction, and application callbacks
+that approve checks and record actual deliveries. It reads explicit context inputs
+only. Transport reachability supplies no membership authority; fixed members and
+source privacy rules still apply. Bindings are immutable once an overlay exists,
+and overlay retirement drains producers before the adapter returns.
+
+Ordinary TOS broadcasts use the native local check/relay/deliver path and propagate
+to the full neighbour set, including the forwarding peer. Legacy behavior remains
+in its own wire profile. Fixed-member opaque messages, empty messages, foreign TL
+objects and trailing data reach the raw application callback, following the C++
+actor. Source certificates do not extend authority in this profile. An explicit
+FEC API preserves a FEC carrier for small payloads, although its original native
+sender/reassembly propagation still differs in3 executed latest cases.
+
+Of the45 additional contexts,28 match the latest C++ actor effects;3 differ and14
+are unsupported. Six additional raw-message controls agree after five actual
+before-change differences. Native checks include transport binding/retirement,
+fixed-member certificate restrictions and small explicit FEC; three behavior
+mutations demonstrate that these checks fail when the guards are removed.
 
 ## Offline candidate-validation target
 

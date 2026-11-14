@@ -379,7 +379,13 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             }
             ctx.data = BroadcastData::Buf(buf);
         }
-        Ok(self.select_broadcast_neighbours(ctx.overlay, neighbours, Some(ctx.peers.other())))
+        // The TOS simple-broadcast actor propagates to its full neighbour set,
+        // including the forwarding peer; duplicate registration stops echoes.
+        let skip = if ctx.overlay.wire_profile == rtos_api::WireProfile::T0
+            && matches!(Self::broadcast_type(), BroadcastType::Simple) {
+            None
+        } else { Some(ctx.peers.other()) };
+        Ok(self.select_broadcast_neighbours(ctx.overlay, neighbours, skip))
     }
 
     async fn recv<'a>(&mut self, bcast: T, mut ctx: BroadcastRecvContext<'a>) -> Result<()> {
@@ -568,6 +574,23 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
                 Ok(BroadcastSendInfo { packets, send_to })
             }
             BroadcastJob::Foreground(bcast) => {
+                if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
+                    if let Broadcast::Overlay_Broadcast(simple) = &bcast {
+                        // TOS sends a locally signed simple carrier through the
+                        // same run/check/relay/deliver path as a received one.
+                        ctx.overlay.owned_broadcasts.remove(&bcast_id);
+                        let bytes = ctx.overlay.serialize_broadcast(&bcast)?;
+                        let peers = AdnlPeers::with_keys(
+                            ctx.src_adnl_key_id.clone(), ctx.src_adnl_key_id.clone(),
+                        );
+                        let send_to = ctx.overlay.neighbours.count();
+                        BroadcastSimpleProtocol.recv(simple.clone(), BroadcastRecvContext {
+                            data: BroadcastData::Raw(&bytes), hops: None, overlay: ctx.overlay,
+                            peers: &peers, verdict: BroadcastCheckResult::Allowed,
+                        }).await?;
+                        return Ok(BroadcastSendInfo { packets: 1, send_to });
+                    }
+                }
                 let mut buf = ctx.overlay.serialize_broadcast(&bcast)?;
                 if let Some(hops) = &neighbours.hops {
                     buf.push(*hops);
@@ -1052,6 +1075,9 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         if let Err(e) =
             ctx.overlay.verify_broadcast_signature(&src_key, &to_sign, bcast.signature(), peer)
         {
+            if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
+                return Err(e);
+            }
             log::debug!(
                 target: TARGET,
                 "Bad signature of {bcast_type} broadcast {} part {} from {peer}: {e}",

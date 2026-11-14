@@ -6,6 +6,8 @@ use adnl::wire_keys::{
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
+#[path = "net/broadcast.rs"]
+mod broadcast;
 #[path = "net/channel.rs"]
 mod channel;
 #[path = "net/fec.rs"]
@@ -30,6 +32,9 @@ fn bytes(v: &Value, name: &str, max: usize) -> Result<Vec<u8>> {
 }
 fn run(v: &Value) -> Result<Value> {
     let op = v["op"].as_str().context("op required")?;
+    if op == "overlay_broadcast" {
+        return broadcast::run(v);
+    }
     if matches!(op, "rldp2_fec_helper" | "rldp2_budget" | "rldp2_receive" | "rldp2_send") {
         return rldp2::run(v);
     }
