@@ -108,6 +108,17 @@ file hashes must match the manifest's MC/WC zerostates. Native execution itself
 checks each transaction/account root against its on-chain value; the canonical
 block receipt contains aggregate transaction counts rather than individual effects.
 
+Add `--require-shard-tops` to qualify the masterchain shard-top commitments.
+The native replay emits descriptors from its reconstructed masterchain state;
+the comparator checks their sequence/root/file identities against the digest-verified
+canonical block inventory, using a temporary SQLite index with bounded cache.
+The workchain zerostate is checked against the native bootstrap whose file hash
+must match the manifest. Missing descriptors, missing referenced blocks, identity
+mismatches and layouts other than the reference replay's single whole workchain 0
+fail explicitly. The result records the flag and check count; older outputs without
+these descriptors do not qualify under this flag. This does not authenticate signatures
+or validate every validator rule. The SQLite identity index is removed on completion.
+
 For a running process, `--allow-prefix` snapshots the current output byte length
 and reports compared/equal/mismatched/refused/not-compared counts and partial lines.
 This observation mode never returns a pass. Exit0 means a complete final comparison,
@@ -141,9 +152,9 @@ blocks, with 4124 transactions, all matching the reference. Bootstrap states and
 raw blocks were read from the recorded archive; C++ provided only selection/order
 and comparison results, never intermediate Rust states. This is an offline
 interval tool: it retains replayed master contexts until explicit release, refuses split/merge,
-and does not verify block signatures, shard-top commitments, or every validator
-rule. Full archive indexing and native dependency planning are available; complete
-execution, signature/shard-top checks and mismatch continuation remain required
+and does not verify block signatures or every validator rule. Shard-top identity
+comparison requires the explicit comparator flag described above. Full archive indexing and native dependency planning are available; complete
+execution, signature checks and mismatch continuation remain required
 for whole-history qualification.
 
 

@@ -188,6 +188,20 @@ impl Replay {
             state.seq_no() == info.seq_no() && state.shard() == info.shard(),
             "resulting state header mismatch"
         );
+        if info.shard().is_masterchain() {
+            let custom =
+                state.read_custom()?.ok_or_else(|| anyhow!("missing masterchain extra"))?;
+            let mut tops = Vec::new();
+            custom.shards.iterate_shards(|shard, description| {
+                tops.push(json!({"workchain":shard.workchain_id(),
+                    "shard":format!("{:016X}",shard.shard_prefix_with_tag()),
+                    "seqno":description.seq_no,
+                    "root_hash":format!("{:X}",description.root_hash),
+                    "file_hash":format!("{:X}",description.file_hash)}));
+                Ok(true)
+            })?;
+            effect["shard_tops"] = json!(tops);
+        }
         let transactions = effect["transactions"]
             .as_array()
             .ok_or_else(|| anyhow!("missing transaction effects"))?
