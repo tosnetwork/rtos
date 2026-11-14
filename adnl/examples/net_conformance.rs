@@ -20,7 +20,7 @@ fn bytes(v: &Value, name: &str, max: usize) -> Result<Vec<u8>> {
 }
 fn run(v: &Value) -> Result<Value> {
     let op = v["op"].as_str().context("op required")?;
-    if matches!(op, "fec_encode" | "fec_decode") {
+    if matches!(op, "fec_type" | "fec_encode" | "fec_decode") {
         return fec::run(v);
     }
     if op == "adnl_id" {
@@ -96,9 +96,15 @@ fn main() -> Result<()> {
             ensure!(harness == "net", "unsupported harness");
             run(&serde_json::from_str(&line)?)
         })();
-        let effect = result.unwrap_or_else(|e| match e.downcast_ref::<KeyRefusal>() {
-            Some(code) => json!({"outcome":"refused","reason":code.0}),
-            None => json!({"harness_error":e.to_string()}),
+        let effect = result.unwrap_or_else(|e| {
+            let reason = e
+                .downcast_ref::<KeyRefusal>()
+                .map(|code| code.0)
+                .or_else(|| e.downcast_ref::<adnl::fec::Refusal>().map(|code| code.0));
+            match reason {
+                Some(code) => json!({"outcome":"refused","reason":code}),
+                None => json!({"harness_error":e.to_string()}),
+            }
         });
         serde_json::to_writer(&mut output, &effect)?;
         writeln!(output)?;

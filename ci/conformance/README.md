@@ -125,13 +125,15 @@ added36 controls yield9544 equal. A separate mismatched-set-hash probe is mutual
 refused at the protocol boundary and is not a passing shared fixture. This is corpus agreement,
 not arbitrary-input, network or production runtime qualification.
 
-The provisional `adnl --example net_conformance` target adds native wire-key,
-signing, verification, deterministic encryption/decryption, shared-secret and
-ADNL-ID text operations. Of1245 original network contexts,304 agree and941 remain
-explicit unsupported operations. Another24 clean-C++ key-agreement controls give
-328equal/941unsupported/0diff across1269 contexts. A separate262-coordinate probe
-and78wire/identity probes agree with the actual clean reference; these probes are
-retained independently from the shared corpus.
+The provisional `adnl --example net_conformance` target connects native wire-key,
+signing, verification, deterministic encryption/decryption, shared-secret,
+ADNL-ID text, RaptorQ/Online/RoundRobin codecs and peer FEC-type operations.
+At the 2026-11-14 peer-parameter checkpoint,588 of1245 original network contexts
+agree and657 remain explicitly unsupported. Added76 clean-C++ controls give
+664equal/657unsupported/0diff across1321 contexts. The Rust runner exits1 for that
+partial support; unsupported operations are not passing cases. A separate
+262-coordinate probe and78wire/identity probes retain their earlier key-checkpoint
+scope, independently from the shared corpus.
 Network key agreement maps the unsigned Edwards-Y wire coordinate modulo the
 field before the existing X25519 multiplication. It need not be a decompressed
 Edwards verification point; zero shared results and the noninvertible coordinate
@@ -145,6 +147,20 @@ strings, and ADNL-ID text uses the native base32/CRC16 helper. Legacy key profil
 and the existing ADNL cipher construction are preserved; these primitive effects
 never grant peer, packet or DHT admission. Full network transport and block
 validation harnesses remain incomplete.
+
+RaptorQ repair APIs use relative repair indices and preserve external ESI on the
+wire. The explicit FEC decoder follows TOS/TON's arrival-order, inactivation and
+Gaussian pivot policy, including inconsistent repair equations; its returned
+encoder retains solved intermediate symbols. Ordinary generic RFC decoder APIs
+remain separate. Online retains repeated indices and reference propagation order,
+then regenerates RoundRobin symbols. A shared CPP/TON RoundRobin assertion on a
+non-divisible full final symbol is recorded as a non-JSON boundary, not a pass.
+Peer FEC types use bounded typed T0 decoding and validate signed fields, the
+TOS-specific768-byte floor, size/count consistency and constructor in that order.
+Type acceptance is separate from decoder capacity: zero-size peer data is valid,
+while a type above56403source symbols cannot create a decoder. Local codec
+configuration bounds remain independent. These APIs do not admit an RLDP transfer;
+RLDP2 packet/state, ADNL packet/preauth and overlay contexts remain unconnected.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
 weight, validator-set, protocol-version, session, vote, explicit finality, structural

@@ -5,6 +5,8 @@ use anyhow::{ensure, Result};
 use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder};
 use std::collections::HashSet;
 mod online;
+mod peer;
+pub use peer::PeerFecType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
@@ -47,7 +49,10 @@ pub struct Encoder {
 impl Encoder {
     pub fn new(algorithm: Algorithm, data: Vec<u8>, symbol_size: u32) -> Result<Self> {
         let parameters = Parameters::new(data.len(), symbol_size)?;
-        Ok(Self { algorithm, parameters, data, engine: None, online: None })
+        Ok(Self::with_parameters(algorithm, data, parameters))
+    }
+    fn with_parameters(algorithm: Algorithm, data: Vec<u8>, parameters: Parameters) -> Self {
+        Self { algorithm, parameters, data, engine: None, online: None }
     }
     pub fn parameters(&self) -> Parameters {
         self.parameters
@@ -107,9 +112,18 @@ impl Decoder {
     pub fn new(algorithm: Algorithm, parameters: Parameters) -> Result<Self> {
         let p = Parameters::new(parameters.data_size, parameters.symbol_size)?;
         ensure!(p.symbols_count == parameters.symbols_count, "inconsistent local source count");
-        Ok(Self {
+        Ok(Self::with_parameters(algorithm, p))
+    }
+    fn from_peer(p: Parameters) -> std::result::Result<Self, Refusal> {
+        if p.symbols_count > 56403 {
+            return Err(Refusal("fec_too_many_symbols"));
+        }
+        Ok(Self::with_parameters(Algorithm::RaptorQ, p))
+    }
+    fn with_parameters(algorithm: Algorithm, p: Parameters) -> Self {
+        Self {
             algorithm,
-            parameters,
+            parameters: p,
             packets: Vec::new(),
             received: HashSet::new(),
             sources: 0,
@@ -117,7 +131,7 @@ impl Decoder {
             result: None,
             regenerator: None,
             online: (algorithm == Algorithm::Online).then(|| online::Decoder::new(p)),
-        })
+        }
     }
     pub fn add_symbol(&mut self, mut id: u32, data: Vec<u8>) -> std::result::Result<(), Refusal> {
         let p = self.parameters;
@@ -197,7 +211,7 @@ impl Decoder {
         } else {
             self.algorithm
         };
-        let mut encoder = Encoder::new(algorithm, data.clone(), self.parameters.symbol_size)?;
+        let mut encoder = Encoder::with_parameters(algorithm, data.clone(), self.parameters);
         encoder.engine = self.regenerator.take();
         Ok(encoder)
     }

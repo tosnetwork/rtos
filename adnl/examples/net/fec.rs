@@ -1,5 +1,5 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
-use adnl::fec::{Algorithm, Decoder, Encoder, Parameters};
+use adnl::fec::{Algorithm, Decoder, Encoder, Parameters, PeerFecType};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 
@@ -29,6 +29,15 @@ fn symbols(encoder: &mut Encoder, ids: Vec<u32>) -> Result<Vec<Value>> {
         .collect()
 }
 pub(super) fn run(v: &Value) -> Result<Value> {
+    if v["op"] == "fec_type" {
+        let peer = PeerFecType::from_wire(&super::bytes(v, "fec_type", 64)?)?;
+        let decoder = match peer.create_decoder() {
+            Ok(_) => "ok",
+            Err(e) => e.0,
+        };
+        return Ok(json!({"outcome":"fec_type","parameters":parameters(peer.parameters()),
+            "decoder":decoder,"canonical":hex::encode(peer.to_wire()?)}));
+    }
     let algorithm = match v["algorithm"].as_str() {
         Some("raptorq") => Algorithm::RaptorQ,
         Some("round_robin") => Algorithm::RoundRobin,
