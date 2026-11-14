@@ -1,11 +1,8 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
-//! Random-access FEC codecs, with deferred receive-side decoding.
+//! Random-access FEC codecs with algorithm-specific receive semantics.
 //! Receive ordering and round-robin semantics follow td/fec in TON/TOS.
 use anyhow::{ensure, Result};
-use raptorq::{
-    EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder,
-    SourceBlockEncoder,
-};
+use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder};
 use std::collections::HashSet;
 mod online;
 
@@ -183,9 +180,7 @@ impl Decoder {
                 self.result = Some(data);
             } else {
                 self.may_decode = false;
-                let mut engine = SourceBlockDecoder::new2(0, &p.config(), p.data_size as u64);
-                let (mut data, regenerator) = engine
-                    .decode_with_encoder(self.packets.clone())
+                let (mut data, regenerator) = raptorq::decode_ordered(&p.config(), &self.packets)
                     .ok_or(Refusal("unclassified"))?;
                 self.regenerator = Some(regenerator);
                 data.truncate(p.data_size);

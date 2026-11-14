@@ -50,13 +50,16 @@ fn native_sender_retains_cpp_repair_bytes_and_external_ids() {
 fn round_robin_tail_and_first_duplicate_follow_native_receive_rules() {
     let mut encoder = Encoder::new(Algorithm::RoundRobin, vec![1, 2, 3], 2).unwrap();
     assert_eq!(encoder.symbol(3).unwrap(), (1, vec![3]));
-    let mut decoder = Decoder::new(Algorithm::RoundRobin, encoder.parameters()).unwrap();
+    // The shared CPP/TON implementation aborts on a full final symbol when data
+    // size is not divisible by symbol size. Compare receiving on whole symbols;
+    // the short encoded tail above is a separate, non-decoding observation.
+    let mut decoder = Decoder::new(Algorithm::RoundRobin, Parameters::new(4, 2).unwrap()).unwrap();
     assert_eq!(decoder.add_symbol(1, vec![3]).unwrap_err().0, "symbol_length");
     decoder.add_symbol(3, vec![3, 99]).unwrap();
     decoder.add_symbol(1, vec![88, 77]).unwrap();
     assert_eq!(decoder.try_decode().unwrap_err().0, "need_more_symbols");
     decoder.add_symbol(0, vec![1, 2]).unwrap();
-    assert_eq!(decoder.try_decode().unwrap(), [1, 2, 3]);
+    assert_eq!(decoder.try_decode().unwrap(), [1, 2, 3, 99]);
 }
 
 #[test]
