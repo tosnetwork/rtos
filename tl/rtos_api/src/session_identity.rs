@@ -39,6 +39,17 @@ pub fn session_members(
                 ValidatorKey::Ed25519(_) => {
                     GroupMember { public_key_hash: v.validator_id()?, adnl, weight }.into_boxed()
                 }
+                ValidatorKey::Pq(key) if key.algorithm_id == 0 => {
+                    // C++ raw PQ construction leaves its classical key zero;
+                    // is_pq() selects by the algorithm, even before admission.
+                    let classical = ValidatorDescr::with_params(
+                        rtos_block::SigPubKey::from_bytes(&[0; 32])?,
+                        v.weight,
+                        None,
+                    );
+                    GroupMember { public_key_hash: classical.validator_id()?, adnl, weight }
+                        .into_boxed()
+                }
                 ValidatorKey::Pq(key) => GroupMemberPQ {
                     validator_id: v.validator_id()?,
                     key_id: key.key_id.clone(),
