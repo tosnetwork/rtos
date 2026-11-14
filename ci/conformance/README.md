@@ -87,6 +87,20 @@ The focused wire-profile and native string tests pass. The broader API library's
 previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
+The provisional `rtos_api --example consensus_conformance` target calls native
+weight and validator-set APIs for `quorum`, `weight_total` and `validator_set`.
+The first74 frozen controls agree with clean CPP1181; the remaining194 consensus
+contexts explicitly refuse as unsupported operations and are not passes. Run
+the whole consensus directory so those gaps remain visible. The raw numeric
+`quorum_weight_reached` predicate matches C++ even for total0 or signed weight
+above total. Node callers retain `has_quorum`'s nonempty and non-overcounted
+membership guards, delegating only the numeric comparison to that predicate.
+This distinction grants no signature or membership authority. A separate2138
+input probe matches C++ effects or protocol-refusal status, including12 mutually
+refused malformed contexts; protocol errors are not passing shared fixtures.
+Session, vote, finality, proof and protocol-version operations still need adapters;
+this does not qualify a running consensus network or proof acceptance.
+
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed
 native corpus stays intact. Its 390 CP43/47 inputs use separately refreshed C++
