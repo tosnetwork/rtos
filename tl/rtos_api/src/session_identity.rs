@@ -287,9 +287,29 @@ pub fn derive_session_from_config(
     let selected = config
         .selected_simplex_config(coordinates.shard.is_masterchain())?
         .ok_or_else(|| error!("selected governing Param30 is missing"))?;
-    selected.config.validate_protocol_version()?;
     coordinates.new_catchain_ids = consensus.new_catchain_ids;
-    let options_hash = UInt256::calc_file_hash(&session_options_bytes(&consensus, &catchain)?);
+    derive_session_from_options(
+        global_id,
+        &ExplicitSessionOptions::from_config(&consensus, &catchain),
+        &selected,
+        coordinates,
+        validators,
+    )
+}
+
+/// Derive from already decoded options and the exact selected cell. Like the
+/// C++ detail factory, this checks protocol support but grants no governing
+/// authority and performs no Param19/header-global-ID admission check.
+pub fn derive_session_from_options(
+    global_id: i32,
+    options: &ExplicitSessionOptions,
+    selected: &rtos_block::SelectedSimplexConfig,
+    mut coordinates: SessionCoordinates<'_>,
+    validators: &[ValidatorDescr],
+) -> Result<SessionIdentity> {
+    selected.config.validate_protocol_version()?;
+    coordinates.new_catchain_ids = options.new_catchain_ids;
+    let options_hash = UInt256::calc_file_hash(&options.bytes()?);
     derive_session_identity(global_id, &options_hash, selected.cell(), coordinates, validators)
 }
 

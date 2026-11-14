@@ -119,11 +119,21 @@ Key-block contexts derive validator subsets and both session identities through
 native APIs. Supplied key blocks are test anchors, not authenticated chain state.
 Another25 clean-C++ controls cover pruned roots, previous references, shard
 alignment, trailing data, reserved fields and versioned governing options.
-Together the original268 and added49 contexts yield257 equal, zero mismatches
+Together the original268 and added63 contexts yield271 equal, zero mismatches
 and60 explicit unsupported refusals. Param29 options expose the full uint64
 height-coefficient product while committing its low32 wire bits; the block-hash
 flag follows the version2 boundary. A separate raw probe pins a product above
-uint32; it is outside the shared fixture schema and is not counted in257.
+uint32; it is outside the shared fixture schema and is not counted in271.
+Twelve further C++ controls pin review findings at the structural boundary:
+BlockInfo captures the software field as104 bits without checking its nested
+constructor, while its full reader keeps that check. Key-block config extraction
+requires the auxiliary cell to end exactly. Optional legacy Param28/29 use the
+C++ factory defaults when absent or not unpackable; strict production accessors
+retain their own contract. The decoded-options session helper grants no governing
+authority. Structural contexts report the header and Param19 IDs independently;
+production finality still rejects a missing or mismatched governing Param19.
+Two additional C++ controls keep pruned Param28/29 unavailable: they refuse as
+proof_malformed and must never fall back to default configuration.
 Session JSON retains the two double tokens until binary64 conversion, preserving
 correct rounding, negative zero and C++'s finite saturation on overflow. The API
 package's dev-only serde_json features enable precise float parsing and borrowed

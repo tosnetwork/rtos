@@ -484,6 +484,24 @@ const MC_BLOCK_EXTRA_TAG: u16 = 0xCCA5; // Original struct.
 
 impl Deserializable for McBlockExtra {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
+        self.read_from_profile(cell, false)
+    }
+}
+
+impl McBlockExtra {
+    /// Structural key-block extraction, including the exact auxiliary-cell
+    /// shape checked by C++ McBlockExtra::unpack. No chain authentication.
+    pub fn config_from_key_block_cell(cell: Cell) -> Result<ConfigParams> {
+        let mut slice = SliceData::load_cell(cell)?;
+        let mut extra = Self::default();
+        extra.read_from_profile(&mut slice, true)?;
+        if slice.remaining_bits() != 0 || slice.remaining_references() != 0 {
+            fail!("key block extra has trailing data");
+        }
+        extra.config.ok_or_else(|| error!("key block extra has no configuration"))
+    }
+
+    fn read_from_profile(&mut self, cell: &mut SliceData, exact_aux: bool) -> Result<()> {
         let tag = cell.get_next_u16()?;
         if tag != MC_BLOCK_EXTRA_TAG {
             fail!(BlockError::InvalidConstructorTag {
@@ -499,6 +517,9 @@ impl Deserializable for McBlockExtra {
         self.prev_blk_signatures.read_from(cell1)?;
         self.recover_create_msg.read_from(cell1)?;
         self.mint_msg.read_from(cell1)?;
+        if exact_aux && (cell1.remaining_bits() != 0 || cell1.remaining_references() != 0) {
+            fail!("key block extra auxiliary cell has trailing data");
+        }
 
         self.config = if key_block { Some(ConfigParams::construct_from(cell)?) } else { None };
 

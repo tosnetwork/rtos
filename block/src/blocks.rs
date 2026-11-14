@@ -558,7 +558,17 @@ impl BlockInfo {
         self.prev_key_block_seqno = slice.get_next_u32()?;
 
         if self.flags & GEN_SOFTWARE_EXISTS_FLAG != 0 {
-            self.gen_software = Some(GlobalVersion::construct_from(slice)?);
+            self.gen_software = Some(if read_previous {
+                GlobalVersion::construct_from(slice)?
+            } else {
+                // BlockInfo::unpack captures this fixed-width subslice without
+                // invoking GlobalVersion::unpack on its constructor byte.
+                slice.get_next_byte()?;
+                GlobalVersion {
+                    version: slice.get_next_u32()?,
+                    capabilities: slice.get_next_u64()?,
+                }
+            });
         }
 
         self.master_ref =

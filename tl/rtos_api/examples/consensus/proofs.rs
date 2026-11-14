@@ -2,9 +2,8 @@
 //! Native governing-proof adapters. Supplied key blocks are explicit test anchors.
 use super::{bits, shard, signature_json, u32_field, ExplicitSessionOptions};
 use anyhow::{ensure, Context, Result};
-use rtos_api::{
-    pq_finality::PqVerificationContext,
-    session_identity::{derive_session_from_config, SessionCoordinates},
+use rtos_api::session_identity::{
+    derive_session_from_options, derive_session_identity, SessionCoordinates,
 };
 use rtos_block::{
     BlockIdExt, BlockProofEnvelope, BlockSignaturesVariant, ConfigParamEnum, Deserializable,
@@ -113,13 +112,14 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
     let proof = read_proof(ctx, "block_proof")?;
     let (key_block, _) = header(&key_proof, &from)?;
     let (_, info) = header(&proof, &to)?;
-    let config = key_block
-        .read_extra()
-        .and_then(|v| v.read_custom())
-        .map_err(|_| domain_error("config_unavailable"))?
-        .and_then(|v| v.config().cloned())
-        .ok_or_else(|| domain_error("config_unavailable"))?;
-    let catchain = config.catchain_config().map_err(|_| domain_error("config_unavailable"))?;
+    let extra = rtos_block::BlockExtra::construct_from_full_cell(key_block.extra_cell())
+        .map_err(|_| domain_error("config_unavailable"))?;
+    let custom = extra.custom_cell().ok_or_else(|| domain_error("config_unavailable"))?;
+    let config = rtos_block::McBlockExtra::config_from_key_block_cell(custom)
+        .map_err(|_| domain_error("config_unavailable"))?;
+    let (catchain, consensus) = config
+        .legacy_proof_consensus_parameters()
+        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let set = config.validator_set().map_err(|_| domain_error("config_unavailable"))?;
     let (validators, hash) = set
         .calc_subset(
@@ -133,43 +133,34 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         return Err(domain_error("no_validator_set"));
     }
     let total = rtos_block::checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
-    let consensus = match config.config(29).map_err(|_| domain_error("config_unavailable"))? {
-        Some(ConfigParamEnum::ConfigParam29(v)) => v,
-        _ => return Err(domain_error("config_unavailable")),
-    };
     let options = ExplicitSessionOptions::from_config(&consensus, &catchain);
     let selected = config
         .selected_simplex_config(true)
         .map_err(|_| domain_error("consensus_config_unavailable"))?
         .ok_or_else(|| domain_error("consensus_config_unavailable"))?;
-    let identity = derive_session_from_config(
+    let coordinates = SessionCoordinates {
+        shard: to.shard(),
+        catchain_seqno: info.gen_catchain_seqno(),
+        vertical_seqno: info.vert_seq_no(),
+        last_key_block_seqno: info.prev_key_block_seqno(),
+        new_catchain_ids: options.new_catchain_ids,
+    };
+    let options_hash = rtos_block::UInt256::calc_file_hash(&options.bytes()?);
+    let identity = derive_session_identity(
         key_block.global_id(),
-        &config,
-        SessionCoordinates {
-            shard: to.shard(),
-            catchain_seqno: info.gen_catchain_seqno(),
-            vertical_seqno: info.vert_seq_no(),
-            last_key_block_seqno: info.prev_key_block_seqno(),
-            new_catchain_ids: consensus.new_catchain_ids,
-        },
+        &options_hash,
+        selected.cell(),
+        coordinates,
+        &validators,
+    )?;
+    let validator_identity = derive_session_from_options(
+        key_block.global_id(),
+        &options,
+        &selected,
+        coordinates,
         &validators,
     )
     .map_err(|_| domain_error("consensus_config_unavailable"))?;
-    let validator_context = PqVerificationContext::from_governing_config(
-        key_block.global_id(),
-        &config,
-        to.clone(),
-        info.vert_seq_no(),
-        info.prev_key_block_seqno(),
-        info.gen_catchain_seqno(),
-    )
-    .map_err(|e| {
-        if e.to_string().contains("Param19") {
-            domain_error("global_id_mismatch")
-        } else {
-            domain_error("consensus_config_unavailable")
-        }
-    })?;
     let config_global_id = match config.config(19)? {
         Some(ConfigParamEnum::ConfigParam19(v)) => Some(v as i32),
         _ => None,
@@ -195,7 +186,7 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         "prev_key_block_seqno":info.prev_key_block_seqno(),"is_key":info.key_block(),"header_validator_set_hash":info.gen_validator_list_hash_short(),
         "validator_set_hash":hash,"total_weight":total.to_string(),"validators":validators,
         "session_id":hex::encode_upper(identity.session_id.as_slice()),
-        "validator_path_session_id":hex::encode_upper(validator_context.expected_session_id().as_slice()),
+        "validator_path_session_id":hex::encode_upper(validator_identity.session_id.as_slice()),
         "signature_set":signature_set,"claimed_weight":claimed}),
     )
 }
