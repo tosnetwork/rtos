@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "qualification": "Inventory only; execution adapters and exact profiles remain to be integrated. Not an all-scenarios qualification.",
+  "qualification": "Selected scenarios only. Unintegrated adapters are refused before execution; no all-scenarios or release qualification.",
   "fixture_sources": [
     "expired_member_restart_fixture.py",
     "first_intent_cut_fixture.py",
@@ -147,25 +147,25 @@
     {
       "id": "rotation-control",
       "driver": "rotation_fixture.py",
-      "scope": "Both predeclared committees: all MC/WC creators and MC signers",
+      "scope": "Both predeclared committees: all MC/WC creators",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "rotation-mixed",
       "driver": "rotation_fixture.py",
-      "scope": "Both predeclared committees: all MC/WC creators and MC signers; two C++ and two Rust per active committee",
+      "scope": "Both predeclared committees: all MC/WC creators; two C++ and two Rust per active committee",
       "depends_on": [
         "rotation-control"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "exact-weight-control",
       "driver": "rotation_fixture.py",
       "scope": "Successor weight40 of60 finality and same-PID recovery",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "exact-weight-mixed",
@@ -174,14 +174,14 @@
       "depends_on": [
         "exact-weight-control"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "necessary-low-weight-control",
       "driver": "rotation_fixture.py",
       "scope": "Initial three necessary signers plus successor exact weight40",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "necessary-low-weight-mixed",
@@ -190,7 +190,7 @@
       "depends_on": [
         "necessary-low-weight-control"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "observer-budget-control",
@@ -215,7 +215,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-partition-member2",
@@ -269,7 +269,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "packet-partition-member5",

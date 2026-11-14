@@ -1,20 +1,44 @@
 # Local C++ / Rust interop runners
 
-## Fixed scenario inventory (execution integration pending)
+## Fixed scenario inventory and serial execution
 
-`scenario_catalog.json` records named scenarios, their assertion scope and native
-control dependencies. Inspect it with `python3 ci/interop/scenarios.py list`, or
+`scenario_catalog.json` records named scenarios, assertion scope and native
+control dependencies. Inspect with `python3 ci/interop/scenarios.py list`, or
 expand a selection with `python3 ci/interop/scenarios.py plan necessary-low-weight-mixed`.
 The planner orders controls before mixed cases and refuses unknown selections,
 cycles, missing drivers and additions/removals in the fixture-source inventory.
-New fixture sources require an explicit inventory review. This check does not
-prove that every parameter combination or assertion is represented.
+This inventory does not prove every parameter combination is represented.
 
-All entries currently remain `unintegrated`: this command does not launch nodes,
-accept previous run results, or issue a qualification verdict. Existing runners
-remain the execution path until exact profiles, resources, receipts and semantic
-result checks are connected. A plan is always `not_executed`, including a plan
-containing every entry. The seven-day follower, replay and fuzz gates are separate.
+The `rotation_v1` adapter runs rotation, exact-weight, necessary-low-weight
+control/mixed pairs and member2/member5 original-database restart. Other entries
+remain `unintegrated`; selecting any of them refuses the entire suite before
+creating runtime directories. An omitted selection means the entire catalog,
+so `run` currently requires an explicit supported selection.
+
+```sh
+"$CPP_PYTHON" ci/interop/scenarios.py run necessary-low-weight-mixed \
+  --cpp-python "$CPP_PYTHON" --snapshot "$CPP_SNAPSHOT" \
+  --profile-template "$EXPLICIT_BASELINE_PROFILE" \
+  --rust-node "$RUST_NODE" --rust-revision "$RUST_REVISION" \
+  --validator-preparer "$VALIDATOR_PREPARER" --block-checker "$BLOCK_CHECKER" \
+  --output "$FRESH_SUITE_OUTPUT"
+```
+
+The template supplies schema, C++ revision, global version, consensus options
+and AUTH network tag. The adapter rebuilds scenario weights and membership,
+uses a fresh timestamp, freezes complete MC/WC Genesis identities before startup,
+and gives each invocation a fresh user/network namespace. Scenarios run serially;
+control failure prevents the dependent mixed run. The original rotation240s,
+activation120s and recovery180s budgets are fixed. No arbitrary extra flags,
+existing runtime-directory reuse or automatic retries are accepted.
+
+`suite.json` retains source/binary/profile hashes and completed scenario result
+hashes; each invocation retains its command, exit and log. Existing native driver
+checks still authenticate certificates, bodies and states. The adapter additionally
+requires successful exit and scenario-specific semantic receipts. It does not
+accept externally supplied result files. `selected_scenarios_passed` applies only
+to that selection; missing adapters and the separate replay, seven-day follower,
+fuzz, review and release gates remain open. `plan` is always `not_executed`.
 
 ## Baseline and bootstrap
 

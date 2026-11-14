@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from scenario_execution import ROTATIONS, execute
+
 CATALOG = Path(__file__).with_name("scenario_catalog.json")
 
 
@@ -28,8 +30,13 @@ def validate(catalog, source_root):
         driver = entry["driver"]
         if Path(driver).name != driver or not (source_root / driver).is_file():
             raise ValueError("Scenario driver must be an existing local file")
-        if entry["execution"] != "unintegrated":
-            raise ValueError("No execution adapter is qualified by this inventory tool")
+        expected_adapter = "rotation_v1" if entry["id"] in ROTATIONS else "unintegrated"
+        if entry["execution"] != expected_adapter or (
+            expected_adapter == "rotation_v1" and driver != "rotation_fixture.py"
+        ):
+            raise ValueError(
+                "Scenario execution adapter does not match the implementation"
+            )
         if not entry["scope"].strip():
             raise ValueError("Every scenario needs an assertion scope")
         if any(dep not in by_id for dep in entry["depends_on"]):
@@ -63,8 +70,19 @@ def order(by_id, selected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["list", "plan"])
+    parser.add_argument("command", choices=["list", "plan", "run"])
     parser.add_argument("scenarios", nargs="*")
+    for option in (
+        "snapshot",
+        "profile-template",
+        "rust-node",
+        "validator-preparer",
+        "block-checker",
+        "cpp-python",
+        "output",
+    ):
+        parser.add_argument("--" + option, type=lambda value: Path(value).resolve())
+    parser.add_argument("--rust-revision")
     args = parser.parse_args()
     raw = CATALOG.read_bytes()
     catalog = json.loads(raw)
@@ -73,6 +91,9 @@ def main():
         parser.error("list takes no scenario selections")
     selected = args.scenarios or list(by_id)
     names = order(by_id, selected)
+    if args.command == "run":
+        execute(args, names, CATALOG)
+        return
     print(
         json.dumps(
             {
