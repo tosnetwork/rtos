@@ -1715,6 +1715,7 @@ impl ValidatorGroup {
 
     /// Track descendants of an already admitted group operation. The parent
     /// keeps its token until all child tasks have been registered.
+    #[track_caller]
     pub(super) fn spawn_task<F>(
         &self,
         rt: &tokio::runtime::Handle,
@@ -1725,8 +1726,33 @@ impl ValidatorGroup {
         F::Output: Send + 'static,
     {
         let panicked = self.task_panicked.clone();
+        let caller = std::panic::Location::caller();
+        let trace = log::log_enabled!(target: "validator", log::Level::Debug)
+            .then(|| (self.session_id.clone(), caller));
         self.tasks.spawn_on(
             async move {
+                struct TaskTrace {
+                    session: UInt256,
+                    id: tokio::task::Id,
+                    started: Instant,
+                }
+                impl Drop for TaskTrace {
+                    fn drop(&mut self) {
+                        log::debug!(target: "validator",
+                            "GROUP_TASK_END: session={:x} task={:?} elapsed_ms={}",
+                            self.session, self.id, self.started.elapsed().as_millis());
+                    }
+                }
+                // Drop also records panic/cancellation. Pair begin/end by the
+                // runtime task ID to locate unfinished tasks, without adding
+                // a registry or cancelling any state writes.
+                let _trace = trace.map(|(session, caller)| {
+                    let id = tokio::task::id();
+                    log::debug!(target: "validator",
+                        "GROUP_TASK_BEGIN: session={session:x} task={id:?} caller={caller} future={}",
+                        std::any::type_name::<F>());
+                    TaskTrace { session, id, started: Instant::now() }
+                });
                 match std::panic::AssertUnwindSafe(future).catch_unwind().await {
                     Ok(value) => value,
                     Err(payload) => {
@@ -1739,6 +1765,7 @@ impl ValidatorGroup {
         )
     }
 
+    #[track_caller]
     pub(super) fn spawn_root_task<F>(&self, rt: &tokio::runtime::Handle, future: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
