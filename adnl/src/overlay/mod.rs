@@ -723,7 +723,8 @@ impl Overlay {
     }
 
     /// Sender admission of an ordinary broadcast: `Forbidden` is refused,
-    /// `NeedCheck` must pass the application check on the local payload.
+    /// `NeedCheck` passes the application check here unless local protocol
+    /// processing owns that check together with delivery and propagation.
     async fn admit_ordinary_send(
         &self,
         source: &Arc<dyn KeyOption>,
@@ -731,6 +732,7 @@ impl Overlay {
         data: &[u8],
         is_fec: bool,
         is_any_sender: bool,
+        check_in_local_protocol: bool,
     ) -> Result<()> {
         let Some(policy) = &self.public_policy else {
             return Ok(());
@@ -751,6 +753,7 @@ impl Overlay {
         );
         match verdict {
             BroadcastCheckResult::Allowed => Ok(()),
+            BroadcastCheckResult::NeedCheck if check_in_local_protocol => Ok(()),
             BroadcastCheckResult::NeedCheck => policy.check(source.id(), data).await,
             BroadcastCheckResult::Forbidden => {
                 fail!(
@@ -2220,6 +2223,8 @@ impl OverlayNode {
                 data.object,
                 is_fec,
                 (ctx.flags & Self::FLAG_BCAST_ANY_SENDER) != 0,
+                self.wire_profile == rtos_api::WireProfile::T0
+                    && matches!(method, AdnlSendMethod::Fast),
             )
             .await?;
         if is_fec {

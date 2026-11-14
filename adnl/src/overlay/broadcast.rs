@@ -920,7 +920,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             held.into_iter()
                 .map(|part| {
                     let neighbours = relay.fixed_neighbours.clone().unwrap_or_else(|| {
-                        overlay.select_broadcast_neighbours(part.count, Some(&part.skip))
+                        let skip = if overlay.wire_profile == rtos_api::WireProfile::T0 {
+                            None
+                        } else { Some(&part.skip) };
+                        overlay.select_broadcast_neighbours(part.count, skip)
                     });
                     (part, neighbours)
                 })
@@ -953,6 +956,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
     }
 
     fn prepare_part(overlay: &Arc<Overlay>, transfer: &mut SendTransferFec) -> Result<Vec<u8>> {
+        overlay.serialize_broadcast(&Self::prepare_signed_part(transfer)?)
+    }
+
+    fn prepare_signed_part(transfer: &mut SendTransferFec) -> Result<Broadcast> {
         let seqno_original = transfer.seqno;
         let chunk = transfer.encoder.encode(&mut transfer.seqno)?;
         let to_sign = Self::calc_to_sign(
@@ -967,7 +974,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         if seqno_original == transfer.seqno {
             transfer.seqno += 1;
         }
-        overlay.serialize_broadcast(&bcast)
+        Ok(bcast)
     }
 
     /// Admit one received part: source verdict, duplicate and same-source
@@ -1490,6 +1497,9 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         if let Some(hops) = relay_hops.or(ctx.hops) {
             buf.push(hops);
         }
+        let skip = if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
+            None
+        } else { Some(ctx.peers.other()) };
         let neighbours = {
             let Some(guard) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
                 return Ok((None, false));
@@ -1516,11 +1526,11 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
                 relay
                     .fixed_neighbours
                     .get_or_insert_with(|| {
-                        ctx.overlay.select_broadcast_neighbours(count, Some(ctx.peers.other()))
+                        ctx.overlay.select_broadcast_neighbours(count, skip)
                     })
                     .clone()
             } else {
-                ctx.overlay.select_broadcast_neighbours(count, Some(ctx.peers.other()))
+                ctx.overlay.select_broadcast_neighbours(count, skip)
             }
         };
         if neighbours.is_empty() {
@@ -1599,6 +1609,46 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
             .telemetry
             .send_transfers
             .update(ctx.overlay.allocated.send_transfers.load(Ordering::Relaxed));
+        if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
+            // The TOS actor signs every local part and processes it as an own
+            // received part. Reassembly, source checks, relay and delivery are
+            // shared with ingress; the source does not bypass its decoder.
+            let to_send = (data_size / transfer.encoder.params().symbol_size as u32 + 1) * 2;
+            let packets = to_send.div_ceil(Self::SIZE_WAVE) * Self::SIZE_WAVE;
+            self.select_broadcast_neighbours(ctx.overlay, neighbours, None);
+            let overlay = ctx.overlay.clone();
+            overlay.owned_broadcasts.remove(bcast_id);
+            let tasks = overlay.tasks.clone();
+            tasks.spawn_cancelable("overlay FEC source", async move {
+                let peers = AdnlPeers::with_keys(
+                    transfer.src_adnl_key_id.clone(), transfer.src_adnl_key_id.clone(),
+                );
+                while transfer.seqno < to_send {
+                    // CPP completes a four-symbol wave before checking its
+                    // send target; short payloads still emit all four symbols.
+                    for _ in 0..Self::SIZE_WAVE {
+                        let result = async {
+                            let Broadcast::Overlay_BroadcastFec(part) =
+                                Self::prepare_signed_part(&mut transfer)? else {
+                                    fail!("Unexpected ordinary FEC carrier");
+                                };
+                            Self::for_recv().recv(part, BroadcastRecvContext {
+                                data: BroadcastData::None, hops: None, overlay: &overlay,
+                                peers: &peers, verdict: BroadcastCheckResult::Allowed,
+                            }).await
+                        }.await;
+                        if let Err(error) = result {
+                            log::warn!(target: TARGET, "Cannot process local FEC part: {error}");
+                            return;
+                        }
+                    }
+                    if transfer.seqno < to_send {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            });
+            return Ok(BroadcastJob::Background(packets));
+        }
         let bcast_type = Self::broadcast_type();
         let max_seqno = (data_size / transfer.encoder.params().symbol_size as u32 + 1) * 3 / 2;
         let overlay = ctx.overlay.clone();

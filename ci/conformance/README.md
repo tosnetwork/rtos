@@ -594,7 +594,7 @@ The latest TOS5af405d channel harness routes through the peer table. Its destina
 lookup is shared with the Rust socket receive pipeline: local identities take
 precedence over inbound channel registrations, before any decryption. An unknown
 destination is refused by that lookup. The standalone Channel API retains its
-channel-only namespace. The latest corpus now has1273 equal effects,3 FEC mismatches
+channel-only namespace. The latest corpus now has1276 equal effects,zero mismatches
 and14 unsupported two-step/Plumtree contexts; this is not a passing whole-net run.
 The earlier640 additional channel comparisons against the latest C++ actor harness
 retain their ebe81eb9 source scope. Native
@@ -622,10 +622,15 @@ to the full neighbour set, including the forwarding peer. Legacy behavior remain
 in its own wire profile. Fixed-member opaque messages, empty messages, foreign TL
 objects and trailing data reach the raw application callback, following the C++
 actor. Source certificates do not extend authority in this profile. An explicit
-FEC API preserves a FEC carrier for small payloads, although its original native
-sender/reassembly propagation still differs in3 executed latest cases.
+FEC API preserves a FEC carrier for small payloads. Locally generated TOS FEC parts
+also pass through native signature checks, reassembly, propagation and delivery.
+The sender completes four-symbol waves, with a10ms interval and the C++ send target;
+ordinary FEC relays use the full neighbour set. Legacy pacing remains scoped.
+TOS source admission refuses forbidden sources; the local protocol performs the
+application check once before delivery/relay. Both simple/FEC approval and refusal
+are covered, including zero emissions on refusal.
 
-Of the45 additional contexts,28 match the latest C++ actor effects;3 differ and14
+Of the45 additional contexts,31 match the latest C++ actor effects;zero differ and14
 are unsupported. Six additional raw-message controls agree after five actual
 before-change differences. Native checks include transport binding/retirement,
 fixed-member certificate restrictions and small explicit FEC; three behavior
