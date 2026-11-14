@@ -856,6 +856,11 @@ impl ValidateQuery {
     async fn get_ref_mc_state(&mut self, base: &mut ValidateBase) -> Result<McData> {
         let (_, mc_id) = base.info.read_master_id()?.master_block_id();
         let mc_state = self.engine.clone().wait_state(&mc_id, Some(1_000), true).await?;
+        // CPP ConfigInfo::needAccountsRoot prepares the masterchain dictionary before
+        // auxiliary descriptor requests. Keep pruned-reference failures at this stage.
+        if base.shard().is_masterchain() {
+            base.prev_state_accounts = mc_state.state()?.read_accounts()?;
+        }
         log::debug!(
             target: "validate_query",
             "({}): in ValidateQuery::get_ref_mc_state() {}",

@@ -592,8 +592,9 @@ described as equivalence for arbitrary accepted u64 gas contexts.
 
 Build `cargo build -p rtos --example validate_conformance --locked -j32` and run
 that target with the shared runner against `$TOS_REFERENCE/test/conformance/vectors/validate`.
-All638 original contexts agree with clean CPP1181:610 accepted candidates and28
-negative outcomes, zero differences/refusals/skips. This is the fixed corpus, not
+All643 current contexts agree with clean CPP5af405d:610 accepted candidates and33
+negative outcomes, zero differences/refusals/skips. The original CPP1181 subset of638
+remains covered. This is the executed corpus, not
 arbitrary-block or whole-node/latest-TOS qualification.
 
 The adapter supplies original block/collated bytes and up to32 explicit state
@@ -603,7 +604,9 @@ is distinct from a candidate rejection. Native validation returns the accepted
 millisecond timestamp only after the entire validation core succeeds. No fixture
 expectations are read and no result is inferred from a structural header check.
 
-The core follows CPP early LT alignment, committed previous-state hash checks,
+Reference masterchain account dictionaries are prepared with masterchain metadata,
+so a pruned required root fails before auxiliary governing-state requests. The core
+follows CPP early LT alignment, committed previous-state hash checks,
 state-header validation order, governing-state selection for shard descriptors,
 zero-state neighbour exclusion, time-before-queue-failure ordering and deferred
 transaction-account reads. Aggregate fee reconciliation follows transaction
@@ -619,8 +622,11 @@ authentication remains required before cache/fake/skip paths. The older descript
 APIs retain their default governing-state argument; this checkpoint explicitly
 loads governing states in ValidateQuery and does not qualify every other caller.
 
-Inputs are bounded to128MiB per JSON line and32MiB per BOC field. This is an adapter
-input bound, not a measured process-memory or validator-work quota. Reason classes
+Inputs are bounded to16MiB per JSON line,4MiB per block/collated/state BOC field
+and8MiB of states in total. All encoded state sizes are checked before any state
+is decoded, matching CPP. The shared boundary control refuses four oversized inputs,
+executes a block at the bound and then answers a frozen input in the same process.
+These are adapter input bounds, not measured process-memory or validator-work quotas. Reason classes
 are rendered from actual native errors, including Rust's nested diagnostic forms.
 Additional unsupported provider operations or panics are harness failures, not
 passing rejection outcomes. Latest-TOS regeneration, asynchronous transport wiring,

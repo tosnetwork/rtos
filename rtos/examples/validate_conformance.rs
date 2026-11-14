@@ -7,8 +7,8 @@ use rtos::{
     validator::{offline, BlockCandidate},
 };
 use rtos_block::{
-    base64_decode, read_single_root_boc, BlockIdExt, CellType, Deserializable, MerkleProof,
-    ShardIdent, UInt256,
+    base64_decode, read_single_root_boc, BlockError, BlockIdExt, CellType, Deserializable,
+    ExceptionCode, MerkleProof, ShardIdent, UInt256,
 };
 use serde_json::{json, Value};
 use std::{
@@ -36,51 +36,102 @@ fn id(v: &Value) -> Result<BlockIdExt> {
         hash(&v["file_hash"])?,
     ))
 }
-fn bytes(v: &Value) -> Result<Vec<u8>> {
-    let b = base64_decode(v.as_str().context("base64 BOC required")?)?;
-    ensure!(b.len() <= 32 << 20, "BOC exceeds32MiB");
-    Ok(b)
+const MAX_CONTEXT_BYTES: u64 = 16 << 20;
+const MAX_BOC_BYTES: usize = 4 << 20;
+const MAX_STATES_BYTES: usize = 8 << 20;
+
+// CPP checks this estimate before invoking any decoder (including for malformed base64).
+fn decoded_size(s: &str) -> usize {
+    let mut n = s.len();
+    for _ in 0..2 {
+        if n > 0 && s.as_bytes()[n - 1] == b'=' {
+            n -= 1;
+        } else {
+            break;
+        }
+    }
+    n / 4 * 3 + (n % 4).saturating_sub(1)
+}
+fn check_size(s: &str, limit: usize, name: &str) -> Result<usize> {
+    let size = decoded_size(s);
+    ensure!(size <= limit, "{name}: larger than {limit} bytes");
+    Ok(size)
+}
+fn bytes(v: &Value, name: &str) -> Result<Vec<u8>> {
+    let s = v.as_str().context("base64 BOC required")?;
+    check_size(s, MAX_BOC_BYTES, name)?;
+    Ok(base64_decode(s)?)
 }
 fn request(v: &Value) -> Result<offline::Request> {
-    let mut states = vec![];
+    // Preserve the reference's field/size-check order; states are preflighted as a batch.
+    let block_id = id(&v["block_id"])?;
+    let data = bytes(&v["block"], "block")?;
+    let collated = if v.get("collated_data").is_some() {
+        bytes(&v["collated_data"], "collated_data")?
+    } else {
+        vec![]
+    };
+    let created_by = hash(&v["created_by"])?;
+    let prev = v["prev"].as_array().context("prev array required")?;
+    ensure!((1..=2).contains(&prev.len()), "one or two previous blocks required");
+    let prev = prev.iter().map(id).collect::<Result<_>>()?;
+    let min_masterchain = id(&v["min_masterchain"])?;
+    let top_masterchain = id(&v["top_masterchain"])?;
+    let validator_set_from = id(&v["validator_set_from"])?;
+    let skip_shard_signatures = v
+        .get("skip_shard_signatures")
+        .map_or(Ok(false), |v| v.as_bool().context("bool required"))?;
     let values = v["states"].as_array().context("states array required")?;
-    ensure!(values.len() <= 32, "at most32states required");
-    for s in values {
-        let mut root = read_single_root_boc(&bytes(&s["state"])?)?;
+    ensure!(values.len() <= 32, "states: more than 32 items");
+    let mut encoded = Vec::with_capacity(values.len());
+    let mut total = 0;
+    for (i, value) in values.iter().enumerate() {
+        ensure!(value.is_object(), "states[{i}]: object required");
+        let s = value["state"].as_str().context("base64 state required")?;
+        total += check_size(s, MAX_BOC_BYTES, &format!("states[{i}].state"))?;
+        ensure!(total <= MAX_STATES_BYTES, "states: larger than {MAX_STATES_BYTES} bytes in total");
+        encoded.push(s);
+    }
+    let mut states = Vec::with_capacity(values.len());
+    for (value, encoded) in values.iter().zip(encoded) {
+        let block = id(&value["block"])?;
+        let mut root = read_single_root_boc(&base64_decode(encoded)?)?;
         if root.cell_type() == CellType::MerkleProof {
             let proof = MerkleProof::construct_from_cell(root)?;
             root = proof.proof.virtualize(1);
         }
-        states.push((id(&s["block"])?, root));
+        states.push((block, root));
     }
-    let prev = v["prev"].as_array().context("prev array required")?;
-    ensure!((1..=2).contains(&prev.len()), "one or two previous blocks required");
-    let collated =
-        if v.get("collated_data").is_some() { bytes(&v["collated_data"])? } else { vec![] };
     Ok(offline::Request {
         candidate: BlockCandidate {
-            block_id: id(&v["block_id"])?,
-            data: bytes(&v["block"])?,
+            block_id,
+            data,
             collated_file_hash: UInt256::calc_file_hash(&collated),
             collated_data: collated,
-            created_by: hash(&v["created_by"])?,
+            created_by,
         },
-        prev: prev.iter().map(id).collect::<Result<_>>()?,
-        min_masterchain: id(&v["min_masterchain"])?,
-        top_masterchain: id(&v["top_masterchain"])?,
-        validator_set_from: id(&v["validator_set_from"])?,
-        skip_shard_signatures: v
-            .get("skip_shard_signatures")
-            .map_or(Ok(false), |v| v.as_bool().context("bool required"))?,
+        prev,
+        min_masterchain,
+        top_masterchain,
+        validator_set_from,
+        skip_shard_signatures,
         states,
     })
 }
 fn reason(e: &anyhow::Error) -> &'static str {
+    if matches!(e.downcast_ref::<BlockError>(), Some(BlockError::PrunedCellAccess(_)))
+        || matches!(e.downcast_ref::<ExceptionCode>(), Some(ExceptionCode::PrunedCellAccess))
+    {
+        return "pruned_input";
+    }
     if e.downcast_ref::<offline::InputUnavailable>().is_some() {
         return "input_unavailable";
     }
     let text = e.to_string();
     let table = [
+        ("block catchain sequence", "validator_set_mismatch"),
+        ("block validator set hash", "validator_set_mismatch"),
+        ("pruned branch", "pruned_input"),
         ("last transaction mismatch", "transaction_invalid"),
         ("claims to be transaction", "transaction_invalid"),
         ("claims that the previous transaction", "transaction_invalid"),
@@ -159,12 +210,12 @@ fn main() -> Result<()> {
     let mut output = io::stdout().lock();
     loop {
         let mut line = String::new();
-        let n = input.by_ref().take((128 << 20) + 2).read_line(&mut line)?;
+        let n = input.by_ref().take(MAX_CONTEXT_BYTES + 2).read_line(&mut line)?;
         if n == 0 {
             break;
         }
         let effect = (|| -> Result<Value> {
-            ensure!(n <= 128 << 20, "context too large");
+            ensure!(n as u64 <= MAX_CONTEXT_BYTES, "context too large");
             ensure!(harness == "validate", "unsupported harness");
             runtime.block_on(run(&serde_json::from_str(&line)?))
         })()
@@ -172,7 +223,7 @@ fn main() -> Result<()> {
         serde_json::to_writer(&mut output, &effect)?;
         writeln!(output)?;
         output.flush()?;
-        ensure!(n <= 128 << 20, "context too large");
+        ensure!(n as u64 <= MAX_CONTEXT_BYTES, "context too large");
     }
     Ok(())
 }
