@@ -222,12 +222,15 @@ impl Bbr {
         }
     }
     pub fn rate(&self) -> f64 {
-        self.max_bandwidth
-            * match self.state {
-                BbrState::Start => 2.8,
-                BbrState::Drain => 1.0 / 2.8,
-                BbrState::ProbeBandwidth => [0.75, 1.0, 1.0, 1.0, 1.0, 1.25][self.cycle],
+        // Preserve the reference's operation order: a rounded reciprocal
+        // changes the finite Drain pacing rate by one ULP for some inputs.
+        match self.state {
+            BbrState::Start => self.max_bandwidth * 2.8,
+            BbrState::Drain => self.max_bandwidth / 2.8,
+            BbrState::ProbeBandwidth => {
+                [0.75, 1.0, 1.0, 1.0, 1.0, 1.25][self.cycle] * self.max_bandwidth
             }
+        }
     }
     pub fn window(&self) -> u32 {
         let gain = if self.state == BbrState::ProbeBandwidth { 2.0 } else { 2.8 };
@@ -379,5 +382,32 @@ mod tests {
         assert_eq!(stat.add(9.0, 5.01, true), 4.0);
         assert_eq!(stat.add(10.0, 10.02, true), 9.0);
         assert_eq!(stat.add(11.0, 20.03, true), 11.0);
+    }
+
+    #[test]
+    fn drain_rate_preserves_cpp_division_rounding() {
+        // Actual clean TOS1181 Bbr::step/get_rate bits, independently recorded
+        // in net07/review-e55fdcde/rate-cpp.txt. Round4 remains in Drain:
+        // in_flight1000 exceeds every tested bandwidth-delay product.
+        let cases = [
+            (3.0, 0x3ff1249249249249u64),
+            (7.0, 0x4004000000000000),
+            (17.0, 0x4018492492492493),
+            (99.0, 0x4041adb6db6db6dc),
+            (100.0, 0x4041db6db6db6db7),
+            (101.0, 0x4042092492492493),
+            (1000.0, 0x4076524924924925),
+        ];
+        for (bandwidth, expected) in cases {
+            let mut rtt = Rtt::default();
+            let mut bdw = Bandwidth::default();
+            bdw.window_max = bandwidth;
+            let mut bbr = Bbr::default();
+            bbr.step(&rtt, &bdw, 1000, 1000.0);
+            rtt.round = 4;
+            bbr.step(&rtt, &bdw, 1000, 1001.0);
+            assert!(bbr.state == BbrState::Drain);
+            assert_eq!(bbr.rate().to_bits(), expected, "bandwidth={bandwidth}");
+        }
     }
 }
