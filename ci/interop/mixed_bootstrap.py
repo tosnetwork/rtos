@@ -17,6 +17,7 @@ from pathlib import Path
 
 from cpp_baseline import (
     ACTIVE_CPP_REVISION,
+    CANDIDATE_CPP_REVISION,
     DEFAULT_AUTH_NETWORK_TAG,
     configure_auth_namespace,
     require_cpp_baseline,
@@ -31,6 +32,11 @@ parser.add_argument(
     "--validator-preparer",
     type=Path,
     help="Enable Rust test signing; default to two C++ processes in a four-member committee",
+)
+parser.add_argument(
+    "--cpp-revision",
+    choices=[ACTIVE_CPP_REVISION, CANDIDATE_CPP_REVISION],
+    help="Explicit reference selection; active signing defaults to the established baseline",
 )
 parser.add_argument("--timeout", type=float, default=180)
 parser.add_argument("--block-checker", type=Path)
@@ -55,17 +61,25 @@ snapshot = args.snapshot.resolve()
 root = args.output.resolve()
 root.mkdir(parents=True, exist_ok=False)
 manifest = json.loads((snapshot / "manifest.json").read_text())
+selected_revision = args.cpp_revision or (
+    ACTIVE_CPP_REVISION if args.validator_preparer else manifest["cpp_source_commit"]
+)
+reference_profile = {
+    "cpp_revision": selected_revision,
+    "auth_network_tag": DEFAULT_AUTH_NETWORK_TAG,
+}
+require_cpp_baseline(manifest["cpp_source_commit"], reference_profile)
 with args.rust_node.open("rb") as stream:
     rust_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
 preparer_sha256 = None
 if args.validator_preparer:
     with args.validator_preparer.open("rb") as stream:
         preparer_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
-    require_cpp_baseline(manifest["cpp_source_commit"])
 (root / "source.json").write_text(
     json.dumps(
         {
             "cpp_snapshot": manifest,
+            "reference_profile": reference_profile,
             "rust_binary": str(args.rust_node.resolve()),
             "rust_binary_sha256": rust_sha256,
             "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -132,10 +146,7 @@ async def main():
     ) as network:
         configure_auth_namespace(
             network.config,
-            {
-                "cpp_revision": ACTIVE_CPP_REVISION,
-                "auth_network_tag": DEFAULT_AUTH_NETWORK_TAG,
-            },
+            reference_profile,
         )
         network.config.shard_validators = 4
         dht = network.create_dht_node()
