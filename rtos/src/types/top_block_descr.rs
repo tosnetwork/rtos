@@ -332,8 +332,12 @@ impl TopBlockDescrStuff {
     }
 
     pub fn prevalidate_with_governing(
-        &self, last_mc_block_id: &BlockIdExt, last_mc_state: &ShardStateStuff,
-        governing: &ShardStateStuff, mode: Mode, res_flags: &mut u8,
+        &self,
+        last_mc_block_id: &BlockIdExt,
+        last_mc_state: &ShardStateStuff,
+        governing: &ShardStateStuff,
+        mode: Mode,
+        res_flags: &mut u8,
     ) -> Result<i32> {
         if governing.block_id() != self.governing_masterchain_block_id()? {
             fail!("governing masterchain state does not match descriptor");
@@ -822,8 +826,7 @@ impl TopBlockDescrStuff {
 
         let governing_extra = governing_mc_state.shard_state_extra()?;
         let cur_validator_set = governing_extra.config.validator_set()?;
-        let cc_seqno =
-            governing_extra.shards().calc_shard_cc_seqno(self.proof_for().shard())?;
+        let cc_seqno = governing_extra.shards().calc_shard_cc_seqno(self.proof_for().shard())?;
 
         let mut vset_ok = false;
         let shard_id = self.proof_for().shard();

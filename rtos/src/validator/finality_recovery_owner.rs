@@ -64,7 +64,9 @@ impl RecoveryRegistry {
         if state.stopping {
             fail!("Recovery session admission stopped");
         }
-        state.bootstrap_holds = state.bootstrap_holds.checked_add(1)
+        state.bootstrap_holds = state
+            .bootstrap_holds
+            .checked_add(1)
             .ok_or_else(|| error!("Recovery bootstrap gate count exhausted"))?;
         Ok(RecoveryBootstrapGate { registry: self.clone() })
     }
@@ -190,8 +192,8 @@ impl Drop for RecoveryBootstrapGate {
     fn drop(&mut self) {
         {
             let mut state = self.registry.reservations.lock().unwrap();
-            state.bootstrap_holds = state.bootstrap_holds.checked_sub(1)
-                .expect("owned recovery bootstrap gate");
+            state.bootstrap_holds =
+                state.bootstrap_holds.checked_sub(1).expect("owned recovery bootstrap gate");
         }
         self.registry.changed.send_modify(|generation| *generation = generation.wrapping_add(1));
     }
@@ -242,7 +244,10 @@ mod tests {
         let generation = registry.generation();
         drop(gate);
         assert!(registry.generation() != generation);
-        assert!(registry.reserve_key(key.clone()).unwrap().is_none(), "normal owner still holds its actual lease");
+        assert!(
+            registry.reserve_key(key.clone()).unwrap().is_none(),
+            "normal owner still holds its actual lease"
+        );
         normal.release();
         registry.reserve_key(key).unwrap().unwrap().release();
     }
@@ -268,7 +273,7 @@ mod tests {
         registry.stop();
         drop(gate);
         assert!(registry.defer_recovery_admission().is_err());
-        assert!(registry.reserve_key((UInt256::from([9;32]),RecoveryRole::Validator)).is_err());
+        assert!(registry.reserve_key((UInt256::from([9; 32]), RecoveryRole::Validator)).is_err());
     }
 
     #[test]

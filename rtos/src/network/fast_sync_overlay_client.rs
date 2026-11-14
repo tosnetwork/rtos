@@ -187,7 +187,10 @@ impl FastSyncOverlayClient {
     /// Observe transport arrival independently of finality's cross-overlay
     /// deduplication. Callers must separately assert successful Engine handling.
     #[cfg(test)]
-    pub(crate) fn received_candidate_and_finality_ingress(&self, id: &rtos_block::BlockIdExt) -> bool {
+    pub(crate) fn received_candidate_and_finality_ingress(
+        &self,
+        id: &rtos_block::BlockIdExt,
+    ) -> bool {
         let seen = self.received_for_test.lock().unwrap();
         seen.0.contains(id) && seen.2.contains(id)
     }

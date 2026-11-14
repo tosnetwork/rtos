@@ -359,7 +359,10 @@ pub async fn run_collate_query(
             }
 
             return Ok((
-                validator_query_candidate_to_validator_block_candidate(collator_transport, candidate),
+                validator_query_candidate_to_validator_block_candidate(
+                    collator_transport,
+                    candidate,
+                ),
                 new_state,
                 new_block,
                 block_root,

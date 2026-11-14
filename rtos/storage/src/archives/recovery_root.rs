@@ -34,7 +34,8 @@ impl Policy {
     /// Presence and trusted factory checks only. The caller must also validate
     /// the durable ledger and rebuild protection before any recovery effects.
     pub(crate) fn check_environment(self, mode: FactoryMode, ledger_exists: bool) -> Result<()> {
-        let expected_mode = if self == Self::Node { FactoryMode::Node } else { FactoryMode::Standalone };
+        let expected_mode =
+            if self == Self::Node { FactoryMode::Node } else { FactoryMode::Standalone };
         if mode != expected_mode {
             fail!("Archive recovery factory mode mismatch");
         }
@@ -112,12 +113,14 @@ impl RootHeader {
         }
         // Preparing is durable before any control directory or sidecar exists.
         // Its inventories describe the complete original canonical state.
-        let unselected_abort = self.state == State::Cleaned && self.aborted
-            && self.selection == Sidecar::default();
+        let unselected_abort =
+            self.state == State::Cleaned && self.aborted && self.selection == Sidecar::default();
         self.selection.require(self.state != State::Preparing && !unselected_abort)?;
-        self.ready.require(!matches!(self.state, State::Preparing | State::Building) && !self.aborted)?;
+        self.ready
+            .require(!matches!(self.state, State::Preparing | State::Building) && !self.aborted)?;
         self.providers.require(matches!(self.state, State::Preparing | State::Cleaned))?;
-        self.maps.require(matches!(self.state, State::Preparing | State::Committed | State::Cleaned))?;
+        self.maps
+            .require(matches!(self.state, State::Preparing | State::Committed | State::Cleaned))?;
         self.data.require(matches!(self.state, State::Preparing | State::Cleaned))?;
         Ok(())
     }
@@ -215,9 +218,13 @@ impl RootHeader {
         }
         let legal = match (self.state, next.state) {
             (State::Preparing, State::Building) => true,
-            (State::Preparing, State::Cleaned) => next.aborted
-                && next.selection == self.selection && next.providers == self.providers
-                && next.maps == self.maps && next.data == self.data,
+            (State::Preparing, State::Cleaned) => {
+                next.aborted
+                    && next.selection == self.selection
+                    && next.providers == self.providers
+                    && next.maps == self.maps
+                    && next.data == self.data
+            }
             (State::Building, State::Ready) => true,
             (State::Building, State::Cleaned) => next.aborted,
             (State::Ready, State::Committed) => self.ready == next.ready,
@@ -240,8 +247,10 @@ struct HeaderReader<'a> {
 
 impl HeaderReader<'_> {
     fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let end = self.pos.checked_add(N).ok_or_else(|| error!("Archive header offset overflow"))?;
-        let value = self.bytes.get(self.pos..end).ok_or_else(|| error!("Truncated archive header"))?;
+        let end =
+            self.pos.checked_add(N).ok_or_else(|| error!("Archive header offset overflow"))?;
+        let value =
+            self.bytes.get(self.pos..end).ok_or_else(|| error!("Truncated archive header"))?;
         self.pos = end;
         value.try_into().map_err(|_| error!("Archive header field size mismatch"))
     }

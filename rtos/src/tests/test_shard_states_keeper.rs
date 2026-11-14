@@ -945,8 +945,10 @@ async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candida
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disk-full harness only"]
 async fn disk_full_incarnation_is_refused_then_advances_past_any_applied_value() -> Result<()> {
-    use crate::publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler};
-    use crate::validator::validator_cleanup_gc::next_cleanup_incarnation;
+    use crate::{
+        publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler},
+        validator::validator_cleanup_gc::next_cleanup_incarnation,
+    };
     let root = enospc_root().join("incarnation");
     std::fs::create_dir_all(&root)?;
     let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;

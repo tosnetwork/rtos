@@ -135,7 +135,8 @@ async fn persistent_repair_custody_missing_parent_refuses_durable_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history_then_cold_checks() {
+async fn persistent_repair_custody_capsule_internal_closure_repairs_real_history_then_cold_checks()
+{
     capsule_cold_integrity(false).await;
 }
 
@@ -226,21 +227,31 @@ async fn capsule_cold_integrity(corrupt: bool) {
     let (generation, digest) = run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let capsule = root.join("retired-history-v1");
     if corrupt {
-        let (manifest_path, original_manifest, manifest) = std::fs::read_dir(&capsule).unwrap()
+        let (manifest_path, original_manifest, manifest) = std::fs::read_dir(&capsule)
+            .unwrap()
             .filter_map(|entry| {
                 let path = entry.unwrap().path();
-                if path.extension().is_none_or(|ext| ext != "json") { return None; }
+                if path.extension().is_none_or(|ext| ext != "json") {
+                    return None;
+                }
                 let bytes = std::fs::read(&path).unwrap();
                 let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 (value["id"] == parent.id().to_string()).then_some((path, bytes, value))
-            }).next().expect("real protected parent capsule manifest must exist");
+            })
+            .next()
+            .expect("real protected parent capsule manifest must exist");
         let blob_path = capsule.join(format!("{}.blob", manifest["state"].as_str().unwrap()));
         let original_blob = std::fs::read(&blob_path).unwrap();
         for case in ["domain", "checksum"] {
             let (path, original, damaged, expected) = if case == "domain" {
                 let mut value = manifest.clone();
                 value["domain"]["init"] = target.id().to_string().into();
-                (&manifest_path, &original_manifest, serde_json::to_vec(&value).unwrap(), "domain/schema mismatch")
+                (
+                    &manifest_path,
+                    &original_manifest,
+                    serde_json::to_vec(&value).unwrap(),
+                    "domain/schema mismatch",
+                )
             } else {
                 let mut bytes = original_blob.clone();
                 bytes[0] ^= 1;
@@ -249,22 +260,47 @@ async fn capsule_cold_integrity(corrupt: bool) {
             std::fs::write(path, &damaged).unwrap();
             let engine = open_engine(dir.path()).await;
             let run = std::panic::AssertUnwindSafe(async {
-                let error = reopen_durable_mc_custody(engine.clone(), generation, exact.clone(), digest.clone())
-                    .await.err().expect("corrupt protected capsule must refuse private custody");
+                let error = reopen_durable_mc_custody(
+                    engine.clone(),
+                    generation,
+                    exact.clone(),
+                    digest.clone(),
+                )
+                .await
+                .err()
+                .expect("corrupt protected capsule must refuse private custody");
                 assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
-                assert_eq!(std::fs::read(path).unwrap(), damaged,
-                    "failed protected capsule authentication must not replace damaged evidence");
-                assert!(!engine.shard_states_keeper().allow_state_gc(parent.id()).unwrap(),
-                    "cold ledger must still protect dependencies after authentication refusal");
-            }).catch_unwind().await;
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    damaged,
+                    "failed protected capsule authentication must not replace damaged evidence"
+                );
+                assert!(
+                    !engine.shard_states_keeper().allow_state_gc(parent.id()).unwrap(),
+                    "cold ledger must still protect dependencies after authentication refusal"
+                );
+            })
+            .catch_unwind()
+            .await;
             close(engine).await;
             // Restore the exact physical backup even if an assertion failed.
             std::fs::write(path, original).unwrap();
             run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             let engine = open_engine(dir.path()).await;
             let run = std::panic::AssertUnwindSafe(async {
-                drop(reopen_durable_mc_custody(engine.clone(), generation, exact.clone(), digest.clone()).await.unwrap());
-            }).catch_unwind().await;
+                drop(
+                    reopen_durable_mc_custody(
+                        engine.clone(),
+                        generation,
+                        exact.clone(),
+                        digest.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            })
+            .catch_unwind()
+            .await;
             close(engine).await;
             run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
@@ -302,18 +338,33 @@ async fn persistent_repair_history_real_local_limits_never_enter_capsule_or_netw
     let result = std::panic::AssertUnwindSafe(async {
         for depth_limit in [false, true] {
             let mut limits = crate::history_read_budget::HistoryReadLimits::default();
-            if depth_limit { limits.depth = 0; } else { limits.cells = 0; }
+            if depth_limit {
+                limits.depth = 0;
+            } else {
+                limits.cells = 0;
+            }
             let budget = crate::history_read_budget::HistoryReadBudget::new(limits);
             for _ in 0..2 {
                 let error = crate::boot::load_history_proof_with_budget(
-                    engine.as_ref(), parent.id(), false, true, Some(&budget),
-                ).await.unwrap_err();
+                    engine.as_ref(),
+                    parent.id(),
+                    false,
+                    true,
+                    Some(&budget),
+                )
+                .await
+                .unwrap_err();
                 assert!(crate::history_read_budget::stops_fallback(&error), "{error:#}");
-                assert_eq!(budget.local_proof_fallbacks(), 0,
-                    "actual local proof resource denial must precede capsule/network fallback");
+                assert_eq!(
+                    budget.local_proof_fallbacks(),
+                    0,
+                    "actual local proof resource denial must precede capsule/network fallback"
+                );
             }
         }
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     close(engine).await;
     drop(dir);
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));

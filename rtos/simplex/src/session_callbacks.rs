@@ -176,11 +176,16 @@ impl SessionCallbacks {
         namespace: &std::path::Path,
         queue: crate::task_queue::TaskQueuePtr,
     ) -> rtos_block::Result<()> {
-        self.initialize_delivery_with_ready(runtime, namespace, Some(self.delivery_ready_callback(queue)))
+        self.initialize_delivery_with_ready(
+            runtime,
+            namespace,
+            Some(self.delivery_ready_callback(queue)),
+        )
     }
-    fn delivery_ready_callback(&self, queue: crate::task_queue::TaskQueuePtr)
-        -> crate::finality_delivery::SourceReadyCallback
-    {
+    fn delivery_ready_callback(
+        &self,
+        queue: crate::task_queue::TaskQueuePtr,
+    ) -> crate::finality_delivery::SourceReadyCallback {
         // A completion resumes SXMAIN, like the C++ await continuation. Keep
         // only a weak queue reference and at most one outstanding wake task.
         let queue = Arc::downgrade(&queue);
@@ -188,7 +193,9 @@ impl SessionCallbacks {
         let pending = Arc::new(AtomicBool::new(false));
         let session = self.session_id.clone();
         Arc::new(move || {
-            if stop.load(Ordering::Acquire) || pending.swap(true, Ordering::AcqRel) { return; }
+            if stop.load(Ordering::Acquire) || pending.swap(true, Ordering::AcqRel) {
+                return;
+            }
             if let Some(queue) = queue.upgrade() {
                 let pending = pending.clone();
                 let session = session.clone();
@@ -253,7 +260,10 @@ impl SessionCallbacks {
     ) -> rtos_block::Result<()> {
         self.delivery_source()?.prepare_intents(has_existing_certificates)
     }
-    pub(crate) fn prepare_database_finality_intents(&self, certificates: &[crate::database::FinalCertRecord]) -> rtos_block::Result<()> {
+    pub(crate) fn prepare_database_finality_intents(
+        &self,
+        certificates: &[crate::database::FinalCertRecord],
+    ) -> rtos_block::Result<()> {
         self.delivery_source()?.prepare_database_intents(certificates)
     }
     pub(crate) fn bind_delivery_start(&self, anchor: BlockIdExt) -> rtos_block::Result<()> {
@@ -275,12 +285,17 @@ impl SessionCallbacks {
         self.delivery_source().unwrap().poll_attempts.load(Ordering::Relaxed)
     }
     pub(crate) fn sealed_finality_output_requirements(
-        &self, id: &crate::block::RawCandidateId,
+        &self,
+        id: &crate::block::RawCandidateId,
     ) -> rtos_block::Result<Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>> {
         self.delivery_source()?.sealed_output_requirements(id)
     }
-    pub(crate) fn seal_finality_outputs(&self,id:&crate::block::RawCandidateId,outputs:Vec<crate::finality_recovery::ExpectedFinalityOutput>)->rtos_block::Result<()> {
-        self.delivery_source()?.seal_outputs(id,outputs)
+    pub(crate) fn seal_finality_outputs(
+        &self,
+        id: &crate::block::RawCandidateId,
+        outputs: Vec<crate::finality_recovery::ExpectedFinalityOutput>,
+    ) -> rtos_block::Result<()> {
+        self.delivery_source()?.seal_outputs(id, outputs)
     }
     #[cfg(test)]
     pub(crate) fn fail_intent_resolution_once_for_test(&self) {
@@ -293,7 +308,10 @@ impl SessionCallbacks {
         self.delivery_source()?.resolve_intent(id)
     }
     pub(crate) fn resolved_finality_intent_count(&self) -> u64 {
-        self.source_delivery.lock().unwrap().as_ref()
+        self.source_delivery
+            .lock()
+            .unwrap()
+            .as_ref()
             .map_or(0, |source| source.resolved_intent_count())
     }
     pub(crate) fn pending_finality_intent_count(&self) -> rtos_block::Result<usize> {

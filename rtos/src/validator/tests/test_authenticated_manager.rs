@@ -2,44 +2,68 @@
 //! Manager/group fixtures use generated governing states and real ADNL ownership.
 //! The Engine adapter supplies deterministic state; it is not a full Engine test.
 use super::*;
+use consensus_common::session_runtime::{
+    AuthenticatedSessionRuntime, LocalRole, SessionNetworkPin,
+};
 use rtos_block::HashmapAugType;
-use consensus_common::session_runtime::{AuthenticatedSessionRuntime, LocalRole, SessionNetworkPin};
 
 fn configure(bootstrap: &mut EmulatorNetworkBootstrap, observer: &PrivateKey) -> Result<()> {
     // Public fixture transport seeds make the independently signed history
     // reproducible. This does not install any PQ signing capability in the node.
     for (index, validator) in bootstrap.validators.iter_mut().enumerate() {
-        let (json, key) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[0x60 + index as u8; 32])?;
+        let (json, key) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(
+            &[0x60 + index as u8; 32],
+        )?;
         validator.adnl_key_json = json;
         validator.validator_descr.adnl_addr = Some(UInt256::from(*key.id().data()));
         validator.adnl_key = key;
     }
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq.json"))?;
-    let members: Vec<_> = (0..2).map(|index| {
-        let row = fixture["rows"].as_array().unwrap().iter().find(|row|
-            row["index"] == index && row["context"] == "TOS-CONSENSUS-SIMPLEX-v1").unwrap();
-        let public_key = hex::decode(row["public_key"].as_str().unwrap()).unwrap();
-        ValidatorDescr::with_pq_params(UInt256::from([index as u8 + 1; 32]), rtos_block::PqConsensusKey {
-            algorithm_id: 1, key_id: rtos_block::derive_consensus_key_id(1, &public_key), public_key,
-        }, 1, UInt256::from(*bootstrap.validators[index].adnl_key.id().data()))
-    }).collect();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../tl/rtos_api/tests/data/live-pq.json"))?;
+    let members: Vec<_> = (0..2)
+        .map(|index| {
+            let row = fixture["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["index"] == index && row["context"] == "TOS-CONSENSUS-SIMPLEX-v1")
+                .unwrap();
+            let public_key = hex::decode(row["public_key"].as_str().unwrap()).unwrap();
+            ValidatorDescr::with_pq_params(
+                UInt256::from([index as u8 + 1; 32]),
+                rtos_block::PqConsensusKey {
+                    algorithm_id: 1,
+                    key_id: rtos_block::derive_consensus_key_id(1, &public_key),
+                    public_key,
+                },
+                1,
+                UInt256::from(*bootstrap.validators[index].adnl_key.id().data()),
+            )
+        })
+        .collect();
     bootstrap.validator_set = ValidatorSet::with_cc_seqno(0, u32::MAX, 2, 0, members.clone())?;
     bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
         cur_validators: bootstrap.validator_set.clone(),
     }))?;
     let mut previous = members[0].clone();
     previous.adnl_addr = Some(UInt256::from(*observer.id().data()));
-    bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam32(rtos_block::ConfigParam32 {
-        prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, vec![previous])?,
-    }))?;
+    bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam32(
+        rtos_block::ConfigParam32 {
+            prev_validators: ValidatorSet::with_cc_seqno(0, u32::MAX, 1, 0, vec![previous])?,
+        },
+    ))?;
     // The signed manager history pins the genesis built with a 2400 ms target rate.
     let v2 = SimplexConfig {
         protocol_version: 2,
-        noncritical_params: rtos_block::NoncriticalParams { target_rate_ms: 2400, ..Default::default() },
+        noncritical_params: rtos_block::NoncriticalParams {
+            target_rate_ms: 2400,
+            ..Default::default()
+        },
         ..Default::default()
     };
     bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
-        mc: Some(v2.clone()), shard: Some(v2),
+        mc: Some(v2.clone()),
+        shard: Some(v2),
     }))?;
     let mut catchain = bootstrap.config_params.catchain_config()?;
     catchain.shard_validators_num = 2;
@@ -127,17 +151,19 @@ impl CustodyLifecycle {
             },
             ..Default::default()
         };
-        bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam30(NewConsensusConfigAll {
-            mc: Some(v2.clone()),
-            shard: Some(v2),
-        }))?;
+        bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam30(
+            NewConsensusConfigAll { mc: Some(v2.clone()), shard: Some(v2) },
+        ))?;
         let mut catchain = bootstrap.config_params.catchain_config()?;
         catchain.shard_validators_num = 2;
         bootstrap.config_params.set_config(ConfigParamEnum::ConfigParam28(catchain))?;
         Ok(())
     }
 
-    fn custody(&self, role: FixtureRole) -> Result<Arc<crate::pq_consensus_config::PqCustodyShared>> {
+    fn custody(
+        &self,
+        role: FixtureRole,
+    ) -> Result<Arc<crate::pq_consensus_config::PqCustodyShared>> {
         let (validator, store) = match role {
             FixtureRole::Observer => (self.outside_id.clone(), self.outside.clone()),
             FixtureRole::Validator => (Self::member_id(0), self.committee[0].clone()),
@@ -149,40 +175,99 @@ impl CustodyLifecycle {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x80, FixtureRole::Observer, false, None, false, None).await
+async fn authenticated_manager_creates_transport_only_observer_and_retires_real_groups(
+) -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(
+        0x80,
+        FixtureRole::Observer,
+        false,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_transient_sink_initialization_on_same_group() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x84, FixtureRole::Observer, true, None, false, None).await
+    run_authenticated_manager_observer_lifecycle(
+        0x84,
+        FixtureRole::Observer,
+        true,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_manager_retries_normal_loser_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x88, FixtureRole::Observer, false, Some(0), false, None).await
+async fn authenticated_manager_retries_normal_loser_after_recovery_admission_on_same_state(
+) -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(
+        0x88,
+        FixtureRole::Observer,
+        false,
+        Some(0),
+        false,
+        None,
+    )
+    .await
 }
 
 /// Future groups exist only for a session this node is a member of, as in
 /// the reference manager; the future recovery race runs as a validator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn authenticated_manager_retries_existing_future_after_recovery_admission_on_same_state() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x8c, FixtureRole::Validator, false, Some(1), false, None).await
+async fn authenticated_manager_retries_existing_future_after_recovery_admission_on_same_state(
+) -> Result<()> {
+    run_authenticated_manager_observer_lifecycle(
+        0x8c,
+        FixtureRole::Validator,
+        false,
+        Some(1),
+        false,
+        None,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_retries_idle_future_without_namespace_notification() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x90, FixtureRole::Validator, false, None, true, None).await
+    run_authenticated_manager_observer_lifecycle(
+        0x90,
+        FixtureRole::Validator,
+        false,
+        None,
+        true,
+        None,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_current_busy_preserves_group_in_real_invocation() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x94, FixtureRole::Observer, false, None, false, Some(true)).await
+    run_authenticated_manager_observer_lifecycle(
+        0x94,
+        FixtureRole::Observer,
+        false,
+        None,
+        false,
+        Some(true),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_manager_current_authentication_error_exits_real_invocation() -> Result<()> {
-    run_authenticated_manager_observer_lifecycle(0x98, FixtureRole::Observer, false, None, false, Some(false)).await
+    run_authenticated_manager_observer_lifecycle(
+        0x98,
+        FixtureRole::Observer,
+        false,
+        None,
+        false,
+        Some(false),
+    )
+    .await
 }
 
 /// Direct fixture updates must obey the invocation's same typed-only policy.
@@ -198,16 +283,25 @@ async fn update_with_history_retry(
                 Ok(()) => return Ok(()),
                 Err(error) if crate::retired_history::is_retryable(&error) => {
                     eprintln!("manager fixture: typed preparation defer: {error}");
-                    let handle = manager.engine.load_block_handle(state.block_id())?
+                    let handle = manager
+                        .engine
+                        .load_block_handle(state.block_id())?
                         .ok_or_else(|| error!("fixture retry MC handle absent"))?;
-                    let next = manager.wait_next_mc_or_materialization_retry(&handle, generation)
-                        .await?.ok_or_else(|| error!("fixture manager stopped during history retry"))?;
-                    anyhow::ensure!(next.id() == state.block_id(), "fixture received unexpected MC during retry");
+                    let next = manager
+                        .wait_next_mc_or_materialization_retry(&handle, generation)
+                        .await?
+                        .ok_or_else(|| error!("fixture manager stopped during history retry"))?;
+                    anyhow::ensure!(
+                        next.id() == state.block_id(),
+                        "fixture received unexpected MC during retry"
+                    );
                 }
                 Err(error) => return Err(error),
             }
         }
-    }).await.map_err(|error| error!("fixture typed history retry deadline: {error}"))?
+    })
+    .await
+    .map_err(|error| error!("fixture typed history retry deadline: {error}"))?
 }
 
 /// Every live group of the manager: its current, future and observer groups.
@@ -223,7 +317,10 @@ fn live_groups(manager: &ValidatorManagerImpl) -> Vec<Arc<ValidatorGroup>> {
 
 /// The groups of current sessions: observer groups for an observer, current
 /// validator groups for a validator.
-fn current_groups(manager: &ValidatorManagerImpl, role: FixtureRole) -> HashMap<UInt256, Arc<ValidatorGroup>> {
+fn current_groups(
+    manager: &ValidatorManagerImpl,
+    role: FixtureRole,
+) -> HashMap<UInt256, Arc<ValidatorGroup>> {
     match role {
         FixtureRole::Validator => manager.current_sessions.clone(),
         FixtureRole::Observer => manager
@@ -250,8 +347,15 @@ fn group_of(manager: &ValidatorManagerImpl, session: &UInt256) -> Option<Arc<Val
         })
 }
 
-async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRole, fail_initial_sink: bool, admission_race: Option<u32>, idle_retry: bool, current_retry: Option<bool>) -> Result<()> {
-    use adnl::{node::AdnlNode, DhtNode, OverlayNode, RldpNode, NetworkStack};
+async fn run_authenticated_manager_observer_lifecycle(
+    seed: u8,
+    role: FixtureRole,
+    fail_initial_sink: bool,
+    admission_race: Option<u32>,
+    idle_retry: bool,
+    current_retry: Option<bool>,
+) -> Result<()> {
+    use adnl::{node::AdnlNode, DhtNode, NetworkStack, OverlayNode, RldpNode};
     let _ = env_logger::builder().is_test(true).try_init();
     eprintln!("manager lifecycle: begin role={role:?} admission_race={admission_race:?}");
     let fixture = CustodyLifecycle::new(seed)?;
@@ -263,7 +367,8 @@ async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRol
         FixtureRole::Observer => fixture.outside_transport.clone(),
         FixtureRole::Validator => bootstrap.validators[0].adnl_key.clone(),
     };
-    let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([seed; 32], 0)])?;
+    let (_, config) =
+        AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([seed; 32], 0)])?;
     let adnl = AdnlNode::with_config(config).await?;
     adnl.add_key(local_transport.clone(), 1)?;
     // Possession of another governing member's transport key confers nothing.
@@ -271,18 +376,28 @@ async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRol
         adnl.add_key(bootstrap.validators[0].adnl_key.clone(), 2)?;
     }
     let dht = DhtNode::with_adnl_node(adnl.clone(), 0)?;
-    let overlay = OverlayNode::with_params_and_profile(adnl.clone(), &[22; 32], 0, rtos_api::WireProfile::T0)?;
+    let overlay = OverlayNode::with_params_and_profile(
+        adnl.clone(),
+        &[22; 32],
+        0,
+        rtos_api::WireProfile::T0,
+    )?;
     let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None)?;
     overlay.set_rldp(rldp.clone())?;
     let stack = Arc::new(NetworkStack { adnl: adnl.clone(), dht, overlay, rldp, quic: None });
     adnl.start_over_udp(vec![stack.overlay.clone(), stack.dht.clone(), stack.rldp.clone()]).await?;
     let actual = consensus_common::ConsensusCommonFactory::create_adnl_overlay_manager(
-        tokio::runtime::Handle::current(), stack, None, false)?;
+        tokio::runtime::Handle::current(),
+        stack,
+        None,
+        false,
+    )?;
     let local_config = serde_json::from_value(serde_json::json!({
         "validator_keys": [],
         "validator_key_ring": {},
     }))?;
-    let (handler, context) = crate::config::NodeConfigHandler::create(local_config, tokio::runtime::Handle::current())?;
+    let (handler, context) =
+        crate::config::NodeConfigHandler::create(local_config, tokio::runtime::Handle::current())?;
     handler.clone().start_sheduler(context, vec![])?;
     let mut engine = BootstrapTestEngine::new_with_local_keys(&bootstrap, Vec::new()).await?;
     engine.transport_config = Some(handler.clone());
@@ -297,10 +412,17 @@ async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRol
     bootstrap.zerostate_id = state.block_id().clone();
     engine.init_mc_block_id = state.block_id().clone();
     let engine = Arc::new(engine);
-    let mut manager = ValidatorManagerImpl::create(engine.clone(), tokio::runtime::Handle::current(), ValidatorManagerConfig::default());
+    let mut manager = ValidatorManagerImpl::create(
+        engine.clone(),
+        tokio::runtime::Handle::current(),
+        ValidatorManagerConfig::default(),
+    );
     // Sessions a full start materializes: two current groups, and for a
     // validator two future groups as well.
-    let session_count = match role { FixtureRole::Observer => 2, FixtureRole::Validator => 4 };
+    let session_count = match role {
+        FixtureRole::Observer => 2,
+        FixtureRole::Validator => 4,
+    };
     let result = async {
         anyhow::ensure!(!engine.get_validator_status(), "no legacy signing eligibility permitted");
         engine.install_masterchain_state(state.clone(), None)?;
@@ -581,7 +703,8 @@ async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRol
             manifests.push((namespace, manifest));
         }
     }
-    let ids = manager.current_sessions.keys().chain(manager.future_sessions.keys()).cloned().collect();
+    let ids =
+        manager.current_sessions.keys().chain(manager.future_sessions.keys()).cloned().collect();
     let stopped = manager.stop_and_remove_sessions(&ids).await;
     let stopped = match stopped {
         Ok(()) => manager.stop_validation().await,
@@ -595,36 +718,60 @@ async fn run_authenticated_manager_observer_lifecycle(seed: u8, role: FixtureRol
         engine.fail_future_history_once.store(role == FixtureRole::Validator, Ordering::SeqCst);
         let mut manager_config = ValidatorManagerConfig::default();
         manager_config.update_interval = Duration::from_millis(20);
-        match spawn_validator_manager(engine.clone(), tokio::runtime::Handle::current(), manager_config) {
+        match spawn_validator_manager(
+            engine.clone(),
+            tokio::runtime::Handle::current(),
+            manager_config,
+        ) {
             Ok(task) => {
                 let started = tokio::time::timeout(Duration::from_secs(5), async {
-                    while engine.validator_network.authenticated_created.load(Ordering::SeqCst) < baseline + session_count {
+                    while engine.validator_network.authenticated_created.load(Ordering::SeqCst)
+                        < baseline + session_count
+                    {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                }).await;
+                })
+                .await;
                 let injected = role == FixtureRole::Observer
                     || engine.future_history_failure_seen.load(Ordering::SeqCst);
                 engine.stop.store(true, Ordering::SeqCst);
                 let joined = task.await;
                 let reopened = (|| {
                     for (namespace, manifest) in &manifests {
-                        let manifest = manifest.as_ref()
+                        let manifest = manifest
+                            .as_ref()
                             .ok_or_else(|| error!("{} had no manifest", namespace.display()))?;
                         anyhow::ensure!(
-                            std::fs::read(namespace.join("session-runtime.json")).ok().as_ref() == Some(manifest),
-                            "{} was not reopened as the same namespace", namespace.display());
+                            std::fs::read(namespace.join("session-runtime.json")).ok().as_ref()
+                                == Some(manifest),
+                            "{} was not reopened as the same namespace",
+                            namespace.display()
+                        );
                     }
                     anyhow::ensure!(!manifests.is_empty(), "no namespace was created");
                     Ok(())
                 })();
-                started.map_err(|_| error!("outer manager did not retry materialization without a new MC"))
-                    .and_then(|_| if injected { Ok(()) } else { Err(error!("outer manager missed controlled future preparation failure")) })
+                started
+                    .map_err(|_| {
+                        error!("outer manager did not retry materialization without a new MC")
+                    })
+                    .and_then(|_| {
+                        if injected {
+                            Ok(())
+                        } else {
+                            Err(error!(
+                                "outer manager missed controlled future preparation failure"
+                            ))
+                        }
+                    })
                     .and_then(|_| joined.map_err(|error| error!("manager task failed: {error}")))
                     .and(reopened)
             }
             Err(error) => Err(error),
         }
-    } else { Ok(()) };
+    } else {
+        Ok(())
+    };
     let drained = adnl.stop_checked().await;
     let scheduler_stopped = handler.stop_and_wait().await;
     stopped?;
@@ -640,8 +787,13 @@ fn authenticated_registry_identity_changes_with_pq_and_transport_rotation() -> R
     let mut bootstrap = EmulatorNetworkBootstrap::build(2)?;
     let classical = bootstrap.validator_set.list().to_vec();
     let mut expected = rtos_block::Sha256::new();
-    for member in &classical { expected.update(member.compute_node_id_short()?.as_slice()); }
-    assert_eq!(compute_validator_list_id(&classical, None)?.unwrap(), UInt256::from(<[u8; 32]>::from(expected.finalize())));
+    for member in &classical {
+        expected.update(member.compute_node_id_short()?.as_slice());
+    }
+    assert_eq!(
+        compute_validator_list_id(&classical, None)?.unwrap(),
+        UInt256::from(<[u8; 32]>::from(expected.finalize()))
+    );
     configure(&mut bootstrap, &observer)?;
     let members = bootstrap.validator_set.list().to_vec();
     let original = compute_validator_list_id(&members, None)?;
@@ -666,19 +818,45 @@ async fn authenticated_group_rejects_anchor_schedule_and_rebinding() -> Result<(
     let engine = Arc::new(BootstrapTestEngine::new_with_local_keys(&bootstrap, Vec::new()).await?);
     let state = engine.build_masterchain_state(&bootstrap, 0)?;
     let shard = ShardIdent::masterchain();
-    let (info, id) = derive_governing_session_info(&state, &shard, bootstrap.validator_set.list(), 0, 0, 0)?;
+    let (info, id) =
+        derive_governing_session_info(&state, &shard, bootstrap.validator_set.list(), 0, 0, 0)?;
     let make_runtime = |zerostate: BlockIdExt| -> Result<Arc<AuthenticatedSessionRuntime>> {
         Ok(Arc::new(AuthenticatedSessionRuntime::from_authenticated_config(
             SessionNetworkPin { global_id: state.state()?.global_id(), zerostate },
-            state.config_params()?, rtos_api::session_identity::SessionCoordinates {
-                shard: &shard, catchain_seqno: 0, vertical_seqno: 0, last_key_block_seqno: 0, new_catchain_ids: false },
-            bootstrap.validator_set.list().to_vec(), key.id().clone())?))
+            state.config_params()?,
+            rtos_api::session_identity::SessionCoordinates {
+                shard: &shard,
+                catchain_seqno: 0,
+                vertical_seqno: 0,
+                last_key_block_seqno: 0,
+                new_catchain_ids: false,
+            },
+            bootstrap.validator_set.list().to_vec(),
+            key.id().clone(),
+        )?))
     };
     let runtime = make_runtime(bootstrap.zerostate_id.clone())?;
-    let options = SimplexSessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
-        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(), ..Default::default() };
-    let group = |options| ValidatorGroup::new(info.clone(), key.clone(), id.clone(),
-        UInt256::from([1; 32]), bootstrap.validator_set.clone(), 0, ConsensusOptions::Simplex(options), engine.clone(), false, None);
+    let options = SimplexSessionOptions {
+        protocol: runtime.protocol(),
+        proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        slots_per_leader_window: runtime.slots_per_leader_window(),
+        ..Default::default()
+    };
+    let group = |options| {
+        ValidatorGroup::new(
+            info.clone(),
+            key.clone(),
+            id.clone(),
+            UInt256::from([1; 32]),
+            bootstrap.validator_set.clone(),
+            0,
+            ConsensusOptions::Simplex(options),
+            engine.clone(),
+            false,
+            None,
+        )
+    };
     let attached = group(options.clone()).with_authenticated_runtime(runtime.clone())?;
     assert_eq!(attached.authenticated_runtime().unwrap().local_role(), LocalRole::Observer);
     assert!(attached.with_authenticated_runtime(runtime.clone()).is_err());
@@ -687,10 +865,17 @@ async fn authenticated_group_rejects_anchor_schedule_and_rebinding() -> Result<(
     assert!(group(bad_slots).with_authenticated_runtime(runtime.clone()).is_err());
     for root in [true, false] {
         let mut zero = bootstrap.zerostate_id.clone();
-        if root { zero.root_hash = UInt256::from([31; 32]); }
-        else { zero.file_hash = UInt256::from([32; 32]); }
+        if root {
+            zero.root_hash = UInt256::from([31; 32]);
+        } else {
+            zero.file_hash = UInt256::from([32; 32]);
+        }
         let wrong = make_runtime(zero)?;
-        assert_eq!(wrong.session_id(), runtime.session_id(), "anchor is independent from session hash");
+        assert_eq!(
+            wrong.session_id(),
+            runtime.session_id(),
+            "anchor is independent from session hash"
+        );
         assert!(group(options.clone()).with_authenticated_runtime(wrong).is_err());
     }
     Ok(())
@@ -700,8 +885,12 @@ async fn authenticated_group_rejects_anchor_schedule_and_rebinding() -> Result<(
 /// `bootstrap` configuration builds, a block whose Merkle update commits
 /// `previous` to it, and a finality proof signed by the committee's custody
 /// keys and checked against the governing configuration before use.
-fn sign_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetworkBootstrap,
-    previous: &Arc<ShardStateStuff>, committee: &[Arc<rtos_pq_consensus::ConsensusKeyStore>]) -> Result<Arc<ShardStateStuff>> {
+fn sign_manager_successor(
+    engine: &BootstrapTestEngine,
+    bootstrap: &EmulatorNetworkBootstrap,
+    previous: &Arc<ShardStateStuff>,
+    committee: &[Arc<rtos_pq_consensus::ConsensusKeyStore>],
+) -> Result<Arc<ShardStateStuff>> {
     use rtos_block::{
         BlkPrevInfo, Block, BlockExtra, BlockInfo, BlockProof, BlockSignaturesSimplex,
         BlockSignaturesSimplexPq, BlockSignaturesVariant, BocFlags, BocWriter, McBlockExtra,
@@ -710,16 +899,31 @@ fn sign_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetw
     let expected = engine.build_masterchain_state(bootstrap, 1)?;
     let mut state = expected.state()?.clone();
     state.set_gen_lt(2);
-    let mut extra = state.read_custom()?.ok_or_else(|| error!("successor has no masterchain extra"))?;
-    extra.prev_blocks.set(&0, &rtos_block::KeyExtBlkRef { key: true, blk_ref: ext_blk_ref(previous.block_id()) },
-        &rtos_block::KeyMaxLt { key: true, max_end_lt: 0 })?;
+    let mut extra =
+        state.read_custom()?.ok_or_else(|| error!("successor has no masterchain extra"))?;
+    extra.prev_blocks.set(
+        &0,
+        &rtos_block::KeyExtBlkRef { key: true, blk_ref: ext_blk_ref(previous.block_id()) },
+        &rtos_block::KeyMaxLt { key: true, max_end_lt: 0 },
+    )?;
     state.write_custom(Some(&extra))?;
     let next_root = state.serialize()?;
     let update = MerkleUpdate::create(previous.root_cell(), &next_root)?;
     let previous_config = previous.config_params()?;
-    let placeholder = BlockIdExt::with_params(ShardIdent::masterchain(), 1, UInt256::default(), UInt256::default());
+    let placeholder = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::default(),
+        UInt256::default(),
+    );
     let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
-        0, previous_config, placeholder, 0, 0, 0)?;
+        0,
+        previous_config,
+        placeholder,
+        0,
+        0,
+        0,
+    )?;
     let mut info = BlockInfo::default();
     info.set_seq_no(1)?;
     info.set_shard(ShardIdent::masterchain());
@@ -737,9 +941,20 @@ fn sign_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetw
     let block = Block::with_params(0, info, ValueFlow::default(), update, block_extra)?;
     let root = block.serialize()?;
     let bytes = BocWriter::with_flags([root.clone()], BocFlags::all())?.write_to_vec()?;
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1, root.repr_hash().clone(), UInt256::calc_file_hash(&bytes));
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&bytes),
+    );
     let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
-        0, previous_config, id.clone(), 0, 0, 0)?;
+        0,
+        previous_config,
+        id.clone(),
+        0,
+        0,
+        0,
+    )?;
     // consensus.candidateHashDataOrdinary of this block with an empty collated hash.
     let mut candidate = 0x3f6431f8u32.to_le_bytes().to_vec();
     candidate.extend((-1i32).to_le_bytes());
@@ -750,10 +965,12 @@ fn sign_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetw
     candidate.extend(UInt256::calc_file_hash(&[]).as_slice());
     let parent = rtos_api::ton::consensus::candidateparent::CandidateParent {
         id: rtos_api::IntoBoxed::into_boxed(rtos_api::ton::consensus::candidateid::CandidateId {
-            slot: 98, hash: UInt256::from([98; 32]),
+            slot: 98,
+            hash: UInt256::from([98; 32]),
         }),
     };
-    candidate.extend(rtos_api::WireProfile::T0.serialize(&rtos_api::IntoBoxed::into_boxed(parent))?);
+    candidate
+        .extend(rtos_api::WireProfile::T0.serialize(&rtos_api::IntoBoxed::into_boxed(parent))?);
     let mut carrier = BlockSignaturesSimplexPq {
         validator_info: ValidatorBaseInfo::with_params(context.subset_hash(), 0),
         session_id: context.expected_session_id().clone(),
@@ -772,11 +989,20 @@ fn sign_manager_successor(engine: &BootstrapTestEngine, bootstrap: &EmulatorNetw
         });
     }
     context.verify_final(&carrier)?;
-    let proof = BlockProof::with_params(id.clone(), MerkleProof::create(&root, |_| true)?.serialize()?,
-        Some(BlockSignaturesVariant::SimplexPq(carrier)));
-    let proof = crate::block_proof::BlockProofStuff::deserialize(&id, proof.write_to_bytes()?, false)?;
-    let state = ShardStateStuff::deserialize_state(id.clone(), &rtos_block::write_boc(&next_root)?,
-        #[cfg(feature = "telemetry")] &engine.telemetry, &engine.allocated)?;
+    let proof = BlockProof::with_params(
+        id.clone(),
+        MerkleProof::create(&root, |_| true)?.serialize()?,
+        Some(BlockSignaturesVariant::SimplexPq(carrier)),
+    );
+    let proof =
+        crate::block_proof::BlockProofStuff::deserialize(&id, proof.write_to_bytes()?, false)?;
+    let state = ShardStateStuff::deserialize_state(
+        id.clone(),
+        &rtos_block::write_boc(&next_root)?,
+        #[cfg(feature = "telemetry")]
+        &engine.telemetry,
+        &engine.allocated,
+    )?;
     let block = BlockStuff::deserialize_block_checked(id.clone(), Arc::new(bytes))?;
     engine.blocks.write().unwrap().insert(id.clone(), block);
     engine.historical_proofs.write().unwrap().insert(id, proof);
@@ -817,7 +1043,9 @@ async fn replaced_observer_admission_records_only_an_orphaned_namespace() -> Res
             .bind_recovery_anchor(bootstrap.zerostate_id.clone())?,
         ))
     };
-    let group = |key: &PrivateKey, runtime: Arc<AuthenticatedSessionRuntime>| -> Result<Arc<ValidatorGroup>> {
+    let group = |key: &PrivateKey,
+                 runtime: Arc<AuthenticatedSessionRuntime>|
+     -> Result<Arc<ValidatorGroup>> {
         let options = SimplexSessionOptions {
             protocol: runtime.protocol(),
             proto_version: runtime.carrier_version(),
@@ -867,9 +1095,8 @@ async fn replaced_observer_admission_records_only_an_orphaned_namespace() -> Res
     );
     assert_eq!(record.identity.as_ref().map(|identity| &identity.local_adnl), Some(&adnl_a));
     assert_eq!(manager.destroyed_sessions, fence, "the session stays live: no fence");
-    assert!(manager
-        .retiring_groups
-        .iter()
-        .any(|(_, _, generation)| generation.as_ref().is_some_and(|(ns, _)| ns == &record.namespace)));
+    assert!(manager.retiring_groups.iter().any(|(_, _, generation)| generation
+        .as_ref()
+        .is_some_and(|(ns, _)| ns == &record.namespace)));
     Ok(())
 }

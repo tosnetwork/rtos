@@ -32,7 +32,8 @@ fn roundtrip_and_record_boundaries() {
             assert_eq!(len, value.len() as u64);
             values.push((tag, value));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(values[0].1, b"abc");
         assert_eq!(values[1], (Record::Provider, b"de".to_vec()));
         assert!(read_manifest(&bytes[..], kind, [41; 16], descriptor, |_, _, _| Ok(())).is_err());
@@ -56,9 +57,12 @@ fn corruption_truncation_counts_and_trailing_bytes_refuse() {
     assert!(decode(&bytes, Kind::Ready, descriptor).is_err());
     let mut changed = bytes.clone();
     changed[37] ^= 1;
-    assert!(decode(&changed, Kind::Selection, Sidecar {
-        digest: sha256_digest(&changed), ..descriptor
-    }).is_err());
+    assert!(decode(
+        &changed,
+        Kind::Selection,
+        Sidecar { digest: sha256_digest(&changed), ..descriptor }
+    )
+    .is_err());
     for records in [0, 1, 3, u64::MAX] {
         assert!(decode(&bytes, Kind::Selection, Sidecar { records, ..descriptor }).is_err());
     }
@@ -69,7 +73,8 @@ fn corruption_truncation_counts_and_trailing_bytes_refuse() {
         assert!(read_manifest(&changed[..], Kind::Selection, [42; 16], descriptor, |_, _, _| {
             visited = true;
             Ok(())
-        }).is_err());
+        })
+        .is_err());
         assert!(!visited);
     }
 }
@@ -87,15 +92,21 @@ fn invalid_order_and_input_eof() {
     assert!(writer.record(Record::Tail, 0, &mut io::empty()).is_err());
     assert!(writer.finish().is_err());
 }
-struct ShortWriter { remaining: usize }
+struct ShortWriter {
+    remaining: usize,
+}
 impl Write for ShortWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if self.remaining == 0 { return Err(io::Error::other("injected write failure")); }
+        if self.remaining == 0 {
+            return Err(io::Error::other("injected write failure"));
+        }
         let n = data.len().min(self.remaining).min(3);
         self.remaining -= n;
         Ok(n)
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 #[test]
 fn partial_writes_cannot_publish_descriptor() {
@@ -108,11 +119,14 @@ fn partial_writes_cannot_publish_descriptor() {
             assert!(writer.finish().is_err(), "failure after {remaining} bytes");
         }
     }
-    let mut writer = ManifestWriter::new(ShortWriter { remaining: 81 }, Kind::Selection, [42; 16]).unwrap();
+    let mut writer =
+        ManifestWriter::new(ShortWriter { remaining: 81 }, Kind::Selection, [42; 16]).unwrap();
     writer.record(Record::Predicate, 3, &mut &b"abc"[..]).unwrap();
     assert_eq!(writer.finish().unwrap().1.bytes, 81);
 }
-struct BoundedInput { remaining: u64 }
+struct BoundedInput {
+    remaining: u64,
+}
 impl Read for BoundedInput {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         assert!(bytes.len() <= BUFFER);
@@ -141,14 +155,17 @@ fn large_synthetic_payload_uses_bounded_buffers() {
         let mut seen = 0;
         loop {
             let n = payload.read(&mut buffer)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             assert!(buffer[..n].iter().all(|byte| *byte == 17));
             seen += n as u64;
         }
         assert_eq!(seen, len);
         total += seen;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(total, length);
 }
 
@@ -156,29 +173,35 @@ fn large_synthetic_payload_uses_bounded_buffers() {
 fn typed_predicate_streams_directly_and_encoder_failures_latch() {
     use crate::archives::truncation_selection::{read_predicate, TruncationSelection};
     use rtos_block::{BlockIdExt, ShardIdent};
-    let cutoff = BlockIdExt::with_params(ShardIdent::masterchain(), 123, [1; 32].into(), [2; 32].into());
+    let cutoff =
+        BlockIdExt::with_params(ShardIdent::masterchain(), 123, [1; 32].into(), [2; 32].into());
     let selection = TruncationSelection::new(cutoff.clone(), Vec::new()).unwrap();
     let mut writer = ManifestWriter::new(Vec::new(), Kind::Selection, [42; 16]).unwrap();
-    writer.record_with(Record::Predicate, selection.encoded_len().unwrap(), |out| {
-        selection.write_predicate(out)
-    }).unwrap();
+    writer
+        .record_with(Record::Predicate, selection.encoded_len().unwrap(), |out| {
+            selection.write_predicate(out)
+        })
+        .unwrap();
     let (bytes, descriptor) = writer.finish().unwrap();
     read_manifest(&bytes[..], Kind::Selection, [42; 16], descriptor, |record, len, input| {
         assert_eq!(record, Record::Predicate);
         let restored = read_predicate(input, len, |_| panic!("unexpected top block"))?;
         assert_eq!(restored, cutoff);
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     for overrun in [false, true] {
         let mut writer = ManifestWriter::new(Vec::new(), Kind::Selection, [42; 16]).unwrap();
-        assert!(writer.record_with(Record::Predicate, 1, |out| {
-            if overrun {
-                // Even a swallowed encoder error must poison publication.
-                assert!(out.write_all(b"ab").is_err());
-                let _ = out.write_all(b"a");
-            }
-            Ok(())
-        }).is_err());
+        assert!(writer
+            .record_with(Record::Predicate, 1, |out| {
+                if overrun {
+                    // Even a swallowed encoder error must poison publication.
+                    assert!(out.write_all(b"ab").is_err());
+                    let _ = out.write_all(b"a");
+                }
+                Ok(())
+            })
+            .is_err());
         assert!(writer.finish().is_err());
     }
 }

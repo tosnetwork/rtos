@@ -30,8 +30,8 @@ use crate::{
     },
     validator::{
         collator::PREV_STATE_WAIT_TIMEOUT_MS,
-        dependency_deadline::DependencyDeadline,
         consensus::ResolverPurpose,
+        dependency_deadline::DependencyDeadline,
         out_msg_queue::{MsgQueueManager, StatesManager},
         state_resolver_cache::{self, StateResolverCache},
         validator_utils::calc_subset_for_masterchain,
@@ -371,12 +371,7 @@ impl ValidateQuery {
                 )
                 .await
             }
-            None => {
-                self.engine
-                    .clone()
-                    .wait_state(prev_id, Some(timeout_ms), true)
-                    .await
-            }
+            None => self.engine.clone().wait_state(prev_id, Some(timeout_ms), true).await,
         }
     }
 
@@ -1070,7 +1065,9 @@ impl ValidateQuery {
             reject_query!("previous state hash mismatch for block {}", base.block_id());
         }
         for state in &base.prev_states {
-            if state.state()?.seq_no() != state.block_id().seq_no() || state.state()?.shard() != state.block_id().shard() {
+            if state.state()?.seq_no() != state.block_id().seq_no()
+                || state.state()?.shard() != state.block_id().shard()
+            {
                 reject_query!("previous state header differs from its block identity");
             }
         }
@@ -1306,10 +1303,18 @@ impl ValidateQuery {
         let governing = if governing_id == mc_data.state.block_id() {
             &mc_data.state
         } else {
-            base.governing_states.get(governing_id).ok_or_else(|| error!("governing masterchain state is unavailable: {}", governing_id))?
+            base.governing_states.get(governing_id).ok_or_else(|| {
+                error!("governing masterchain state is unavailable: {}", governing_id)
+            })?
         };
         let chain_len = tsbd
-            .prevalidate_with_governing(mc_data.state.block_id(), &mc_data.state, governing, do_flags, &mut res_flags)
+            .prevalidate_with_governing(
+                mc_data.state.block_id(),
+                &mc_data.state,
+                governing,
+                do_flags,
+                &mut res_flags,
+            )
             .map_err(|err| {
                 error!(
                     "ShardTopBlockDescr for {} is invalid: res_flags={}, err: {}",
@@ -2521,7 +2526,8 @@ impl ValidateQuery {
     }
 
     fn check_value_flow_fees(base: &ValidateBase) -> Result<()> {
-        let fees_import = CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
+        let fees_import =
+            CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
         let transaction_fees = base.account_blocks.full_transaction_fees();
         let expected_fee_burned = Self::expected_fee_burned(base, transaction_fees, &fees_import)?;
         let mut expected_fees = transaction_fees.clone();
@@ -5908,8 +5914,12 @@ impl ValidateQuery {
         // log::debug!(target: "validate_query", "({}): checking all transactions", base.next_block_descr);
         let (capabilities, block_version) =
             base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
-        let config =
-            BlockchainConfig::with_params_for_shard(capabilities, block_version, base.config_params.clone(), base.shard().is_masterchain())?;
+        let config = BlockchainConfig::with_params_for_shard(
+            capabilities,
+            block_version,
+            base.config_params.clone(),
+            base.shard().is_masterchain(),
+        )?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
             let libraries = libraries.clone();
@@ -7014,7 +7024,9 @@ impl ValidateQuery {
         base.top_shard_descr_dict.collection().iterate(|item| {
             let block_id = item.0.proof_for().clone();
             let descriptor = TopBlockDescrStuff::new(item.0, &block_id, base.is_fake, false)
-                .map_err(|e| error!("cannot unpack ShardTopBlockDescr while loading governing state: {e}"))?;
+                .map_err(|e| {
+                    error!("cannot unpack ShardTopBlockDescr while loading governing state: {e}")
+                })?;
             let id = descriptor.governing_masterchain_block_id()?.clone();
             if id != *mc_data.state.block_id() && !governing_ids.contains(&id) {
                 governing_ids.push(id);

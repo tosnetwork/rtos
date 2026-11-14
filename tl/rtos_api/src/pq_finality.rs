@@ -7,11 +7,11 @@ use crate::{
     session_identity::{derive_session_from_config, SessionCoordinates},
     IntoBoxed,
 };
-use rtos_block::config_read_budget::{self as cb, ConfigReadBudget};
 use rtos_block::{
-    checked_validator_weight_sum, error, fail, has_quorum, BlockIdExt, BlockSignaturesSimplexPq,
-    ConfigParamEnum, ConfigParams, PqBlockValidatorWeight, Result, Serializable, UInt256,
-    ValidatorDescr, ValidatorKey,
+    checked_validator_weight_sum,
+    config_read_budget::{self as cb, ConfigReadBudget},
+    error, fail, has_quorum, BlockIdExt, BlockSignaturesSimplexPq, ConfigParamEnum, ConfigParams,
+    PqBlockValidatorWeight, Result, Serializable, UInt256, ValidatorDescr, ValidatorKey,
 };
 use std::{collections::HashMap, io::Cursor};
 

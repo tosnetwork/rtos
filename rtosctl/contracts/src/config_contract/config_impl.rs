@@ -9,8 +9,8 @@
  */
 use super::{ConfigContractWrapper, ConfigProposal, ProposalHash, ProposedParam};
 use crate::{
-    stack_utils::{bytes_to_stack_entry, i64_to_stack_entry},
     ContractProvider, SmartContract,
+    stack_utils::{bytes_to_stack_entry, i64_to_stack_entry},
 };
 use anyhow::Context;
 use rtos_block::MsgAddressInt;
@@ -217,12 +217,12 @@ mod tests {
     use super::*;
     use common::tvm_stack_parser::TvmStackParser;
     use rtos_api::ton::tvm::{
-        cell, list,
+        List, Number, StackEntry, Tuple, cell, list,
         numberdecimal::NumberDecimal,
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
-        tuple, List, Number, StackEntry, Tuple,
+        tuple,
     };
-    use rtos_block::{write_boc, BuilderData, Cell, IBitstring};
+    use rtos_block::{BuilderData, Cell, IBitstring, write_boc};
     use std::collections::HashMap;
 
     // ===== Stack entry helper functions =====

@@ -372,7 +372,9 @@ async fn circulation_with_retry_turn(events: usize, close_demand: bool, single_r
     })
     .catch_unwind()
     .await;
-    for receiver in certified_receivers { receiver.stop_and_wait().await.unwrap(); }
+    for receiver in certified_receivers {
+        receiver.stop_and_wait().await.unwrap();
+    }
     pair.stop_all().await;
     let (runtime, namespace, domain, first, (old_path, old_bytes)) =
         run.unwrap_or_else(|panic| std::panic::resume_unwind(panic));

@@ -79,11 +79,15 @@ async fn open_db(dir: &Path) -> Result<InternalDb> {
     InternalDb::with_update(
         InternalDbConfig {
             db_directory: db_dir.to_string_lossy().to_string(),
-            archival_mode: if dir.join("dynamic-state-fixture").exists() { None } else { Some(ArchivalModeConfig {
-                epoch_size: 20_000,
-                new_epochs_path: epochs_path,
-                existing_epochs: vec![],
-            }) },
+            archival_mode: if dir.join("dynamic-state-fixture").exists() {
+                None
+            } else {
+                Some(ArchivalModeConfig {
+                    epoch_size: 20_000,
+                    new_epochs_path: epochs_path,
+                    existing_epochs: vec![],
+                })
+            },
             ..Default::default()
         },
         false,

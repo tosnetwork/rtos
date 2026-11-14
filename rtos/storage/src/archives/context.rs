@@ -58,7 +58,13 @@ pub struct ArchiveDomain {
 impl Default for ArchiveDomain {
     fn default() -> Self {
         Self {
-            state: Mutex::new(State { epoch: 0, phase: Phase::Open, owners: Arc::default(), recovery_claimed: false, packages: Vec::new() }),
+            state: Mutex::new(State {
+                epoch: 0,
+                phase: Phase::Open,
+                owners: Arc::default(),
+                recovery_claimed: false,
+                packages: Vec::new(),
+            }),
             #[cfg(all(test, target_os = "linux"))]
             read_probe: Mutex::new(None),
         }
@@ -79,14 +85,18 @@ impl ArchiveDomain {
         self.state.lock().map_err(|_| ArchiveContextError::Poisoned.into())
     }
     fn check_epoch(state: &State, expected: u64) -> Result<()> {
-        if super::package::retirement_restart_required() { return Err(ArchiveContextError::RestartRequired.into()); }
+        if super::package::retirement_restart_required() {
+            return Err(ArchiveContextError::RestartRequired.into());
+        }
         if state.epoch != expected {
             return Err(ArchiveContextError::Stale { expected, current: state.epoch }.into());
         }
         Ok(())
     }
     fn check_open(state: &State) -> Result<()> {
-        if super::package::retirement_restart_required() { return Err(ArchiveContextError::RestartRequired.into()); }
+        if super::package::retirement_restart_required() {
+            return Err(ArchiveContextError::RestartRequired.into());
+        }
         match state.phase {
             Phase::Open => Ok(()),
             Phase::Closing => Err(ArchiveContextError::Closed(state.epoch).into()),
@@ -131,7 +141,10 @@ impl ArchiveDomain {
         if state.phase == Phase::RecoveryRequired {
             return Err(ArchiveContextError::RecoveryRequired(state.epoch).into());
         }
-        if state.phase != Phase::Closing || state.owners.outstanding() != 0 || state.recovery_claimed {
+        if state.phase != Phase::Closing
+            || state.owners.outstanding() != 0
+            || state.recovery_claimed
+        {
             return Err(ArchiveContextError::NotDrained.into());
         }
         state.epoch = state.epoch.checked_add(1).ok_or(ArchiveContextError::EpochOverflow)?;
@@ -150,8 +163,12 @@ impl ArchiveProvider {
     pub(crate) fn bound(provider: Arc<RocksDb>, domain: Arc<ArchiveDomain>) -> Self {
         Self { provider, domain }
     }
-    pub fn db(&self) -> &Arc<RocksDb> { &self.provider }
-    pub fn domain(&self) -> &Arc<ArchiveDomain> { &self.domain }
+    pub fn db(&self) -> &Arc<RocksDb> {
+        &self.provider
+    }
+    pub fn domain(&self) -> &Arc<ArchiveDomain> {
+        &self.domain
+    }
 
     pub fn view(&self) -> Result<ArchiveView> {
         let state = self.domain.lock()?;
@@ -170,15 +187,19 @@ impl std::fmt::Debug for ArchiveView {
     }
 }
 impl ArchiveView {
-    pub fn binding(&self) -> &ArchiveProvider { &self.binding }
+    pub fn binding(&self) -> &ArchiveProvider {
+        &self.binding
+    }
 
     /// Inherit into this captured view without reopening root admission.
     pub fn inherit(&self, parent: &ArchiveOperation) -> Result<ArchiveOperation> {
         let operation = parent.inherit(&self.binding)?;
         if self.epoch != operation.epoch {
             return Err(ArchiveContextError::Stale {
-                expected: self.epoch, current: operation.epoch,
-            }.into());
+                expected: self.epoch,
+                current: operation.epoch,
+            }
+            .into());
         }
         Ok(operation)
     }
@@ -189,7 +210,9 @@ impl ArchiveView {
     /// Called while constructor admission is still held. Closing permits that
     /// constructor to finish; a recovery snapshot must wait for its ticket.
     pub(super) fn register_package(
-        &self, parent: &ArchiveOperation, package: &Arc<super::package::PackageState>,
+        &self,
+        parent: &ArchiveOperation,
+        package: &Arc<super::package::PackageState>,
     ) -> Result<()> {
         let _registration = self.inherit(parent)?;
         let mut state = self.binding.domain.lock()?;
@@ -328,7 +351,8 @@ impl Drop for NativeCustody {
 
 #[must_use = "the acquired resource remains owned until consumed or dropped"]
 pub(crate) struct NativeAcquisition<T: Send + 'static> {
-    value: Option<T>, custody: Option<NativeCustody>,
+    value: Option<T>,
+    custody: Option<NativeCustody>,
 }
 impl<T: Send + 'static> NativeAcquisition<T> {
     /// Registration only: this callback must not perform canonical mutations.

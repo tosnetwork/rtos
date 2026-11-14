@@ -286,8 +286,8 @@ struct TestGcBatchProgress {
     watched_epoch: Option<u64>,
 }
 
-type StateTaskJoin = futures::future::Shared<futures::future::BoxFuture<'static,
-    std::result::Result<(), Arc<str>>>>;
+type StateTaskJoin =
+    futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<(), Arc<str>>>>;
 #[derive(Default)]
 struct StateTaskOwners {
     closed: bool,
@@ -296,8 +296,7 @@ struct StateTaskOwners {
 }
 fn state_task_join(task: tokio::task::JoinHandle<()>) -> StateTaskJoin {
     use futures::FutureExt;
-    task.map(|result| result.map_err(|error| Arc::<str>::from(error.to_string())))
-        .boxed().shared()
+    task.map(|result| result.map_err(|error| Arc::<str>::from(error.to_string()))).boxed().shared()
 }
 
 pub struct ShardStateDb {
@@ -505,7 +504,9 @@ impl ShardStateDb {
         // A stop concurrent with start_gc either joins it or prevents its spawn.
         let owner = self.clone();
         let mut tasks = owner.task_owners.lock().unwrap();
-        if tasks.closed { return; }
+        if tasks.closed {
+            return;
+        }
         if progress_barrier.is_some() {
             gc_resolver.require_durable_progress();
         }
@@ -744,11 +745,16 @@ impl ShardStateDb {
         // task's captured DB ownership has actually been released.
         let mut failures = Vec::new();
         for task in [worker, gc].into_iter().flatten() {
-            if let Err(error) = task.await { failures.push(error.to_string()); }
+            if let Err(error) = task.await {
+                failures.push(error.to_string());
+            }
         }
         self.stop.store(Self::MASK_STOPPED, Ordering::Relaxed);
-        if failures.is_empty() { Ok(()) }
-        else { Err(error!("State storage tasks failed: {}", failures.join("; "))) }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(error!("State storage tasks failed: {}", failures.join("; ")))
+        }
     }
 
     #[cfg(test)]
@@ -1232,7 +1238,9 @@ impl ShardStateDb {
         #[cfg(test)]
         {
             let gate = self.late_index_gate.lock().unwrap().take();
-            if let Some(gate) = gate { gate()?; }
+            if let Some(gate) = gate {
+                gate()?;
+            }
         }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id.clone(), save_utime);

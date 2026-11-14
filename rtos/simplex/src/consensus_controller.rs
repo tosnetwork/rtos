@@ -202,7 +202,12 @@ struct FinalityRetryPass {
     outputs: HashMap<(BlockIdExt, bool, UInt256), ExpectedFinalityOutput>,
 }
 impl FinalityRetryPass {
-    fn output(&mut self, block: &BlockIdExt, is_final: bool, source: &UInt256) -> ExpectedFinalityOutput {
+    fn output(
+        &mut self,
+        block: &BlockIdExt,
+        is_final: bool,
+        source: &UInt256,
+    ) -> ExpectedFinalityOutput {
         let key = (block.clone(), is_final, source.clone());
         if let Some(output) = self.outputs.get(&key) {
             return output.clone();
@@ -413,8 +418,13 @@ pub(crate) trait ConsensusBackend {
 
     /// FinalCert ancestry can include notarized skipped slots. Resolve their
     /// contents without the ordinary obsolete-vote repair filter.
-    fn request_candidate_for_finality(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
-        self.request_candidate(slot,hash,delay);
+    fn request_candidate_for_finality(
+        &self,
+        slot: SlotIndex,
+        hash: UInt256,
+        delay: Option<Duration>,
+    ) {
+        self.request_candidate(slot, hash, delay);
     }
 
     /// Reset per-slot state after a slot is materially finalized (FSM/receiver
@@ -858,11 +868,13 @@ impl ConsensusController {
         // Pin only receipts already earned by actual node acceptance, and only
         // while a retained source's complete resolved plan still references
         // them. Once those plans finish, the next prune reclaims the receipts.
-        let in_flight_ancestors: HashSet<_> = self.finalized_pending_body.values()
+        let in_flight_ancestors: HashSet<_> = self
+            .finalized_pending_body
+            .values()
             .flat_map(|entry| entry.resolved_output_plan.iter().map(|(id, _)| id.clone()))
             .collect();
-        self.acknowledged_ancestor_approvals.retain(|id|
-            id.slot >= up_to_slot || in_flight_ancestors.contains(id));
+        self.acknowledged_ancestor_approvals
+            .retain(|id| id.slot >= up_to_slot || in_flight_ancestors.contains(id));
     }
 }
 
@@ -2080,7 +2092,16 @@ impl ConsensusController {
         // Always keep a pending entry until recursive parent-chain materialization
         // succeeds end-to-end. This provides deterministic retries on late body/cert
         // arrivals and ensures ancestor parity is eventually reached.
-        let entry = FinalizedEntry { event: event.clone(), intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), continuation: None, sealed_output_requirements: None, finalized_at: self.now() };
+        let entry = FinalizedEntry {
+            event: event.clone(),
+            intent_retained: false,
+            acknowledged_source_candidates: HashSet::new(),
+            walked_candidates: HashSet::new(),
+            resolved_output_plan: Vec::new(),
+            continuation: None,
+            sealed_output_requirements: None,
+            finalized_at: self.now(),
+        };
         // C++ state-resolver.cpp: a duplicate joins the existing InFlight
         // operation, preserving its original certificate and completed phases.
         self.finalized_pending_body.entry(finalized_id.clone()).or_insert(entry);
@@ -2368,15 +2389,25 @@ impl ConsensusController {
         attempt: &mut ChainAttempt,
     ) -> bool {
         if self.description.authenticated_runtime().is_some()
-            && self.finalized_pending_body.get(trigger_id)
+            && self
+                .finalized_pending_body
+                .get(trigger_id)
                 .is_some_and(|entry| entry.sealed_output_requirements.is_none())
         {
             match self.callbacks.sealed_finality_output_requirements(trigger_id) {
-                Ok(required) => self.finalized_pending_body.get_mut(trigger_id).unwrap()
-                    .sealed_output_requirements = required,
+                Ok(required) => {
+                    self.finalized_pending_body
+                        .get_mut(trigger_id)
+                        .unwrap()
+                        .sealed_output_requirements = required
+                }
                 Err(error) => {
-                    log::error!("Session {} source {}:{} cannot bind sealed output requirements: {error}",
-                        self.session_id().to_hex_string(), trigger_id.slot, trigger_id.hash.to_hex_string());
+                    log::error!(
+                        "Session {} source {}:{} cannot bind sealed output requirements: {error}",
+                        self.session_id().to_hex_string(),
+                        trigger_id.slot,
+                        trigger_id.hash.to_hex_string()
+                    );
                     self.begin_candidate_attempt(attempt, trigger_id);
                     attempt.fail(
                         trigger_id,
@@ -2397,7 +2428,9 @@ impl ConsensusController {
                 return result;
             }
         }
-        let required_output_set: Option<HashSet<_>> = self.finalized_pending_body.get(trigger_id)
+        let required_output_set: Option<HashSet<_>> = self
+            .finalized_pending_body
+            .get(trigger_id)
             .and_then(|entry| entry.sealed_output_requirements.as_ref())
             .map(|outputs| outputs.iter().cloned().collect());
         let mut remaining_required = required_output_set.clone().unwrap_or_default();
@@ -2484,21 +2517,27 @@ impl ConsensusController {
                     // Approval can reuse this walk's previously resolved suffix;
                     // a startup marker alone cannot supply that authority.
                     if self.acknowledged_ancestor_approvals.contains(&current_id) {
-                        if let Some(index) = entry.resolved_output_plan.iter()
-                            .position(|(id, _)| id == &current_id)
+                        if let Some(index) =
+                            entry.resolved_output_plan.iter().position(|(id, _)| id == &current_id)
                         {
                             let suffix = &entry.resolved_output_plan[index..];
-                            if remaining_required.iter().all(|required|
-                                suffix.iter().any(|(_, output)| output == required))
+                            if remaining_required
+                                .iter()
+                                .all(|required| suffix.iter().any(|(_, output)| output == required))
                             {
-                                for (_, output) in suffix { remaining_required.remove(output); }
-                                expected_outputs.extend(suffix.iter().map(|(_, output)| output.clone()));
+                                for (_, output) in suffix {
+                                    remaining_required.remove(output);
+                                }
+                                expected_outputs
+                                    .extend(suffix.iter().map(|(_, output)| output.clone()));
                                 resolved_output_plan.extend_from_slice(suffix);
                                 break;
                             }
                         }
                     }
-                    if !entry.walked_candidates.contains(&current_id) && remaining_required.is_empty() {
+                    if !entry.walked_candidates.contains(&current_id)
+                        && remaining_required.is_empty()
+                    {
                         break;
                     }
                 } else {
@@ -2572,7 +2611,8 @@ impl ConsensusController {
             // top is not this source's durable handoff receipt. Authenticated
             // recovery retains that dependency walk below the applied top.
             let block_below_applied_floor = self.description.authenticated_runtime().is_none()
-                && !has_final_cert && received.block_id.seq_no() < applied_floor;
+                && !has_final_cert
+                && received.block_id.seq_no() < applied_floor;
             let body_available = received.has_real_body();
 
             if workchain {
@@ -2711,8 +2751,10 @@ impl ConsensusController {
         // erase any output this exact source had sealed before interruption.
         // Require the full original set before issuing WC callbacks; every
         // member still crosses the normal certificate/node-acceptance path.
-        if !remaining_required.is_empty() || required_output_set.as_ref().is_some_and(|required|
-            expected_outputs.iter().any(|output| !required.contains(output)))
+        if !remaining_required.is_empty()
+            || required_output_set.as_ref().is_some_and(|required| {
+                expected_outputs.iter().any(|output| !required.contains(output))
+            })
         {
             log::debug!(
                 "Session {} source {}:{} sealed output obligations not fully resolved",
@@ -2742,18 +2784,32 @@ impl ConsensusController {
                     Vec::new()
                 };
             }
-            if self.description.authenticated_runtime().is_some() && resolved_workchain.len() <= 1024 {
-                let steps = resolved_workchain.iter().rev().map(|(id, received, has_final_cert)| {
-                    FinalityPlanStep {
-                        id: id.clone(), block: received.block_id.clone(), parent: received.parent_id.clone(),
-                        is_empty: received.is_empty, has_final_cert: *has_final_cert,
-                        source: (!received.is_empty).then(||
-                            UInt256::from(*self.build_source_info_for_received(received).source.id().data())),
-                    }
-                }).collect();
-                let entry = self.finalized_pending_body.get_mut(trigger_id).expect("registered source");
+            if self.description.authenticated_runtime().is_some()
+                && resolved_workchain.len() <= 1024
+            {
+                let steps = resolved_workchain
+                    .iter()
+                    .rev()
+                    .map(|(id, received, has_final_cert)| FinalityPlanStep {
+                        id: id.clone(),
+                        block: received.block_id.clone(),
+                        parent: received.parent_id.clone(),
+                        is_empty: received.is_empty,
+                        has_final_cert: *has_final_cert,
+                        source: (!received.is_empty).then(|| {
+                            UInt256::from(
+                                *self.build_source_info_for_received(received).source.id().data(),
+                            )
+                        }),
+                    })
+                    .collect();
+                let entry =
+                    self.finalized_pending_body.get_mut(trigger_id).expect("registered source");
                 entry.continuation = Some(FinalityContinuation {
-                    steps, next: 0, outputs: expected_outputs, trigger_hash_data: trigger_candidate_hash_data,
+                    steps,
+                    next: 0,
+                    outputs: expected_outputs,
+                    trigger_hash_data: trigger_candidate_hash_data,
                     requirements: entry.sealed_output_requirements.clone(),
                 });
                 // Larger plans retain the original complete walk. The bound is
@@ -2790,8 +2846,14 @@ impl ConsensusController {
                 }
                 let mut ready = true;
                 self.try_emit_recursive_finalized_callback(
-                    backend, &id, &received, event, has_final_cert,
-                    trigger_slot, &trigger_candidate_hash_data, &mut ready,
+                    backend,
+                    &id,
+                    &received,
+                    event,
+                    has_final_cert,
+                    trigger_slot,
+                    &trigger_candidate_hash_data,
+                    &mut ready,
                 );
                 if !ready {
                     let failure = self.take_handoff_failure(&id);
@@ -2843,7 +2905,9 @@ impl ConsensusController {
         attempt: &mut ChainAttempt,
     ) -> Option<bool> {
         let mut plan = self.finalized_pending_body.get_mut(trigger_id)?.continuation.take()?;
-        if self.finalized_pending_body.get(trigger_id)?.sealed_output_requirements != plan.requirements {
+        if self.finalized_pending_body.get(trigger_id)?.sealed_output_requirements
+            != plan.requirements
+        {
             return None; // Newly bound obligations need the complete original resolver.
         }
         let result = self.drive_finality_plan(backend, trigger_id, event, pass, &mut plan, attempt);
@@ -2886,10 +2950,13 @@ impl ConsensusController {
                 );
                 return Some(false);
             };
-            let source = (!received.is_empty).then(||
-                UInt256::from(*self.build_source_info_for_received(&received).source.id().data()));
-            if received.slot != step.id.slot || received.block_id != step.block
-                || received.parent_id != step.parent || received.is_empty != step.is_empty
+            let source = (!received.is_empty).then(|| {
+                UInt256::from(*self.build_source_info_for_received(&received).source.id().data())
+            });
+            if received.slot != step.id.slot
+                || received.block_id != step.block
+                || received.parent_id != step.parent
+                || received.is_empty != step.is_empty
                 || source != step.source
                 || (!received.candidate_hash_data_bytes.is_empty()
                     && UInt256::calc_file_hash(&received.candidate_hash_data_bytes) != step.id.hash)
@@ -2929,13 +2996,21 @@ impl ConsensusController {
             }
             let mut ready = true;
             self.try_emit_recursive_finalized_callback(
-                backend, &step.id, &received, event, step.has_final_cert,
-                trigger_id.slot, &plan.trigger_hash_data, &mut ready,
+                backend,
+                &step.id,
+                &received,
+                event,
+                step.has_final_cert,
+                trigger_id.slot,
+                &plan.trigger_hash_data,
+                &mut ready,
             );
             if !ready {
                 let failure = self.take_handoff_failure(&step.id);
                 attempt.fail(&step.id, failure);
-                if !step.has_final_cert { pass.pending_ancestors.insert(step.id.clone()); }
+                if !step.has_final_cert {
+                    pass.pending_ancestors.insert(step.id.clone());
+                }
                 return Some(false);
             }
             if !self.maybe_apply_finalized_state(backend, &step.id, step.has_final_cert) {
@@ -2997,8 +3072,10 @@ impl ConsensusController {
         let trigger_id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
         let source_replay = durable
             && self.replayed_source_finalizations.contains(&trigger_id)
-            && self.finalized_pending_body.get(&trigger_id).is_some_and(|entry|
-                !entry.acknowledged_source_candidates.contains(candidate_id))
+            && self
+                .finalized_pending_body
+                .get(&trigger_id)
+                .is_some_and(|entry| !entry.acknowledged_source_candidates.contains(candidate_id))
             && (has_final_cert || !self.acknowledged_ancestor_approvals.contains(candidate_id));
         if source_replay {
             // The startup seed is no completion receipt for this source. Keep
@@ -3006,7 +3083,9 @@ impl ConsensusController {
             // the normal node handoff actually completes.
             self.finalized_delivery_sent.remove(candidate_id);
         }
-        if received.is_empty || (self.finalized_delivery_sent.contains(candidate_id) && !source_replay) {
+        if received.is_empty
+            || (self.finalized_delivery_sent.contains(candidate_id) && !source_replay)
+        {
             return;
         }
 
@@ -3156,8 +3235,11 @@ impl ConsensusController {
                 self.acknowledged_ancestor_approvals.insert(candidate_id.clone());
             }
             if source_replay {
-                self.finalized_pending_body.get_mut(&trigger_id).expect("registered source trigger")
-                    .acknowledged_source_candidates.insert(candidate_id.clone());
+                self.finalized_pending_body
+                    .get_mut(&trigger_id)
+                    .expect("registered source trigger")
+                    .acknowledged_source_candidates
+                    .insert(candidate_id.clone());
             }
             let now = self.now();
             self.telemetry.record_self_collation_acceptance(
@@ -3231,7 +3313,11 @@ impl ConsensusController {
                     "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_metadata",
                     self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
                     cursor.slot.value(), cursor.hash.to_hex_string());
-                backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(
+                    cursor.slot,
+                    cursor.hash,
+                    Some(Duration::ZERO),
+                );
                 return false;
             };
             if received.candidate_hash_data_bytes.is_empty() {
@@ -3239,25 +3325,37 @@ impl ConsensusController {
                     "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_hash_data",
                     self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
                     cursor.slot.value(), cursor.hash.to_hex_string());
-                backend.request_candidate_for_finality(cursor.slot, cursor.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(
+                    cursor.slot,
+                    cursor.hash,
+                    Some(Duration::ZERO),
+                );
                 return false;
             }
             let Some(parent) = received.parent_id.clone() else {
                 return true;
             };
             if parent.slot >= cursor.slot {
-                log::error!("Session {} cannot persist non-decreasing recovery ancestry", self.session_id());
+                log::error!(
+                    "Session {} cannot persist non-decreasing recovery ancestry",
+                    self.session_id()
+                );
                 return false;
             }
             if self.finalized_blocks.contains(&parent) {
                 return true;
             }
-            if backend.simplex_state().get_notarize_certificate(parent.slot, &parent.hash).is_none() {
+            if backend.simplex_state().get_notarize_certificate(parent.slot, &parent.hash).is_none()
+            {
                 log::debug!(target: "simplex_resolver",
                     "RECOVERY_ANCESTRY_PENDING: session={} candidate_slot={} candidate_hash={} dependency_slot={} dependency_hash={} reason=missing_notar",
                     self.session_id().to_hex_string(), candidate.slot.value(), candidate.hash.to_hex_string(),
                     parent.slot.value(), parent.hash.to_hex_string());
-                backend.request_candidate_for_finality(parent.slot, parent.hash, Some(Duration::ZERO));
+                backend.request_candidate_for_finality(
+                    parent.slot,
+                    parent.hash,
+                    Some(Duration::ZERO),
+                );
                 return false;
             }
             cursor = parent;
@@ -3824,7 +3922,19 @@ impl ConsensusController {
         event: BlockFinalizedEvent,
         finalized_at: SystemTime,
     ) {
-        self.finalized_pending_body.insert(id, FinalizedEntry { event, intent_retained: false, acknowledged_source_candidates: HashSet::new(), walked_candidates: HashSet::new(), resolved_output_plan: Vec::new(), continuation: None, sealed_output_requirements: None, finalized_at });
+        self.finalized_pending_body.insert(
+            id,
+            FinalizedEntry {
+                event,
+                intent_retained: false,
+                acknowledged_source_candidates: HashSet::new(),
+                walked_candidates: HashSet::new(),
+                resolved_output_plan: Vec::new(),
+                continuation: None,
+                sealed_output_requirements: None,
+                finalized_at,
+            },
+        );
         self.telemetry.finalized_pending_body_gauge.set(self.finalized_pending_body.len() as f64);
     }
 
@@ -3875,9 +3985,14 @@ mod retry_pass_tests {
 
     #[test]
     fn finality_retry_output_cache_preserves_all_inputs_and_overflow() {
-        let block = |seq| BlockIdExt::with_params(
-            rtos_block::ShardIdent::masterchain(), seq,
-            UInt256::from([1; 32]), UInt256::from([2; 32]));
+        let block = |seq| {
+            BlockIdExt::with_params(
+                rtos_block::ShardIdent::masterchain(),
+                seq,
+                UInt256::from([1; 32]),
+                UInt256::from([2; 32]),
+            )
+        };
         let source = UInt256::from([3; 32]);
         let other_source = UInt256::from([4; 32]);
         let mut pass = FinalityRetryPass::default();
@@ -3889,7 +4004,9 @@ mod retry_pass_tests {
         assert_ne!(pass.output(&block(1), false, &other_source), first);
         assert_ne!(pass.output(&block(2), false, &source), first);
         assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 3);
-        for seq in 1000..2024 { pass.output(&block(seq), false, &source); }
+        for seq in 1000..2024 {
+            pass.output(&block(seq), false, &source);
+        }
         assert_eq!(pass.outputs.len(), 1024);
         let before = ExpectedFinalityOutput::construction_count_for_test();
         let uncached = pass.output(&block(9999), true, &other_source);
@@ -3897,12 +4014,18 @@ mod retry_pass_tests {
         assert!(uncached.is_final);
         assert_eq!(uncached.source_validator, other_source.to_hex_string());
         assert_eq!(pass.output(&block(9999), true, &other_source), uncached);
-        assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 2,
-            "overflow must compute the original output rather than discard or alias it");
+        assert_eq!(
+            ExpectedFinalityOutput::construction_count_for_test() - before,
+            2,
+            "overflow must compute the original output rather than discard or alias it"
+        );
         assert_eq!(pass.output(&block(1), false, &source), first);
         let before = ExpectedFinalityOutput::construction_count_for_test();
         assert_eq!(FinalityRetryPass::default().output(&block(1), false, &source), first);
-        assert_eq!(ExpectedFinalityOutput::construction_count_for_test() - before, 1,
-            "a fresh pass must rebuild identity from its actual current inputs");
+        assert_eq!(
+            ExpectedFinalityOutput::construction_count_for_test() - before,
+            1,
+            "a fresh pass must rebuild identity from its actual current inputs"
+        );
     }
 }

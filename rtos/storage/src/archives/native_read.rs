@@ -74,11 +74,15 @@ async fn read_owned<T: Send + 'static>(
     tokio::task::spawn_blocking(move || {
         let mut owner = open_owned(operation, path)?;
         read(&mut owner.file)
-    }).await.map_err(|error| error!("Archive native read owner failed: {error}"))?
+    })
+    .await
+    .map_err(|error| error!("Archive native read owner failed: {error}"))?
 }
 
 impl Read for OwnedReader {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> { self.file.read(bytes) }
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(bytes)
+    }
 }
 
 /// The stream retains its actual descriptor and admission between entries.
@@ -89,25 +93,40 @@ pub(super) struct NativePackageReader {
     limits: ArchiveReadLimits,
 }
 impl NativePackageReader {
-    pub(super) async fn open(operation: ArchiveOperation, path: PathBuf, limits: ArchiveReadLimits) -> Result<Self> {
+    pub(super) async fn open(
+        operation: ArchiveOperation,
+        path: PathBuf,
+        limits: ArchiveReadLimits,
+    ) -> Result<Self> {
         let reader = tokio::task::spawn_blocking(move || {
             let mut reader = BufReader::with_capacity(1 << 19, open_owned(operation, path)?);
             let mut header = [0; PKG_HEADER_SIZE];
             reader.read_exact(&mut header)?;
-            if u32::from_le_bytes(header) != PKG_HEADER_MAGIC { fail!("Package file header mismatch"); }
+            if u32::from_le_bytes(header) != PKG_HEADER_MAGIC {
+                fail!("Package file header mismatch");
+            }
             Ok::<_, anyhow::Error>(reader)
-        }).await.map_err(|e| error!("Native package stream open failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package stream open failed: {e}"))??;
         Ok(Self { reader: Some(reader), limits })
     }
 
     pub(super) async fn next(&mut self) -> Result<Option<PackageEntry>> {
-        let mut reader = self.reader.take().ok_or_else(|| error!("Package stream is closed after cancellation or read failure"))?;
+        let mut reader = self
+            .reader
+            .take()
+            .ok_or_else(|| error!("Package stream is closed after cancellation or read failure"))?;
         let limits = self.limits;
         let (reader, entry) = tokio::task::spawn_blocking(move || {
             let entry = PackageEntry::read_next_bounded_sync(&mut reader, limits);
             (reader, entry)
-        }).await.map_err(|e| error!("Native package stream read failed: {e}"))?;
-        if entry.is_ok() { self.reader = Some(reader); }
+        })
+        .await
+        .map_err(|e| error!("Native package stream read failed: {e}"))?;
+        if entry.is_ok() {
+            self.reader = Some(reader);
+        }
         entry
     }
 }

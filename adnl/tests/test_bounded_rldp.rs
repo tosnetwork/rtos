@@ -224,8 +224,11 @@ struct OversizeWirePeer {
 #[async_trait::async_trait]
 impl Subscriber for OversizeWirePeer {
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        use rtos_api::ton::{rldp, rldp2};
-        use rtos_api::{deserialize_boxed, IntoBoxed};
+        use rtos_api::{
+            deserialize_boxed,
+            ton::{rldp, rldp2},
+            IntoBoxed,
+        };
         use std::sync::atomic::Ordering;
         if !self.armed.load(Ordering::Acquire) {
             return Ok(false);

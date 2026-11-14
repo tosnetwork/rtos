@@ -186,10 +186,7 @@ fn post_candidate_request(
     delay: Option<Duration>,
     for_finality: bool,
 ) {
-    let id = RawCandidateId {
-        slot,
-        hash: hash.clone(),
-    };
+    let id = RawCandidateId { slot, hash: hash.clone() };
     let delay = delay.unwrap_or(crate::candidate_controller::CANDIDATE_REQUEST_DELAY);
     {
         let mut requests = pending.lock().unwrap();
@@ -200,18 +197,10 @@ fn post_candidate_request(
         }
         requests.insert(id.clone(), (delay, for_finality));
     }
-    let mut ticket = CandidateRequestTicket {
-        pending: pending.clone(),
-        id,
-        armed: true,
-    };
+    let mut ticket = CandidateRequestTicket { pending: pending.clone(), id, armed: true };
     crate::task_queue::post_closure(queue, move |p: &mut SessionProcessor| {
-        let (delay, for_finality) = ticket
-            .pending
-            .lock()
-            .unwrap()
-            .remove(&ticket.id)
-            .expect("queued repair ticket");
+        let (delay, for_finality) =
+            ticket.pending.lock().unwrap().remove(&ticket.id).expect("queued repair ticket");
         ticket.armed = false;
         if for_finality {
             p.request_candidate_for_finality(slot, hash, Some(delay));
@@ -1279,7 +1268,9 @@ impl SessionProcessor {
     /// A durable source or node-acceptance completion is an explicit
     /// continuation, not unrelated traffic waiting for the periodic fallback.
     pub(crate) fn on_finality_delivery_ready(&mut self) {
-        if self.consensus.durable_pending_floor().is_none() { return; }
+        if self.consensus.durable_pending_floor().is_none() {
+            return;
+        }
         self.with_consensus_backend(|consensus, backend| {
             consensus.retry_pending_recursive_finalization(backend)
         });
@@ -1308,7 +1299,6 @@ impl SessionProcessor {
     ) {
         self.with_candidate_backend(|c, b| c.request_candidate_for_finality(slot, hash, delay, b));
     }
-
 
     /// Cancel outbound repair for a slot after it finalizes / skips. Delegates to
     /// [`CandidateController::cancel_repairs_for_slot`].
@@ -1749,7 +1739,14 @@ impl CollationBackend for CollationBackendAdapter<'_> {
         // The fetch runs the full `request_candidate` machinery, which needs
         // `&mut SessionProcessor`; bounce it onto SXMAIN from the
         // `check_collation` parent-resolution gate.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, None, false);
+        post_candidate_request(
+            self.task_queue,
+            self.deferred_candidate_requests,
+            slot,
+            hash,
+            None,
+            false,
+        );
     }
 
     fn self_receive_candidate(&self, self_idx: u32, candidate: CandidateData) {
@@ -1959,7 +1956,14 @@ impl ValidationBackend for ValidationBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay, false);
+        post_candidate_request(
+            self.task_queue,
+            self.deferred_candidate_requests,
+            slot,
+            hash,
+            delay,
+            false,
+        );
     }
 }
 
@@ -2197,7 +2201,14 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
     fn request_candidate(&self, slot: SlotIndex, hash: UInt256, delay: Option<Duration>) {
         // The fetch runs the full `request_candidate` machinery (shared throttle
         // map), which needs `&mut SessionProcessor`; bounce it onto SXMAIN.
-        post_candidate_request(self.task_queue, self.deferred_candidate_requests, slot, hash, delay, false);
+        post_candidate_request(
+            self.task_queue,
+            self.deferred_candidate_requests,
+            slot,
+            hash,
+            delay,
+            false,
+        );
     }
 
     fn request_candidate_for_finality(
@@ -2215,8 +2226,6 @@ impl ConsensusBackend for ConsensusBackendAdapter<'_> {
             true,
         );
     }
-
-
 
     fn reset_slot_state(&self, slot: SlotIndex) {
         // `reset_slot_state` -> `cleanup_old_candidates` re-enters
@@ -2799,7 +2808,8 @@ impl SessionProcessor {
         // A verified source FinalCert still owns an unfinished handoff. Session
         // finalized-block metadata alone cannot certify this source's node ACK.
         self.consensus.register_source_finality_replay(RawCandidateId {
-            slot: event.slot, hash: event.block_hash.clone(),
+            slot: event.slot,
+            hash: event.block_hash.clone(),
         });
         self.save_certificate_before_finalization(event, false);
         self.check_all();
@@ -2828,7 +2838,8 @@ impl SessionProcessor {
     /// successful. Publish as an actor message, as in C++, so storage callback
     /// dispatch does not run the recursive finalization walk inline.
     fn publish_saved_finalization(&mut self, id: &RawCandidateId) {
-        let Some(event) = self.pending_saved_finalizations.get_mut(id).and_then(Option::take) else {
+        let Some(event) = self.pending_saved_finalizations.get_mut(id).and_then(Option::take)
+        else {
             return;
         };
         let id = id.clone();
@@ -2860,7 +2871,10 @@ impl SessionProcessor {
     }
 
     pub(crate) fn on_transport_certificate(
-        &mut self, peer: consensus_common::PublicKeyHash, source_idx: Option<u32>, certificate: Certificate,
+        &mut self,
+        peer: consensus_common::PublicKeyHash,
+        source_idx: Option<u32>,
+        certificate: Certificate,
     ) {
         let verified = self.with_consensus_backend(|consensus, backend| {
             consensus.on_certificate_from_peer(backend, Some(peer), source_idx, certificate)

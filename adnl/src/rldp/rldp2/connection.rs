@@ -1,10 +1,10 @@
 // Copyright 2017-2020 Telegram Systems LLP
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! Owned RLDP2 connection state. Times are monotonic seconds since connection creation.
-use super::outbound::OutboundConnection;
-use super::timer::TimerHeap;
 use super::{
     budget::{self, InboundBudget, Kind, PeerId, Reservation},
+    outbound::OutboundConnection,
+    timer::TimerHeap,
     DEFAULT_MTU, PART_SIZE, SYMBOL_SIZE,
 };
 use crate::fec::{Decoder, PeerFecType, Refusal};

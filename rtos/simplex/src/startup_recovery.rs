@@ -332,15 +332,23 @@ impl SessionStartupRecoveryProcessor {
         }
 
         #[cfg(any(test, feature = "isolated-consensus-signing"))]
-        crate::cold_bootstrap_test_control::apply_from_environment(&self.description, &mut bootstrap)?;
+        crate::cold_bootstrap_test_control::apply_from_environment(
+            &self.description,
+            &mut bootstrap,
+        )?;
 
         // Metadata alone never marks a slot generated. The set is derived only
         // after authenticating the complete PQ bootstrap/journal, and applied
         // below only to IDs for which actual candidate bytes are restored.
-        let own_payloads: HashSet<_> = bootstrap.candidate_infos.iter()
-            .filter(|record| self.description.pq_context().is_some()
-                && self.self_idx == Some(ValidatorIndex::new(record.leader_idx)))
-            .map(|record| record.candidate_id.clone()).collect();
+        let own_payloads: HashSet<_> = bootstrap
+            .candidate_infos
+            .iter()
+            .filter(|record| {
+                self.description.pq_context().is_some()
+                    && self.self_idx == Some(ValidatorIndex::new(record.leader_idx))
+            })
+            .map(|record| record.candidate_id.clone())
+            .collect();
 
         self.recovery_begin_startup_replay(backend);
 
@@ -481,7 +489,12 @@ impl SessionStartupRecoveryProcessor {
             "Session {}: step 10/12 - restoring candidate bytes cache",
             self.session_id.to_hex_string()
         );
-        self.restore_candidate_cache(backend, &session_boot.finalized_blocks, &candidate_payloads, &own_payloads)?;
+        self.restore_candidate_cache(
+            backend,
+            &session_boot.finalized_blocks,
+            &candidate_payloads,
+            &own_payloads,
+        )?;
 
         // Step 10b: Rebuild receiver standstill caches (votes + cert bundles + last_final_cert)
         //
@@ -543,7 +556,8 @@ impl SessionStartupRecoveryProcessor {
         self.description.verify_own_journal(&bootstrap.own_journal)?;
         // Authenticate every persisted vote/certificate before touching the FSM,
         // receiver caches, finalized cursor, or listener callbacks.
-        let mut replayed_notars: HashMap<RawCandidateId, HashMap<ValidatorIndex, SignatureBytes>> = HashMap::new();
+        let mut replayed_notars: HashMap<RawCandidateId, HashMap<ValidatorIndex, SignatureBytes>> =
+            HashMap::new();
         for record in &bootstrap.votes {
             if UInt256::calc_file_hash(&record.data) != record.vote_hash {
                 rtos_block::fail!("PQ recovery vote key mismatch");
@@ -616,17 +630,27 @@ impl SessionStartupRecoveryProcessor {
                 continue;
             }
             let certificate = crate::certificate::NotarCert {
-                vote: crate::simplex_state::NotarizeVote { slot: id.slot, block_hash: id.hash.clone() },
-                signatures: signatures.into_iter().map(|(validator_idx, signature)| {
-                    crate::certificate::VoteSignature::new(validator_idx, signature)
-                }).collect(),
+                vote: crate::simplex_state::NotarizeVote {
+                    slot: id.slot,
+                    block_hash: id.hash.clone(),
+                },
+                signatures: signatures
+                    .into_iter()
+                    .map(|(validator_idx, signature)| {
+                        crate::certificate::VoteSignature::new(validator_idx, signature)
+                    })
+                    .collect(),
             };
-            if certificate.total_weight(&self.description)? < crate::utils::threshold_66(self.description.get_total_weight()) {
+            if certificate.total_weight(&self.description)?
+                < crate::utils::threshold_66(self.description.get_total_weight())
+            {
                 continue;
             }
             crate::certificate::NotarCert::from_tl_signatures(
-                &certificate.to_tl_vote_signature_set(), certificate.vote,
-                &self.description, &self.session_id,
+                &certificate.to_tl_vote_signature_set(),
+                certificate.vote,
+                &self.description,
+                &self.session_id,
             )?;
             notars.insert(id);
         }
@@ -639,12 +663,20 @@ impl SessionStartupRecoveryProcessor {
             let bytes = serialize_boxed(&info.candidate_hash_data)?;
             let computed = UInt256::calc_file_hash(&bytes);
             if computed != info.candidate_id.hash {
-                rtos_block::fail!("PQ recovery candidate hash mismatch at slot {}: stored {}, computed {}",
-                    info.candidate_id.slot.value(), info.candidate_id.hash, computed);
+                rtos_block::fail!(
+                    "PQ recovery candidate hash mismatch at slot {}: stored {}, computed {}",
+                    info.candidate_id.slot.value(),
+                    info.candidate_id.hash,
+                    computed
+                );
             }
             if info.candidate_hash_data.block().shard() != self.description.get_shard() {
-                rtos_block::fail!("PQ recovery candidate shard mismatch at slot {}: stored {}, expected {}",
-                    info.candidate_id.slot.value(), info.candidate_hash_data.block().shard(), self.description.get_shard());
+                rtos_block::fail!(
+                    "PQ recovery candidate shard mismatch at slot {}: stored {}, expected {}",
+                    info.candidate_id.slot.value(),
+                    info.candidate_hash_data.block().shard(),
+                    self.description.get_shard()
+                );
             }
             if !crate::utils::check_candidate_signature(
                 &self.session_id,
@@ -745,11 +777,15 @@ impl SessionStartupRecoveryProcessor {
         for record in &bootstrap.finalized_blocks {
             let mut cursor = record.parent.as_ref();
             while cursor != previous {
-                let id = cursor.ok_or_else(|| error!("PQ recovery disconnected finalized chain"))?;
+                let id =
+                    cursor.ok_or_else(|| error!("PQ recovery disconnected finalized chain"))?;
                 if !supported.contains(id) {
-                    rtos_block::fail!("PQ recovery finalized ancestor lacks authenticated finality");
+                    rtos_block::fail!(
+                        "PQ recovery finalized ancestor lacks authenticated finality"
+                    );
                 }
-                cursor = parents.get(id)
+                cursor = parents
+                    .get(id)
                     .ok_or_else(|| error!("PQ recovery finalized ancestor metadata missing"))?
                     .as_ref();
             }
@@ -1713,7 +1749,9 @@ impl SessionStartupRecoveryProcessor {
                 SimplexEvent::NotarizationReached(event) => {
                     let id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
                     if !notars.contains(&id) {
-                        backend.persist_reconstructed_certificate(SimplexEvent::NotarizationReached(event));
+                        backend.persist_reconstructed_certificate(
+                            SimplexEvent::NotarizationReached(event),
+                        );
                         saved_reconstructed += 1;
                     } else {
                         dropped_notarization += 1;
@@ -1721,7 +1759,9 @@ impl SessionStartupRecoveryProcessor {
                 }
                 SimplexEvent::SkipCertificateReached(event) => {
                     if !skips.contains(&event.slot) {
-                        backend.persist_reconstructed_certificate(SimplexEvent::SkipCertificateReached(event));
+                        backend.persist_reconstructed_certificate(
+                            SimplexEvent::SkipCertificateReached(event),
+                        );
                         saved_reconstructed += 1;
                     } else {
                         dropped_skip_cert_reached += 1;
@@ -1730,7 +1770,9 @@ impl SessionStartupRecoveryProcessor {
                 SimplexEvent::FinalizationReached(event) => {
                     let id = RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
                     if !finals.contains(&id) {
-                        backend.persist_reconstructed_certificate(SimplexEvent::FinalizationReached(event));
+                        backend.persist_reconstructed_certificate(
+                            SimplexEvent::FinalizationReached(event),
+                        );
                         saved_reconstructed += 1;
                     } else {
                         dropped_finalization_reached += 1;

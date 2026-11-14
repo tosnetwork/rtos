@@ -2338,21 +2338,35 @@ fn late_callback_cannot_replace_newer_generation_or_rewind_precollation() {
     let mut backend = FakeCollationBackend::new(new_slot, WindowIndex::new(23))
         .with_received(make_candidate_id(92, 0xBA), make_received(92, block.clone(), None));
     ctrl.set_last_generated_slot(Some(new_slot));
-    ctrl.block_generation_active = Some(in_flight_state(95, 23, 95, now + Duration::from_secs(100)));
+    ctrl.block_generation_active =
+        Some(in_flight_state(95, 23, 95, now + Duration::from_secs(100)));
     // Simulate the old request being replaced after reset/retry. Its queued
     // success and failure must leave the new request at the same slot intact.
     ctrl.insert_precollated(old_slot, make_precollated(94, Some(parent.clone())));
-    ctrl.on_collation_complete(&mut backend, old_slot, 93,
-        CollationResult::Empty { parent_block_id: block.clone() });
-    ctrl.on_collation_failed_impl(&mut backend, old_slot, 93, rtos_block::error!("obsolete failure"));
+    ctrl.on_collation_complete(
+        &mut backend,
+        old_slot,
+        93,
+        CollationResult::Empty { parent_block_id: block.clone() },
+    );
+    ctrl.on_collation_failed_impl(
+        &mut backend,
+        old_slot,
+        93,
+        rtos_block::error!("obsolete failure"),
+    );
     assert_eq!(ctrl.precollated(old_slot).unwrap().request.get_request_id(), 94);
     assert_eq!(ctrl.block_generation_active.as_ref().unwrap().request_id, 95);
     assert!(backend.published.borrow().is_empty());
     assert!(queue.delayed().is_empty());
     // A valid late same-window result still publishes (C++ parity), but its
     // follow-up slot94 cannot dispatch behind slot95. Keep invoke's assertion.
-    ctrl.on_collation_complete(&mut backend, old_slot, 94,
-        CollationResult::Empty { parent_block_id: block });
+    ctrl.on_collation_complete(
+        &mut backend,
+        old_slot,
+        94,
+        CollationResult::Empty { parent_block_id: block },
+    );
     assert_eq!(backend.published.borrow().len(), 1);
     assert_eq!(backend.self_received.borrow().len(), 1);
     assert!(!ctrl.precollated_contains(SlotIndex::new(94)));
@@ -2360,8 +2374,12 @@ fn late_callback_cannot_replace_newer_generation_or_rewind_precollation() {
     assert_eq!(ctrl.block_generation_active.as_ref().unwrap().request_id, 95);
     assert!(queue.delayed().is_empty());
     // An already consumed callback has no remaining publication rights.
-    ctrl.on_collation_complete(&mut backend, old_slot, 94,
-        CollationResult::Empty { parent_block_id: make_block_id(42, 0xBA) });
+    ctrl.on_collation_complete(
+        &mut backend,
+        old_slot,
+        94,
+        CollationResult::Empty { parent_block_id: make_block_id(42, 0xBA) },
+    );
     assert_eq!(backend.published.borrow().len(), 1);
 }
 

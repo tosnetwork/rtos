@@ -9,8 +9,10 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::context::{ArchiveOperation, ArchiveProvider, ArchiveView};
-use super::truncation_selection::TruncationSelection;
+use super::{
+    context::{ArchiveOperation, ArchiveProvider, ArchiveView},
+    truncation_selection::TruncationSelection,
+};
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -224,10 +226,18 @@ impl ArchiveManager {
         #[cfg(feature = "telemetry")] telemetry: Arc<StorageTelemetry>,
         allocated: Arc<StorageAlloc>,
     ) -> Result<Self> {
-        let mut manager = Self::with_data(binding, startup, db_root_path, db_provider,
-            last_unneeded_key_block, shard_split_depth,
-            #[cfg(feature = "telemetry")] telemetry,
-            allocated).await?;
+        let mut manager = Self::with_data(
+            binding,
+            startup,
+            db_root_path,
+            db_provider,
+            last_unneeded_key_block,
+            shard_split_depth,
+            #[cfg(feature = "telemetry")]
+            telemetry,
+            allocated,
+        )
+        .await?;
         manager.factory = super::recovery_root::FactoryMode::Node;
         Ok(manager)
     }
@@ -270,7 +280,11 @@ impl ArchiveManager {
             UnappliedDirectory::open(unapplied_files_path.clone(), db_root_path.as_ref().clone())
                 .await?;
         let ret = Self {
-            published: std::sync::RwLock::new(Arc::new(PublishedArchive { view, file_maps, db_provider })),
+            published: std::sync::RwLock::new(Arc::new(PublishedArchive {
+                view,
+                file_maps,
+                db_provider,
+            })),
             db,
             db_root_path,
             factory: super::recovery_root::FactoryMode::Standalone,
@@ -415,7 +429,9 @@ impl ArchiveManager {
         let _proof = handle.proof_file_lock().write().await;
         if handle.is_archived() {
             let id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
-            let descriptor = self.get_file_desc(&id, false).await?
+            let descriptor = self
+                .get_file_desc(&id, false)
+                .await?
                 .ok_or_else(|| error!("Required archive descriptor is absent"))?;
             // Both entries belong to this block's same package/provider.
             descriptor.archive_slice().sync_block_package(handle, observer.clone()).await?;
@@ -426,10 +442,14 @@ impl ArchiveManager {
             } else {
                 PackageEntryId::Proof(handle.id())
             };
-            super::package::sync_files_and_parents_observed(&[
-                self.unapplied_files_path.join(body.filename_short()),
-                self.unapplied_files_path.join(proof.filename_short()),
-            ], observer.clone()).await?;
+            super::package::sync_files_and_parents_observed(
+                &[
+                    self.unapplied_files_path.join(body.filename_short()),
+                    self.unapplied_files_path.join(proof.filename_short()),
+                ],
+                observer.clone(),
+            )
+            .await?;
         }
         self.db.sync_wal_observed(observer.as_deref())?;
         Ok(())
@@ -439,11 +459,16 @@ impl ArchiveManager {
     /// clear handle flags or fall back to another source.
     #[cfg(any(test, feature = "integration-test-support"))]
     pub async fn test_remove_archived_artifacts(&self, handle: &BlockHandle) -> Result<()> {
-        if !handle.is_archived() { fail!("Fault fixture requires real archived block"); }
+        if !handle.is_archived() {
+            fail!("Fault fixture requires real archived block");
+        }
         let _body = handle.block_file_lock().write().await;
         let _proof = handle.proof_file_lock().write().await;
         let id = self.get_package_id(get_mc_seq_no(handle), handle.is_key_block()?).await?;
-        let fd = self.get_file_desc(&id, false).await?.ok_or_else(|| error!("Fault fixture slice absent"))?;
+        let fd = self
+            .get_file_desc(&id, false)
+            .await?
+            .ok_or_else(|| error!("Fault fixture slice absent"))?;
         fd.archive_slice().test_remove_entry_offset(&PackageEntryId::Block(handle.id()))?;
         fd.archive_slice().test_remove_entry_offset(&PackageEntryId::Proof(handle.id()))
     }
@@ -470,7 +495,9 @@ impl ArchiveManager {
             } else {
                 let found = current.file_maps.files().get_closest_id(get_mc_seq_no(handle)).await;
                 let _checked = current.view.inherit(&operation)?;
-                let id = found.ok_or_else(|| super::bounded_read::ArchiveArtifactMissing::new("package route"))?;
+                let id = found.ok_or_else(|| {
+                    super::bounded_read::ArchiveArtifactMissing::new("package route")
+                })?;
                 PackageId::for_block(id)
             };
             let fd = self
@@ -490,7 +517,12 @@ impl ArchiveManager {
             filename.len() as u64,
             limits.filename_bytes,
         )?;
-        super::native_read::read_loose(current.view.inherit(&operation)?, self.unapplied_files_path.join(filename), limits).await
+        super::native_read::read_loose(
+            current.view.inherit(&operation)?,
+            self.unapplied_files_path.join(filename),
+            limits,
+        )
+        .await
     }
 
     pub async fn get_file<B: Borrow<BlockIdExt> + Hash>(
@@ -551,7 +583,8 @@ impl ArchiveManager {
         if handle.is_archived() {
             return Ok(());
         }
-        let _owner = handle.try_begin_archive_migration()
+        let _owner = handle
+            .try_begin_archive_migration()
             .ok_or_else(|| error!("Archive migration already active for {}", handle.id()))?;
 
         let proof_inited = handle.has_proof();
@@ -704,8 +737,15 @@ impl ArchiveManager {
     ) -> Result<Vec<u8>> {
         let current = self.snapshot();
         let operation = current.view.enter()?;
-        super::bounded_read::check_length("range", u64::from(limit), super::bounded_read::ARCHIVE_RANGE_MAX_BYTES)?;
-        let fd = match self.get_file_desc_in(&operation, &PackageId::for_block(archive_id as u32)).await? {
+        super::bounded_read::check_length(
+            "range",
+            u64::from(limit),
+            super::bounded_read::ARCHIVE_RANGE_MAX_BYTES,
+        )?;
+        let fd = match self
+            .get_file_desc_in(&operation, &PackageId::for_block(archive_id as u32))
+            .await?
+        {
             Some(file_desc) => file_desc,
             None => {
                 match self
@@ -739,14 +779,18 @@ impl ArchiveManager {
     }
 
     #[cfg(any(test, feature = "integration-test-support"))]
-    pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+    pub fn test_pause_gc_selection(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
         let current = self.snapshot();
         current.file_maps.files().test_pause_gc_selection()
     }
 
     pub async fn gc(&self, last_unneeded_key_block: &BlockIdExt) {
         let current = self.snapshot();
-        let Ok(_admission) = current.view.enter() else { return; };
+        let Ok(_admission) = current.view.enter() else {
+            return;
+        };
         if let Err(e) = current.file_maps.files().gc(last_unneeded_key_block).await {
             log::info!(target: TARGET, "archive_manager gc is error: {:?}", e);
         }
@@ -895,7 +939,9 @@ impl ArchiveManager {
 
     /// Existing descriptor lookup for an already-admitted read; never creates.
     async fn get_file_desc_in(
-        &self, parent: &ArchiveOperation, id: &PackageId,
+        &self,
+        parent: &ArchiveOperation,
+        id: &PackageId,
     ) -> Result<Option<Arc<FileDescription>>> {
         let current = self.snapshot();
         let operation = current.view.inherit(parent)?;
@@ -906,11 +952,13 @@ impl ArchiveManager {
                 operation: current.view.inherit(&operation)?,
             },
             PackageType::Blocks => {
-                let Some(resolved) = current.db_provider.resolve_for_read(&operation, id.id()).await? else {
+                let Some(resolved) =
+                    current.db_provider.resolve_for_read(&operation, id.id()).await?
+                else {
                     return Ok(None);
                 };
                 resolved
-            },
+            }
         };
         let found = current.file_maps.get(id.package_type()).get(id.id()).await;
         let _checked = resolved.operation.view().inherit(&resolved.operation)?;
@@ -959,7 +1007,9 @@ impl ArchiveManager {
         let slice_db = resolved.provider.db().clone();
         let slice_root_path = resolved.root_path.clone();
         super::recovery_guard::ensure_slice_clear(
-            slice_db.db(), &slice_root_path, id.id(),
+            slice_db.db(),
+            &slice_root_path,
+            id.id(),
             matches!(id.package_type(), PackageType::KeyBlocks),
         )?;
         let dir = slice_root_path.join(id.path());
@@ -1024,7 +1074,9 @@ impl ArchiveManager {
             }
         } else {
             let mut package_id = mc_seq_no - (mc_seq_no % ARCHIVE_SLICE_SIZE);
-            if let Some(found_package_id) = current.file_maps.files().get_closest_id(mc_seq_no).await {
+            if let Some(found_package_id) =
+                current.file_maps.files().get_closest_id(mc_seq_no).await
+            {
                 if package_id < found_package_id {
                     package_id = found_package_id;
                 }
@@ -1169,7 +1221,9 @@ impl ArchiveManager {
         let slice_db = resolved.provider.db().clone();
         let slice_root_path = resolved.root_path.clone();
         super::recovery_guard::ensure_slice_clear(
-            slice_db.db(), &slice_root_path, id.id(),
+            slice_db.db(),
+            &slice_root_path,
+            id.id(),
             matches!(id.package_type(), PackageType::KeyBlocks),
         )?;
         let dir = slice_root_path.join(id.path());
@@ -1206,7 +1260,10 @@ impl ArchiveManager {
 
     pub async fn trunc(&self, selection: Arc<TruncationSelection>) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
-        { let _ = selection; fail!("Durable archive truncation requires Linux"); }
+        {
+            let _ = selection;
+            fail!("Durable archive truncation requires Linux");
+        }
         #[cfg(target_os = "linux")]
         {
             let _serial = self.recovery_mutex.lock().await;
@@ -1214,7 +1271,9 @@ impl ArchiveManager {
             let protection = self.db.repair_protection().clone();
             {
                 let _check = protection.deletion().await;
-                if protection.archive_range(0, None) { fail!("Archive truncation conflicts with repair custody"); }
+                if protection.archive_range(0, None) {
+                    fail!("Archive truncation conflicts with repair custody");
+                }
             }
             let domain = current.view.binding().domain().clone();
             let closed = domain.close(current.view.epoch())?;
@@ -1222,7 +1281,10 @@ impl ArchiveManager {
             let participants = current.db_provider.recovery_participants()?;
             let execution = domain.begin_recovery(current.view.epoch(), &participants.bindings)?;
             execution.wait_for_old_io().await?;
-            execution.retire_packages()?.await.map_err(|e| error!("Archive retirement failed: {e}"))??
+            execution
+                .retire_packages()?
+                .await
+                .map_err(|e| error!("Archive retirement failed: {e}"))??
                 .consume(|_| Ok(()))?;
             let ledger = self.db.db().cf_handle("repair_dependency_leases_v1").is_some();
             use super::recovery_root::{FactoryMode, Policy};
@@ -1234,23 +1296,43 @@ impl ArchiveManager {
             policy.check_environment(self.factory, ledger)?;
             let deletion = protection.deletion().await;
             let mutation = protection.artifact_mutation().await;
-            let receipt = execution.spawn_recovery_phase(move || {
-                let _guards = (mutation, deletion);
-                let plan = super::recovery_producer::Plan::new(&participants.providers, &selection)?;
-                let root = plan.produce(policy)?;
-                Ok(Some(super::recovery_worker::recover_live(participants.providers, root)?))
-            })?.await.map_err(|e| error!("Native archive truncation failed: {e}"))??;
+            let receipt = execution
+                .spawn_recovery_phase(move || {
+                    let _guards = (mutation, deletion);
+                    let plan =
+                        super::recovery_producer::Plan::new(&participants.providers, &selection)?;
+                    let root = plan.produce(policy)?;
+                    Ok(Some(super::recovery_worker::recover_live(participants.providers, root)?))
+                })?
+                .await
+                .map_err(|e| error!("Native archive truncation failed: {e}"))??;
             let mut completion = None;
-            receipt.consume(|value| { completion = value.take(); Ok(()) })?;
-            let startup = execution.begin_rebuild(completion.ok_or_else(|| error!("Missing recovery completion"))?, current.view.binding())?;
+            receipt.consume(|value| {
+                completion = value.take();
+                Ok(())
+            })?;
+            let startup = execution.begin_rebuild(
+                completion.ok_or_else(|| error!("Missing recovery completion"))?,
+                current.view.binding(),
+            )?;
             let db_provider = current.db_provider.rebuilt(&startup)?;
-            let file_maps = FileMaps::new(self.db.clone(), &startup, &self.db_root_path, &db_provider,
+            let file_maps = FileMaps::new(
+                self.db.clone(),
+                &startup,
+                &self.db_root_path,
+                &db_provider,
                 self.last_unneeded_key_block,
-                #[cfg(feature = "telemetry")] &self.telemetry,
-                &self.allocated).await?;
-            let published = Arc::new(PublishedArchive { view: startup.view(), file_maps, db_provider });
+                #[cfg(feature = "telemetry")]
+                &self.telemetry,
+                &self.allocated,
+            )
+            .await?;
+            let published =
+                Arc::new(PublishedArchive { view: startup.view(), file_maps, db_provider });
             drop(startup);
-            execution.publish(|| { *self.published.write().unwrap_or_else(|error| error.into_inner()) = published; })
+            execution.publish(|| {
+                *self.published.write().unwrap_or_else(|error| error.into_inner()) = published;
+            })
         }
     }
 
@@ -1328,7 +1410,8 @@ impl ArchiveManager {
         F: FnMut(&BlockRanges) -> std::cmp::Ordering + Send,
     {
         let current = self.snapshot();
-        current.file_maps
+        current
+            .file_maps
             .files()
             .get_closest_by(|entry| {
                 let blocks_ranges = entry.value().blocks_ranges();

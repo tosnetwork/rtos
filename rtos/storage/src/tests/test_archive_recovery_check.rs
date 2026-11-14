@@ -1,6 +1,5 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-use super::super::epoch::EpochEntry;
-use super::*;
+use super::{super::epoch::EpochEntry, *};
 use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -358,8 +357,10 @@ fn native_child() {
 
 #[test]
 fn many_families_do_not_trigger_legacy_cleanup() {
-    use crate::db::rocksdb::{LAST_UNNEEDED_KEY_BLOCK, NODE_STATE_DB_NAME};
-    use crate::traits::Serializable;
+    use crate::{
+        db::rocksdb::{LAST_UNNEEDED_KEY_BLOCK, NODE_STATE_DB_NAME},
+        traits::Serializable,
+    };
     for pending in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();

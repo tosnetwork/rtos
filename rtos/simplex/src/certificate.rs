@@ -519,9 +519,14 @@ impl Certificate<Vote> {
         desc: &SessionDescription,
         session_id: &SessionId,
     ) -> Result<Self> {
-        Self::from_tl_authority(tl_cert, session_id, desc.get_total_nodes(),
-            desc.get_threshold_66(), |index| (desc.get_source_public_key(index), desc.get_node_weight(index)),
-            &|| Ok(()))
+        Self::from_tl_authority(
+            tl_cert,
+            session_id,
+            desc.get_total_nodes(),
+            desc.get_threshold_66(),
+            |index| (desc.get_source_public_key(index), desc.get_node_weight(index)),
+            &|| Ok(()),
+        )
     }
 
     pub(crate) fn from_authenticated_runtime(
@@ -532,14 +537,23 @@ impl Certificate<Vote> {
         if runtime.pq_context().is_none() {
             fail!("Source history requires authenticated PQ runtime");
         }
-        let nodes = runtime.committee().iter()
-            .map(crate::SimplexSessionNode::from_descriptor).collect::<Result<Vec<_>>>()?;
+        let nodes = runtime
+            .committee()
+            .iter()
+            .map(crate::SimplexSessionNode::from_descriptor)
+            .collect::<Result<Vec<_>>>()?;
         let total = rtos_block::checked_validator_weight_sum(nodes.iter().map(|n| n.weight))?;
-        Self::from_tl_authority(tl_cert, runtime.session_id(), nodes.len(),
-            crate::utils::threshold_66(total), |index| {
+        Self::from_tl_authority(
+            tl_cert,
+            runtime.session_id(),
+            nodes.len(),
+            crate::utils::threshold_66(total),
+            |index| {
                 let node = &nodes[index.value() as usize];
                 (&node.identity, node.weight)
-            }, step)
+            },
+            step,
+        )
     }
 
     fn from_tl_authority<'a>(
@@ -592,10 +606,7 @@ impl Certificate<Vote> {
 
             // Mark as voted and accumulate weight
             voted[validator_idx.value() as usize] = true;
-            voted_weight = rtos_block::checked_add_validator_weight(
-                voted_weight,
-                weight,
-            )?;
+            voted_weight = rtos_block::checked_add_validator_weight(voted_weight, weight)?;
             signatures.push(sig);
         }
 

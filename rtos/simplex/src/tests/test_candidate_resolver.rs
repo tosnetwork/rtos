@@ -558,7 +558,10 @@ fn test_bad_signature_ban_state_record_and_expire() {
     state.record(ban_peer(3), now);
 
     assert!(state.is_banned(&ban_peer(3), now), "source must be banned immediately after record()");
-    assert!(state.is_banned(&ban_peer(3), now + duration / 2), "source must remain banned mid-window");
+    assert!(
+        state.is_banned(&ban_peer(3), now + duration / 2),
+        "source must remain banned mid-window"
+    );
 
     let expired_at = now + duration + Duration::from_millis(1);
     assert!(!state.is_banned(&ban_peer(3), expired_at), "ban must lift at expiry");

@@ -209,15 +209,22 @@ impl<'a> Plan<'a> {
         let mut decision = self.content_decision(member)?;
         // Legacy package filenames are derived from their metadata ordinal.
         // Keep empty interior slots so later retained packages keep that identity.
-        if !decision.retained && member.archive.disposition == Disposition::Filter
-            && member.archive.sliced && !member.archive.separated
+        if !decision.retained
+            && member.archive.disposition == Disposition::Filter
+            && member.archive.sliced
+            && !member.archive.separated
         {
-            self.members(member.archive.provider, member.archive.key, member.archive.id, |later| {
-                if later.index > member.index && self.content_decision(&later)?.retained {
-                    decision.retained = true;
-                }
-                Ok(())
-            })?;
+            self.members(
+                member.archive.provider,
+                member.archive.key,
+                member.archive.id,
+                |later| {
+                    if later.index > member.index && self.content_decision(&later)?.retained {
+                        decision.retained = true;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(decision)
     }
@@ -469,11 +476,15 @@ impl Plan<'_> {
                         let decision = self.decision(&member)?;
                         if decision.retained {
                             if ordinal == target {
-                                projected = Some(serde_cbor::to_vec(&PackageEntryMeta::with_data(
-                                    decision.size, member.meta.version(), Some(&member.info),
-                                ))?);
+                                projected =
+                                    Some(serde_cbor::to_vec(&PackageEntryMeta::with_data(
+                                        decision.size,
+                                        member.meta.version(),
+                                        Some(&member.info),
+                                    ))?);
                             }
-                            ordinal = ordinal.checked_add(1)
+                            ordinal = ordinal
+                                .checked_add(1)
                                 .ok_or_else(|| error!("Package count overflow"))?;
                         }
                         Ok(())
@@ -836,7 +847,8 @@ impl Plan<'_> {
         self.sync_operation_directories(&root)?;
         if super::recovery_data::inventory(self.providers)? != preparing.data
             || recovery_parent::native_inventory(self.main()?.db())? != preparing.maps
-            || self.providers.inventory()? != preparing.providers {
+            || self.providers.inventory()? != preparing.providers
+        {
             fail!("Canonical archive changed during Selection construction");
         }
         preparing.check_successor(&root)?;

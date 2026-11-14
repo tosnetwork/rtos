@@ -123,9 +123,17 @@ impl ArchiveDbProvider for EpochDbProvider {
     }
     fn recovery_participants(&self) -> Result<ArchiveRecoverySet> {
         let binding = self.main_binding();
-        let root = binding.db().db().path().parent()
+        let root = binding
+            .db()
+            .db()
+            .path()
+            .parent()
             .ok_or_else(|| rtos_block::error!("Missing live main database root"))?;
-        super::recovery_providers::RecoveryProviders::from_live(binding, root, Some(self.router.recovery_epochs()))
+        super::recovery_providers::RecoveryProviders::from_live(
+            binding,
+            root,
+            Some(self.router.recovery_epochs()),
+        )
     }
     fn main_binding(&self) -> &ArchiveProvider {
         self.router.view().binding()

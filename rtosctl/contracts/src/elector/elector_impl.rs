@@ -178,10 +178,10 @@ fn parse_past_elections_stack(stack: &TvmStackParser) -> anyhow::Result<Vec<Past
 mod tests {
     use super::*;
     use rtos_api::ton::tvm::{
-        cell, list,
+        List, Number, Tuple, cell, list,
         numberdecimal::NumberDecimal,
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
-        tuple, List, Number, Tuple,
+        tuple,
     };
     use rtos_block::{BuilderData, Cell, Coins, IBitstring, Serializable, SliceData};
 

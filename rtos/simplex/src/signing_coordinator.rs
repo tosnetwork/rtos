@@ -102,25 +102,41 @@ impl SigningBinding {
         if schema != 3 && schema != PRODUCTION_SCHEMA {
             fail!("Authenticated runtime has no signing binding schema {schema}");
         }
-        let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role() else {
+        let consensus_common::session_runtime::LocalRole::Validator(index) = runtime.local_role()
+        else {
             fail!("Observer cannot own a signing journal");
         };
-        let member = runtime.committee().get(index as usize)
+        let member = runtime
+            .committee()
+            .get(index as usize)
             .ok_or_else(|| error!("Runtime validator index is outside committee"))?;
         let identity = ValidatorIdentity::from_descriptor(member)?;
-        let key = identity.pq_key().ok_or_else(|| error!("Authenticated journal requires PQ key"))?;
+        let key =
+            identity.pq_key().ok_or_else(|| error!("Authenticated journal requires PQ key"))?;
         let pin = runtime.pin();
         let binding = Self {
-            schema, wire_profile: runtime.wire_profile() as u8,
-            global_id: pin.global_id, zerostate_workchain: pin.zerostate.shard().workchain_id(),
-            zerostate_root: *pin.zerostate.root_hash().as_array(), zerostate_file: *pin.zerostate.file_hash().as_array(),
-            profile: *runtime.profile().as_array(), session: *runtime.session_id().as_array(),
-            committee: *runtime.committee_digest()?.as_array(), validator: *identity.id().data(),
-            algorithm: u32::from(key.algorithm_id), key_id: *key.key_id.as_array(), public_key: key.public_key.clone(),
-            generation, expire_at, shard_workchain: runtime.shard().workchain_id(),
-            shard_prefix: runtime.shard().shard_prefix_with_tag(), protocol: runtime.carrier_version(),
-            simplex_protocol: Some(runtime.protocol().version()), local_adnl: Some(*runtime.local_adnl().data()),
-            local_index: index, validator_count: runtime.committee().len().try_into()?,
+            schema,
+            wire_profile: runtime.wire_profile() as u8,
+            global_id: pin.global_id,
+            zerostate_workchain: pin.zerostate.shard().workchain_id(),
+            zerostate_root: *pin.zerostate.root_hash().as_array(),
+            zerostate_file: *pin.zerostate.file_hash().as_array(),
+            profile: *runtime.profile().as_array(),
+            session: *runtime.session_id().as_array(),
+            committee: *runtime.committee_digest()?.as_array(),
+            validator: *identity.id().data(),
+            algorithm: u32::from(key.algorithm_id),
+            key_id: *key.key_id.as_array(),
+            public_key: key.public_key.clone(),
+            generation,
+            expire_at,
+            shard_workchain: runtime.shard().workchain_id(),
+            shard_prefix: runtime.shard().shard_prefix_with_tag(),
+            protocol: runtime.carrier_version(),
+            simplex_protocol: Some(runtime.protocol().version()),
+            local_adnl: Some(*runtime.local_adnl().data()),
+            local_index: index,
+            validator_count: runtime.committee().len().try_into()?,
             slots_per_window: runtime.slots_per_leader_window(),
         };
         binding.validate_schema()?;
@@ -459,16 +475,29 @@ pub(crate) struct TestSessionSigner {
 }
 #[cfg(any(test, feature = "isolated-consensus-signing"))]
 impl TestSessionSigner {
-    pub(crate) fn open(self, runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
-        db: SimplexDbPtr) -> Result<std::sync::Arc<SigningCoordinator>> {
-        let binding = SigningBinding::from_authenticated_runtime(runtime, self.generation, u64::from(self.store.expire_at()))?;
+    pub(crate) fn open(
+        self,
+        runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
+        db: SimplexDbPtr,
+    ) -> Result<std::sync::Arc<SigningCoordinator>> {
+        let binding = SigningBinding::from_authenticated_runtime(
+            runtime,
+            self.generation,
+            u64::from(self.store.expire_at()),
+        )?;
         let member = &runtime.committee()[binding.local_index as usize];
         let stable = member.validator_id()?;
         let mut custody = rtos_pq_consensus::PqConsensusCustody::default();
         custody.install(stable.clone(), self.store.clone(), 0, self.store.expire_at())?;
         let signer = Signer::from_test_custody(&custody, &stable, member)?;
-        Ok(std::sync::Arc::new(SigningCoordinator::open(db, binding,
-            ValidatorIdentity::from_descriptor(member)?, &self.owner_root, self.initialize, signer)?))
+        Ok(std::sync::Arc::new(SigningCoordinator::open(
+            db,
+            binding,
+            ValidatorIdentity::from_descriptor(member)?,
+            &self.owner_root,
+            self.initialize,
+            signer,
+        )?))
     }
 }
 
@@ -859,7 +888,11 @@ impl SigningCoordinator {
         };
         Ok(utils::create_data_to_sign(&UInt256::from(b.session), &unsigned))
     }
-    fn verify_record(identity: &ValidatorIdentity, b: &SigningBinding, record: &Record) -> Result<()> {
+    fn verify_record(
+        identity: &ValidatorIdentity,
+        b: &SigningBinding,
+        record: &Record,
+    ) -> Result<()> {
         if record.binding != *UInt256::calc_file_hash(&encode(b)?).as_array() {
             fail!("decision binding mismatch");
         }
@@ -1008,8 +1041,11 @@ impl SigningCoordinator {
             // These write timings include storage queueing and durable completion;
             // they do not identify an individual syscall. Keep intent-before-sign
             // and signed-record-before-release ordering, including error poisoning.
-            let measured = lock_elapsed + intent_elapsed + signing_elapsed
-                + verification_elapsed + signed_elapsed;
+            let measured = lock_elapsed
+                + intent_elapsed
+                + signing_elapsed
+                + verification_elapsed
+                + signed_elapsed;
             log::warn!(
                 "SIGNING_FLOW: session={} kind={} slot={} pre_release_ok={} lock_ms={} \
                 intent_write_ms={} sign_ms={} verify_ms={} signed_write_ms={} other_ms={} total_ms={}",
@@ -1145,9 +1181,13 @@ pub(crate) fn verify_recovery_journal(
     runtime: &consensus_common::session_runtime::AuthenticatedSessionRuntime,
     raw: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
-    if raw.is_empty() { return Ok(()); }
+    if raw.is_empty() {
+        return Ok(());
+    }
     let headers = raw.iter().filter(|(key, _)| key == HEADER).collect::<Vec<_>>();
-    if headers.len() != 1 { fail!("Recovery journal requires exactly one header"); }
+    if headers.len() != 1 {
+        fail!("Recovery journal requires exactly one header");
+    }
     let header: Header = decode(&headers[0].1)?;
     header.validate()?;
     let expected = SigningBinding::for_runtime(
@@ -1156,22 +1196,35 @@ pub(crate) fn verify_recovery_journal(
         header.binding.generation,
         header.binding.expire_at,
     )?;
-    if header.binding != expected || expected.generation == 0 { fail!("Recovery journal authenticated binding mismatch"); }
-    let identity = ValidatorIdentity::from_descriptor(&runtime.committee()[expected.local_index as usize])?;
+    if header.binding != expected || expected.generation == 0 {
+        fail!("Recovery journal authenticated binding mismatch");
+    }
+    let identity =
+        ValidatorIdentity::from_descriptor(&runtime.committee()[expected.local_index as usize])?;
     let mut previous = Vec::new();
     let mut sequences = std::collections::BTreeSet::new();
     let mut keys = std::collections::BTreeSet::new();
     for (key, value) in raw {
         validate_record(key, value)?;
-        if !keys.insert(key) { fail!("Duplicate recovery journal key"); }
-        if key == HEADER { continue; }
+        if !keys.insert(key) {
+            fail!("Duplicate recovery journal key");
+        }
+        if key == HEADER {
+            continue;
+        }
         let record: Record = decode(value)?;
         SigningCoordinator::verify_record(&identity, &expected, &record)?;
-        if !sequences.insert(record.sequence) { fail!("Duplicate recovery journal sequence"); }
-        if previous.iter().any(|old| !compatible(old, &record.decision)) { fail!("Conflicting recovery signing intents"); }
+        if !sequences.insert(record.sequence) {
+            fail!("Duplicate recovery journal sequence");
+        }
+        if previous.iter().any(|old| !compatible(old, &record.decision)) {
+            fail!("Conflicting recovery signing intents");
+        }
         previous.push(record.decision);
     }
-    if sequences.iter().copied().ne(1..=sequences.len() as u64) { fail!("Recovery journal sequence gap"); }
+    if sequences.iter().copied().ne(1..=sequences.len() as u64) {
+        fail!("Recovery journal sequence gap");
+    }
     Ok(())
 }
 

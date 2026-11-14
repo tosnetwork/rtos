@@ -353,7 +353,9 @@ impl SessionHolder {
     }
 
     /// Teardown observer of the session's storage; only Simplex sessions certify it.
-    pub(crate) fn storage_teardown_receipt(&self) -> Option<consensus_common::StorageTeardownReceipt> {
+    pub(crate) fn storage_teardown_receipt(
+        &self,
+    ) -> Option<consensus_common::StorageTeardownReceipt> {
         match &self.inner {
             SessionInner::Simplex(session) => session.storage_teardown_receipt(),
             _ => None,

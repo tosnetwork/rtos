@@ -64,7 +64,7 @@ async fn seed(db: &Arc<RocksDb>, root: &Arc<PathBuf>, kind: PackageType) {
     drop(
         ArchiveSlice::new_empty(
             db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root.clone(),
             0,
             kind,
@@ -120,7 +120,12 @@ async fn constructor_case(mode: &str) {
                             ArchiveSlice::with_data(
                                 db.repair_protection().clone(),
                                 db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+                                &db.test_archive_provider()
+                                    .unwrap()
+                                    .view()
+                                    .unwrap()
+                                    .enter()
+                                    .unwrap(),
                                 root.clone(),
                                 0,
                                 kind,
@@ -141,7 +146,7 @@ async fn constructor_case(mode: &str) {
                 "new_empty" => typed(
                     ArchiveSlice::new_empty(
                         db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+                        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
                         root.clone(),
                         0,
                         kind,
@@ -157,7 +162,7 @@ async fn constructor_case(mode: &str) {
                 "new_for_import" => typed(
                     ArchiveSlice::new_for_import(
                         db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+                        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
                         root.clone(),
                         0,
                         kind,
@@ -198,15 +203,20 @@ async fn file_map_preserves_live_index_for_main_and_epoch_providers() {
                 let dir = tempfile::tempdir().unwrap();
                 let root = Arc::new(dir.path().to_path_buf());
                 let main = RocksDb::new(&*root, "db", None, AccessType::ReadWrite).unwrap();
-                let binding = main.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
+                let binding = main
+                    .bind_archive_domain(crate::archives::context::ArchiveDomain::new())
+                    .unwrap();
                 let startup = binding.view().unwrap().enter().unwrap();
                 let provider: Arc<dyn ArchiveDbProvider> =
                     if epoch_mode && matches!(kind, PackageType::Blocks) {
-                        let router = EpochRouter::new(&ArchivalModeConfig {
-                            epoch_size: 20000,
-                            new_epochs_path: root.join("epochs"),
-                            existing_epochs: vec![],
-                        }, &startup)
+                        let router = EpochRouter::new(
+                            &ArchivalModeConfig {
+                                epoch_size: 20000,
+                                new_epochs_path: root.join("epochs"),
+                                existing_epochs: vec![],
+                            },
+                            &startup,
+                        )
                         .await
                         .unwrap();
                         Arc::new(EpochDbProvider::new(Arc::new(router)))
@@ -286,7 +296,7 @@ async fn legacy_cleanup_preserves_unresolved_inputs_and_clean_control_drops() {
             "unknown" => marker(&db, PackageType::Blocks, b"UnknownRecoveryVersion"),
             "staging" => staging(&root),
             "orphan" => {
-                let operation = root.join("archive/recovery").join(hex::encode([5;16]));
+                let operation = root.join("archive/recovery").join(hex::encode([5; 16]));
                 fs::create_dir_all(&operation).unwrap();
                 fs::write(operation.join("selection.v1"), b"retain before Building").unwrap();
             }
@@ -363,7 +373,6 @@ async fn dangling_package_ancestors_preserve_cleanup_inputs() {
         assert_eq!(fs::read_link(link).unwrap(), root.join("missing-target"));
     }
 }
-
 
 #[tokio::test]
 async fn all_slice_constructors_refuse_failed_context_before_deletion_lock_or_changes() {
@@ -452,19 +461,24 @@ fn orphan_operation_controls_refuse_all_guards_without_changing_bytes() -> Resul
     fs::create_dir_all(&controls)?;
     ensure_root_controls_clear(db.db())?;
     let names = db.cfs().expect("open database column families");
-    let operation = controls.join(hex::encode([1;16])); fs::create_dir(&operation)?;
+    let operation = controls.join(hex::encode([1; 16]));
+    fs::create_dir(&operation)?;
     let before = snapshot(&db);
     for populated in [false, true] {
-        if populated { fs::write(operation.join("selection.v1"), b"selection before root")?; }
+        if populated {
+            fs::write(operation.join("selection.v1"), b"selection before root")?;
+        }
         let files = package_bytes(dir.path());
         typed(ensure_root_controls_clear(db.db()).unwrap_err());
         typed(ensure_provider_clear(db.db(), dir.path(), &names).unwrap_err());
         typed(ensure_open_provider_clear(db.db(), dir.path()).unwrap_err());
         typed(ensure_slice_clear(db.db(), dir.path(), 0, false).unwrap_err());
-        assert_eq!(snapshot(&db), before); assert_eq!(package_bytes(dir.path()), files);
+        assert_eq!(snapshot(&db), before);
+        assert_eq!(package_bytes(dir.path()), files);
         assert!(operation.is_dir());
     }
-    fs::remove_file(operation.join("selection.v1"))?; fs::remove_dir(operation)?;
+    fs::remove_file(operation.join("selection.v1"))?;
+    fs::remove_dir(operation)?;
     fs::write(controls.join("unknown-control"), b"preserved")?;
     typed(ensure_root_controls_clear(db.db()).unwrap_err());
     assert_eq!(fs::read(controls.join("unknown-control"))?, b"preserved");
@@ -476,12 +490,15 @@ fn orphan_operation_controls_refuse_all_guards_without_changing_bytes() -> Resul
 fn orphan_control_aliases_and_wrong_types_are_preserved() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
-    let archive = dir.path().join("archive"); fs::create_dir(&archive)?;
+    let archive = dir.path().join("archive");
+    fs::create_dir(&archive)?;
     let controls = archive.join("recovery");
     fs::write(&controls, b"unexpected file")?;
     typed(ensure_root_controls_clear(db.db()).unwrap_err());
-    assert_eq!(fs::read(&controls)?, b"unexpected file"); fs::remove_file(&controls)?;
-    let target = dir.path().join("saved-controls"); fs::create_dir(&target)?;
+    assert_eq!(fs::read(&controls)?, b"unexpected file");
+    fs::remove_file(&controls)?;
+    let target = dir.path().join("saved-controls");
+    fs::create_dir(&target)?;
     fs::write(target.join("selection.v1"), b"keep target")?;
     std::os::unix::fs::symlink(&target, &controls)?;
     typed(ensure_root_controls_clear(db.db()).unwrap_err());

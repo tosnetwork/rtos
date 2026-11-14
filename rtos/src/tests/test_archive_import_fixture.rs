@@ -15,17 +15,26 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn chains(&self) -> Vec<bool> {
-        if self.data["masterchain_only"].as_bool() == Some(true) { vec![false] } else { vec![false, true] }
+        if self.data["masterchain_only"].as_bool() == Some(true) {
+            vec![false]
+        } else {
+            vec![false, true]
+        }
     }
     #[cfg(feature = "isolated-consensus-signing")]
     pub fn active_validator() -> Result<Self> {
         let generated = std::process::Command::new(std::env::var("RTOS_ACTIVE_FIXTURE_GENERATOR")?)
-            .arg("--active-validator").output()?;
+            .arg("--active-validator")
+            .output()?;
         assert!(generated.status.success(), "active history generator failed");
         let mut data: serde_json::Value = serde_json::from_slice(&generated.stdout)?;
         for row in data["cases"].as_array_mut().unwrap() {
             let signed = std::process::Command::new(std::env::var("RTOS_PUBLIC_FIXTURE_SIGNER")?)
-                .args(["1", row["preimage"].as_str().unwrap(), &hex::encode(b"TOS-CONSENSUS-SIMPLEX-v1")])
+                .args([
+                    "1",
+                    row["preimage"].as_str().unwrap(),
+                    &hex::encode(b"TOS-CONSENSUS-SIMPLEX-v1"),
+                ])
                 .output()?;
             assert!(signed.status.success(), "public fixture signing failed");
             let text = std::str::from_utf8(&signed.stdout)?;
@@ -37,26 +46,45 @@ impl Fixture {
     }
     #[cfg(feature = "isolated-consensus-signing")]
     pub fn active_network() -> Result<Self> {
-        let stores = (0..4).map(|i| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa0 + i; 32], u32::MAX))
+        let stores = (0..4)
+            .map(|i| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0xa0 + i; 32], u32::MAX))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let keys = tempfile::NamedTempFile::new()?;
-        std::fs::write(keys.path(), serde_json::to_vec(&stores.iter().map(|k| hex::encode(&k.consensus_key().public_key)).collect::<Vec<_>>())?)?;
+        std::fs::write(
+            keys.path(),
+            serde_json::to_vec(
+                &stores
+                    .iter()
+                    .map(|k| hex::encode(&k.consensus_key().public_key))
+                    .collect::<Vec<_>>(),
+            )?,
+        )?;
         let generated = std::process::Command::new(std::env::var("RTOS_ACTIVE_FIXTURE_GENERATOR")?)
-            .arg("--active-network-keys").arg(keys.path()).output()?;
+            .arg("--active-network-keys")
+            .arg(keys.path())
+            .output()?;
         assert!(generated.status.success(), "four-validator history generator failed");
         let mut data: serde_json::Value = serde_json::from_slice(&generated.stdout)?;
         for row in data["cases"].as_array_mut().unwrap() {
             let preimage = hex::decode(row["preimage"].as_str().unwrap())?;
-            let signatures = stores.iter().enumerate().map(|(i, store)| Ok(serde_json::json!({
-                "validator_id":hex::encode([i as u8 + 1; 32]),
-                "signature":hex::encode(store.sign_consensus(&preimage)?.bytes),
-            }))).collect::<Result<Vec<_>>>()?;
+            let signatures = stores
+                .iter()
+                .enumerate()
+                .map(|(i, store)| {
+                    Ok(serde_json::json!({
+                        "validator_id":hex::encode([i as u8 + 1; 32]),
+                        "signature":hex::encode(store.sign_consensus(&preimage)?.bytes),
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
             row["signatures"] = signatures.into();
         }
         Ok(Self { data })
     }
     pub fn node_finality() -> Self {
-        Self { data: serde_json::from_str(include_str!("static/node-finality-history.json")).unwrap() }
+        Self {
+            data: serde_json::from_str(include_str!("static/node-finality-history.json")).unwrap(),
+        }
     }
     pub fn node_recovery() -> Self {
         Self {
@@ -121,15 +149,27 @@ impl Fixture {
                 sig_count: if self.data["active_network"] == true { 4 } else { 1 },
                 sig_weight: if self.data["active_network"] == true { 4 } else { 2 },
                 signatures: if self.data["active_network"] == true {
-                    row["signatures"].as_array().unwrap().iter().map(|s| Ok(PqBlockSignaturePair {
-                        validator_id: UInt256::from_slice(&hex::decode(s["validator_id"].as_str().unwrap())?),
-                        algorithm_id: 1, signature: hex::decode(s["signature"].as_str().unwrap())?,
-                    })).collect::<Result<Vec<_>>>()?
-                } else { vec![PqBlockSignaturePair {
-                    validator_id: UInt256::from([2; 32]),
-                    algorithm_id: 1,
-                    signature: hex::decode(row["signature"].as_str().unwrap())?,
-                }] },
+                    row["signatures"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|s| {
+                            Ok(PqBlockSignaturePair {
+                                validator_id: UInt256::from_slice(&hex::decode(
+                                    s["validator_id"].as_str().unwrap(),
+                                )?),
+                                algorithm_id: 1,
+                                signature: hex::decode(s["signature"].as_str().unwrap())?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    vec![PqBlockSignaturePair {
+                        validator_id: UInt256::from([2; 32]),
+                        algorithm_id: 1,
+                        signature: hex::decode(row["signature"].as_str().unwrap())?,
+                    }]
+                },
             }))
         };
         BlockProofStuff::new(
@@ -253,7 +293,11 @@ impl Fixture {
                         assert_eq!(master.file_hash, prevmc.file_hash);
                         assert_eq!(loaded.state()?.master_ref().unwrap().master, master);
                     } else {
-                        let expected_shards = if self.chains().len() == 1 { vec![] } else { vec![self.id(seq, true)] };
+                        let expected_shards = if self.chains().len() == 1 {
+                            vec![]
+                        } else {
+                            vec![self.id(seq, true)]
+                        };
                         assert_eq!(block.top_blocks_all()?, expected_shards);
                         assert_eq!(
                             crate::shard_state::ShardHashesStuff::from(

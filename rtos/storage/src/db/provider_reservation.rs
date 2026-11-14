@@ -248,7 +248,9 @@ impl Drop for PathIntent {
 /// recovery owner it retains ordinary configured aliases until root inspection.
 pub(crate) struct BootstrapReservation(ProviderReservation);
 impl BootstrapReservation {
-    pub(crate) fn into_owner(self) -> ProviderReservation { self.0 }
+    pub(crate) fn into_owner(self) -> ProviderReservation {
+        self.0
+    }
 }
 
 pub(crate) struct ProviderReservation {
@@ -271,8 +273,11 @@ impl ProviderReservation {
     /// Reserve an existing directory without creating it or resolving through
     /// symlinks. The resulting owner must outlive native DB open/close.
     pub(crate) fn open_existing(path: &Path) -> Result<Self> {
-        Self::check_existing_path(&if path.is_absolute() { path.to_path_buf() }
-            else { std::env::current_dir()?.join(path) })?;
+        Self::check_existing_path(&if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        })?;
         let mut owner = Self::inspect_existing(path)?.into_owner();
         owner.require_strict_path()?;
         Ok(owner)
@@ -304,7 +309,9 @@ impl ProviderReservation {
         Ok(())
     }
     pub(crate) fn verify_existing(&self) -> Result<()> {
-        if !self.strict_existing { return Err(ReservationError::InvalidPath(self.requested.clone())); }
+        if !self.strict_existing {
+            return Err(ReservationError::InvalidPath(self.requested.clone()));
+        }
         self.verify()
     }
     pub(crate) fn destroy(path: &Path) -> Result<Option<Self>> {
@@ -350,7 +357,8 @@ impl ProviderReservation {
                 .ok_or(ReservationError::Poisoned)?
                 .identity = Some(id);
         }
-        let result = Self { slot, directory, requested, path, identity: id, strict_existing: false };
+        let result =
+            Self { slot, directory, requested, path, identity: id, strict_existing: false };
         result.verify()?;
         Ok(result)
     }
@@ -358,7 +366,9 @@ impl ProviderReservation {
         &self.path
     }
     pub(crate) fn verify(&self) -> Result<()> {
-        if self.strict_existing { Self::check_existing_path(&self.requested)?; }
+        if self.strict_existing {
+            Self::check_existing_path(&self.requested)?;
+        }
         let actual = fs::canonicalize(&self.requested)
             .map_err(|_| ReservationError::IdentityChanged(self.requested.clone()))?;
         if !same_path(&actual, &self.path) || identity(&self.directory)? != self.identity {

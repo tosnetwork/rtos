@@ -10,9 +10,10 @@ use crate::{
     test_helper::TestEngine,
 };
 use rtos_block::{Result, UInt256};
-use storage::sst_native_test as rocksdb;
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
-use storage::{db::rocksdb::RocksDb, shardstate_db_async::AllowStateGcResolver};
+use storage::{
+    db::rocksdb::RocksDb, shardstate_db_async::AllowStateGcResolver, sst_native_test as rocksdb,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const LEASE_CF: &str = "repair_dependency_leases_v1";

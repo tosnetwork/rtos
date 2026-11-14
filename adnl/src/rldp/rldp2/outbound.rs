@@ -2,8 +2,7 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! Stateful RLDP2 outbound scheduling, with a clock supplied by the connection.
 //! Ported from TOS1181/TON857b RLDP2 connection, sender and congestion controller.
-use super::timer::TimerHeap;
-use super::{FecHelper, PART_SIZE, SYMBOL_SIZE};
+use super::{timer::TimerHeap, FecHelper, PART_SIZE, SYMBOL_SIZE};
 use crate::fec::{Algorithm, Encoder};
 use anyhow::{ensure, Result};
 use rtos_api::{

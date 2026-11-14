@@ -9,9 +9,11 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::context::{ArchiveContextError, ArchiveOperation};
-use super::ARCHIVE_SLICE_SIZE;
-use super::truncation_selection::TruncationSelection;
+use super::{
+    context::{ArchiveContextError, ArchiveOperation},
+    truncation_selection::TruncationSelection,
+    ARCHIVE_SLICE_SIZE,
+};
 #[cfg(feature = "telemetry")]
 use crate::StorageTelemetry;
 use crate::{
@@ -290,7 +292,9 @@ impl FileMap {
                 "Opening archive slice {}, finalized {}, unneeded {}",
                 key, finalized, unneeded
             );
-            let resolved = db_provider.resolve_for_read(startup, key).await?
+            let resolved = db_provider
+                .resolve_for_read(startup, key)
+                .await?
                 .ok_or_else(|| error!("Indexed archive {key} has no existing epoch provider"))?;
             let slice_root_path = resolved.root_path.clone();
             let archive_slice = match ArchiveSlice::with_data(
@@ -310,7 +314,9 @@ impl FileMap {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    if e.is::<super::recovery_guard::ArchiveRecoveryRequired>() || e.is::<ArchiveContextError>() {
+                    if e.is::<super::recovery_guard::ArchiveRecoveryRequired>()
+                        || e.is::<ArchiveContextError>()
+                    {
                         return Err(e);
                     }
                     if protected {
@@ -339,7 +345,9 @@ impl FileMap {
             // ranges from the actual indexes before deciding the slice is empty.
             let ranges = if ranges.iter().next().is_none() {
                 archive_slice.rebuild_block_ranges()?
-            } else { ranges };
+            } else {
+                ranges
+            };
             let value = Arc::new(FileDescription::with_data(
                 PackageId::with_values(key, package_type),
                 archive_slice,
@@ -356,7 +364,9 @@ impl FileMap {
         }
 
         Ok(Self {
-            protection, storage, elements: tokio::sync::RwLock::new(elements),
+            protection,
+            storage,
+            elements: tokio::sync::RwLock::new(elements),
             #[cfg(any(test, feature = "integration-test-support"))]
             test_gc_selection: Default::default(),
         })
@@ -418,7 +428,9 @@ impl FileMap {
     /// Pause exactly one selection before taking any deletion lock. Only keys
     /// are observed: retaining archive Arcs here would itself prevent real GC.
     #[cfg(any(test, feature = "integration-test-support"))]
-    pub fn test_pause_gc_selection(&self) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
+    pub fn test_pause_gc_selection(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<Vec<u32>>, Arc<tokio::sync::Notify>) {
         let (sent, received) = tokio::sync::oneshot::channel();
         let release = Arc::new(tokio::sync::Notify::new());
         *self.test_gc_selection.lock().unwrap() = Some((sent, release.clone()));
@@ -606,8 +618,10 @@ impl FileMaps {
         #[cfg(feature = "telemetry")] telemetry: &Arc<StorageTelemetry>,
         allocated: &Arc<StorageAlloc>,
     ) -> Result<Self> {
-        let key_db_provider: Arc<dyn ArchiveDbProvider> =
-            Arc::new(SingleDbProvider::new(db_provider.main_binding().clone(), db_root_path.clone()));
+        let key_db_provider: Arc<dyn ArchiveDbProvider> = Arc::new(SingleDbProvider::new(
+            db_provider.main_binding().clone(),
+            db_root_path.clone(),
+        ));
         Ok(Self {
             files: FileMap::new(
                 db.clone(),
@@ -693,10 +707,20 @@ mod empty_range_tests {
             for mask in 0..(1usize << len) {
                 let present: Vec<_> = (0..len).filter(|&i| mask & (1 << i) != 0).collect();
                 for query in 0..=70 {
-                    let expected = present.iter().copied().find(|&i| (i + 1) * 10 >= query)
+                    let expected = present
+                        .iter()
+                        .copied()
+                        .find(|&i| (i + 1) * 10 >= query)
                         .or_else(|| present.last().copied());
-                    assert_eq!(closest_nonempty_range(len, |i| mask & (1 << i) != 0,
-                        |i| ((i + 1) * 10).cmp(&query)), expected, "len={len} mask={mask} query={query}");
+                    assert_eq!(
+                        closest_nonempty_range(
+                            len,
+                            |i| mask & (1 << i) != 0,
+                            |i| ((i + 1) * 10).cmp(&query)
+                        ),
+                        expected,
+                        "len={len} mask={mask} query={query}"
+                    );
                 }
             }
         }

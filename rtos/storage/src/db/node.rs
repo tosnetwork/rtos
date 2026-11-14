@@ -31,34 +31,56 @@ pub struct NodeDbBootstrap {
     providers: Option<crate::archives::recovery_providers::RecoveryProviders>,
 }
 impl NodeDbBootstrap {
-    pub fn database(&self) -> &Arc<RocksDb> { &self.db }
-    pub fn requires_recovery(&self) -> bool { self.pending.is_some() }
+    pub fn database(&self) -> &Arc<RocksDb> {
+        &self.db
+    }
+    pub fn requires_recovery(&self) -> bool {
+        self.pending.is_some()
+    }
     /// Called after the node has loaded its existing durable protection. This
     /// inspects and retains all managed providers; it performs no root replay.
     pub async fn inspect_recovery_providers(
-        &mut self, config: Option<&crate::archives::epoch::ArchivalModeConfig>,
+        &mut self,
+        config: Option<&crate::archives::epoch::ArchivalModeConfig>,
         protection: &Arc<crate::repair_protection::RepairProtection>,
     ) -> Result<()> {
         let root = self.pending.as_ref().ok_or_else(|| error!("No pending node recovery"))?;
-        if self.providers.is_some() { fail!("Recovery providers already inspected"); }
+        if self.providers.is_some() {
+            fail!("Recovery providers already inspected");
+        }
         let expected = root.encode()?;
-        if self.db.db().get_pinned(crate::archives::recovery_root::ROOT_KEY)?.as_deref() != Some(expected.as_slice()) {
+        if self.db.db().get_pinned(crate::archives::recovery_root::ROOT_KEY)?.as_deref()
+            != Some(expected.as_slice())
+        {
             fail!("Archive root changed during node bootstrap");
         }
-        self.providers = Some(crate::archives::recovery_providers::RecoveryProviders::inspect(
-            self.db.clone(), root, config, protection,
-        ).await?);
+        self.providers = Some(
+            crate::archives::recovery_providers::RecoveryProviders::inspect(
+                self.db.clone(),
+                root,
+                config,
+                protection,
+            )
+            .await?,
+        );
         Ok(())
     }
     /// Existing durable protection must have been rebuilt before this call.
     pub async fn recover_pending(&mut self) -> Result<()> {
-        if self.recovery_started { fail!("Bootstrap recovery already started; reopen after failure or cancellation"); }
+        if self.recovery_started {
+            fail!("Bootstrap recovery already started; reopen after failure or cancellation");
+        }
         let root = self.pending.clone().ok_or_else(|| error!("No pending node recovery"))?;
         #[cfg(not(target_os = "linux"))]
-        { fail!("Archive bootstrap recovery requires Linux"); }
+        {
+            fail!("Archive bootstrap recovery requires Linux");
+        }
         #[cfg(target_os = "linux")]
         {
-            let providers = self.providers.take().ok_or_else(|| error!("Recovery providers have not been validated"))?;
+            let providers = self
+                .providers
+                .take()
+                .ok_or_else(|| error!("Recovery providers have not been validated"))?;
             self.recovery_started = true;
             let protection = providers.protection.clone();
             let deletion = protection.deletion().await;
@@ -66,7 +88,9 @@ impl NodeDbBootstrap {
             tokio::task::spawn_blocking(move || {
                 let _guards = (mutation, deletion);
                 crate::archives::recovery_worker::recover_cleaned(providers, root)
-            }).await.map_err(|e| error!("Native bootstrap recovery failed: {e}"))??;
+            })
+            .await
+            .map_err(|e| error!("Native bootstrap recovery failed: {e}"))??;
             self.recovery_complete = true;
             self.pending = None;
             Ok(())
@@ -78,7 +102,8 @@ impl NodeDbBootstrap {
         }
         if self.pending.is_some() {
             crate::archives::recovery_guard::ensure_open_provider_clear(
-                self.db.db(), self.db.db().path().parent().expect("node DB has a parent"),
+                self.db.db(),
+                self.db.db().path().parent().expect("node DB has a parent"),
             )?;
         }
         Ok(self.db)
@@ -86,20 +111,30 @@ impl NodeDbBootstrap {
 }
 
 pub fn open_node_db_for_bootstrap(
-    root: impl AsRef<Path>, config: &CellsDbConfig, access: AccessType,
+    root: impl AsRef<Path>,
+    config: &CellsDbConfig,
+    access: AccessType,
 ) -> Result<NodeDbBootstrap> {
-    use crate::archives::recovery_root::{FactoryMode, RootHeader, ROOT_KEY, PARTICIPANT_KEY};
+    use crate::archives::recovery_root::{FactoryMode, RootHeader, PARTICIPANT_KEY, ROOT_KEY};
     let writable = access == AccessType::ReadWrite;
     let (mut db, deferred_cleanup) = open_physical(root.as_ref(), config, access, true)?;
-    let pending = db.db().get_pinned(ROOT_KEY)?.map(|bytes| RootHeader::decode(&bytes)).transpose()?;
+    let pending =
+        db.db().get_pinned(ROOT_KEY)?.map(|bytes| RootHeader::decode(&bytes)).transpose()?;
     if let Some(header) = &pending {
-        if !writable { fail!("Pending archive root requires writable recovery bootstrap"); }
-        Arc::get_mut(&mut db).ok_or_else(|| error!("Main bootstrap provider shared before root inspection"))?
+        if !writable {
+            fail!("Pending archive root requires writable recovery bootstrap");
+        }
+        Arc::get_mut(&mut db)
+            .ok_or_else(|| error!("Main bootstrap provider shared before root inspection"))?
             .require_strict_recovery_path()?;
-        header.policy.check_environment(FactoryMode::Node, db.db().cf_handle("repair_dependency_leases_v1").is_some())?;
+        header.policy.check_environment(
+            FactoryMode::Node,
+            db.db().cf_handle("repair_dependency_leases_v1").is_some(),
+        )?;
         let identity = db.db().get_db_identity()?;
         if header.database_identity_bytes != identity.len() as u64
-            || header.database_identity_digest != sha256_digest(&identity) {
+            || header.database_identity_digest != sha256_digest(&identity)
+        {
             fail!("Archive root belongs to another native main database");
         }
     } else {
@@ -107,13 +142,24 @@ pub fn open_node_db_for_bootstrap(
             fail!("Orphan archive recovery participant on main database");
         }
         crate::archives::recovery_guard::ensure_root_controls_clear(db.db())?;
-        if deferred_cleanup { db.finish_ordinary_bootstrap()?; }
+        if deferred_cleanup {
+            db.finish_ordinary_bootstrap()?;
+        }
     }
-    Ok(NodeDbBootstrap { db, pending, providers: None, recovery_started: false, recovery_complete: false })
+    Ok(NodeDbBootstrap {
+        db,
+        pending,
+        providers: None,
+        recovery_started: false,
+        recovery_complete: false,
+    })
 }
 
 fn open_physical(
-    root: &Path, config: &CellsDbConfig, access: AccessType, bootstrap: bool,
+    root: &Path,
+    config: &CellsDbConfig,
+    access: AccessType,
+    bootstrap: bool,
 ) -> Result<(Arc<RocksDb>, bool)> {
     let path = root.join(NODE_DB_NAME);
     let existing = path.try_exists()? && std::fs::read_dir(&path)?.next().is_some();
@@ -121,10 +167,14 @@ fn open_physical(
     // and native opening share the same managed provider reservation.
     let owner = if bootstrap && existing && access == AccessType::ReadWrite {
         Some(super::provider_reservation::ProviderReservation::inspect_existing(&path)?)
-    } else { None };
+    } else {
+        None
+    };
     let families = if existing {
         rocksdb::DB::list_cf(&rocksdb::Options::default(), &path)?
-    } else { Vec::new() };
+    } else {
+        Vec::new()
+    };
     let mut options = HashMap::new();
     let mut caches = Vec::new();
     if families.iter().any(|name| name == CELLS_CF_NAME) {
@@ -140,8 +190,12 @@ fn open_physical(
     let deferred_cleanup = owner.is_some();
     let db = if let Some(owner) = owner {
         RocksDb::open_existing_for_bootstrap(owner, options)?
-    } else { RocksDb::new(root, NODE_DB_NAME, options, access)? };
-    for cache in caches { db.register_cache(cache); }
+    } else {
+        RocksDb::new(root, NODE_DB_NAME, options, access)?
+    };
+    for cache in caches {
+        db.register_cache(cache);
+    }
     Ok((db, deferred_cleanup))
 }
 

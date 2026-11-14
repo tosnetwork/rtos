@@ -147,7 +147,9 @@ pub(super) fn inventory(providers: &RecoveryProviders, root: &RootHeader) -> Res
                 return Ok(());
             }
             if name == "ready.v1" && ready_intent && participant.descriptor.anchor == Anchor::Node {
-                if !present(&path)? { fail!("Missing declared Ready staging file"); }
+                if !present(&path)? {
+                    fail!("Missing declared Ready staging file");
+                }
                 return Ok(());
             }
             let hex = name

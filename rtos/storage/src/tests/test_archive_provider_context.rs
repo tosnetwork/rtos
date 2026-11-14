@@ -34,8 +34,11 @@ async fn epoch_read_resolution_does_not_create_and_pins_cached_destination_durin
     let router = Arc::new(EpochRouter::new(&config, &operation).await.unwrap());
     let provider = EpochDbProvider::new(router.clone());
     let missing = provider.resolve_for_read(&operation, 0).await.unwrap();
-    assert_eq!(std::fs::read_dir(&config.new_epochs_path).unwrap().count(), 0,
-        "readonly epoch lookup created directory or DB");
+    assert_eq!(
+        std::fs::read_dir(&config.new_epochs_path).unwrap().count(),
+        0,
+        "readonly epoch lookup created directory or DB"
+    );
     assert!(missing.is_none());
     drop(missing);
     let seeded = provider.db_for_archive(&operation, 0).await.unwrap();
@@ -46,8 +49,10 @@ async fn epoch_read_resolution_does_not_create_and_pins_cached_destination_durin
     let resolved = provider.resolve_for_read(&operation, 100).await.unwrap().unwrap();
     assert!(Arc::ptr_eq(resolved.provider.db(), router.resolve(0).unwrap().db()));
     let missing = provider.resolve_for_read(&operation, 20000).await.unwrap();
-    assert!(!config.new_epochs_path.join("epoch_1").exists(),
-        "readonly epoch lookup created directory or DB");
+    assert!(
+        !config.new_epochs_path.join("epoch_1").exists(),
+        "readonly epoch lookup created directory or DB"
+    );
     assert!(missing.is_none());
     drop(missing);
     assert_eq!(binding.domain().outstanding(), 2);
@@ -157,7 +162,6 @@ async fn failed_startup_refuses_router_before_directory_creation() {
     assert!(!config.new_epochs_path.exists());
 }
 
-
 #[tokio::test]
 async fn file_map_context_refusal_never_deletes_unneeded_index() {
     struct FailAfterResolve(SingleDbProvider);
@@ -208,8 +212,11 @@ async fn file_map_context_refusal_never_deletes_unneeded_index() {
         &Arc::new(StorageAlloc::default()),
     )
     .await;
-    assert_eq!(db.db().get_cf(&cf, 0u32.to_le_bytes()).unwrap(), Some(row.clone()),
-        "context refusal deleted indexed slice");
+    assert_eq!(
+        db.db().get_cf(&cf, 0u32.to_le_bytes()).unwrap(),
+        Some(row.clone()),
+        "context refusal deleted indexed slice"
+    );
     let error = opened.err().expect("context refusal was swallowed by FileMap cleanup");
     assert_eq!(
         error.downcast_ref::<ArchiveContextError>(),

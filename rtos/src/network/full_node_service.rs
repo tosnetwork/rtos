@@ -70,7 +70,9 @@ pub struct FullNodeOverlayService {
     #[cfg(test)]
     bounded_queries: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    pss_reply: std::sync::Mutex<Option<(Arc<rtos_block::KeyId>, PersistentStateIdV2, Option<i64>, Vec<u8>)>>,
+    pss_reply: std::sync::Mutex<
+        Option<(Arc<rtos_block::KeyId>, PersistentStateIdV2, Option<i64>, Vec<u8>)>,
+    >,
     #[cfg(test)]
     pss_observations: std::sync::Mutex<Vec<(BlockIdExt, Option<i64>, Option<usize>)>>,
     // Persistent-state requests in arrival order: "prepare", "size" and
@@ -155,7 +157,13 @@ impl FullNodeOverlayService {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_pss_reply(&self, peer: Arc<rtos_block::KeyId>, state: PersistentStateIdV2, offset: Option<i64>, bytes: Vec<u8>) {
+    pub(crate) fn test_pss_reply(
+        &self,
+        peer: Arc<rtos_block::KeyId>,
+        state: PersistentStateIdV2,
+        offset: Option<i64>,
+        bytes: Vec<u8>,
+    ) {
         let mut reply = self.pss_reply.lock().unwrap();
         assert!(reply.is_none(), "unused scoped PSS reply");
         *reply = Some((peer, state, offset, bytes));
@@ -509,7 +517,11 @@ impl FullNodeOverlayService {
                     )
                     .await?;
                 #[cfg(test)]
-                self.pss_observations.lock().unwrap().push((query.state.block.clone(), Some(query.offset), Some(data.len())));
+                self.pss_observations.lock().unwrap().push((
+                    query.state.block.clone(),
+                    Some(query.offset),
+                    Some(data.len()),
+                ));
                 let answer = TaggedByteVec {
                     object: data,
                     #[cfg(feature = "telemetry")]
@@ -583,18 +595,27 @@ impl FullNodeOverlayService {
     }
 
     #[cfg(test)]
-    pub(crate) async fn test_persistent_size(&self, id: PersistentStatePartId) -> Result<Option<u64>> {
+    pub(crate) async fn test_persistent_size(
+        &self,
+        id: PersistentStatePartId,
+    ) -> Result<Option<u64>> {
         let answer = self.get_persistent_state_size_internal(id).await?;
-        let answer = answer.downcast::<ton_node::PersistentStateSize>()
+        let answer = answer
+            .downcast::<ton_node::PersistentStateSize>()
             .map_err(|_| rtos_block::error!("Unexpected persistent-size reply type"))?;
         Ok(match answer {
-            ton_node::PersistentStateSize::TonNode_PersistentStateSize(value) => Some(value.size as u64),
+            ton_node::PersistentStateSize::TonNode_PersistentStateSize(value) => {
+                Some(value.size as u64)
+            }
             ton_node::PersistentStateSize::TonNode_PersistentStateSizeNotFound => None,
         })
     }
 
     #[cfg(test)]
-    pub(crate) async fn test_persistent_slice(&self, id: &PersistentStatePartId) -> Result<Vec<u8>> {
+    pub(crate) async fn test_persistent_slice(
+        &self,
+        id: &PersistentStatePartId,
+    ) -> Result<Vec<u8>> {
         let query = DownloadPersistentStateSliceV2 {
             state: PersistentStateIdV2 {
                 block: id.block_id().clone(),
@@ -706,7 +727,11 @@ impl FullNodeOverlayService {
     // tonNode.getArchiveSlice archive_id:long offset:long max_size:int = tonNode.Data;
     async fn get_archive_slice(&self, query: GetArchiveSlice) -> Result<TaggedByteVec> {
         if query.max_size as usize > storage::archives::bounded_read::ARCHIVE_RANGE_MAX_BYTES {
-            fail!("Part size {} is too big, max is {}", query.max_size, storage::archives::bounded_read::ARCHIVE_RANGE_MAX_BYTES);
+            fail!(
+                "Part size {} is too big, max is {}",
+                query.max_size,
+                storage::archives::bounded_read::ARCHIVE_RANGE_MAX_BYTES
+            );
         }
         let answer = TaggedByteVec {
             object: self
@@ -1530,7 +1555,9 @@ impl Subscriber for FullNodeOverlayService {
             } else if query.is::<GetPersistentStateSizeV2>() {
                 self.pss_requests.lock().unwrap().push("size".to_string());
                 Some((query.clone().downcast::<GetPersistentStateSizeV2>().unwrap().state, None))
-            } else { None };
+            } else {
+                None
+            };
             if query.is::<PreparePersistentState>() {
                 self.pss_requests.lock().unwrap().push("prepare".to_string());
             }
@@ -1541,9 +1568,17 @@ impl Subscriber for FullNodeOverlayService {
                     peer == adnl_peers.other() && expected == &state && at == &offset
                 }) {
                     let (_, _, _, bytes) = reply.take().unwrap();
-                    self.pss_observations.lock().unwrap().push((state.block.clone(), offset, Some(bytes.len())));
+                    self.pss_observations.lock().unwrap().push((
+                        state.block.clone(),
+                        offset,
+                        Some(bytes.len()),
+                    ));
                     return Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(
-                        TaggedByteVec { object: bytes, #[cfg(feature = "telemetry")] tag: 0 },
+                        TaggedByteVec {
+                            object: bytes,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
                     )))));
                 }
             }

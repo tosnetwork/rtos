@@ -133,11 +133,16 @@ async fn replay_namespace(
                     // the authentication timeout must not detach this read.
                     request = tokio::task::spawn_blocking(move || {
                         crate::propagation_outbox::load_legacy_close_request(&db, &request)
-                    }).await.map_err(|error| error!("Legacy close read join: {error}"))??;
+                    })
+                    .await
+                    .map_err(|error| error!("Legacy close read join: {error}"))??;
                 }
                 tokio::time::timeout(
                     AUTH_TIMEOUT,
-                    engine.clone().authenticate_closing_source_with_history(request.clone(), namespace.clone()),
+                    engine.clone().authenticate_closing_source_with_history(
+                        request.clone(),
+                        namespace.clone(),
+                    ),
                 )
                 .await
                 .map_err(|_| error!("Source closing history temporarily unavailable"))?

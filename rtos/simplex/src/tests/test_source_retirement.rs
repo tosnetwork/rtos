@@ -5,8 +5,10 @@ use crate::finality_recovery::{ExpectedFinalityOutput, FinalityIntentStore};
 use consensus_common::finality_delivery::{
     FinalityTerminalCompletion, FinalizedDeliveryCompletion,
 };
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 struct Budget;
 impl SourceHistoryDebtBudget for Budget {

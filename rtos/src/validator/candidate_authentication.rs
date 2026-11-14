@@ -91,7 +91,8 @@ pub(super) mod tests {
     use rtos_api::session_identity::SessionCoordinates;
     use rtos_block::{BlockIdExt, ConfigParams, Deserializable, KeyId, ShardIdent, ValidatorSet};
 
-    pub(in crate::validator) fn fixture() -> (AuthenticatedSessionRuntime, CandidateAuthenticationEvidence) {
+    pub(in crate::validator) fn fixture(
+    ) -> (AuthenticatedSessionRuntime, CandidateAuthenticationEvidence) {
         let json: serde_json::Value = serde_json::from_str(include_str!(
             "../full_node/finality/testdata/v2-propagation-recovery.json"
         ))
@@ -116,7 +117,9 @@ pub(super) mod tests {
         // Match the group's ValidatorSet representation. Prefix weights are
         // internal lookup metadata and do not change the signed committee.
         let committee = ValidatorSet::new(0, 100000, committee.len() as u16, committee)
-            .unwrap().list().to_vec();
+            .unwrap()
+            .list()
+            .to_vec();
         // This is an explicitly trusted isolated test configuration, not a test
         // of governing-chain authentication or network peer admission.
         let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
@@ -230,7 +233,8 @@ pub(super) mod tests {
         changed = evidence.clone();
         changed.candidate_hash_data = rtos_api::serialize_boxed(&parsed).unwrap();
         assert!(verify_candidate_for_relay(&runtime, &changed, size, 0)
-            .err().expect("inverted parent must fail")
+            .err()
+            .expect("inverted parent must fail")
             .to_string()
             .contains("parent slot"));
     }

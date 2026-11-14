@@ -9,8 +9,7 @@
 //! `DigestMismatch` only reports disagreement between artifacts that still exist.
 use super::*;
 use crate::finality_recovery::SourceHistoryDebtBudget;
-use consensus_common::finality_delivery::DurableFinalitySink;
-use consensus_common::StorageTeardownReceipt;
+use consensus_common::{finality_delivery::DurableFinalitySink, StorageTeardownReceipt};
 
 const INVENTORY_TAG: &str = "rtos/source-retirement-inventory/v1";
 

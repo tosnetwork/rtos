@@ -27,7 +27,8 @@ const PART: usize = 2 << 20;
 
 fn artifact_missing(error: &anyhow::Error) -> bool {
     error.downcast_ref::<storage::archives::bounded_read::ArchiveArtifactMissing>().is_some()
-        || error.downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
+        || error
+            .downcast_ref::<storage::archives::bounded_read::ArchiveReadNotStarted>()
             .is_some_and(|e| e.is_not_found())
 }
 
@@ -70,24 +71,41 @@ impl Request {
         }))
     }
     #[cfg(test)]
-    pub(crate) async fn test_with_limits(engine: Arc<Engine>, limits: HistoryReadLimits) -> Result<Arc<Self>> {
+    pub(crate) async fn test_with_limits(
+        engine: Arc<Engine>,
+        limits: HistoryReadLimits,
+    ) -> Result<Arc<Self>> {
         Self::with_limits(engine, limits).await
     }
     #[cfg(test)]
-    pub(crate) async fn test_with_replay_limit(engine: Arc<Engine>, limit: usize) -> Result<Arc<Self>> {
-        if limit == 0 || limit > MAX_REPLAY { fail!("Test replay limit must only lower the production bound"); }
+    pub(crate) async fn test_with_replay_limit(
+        engine: Arc<Engine>,
+        limit: usize,
+    ) -> Result<Arc<Self>> {
+        if limit == 0 || limit > MAX_REPLAY {
+            fail!("Test replay limit must only lower the production bound");
+        }
         let mut request = Self::new(engine).await?;
-        Arc::get_mut(&mut request).ok_or_else(|| error!("New history request unexpectedly shared"))?.replay_limit = limit;
+        Arc::get_mut(&mut request)
+            .ok_or_else(|| error!("New history request unexpectedly shared"))?
+            .replay_limit = limit;
         Ok(request)
     }
     fn replay_limit(&self) -> usize {
         #[cfg(test)]
-        { self.replay_limit }
+        {
+            self.replay_limit
+        }
         #[cfg(not(test))]
-        { MAX_REPLAY }
+        {
+            MAX_REPLAY
+        }
     }
     #[cfg(test)]
-    pub(crate) async fn test_snapshot(&self, id: &BlockIdExt) -> Result<Option<Arc<ShardStateStuff>>> {
+    pub(crate) async fn test_snapshot(
+        &self,
+        id: &BlockIdExt,
+    ) -> Result<Option<Arc<ShardStateStuff>>> {
         self.snapshot(id).await
     }
     pub(crate) fn budget(&self) -> &Arc<HistoryReadBudget> {
@@ -195,7 +213,10 @@ impl Request {
         };
         let reservation = self.budget.reserve(ReadKind::State, length)?;
         if reservation.allowance() != length {
-            return Err(crate::history_read_budget::HistoryBudgetExceeded("snapshot cumulative bytes").into());
+            return Err(crate::history_read_budget::HistoryBudgetExceeded(
+                "snapshot cumulative bytes",
+            )
+            .into());
         }
         rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
             self.budget.as_ref(),
@@ -243,9 +264,11 @@ impl Request {
         self.budget.step()?;
         if let Some(handle) = self.engine.load_block_handle(id)? {
             if handle.has_data() && handle.has_proof() {
-                match crate::publication_repair::read_pair(self.engine.as_ref(), id, &self.budget).await {
+                match crate::publication_repair::read_pair(self.engine.as_ref(), id, &self.budget)
+                    .await
+                {
                     Ok(pair) => return Ok(pair),
-                    Err(error) if artifact_missing(&error) => {},
+                    Err(error) if artifact_missing(&error) => {}
                     Err(error) => return Err(error),
                 }
             }

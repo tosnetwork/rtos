@@ -375,8 +375,12 @@ impl PropagationOutbox {
         let id = RecordId(state.snapshot.next_id);
         let next_id = id.0.checked_add(1).ok_or_else(|| error!("Outbox ID space exhausted"))?;
         let pending = record.effects.clone();
-        let entry =
-            UnverifiedRecord { id, stage: PublicationStage::Prepared, record: Arc::new(record), pending };
+        let entry = UnverifiedRecord {
+            id,
+            stage: PublicationStage::Prepared,
+            record: Arc::new(record),
+            pending,
+        };
         let mut batch = Batch::default();
         self.put_body(&mut batch, &entry)?;
         self.put_state(&mut batch, &entry, None)?;
@@ -580,12 +584,15 @@ impl PropagationOutbox {
         }
         let mut batch = Batch::default();
         let mut released = 0usize;
-        for close in state.snapshot.closing.iter().filter(|close| {
-            associations.iter().any(|a| a.delivery_id == close.binding.delivery_id)
-        }) {
+        for close in
+            state.snapshot.closing.iter().filter(|close| {
+                associations.iter().any(|a| a.delivery_id == close.binding.delivery_id)
+            })
+        {
             batch.deletes.push(close_key(&close.binding.delivery_id));
-            released =
-                released.checked_add(closing::close_quota(close)?).ok_or_else(|| error!("Close bytes overflow"))?;
+            released = released
+                .checked_add(closing::close_quota(close)?)
+                .ok_or_else(|| error!("Close bytes overflow"))?;
         }
         batch.puts.extend(extra.iter().cloned());
         self.commit(&mut state, batch)?;
@@ -751,12 +758,7 @@ impl PropagationOutbox {
     }
 
     /// Write the new state of the entry at `index` and install it.
-    fn replace_entry(
-        &self,
-        state: &mut State,
-        index: usize,
-        next: UnverifiedRecord,
-    ) -> Result<()> {
+    fn replace_entry(&self, state: &mut State, index: usize, next: UnverifiedRecord) -> Result<()> {
         let delivery = delivery_of(&state.snapshot, next.id).cloned();
         validate_pending(&next.record, next.stage, &next.pending)?;
         let mut batch = Batch::default();
@@ -776,7 +778,9 @@ impl PropagationOutbox {
 
     fn put_body(&self, batch: &mut Batch, entry: &UnverifiedRecord) -> Result<()> {
         validate_record(&entry.record, &self.domain, &self.limits)?;
-        batch.puts.push((body_key(entry.id), encode_body(&self.domain_digest, entry, &self.limits)?));
+        batch
+            .puts
+            .push((body_key(entry.id), encode_body(&self.domain_digest, entry, &self.limits)?));
         Ok(())
     }
 
@@ -861,8 +865,7 @@ fn close_key(delivery_id: &UInt256) -> String {
 }
 fn parse_record_key(key: &str, prefix: &str) -> Result<RecordId> {
     let hex = key.strip_prefix(prefix).ok_or_else(|| error!("Outbox key outside its kind"))?;
-    if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if hex.len() != 16 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         fail!("Malformed outbox record key {key}");
     }
     Ok(RecordId(u64::from_str_radix(hex, 16)?))
@@ -1127,7 +1130,11 @@ fn encode_meta(domain_digest: &UInt256, snapshot: &Snapshot) -> Result<Vec<u8>> 
     Ok(seal(out))
 }
 
-fn encode_body(domain_digest: &UInt256, entry: &UnverifiedRecord, limits: &Limits) -> Result<Vec<u8>> {
+fn encode_body(
+    domain_digest: &UInt256,
+    entry: &UnverifiedRecord,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
     let record = &entry.record;
     let mut out = value_encoder(BODY_MAGIC, domain_digest)?;
     out.maximum = limits.max_snapshot_bytes;
@@ -1398,11 +1405,7 @@ fn decode_state(
                     carrier_version: input.u32()?,
                     local_adnl: input.hash()?,
                     source_validator: input.hash()?,
-                    local_validator_index: if input.boolean()? {
-                        Some(input.u32()?)
-                    } else {
-                        None
-                    },
+                    local_validator_index: if input.boolean()? { Some(input.u32()?) } else { None },
                 })
             } else {
                 None
@@ -1536,8 +1539,7 @@ fn decode_rows(
         // Only a Draft creates an empty Prepared intent, and a Draft always has
         // a retained delivery identity; otherwise mark_accepted would create
         // an identity-less Completed record that cannot reopen.
-        if state.stage == PublicationStage::Prepared && record.effects.is_empty() && !has_delivery
-        {
+        if state.stage == PublicationStage::Prepared && record.effects.is_empty() && !has_delivery {
             fail!("Empty Prepared publication requires a delivery identity");
         }
         entries.push(UnverifiedRecord {
@@ -1548,7 +1550,8 @@ fn decode_rows(
         });
     }
     closes.sort_by_key(|close| close.binding.close_generation);
-    let snapshot = Snapshot { next_close_generation, closing: closes, next_id, entries, deliveries };
+    let snapshot =
+        Snapshot { next_close_generation, closing: closes, next_id, entries, deliveries };
     closing::validate_history(&snapshot, domain)?;
     Ok((snapshot, sizes, total))
 }
@@ -1847,8 +1850,10 @@ pub(crate) mod test_stores {
 
 #[cfg(test)]
 mod tests {
-    use super::test_stores::{DiskStore, MemoryStore};
-    use super::*;
+    use super::{
+        test_stores::{DiskStore, MemoryStore},
+        *,
+    };
     use std::{process::Command, sync::atomic::Ordering};
     use storage::db::rocksdb::AccessType;
 
@@ -1909,11 +1914,16 @@ mod tests {
         let before = disk.sync_attempts.load(Ordering::Relaxed);
         assert!(store.checkpoint_sent(id, &[effect(PublicationKind::Candidate)])?);
         let current = store.pending()?.into_iter().find(|entry| entry.id == id).unwrap();
-        assert_eq!(held.record.block_data.as_ptr(), current.record.block_data.as_ptr(),
-            "a transport checkpoint copied retained block evidence");
-        assert_eq!(held.record.proof_data.as_ref().unwrap().as_ptr(),
+        assert_eq!(
+            held.record.block_data.as_ptr(),
+            current.record.block_data.as_ptr(),
+            "a transport checkpoint copied retained block evidence"
+        );
+        assert_eq!(
+            held.record.proof_data.as_ref().unwrap().as_ptr(),
             current.record.proof_data.as_ref().unwrap().as_ptr(),
-            "a transport checkpoint copied retained proof evidence");
+            "a transport checkpoint copied retained proof evidence"
+        );
         assert_eq!(held.record, current.record);
         assert_eq!(held.pending.len(), 3, "a reader's earlier checkpoint must not change");
         assert_eq!(current.pending.len(), 2);
@@ -1992,7 +2002,9 @@ mod tests {
             let operations = (measured.len() * 2) as u128;
             let elapsed = started.elapsed().as_micros() / operations;
             let bytes = u128::from(allocated().saturating_sub(before)) / operations;
-            eprintln!("outbox transition with {held} records held: {elapsed} us, {bytes} bytes allocated");
+            eprintln!(
+                "outbox transition with {held} records held: {elapsed} us, {bytes} bytes allocated"
+            );
         }
         Ok(())
     }
@@ -2260,10 +2272,16 @@ mod tests {
         };
         let first = RecordId(1);
         // Missing metadata beside records is corruption, not a first open.
-        assert!(edit(&|rows| { rows.remove(META_KEY); })?);
+        assert!(edit(&|rows| {
+            rows.remove(META_KEY);
+        })?);
         // An orphan body and an orphan state.
-        assert!(edit(&|rows| { rows.remove(&state_key(first)); })?);
-        assert!(edit(&|rows| { rows.remove(&body_key(first)); })?);
+        assert!(edit(&|rows| {
+            rows.remove(&state_key(first));
+        })?);
+        assert!(edit(&|rows| {
+            rows.remove(&body_key(first));
+        })?);
         // A value moved under another record's key.
         assert!(edit(&|rows| {
             let body = rows.remove(&body_key(first)).unwrap();
@@ -2277,7 +2295,9 @@ mod tests {
             rows.insert(body_key(RecordId(9)), body);
         })?);
         // An unknown key in the namespace.
-        assert!(edit(&|rows| { rows.insert(format!("{KEY_PREFIX}x"), vec![0]); })?);
+        assert!(edit(&|rows| {
+            rows.insert(format!("{KEY_PREFIX}x"), vec![0]);
+        })?);
         // A body stored as a state, and every truncation of every value.
         assert!(edit(&|rows| {
             let body = rows.get(&body_key(first)).unwrap().clone();
@@ -2339,7 +2359,10 @@ mod tests {
         };
         let disk = rows(Some(&delivery))?;
         let store = reload(disk.clone())?;
-        assert_eq!(store.delivery(&delivery.delivery_id)?.unwrap().1.stage, PublicationStage::Prepared);
+        assert_eq!(
+            store.delivery(&delivery.delivery_id)?.unwrap().1.stage,
+            PublicationStage::Prepared
+        );
         store.mark_accepted(RecordId(1))?;
         drop(store);
         assert_eq!(
@@ -2473,7 +2496,10 @@ mod tests {
         assert_eq!(outbox.pending()?.len(), 1);
         outbox.mark_ready(id)?;
         drop(outbox);
-        assert_eq!(memory(store.clone(), limits.clone()).pending()?[0].stage, PublicationStage::Ready);
+        assert_eq!(
+            memory(store.clone(), limits.clone()).pending()?[0].stage,
+            PublicationStage::Ready
+        );
         let total: usize = store.snapshot().iter().map(|(k, v)| k.len() + v.len()).sum();
         assert!(total <= limits.max_snapshot_bytes);
         Ok(())
@@ -2521,9 +2547,14 @@ mod tests {
             let (delivery, original) = store.delivery(&id)?.unwrap();
             let writes = disk.sync_attempts.load(Ordering::Relaxed);
             let rows = disk.snapshot();
-            for _ in 0..8 { store.retain_delivery(&delivery)?; }
-            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes,
-                "canonical reference must reuse this writer's already synced record");
+            for _ in 0..8 {
+                store.retain_delivery(&delivery)?;
+            }
+            assert_eq!(
+                disk.sync_attempts.load(Ordering::Relaxed),
+                writes,
+                "canonical reference must reuse this writer's already synced record"
+            );
             assert_eq!(disk.snapshot(), rows);
             let mut forged = delivery.clone();
             forged.last_mc += 1;
@@ -2531,15 +2562,20 @@ mod tests {
             drop(store);
             let reopened = memory(disk.clone(), Limits::default());
             reopened.retain_delivery(&delivery)?;
-            assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes + 1,
-                "cold decoding alone must not stand in for a current-writer sync");
+            assert_eq!(
+                disk.sync_attempts.load(Ordering::Relaxed),
+                writes + 1,
+                "cold decoding alone must not stand in for a current-writer sync"
+            );
             reopened.retain_delivery(&delivery)?;
             assert_eq!(disk.sync_attempts.load(Ordering::Relaxed), writes + 1);
             assert_eq!(reopened.delivery(&id)?.unwrap().1, original);
             disk.failure.store(failure, Ordering::Release);
             assert!(reopened.mark_accepted(delivery.record_id).is_err());
-            assert!(reopened.retain_delivery(&delivery).is_err(),
-                "an uncertain later write invalidates every prior synchronized reference");
+            assert!(
+                reopened.retain_delivery(&delivery).is_err(),
+                "an uncertain later write invalidates every prior synchronized reference"
+            );
         }
         Ok(())
     }

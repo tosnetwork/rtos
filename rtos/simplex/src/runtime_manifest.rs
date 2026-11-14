@@ -173,7 +173,8 @@ impl RuntimeManifest {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir(directory)?;
-        let database = crate::database::SimplexDb::open(directory, &runtime.session_id().to_hex_string())?;
+        let database =
+            crate::database::SimplexDb::open(directory, &runtime.session_id().to_hex_string())?;
         database.close(None)?;
         drop(database);
         let mut file = OpenOptions::new()
@@ -202,7 +203,9 @@ mod tests {
         let (observer, _, _) = runtime(false);
         let first = RuntimeManifest::open(&observer, &directory).unwrap();
         assert!(RuntimeManifest::open(&observer, &directory).is_err());
-        let database = crate::database::SimplexDb::open(&directory, &observer.session_id().to_hex_string()).unwrap();
+        let database =
+            crate::database::SimplexDb::open(&directory, &observer.session_id().to_hex_string())
+                .unwrap();
         database.close(None).unwrap();
         drop(database);
         drop(first);
@@ -237,7 +240,10 @@ mod tests {
         let sentinel = directory.join("retained-source");
         std::fs::write(&sentinel, b"original debt").unwrap();
         let error = RuntimeManifest::provision_test_validator(&validator, &directory).unwrap_err();
-        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"original debt");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         assert!(!directory.join("session-runtime.json").exists());

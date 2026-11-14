@@ -9,13 +9,13 @@
  */
 use base64::Engine;
 use rtos_api::{
-    ton::tvm::{
-        cell::Cell as TvmCell, list, numberdecimal::NumberDecimal, slice, stackentry, tuple, List,
-        Number, StackEntry, Tuple,
-    },
     IntoBoxed,
+    ton::tvm::{
+        List, Number, StackEntry, Tuple, cell::Cell as TvmCell, list, numberdecimal::NumberDecimal,
+        slice, stackentry, tuple,
+    },
 };
-use rtos_block::{base64_encode, Result as BlockResult};
+use rtos_block::{Result as BlockResult, base64_encode};
 use serde::ser::SerializeSeq;
 use std::fmt::Formatter;
 

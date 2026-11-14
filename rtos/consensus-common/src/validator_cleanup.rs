@@ -8,10 +8,10 @@
 //! permanently retired. This module holds the record, its strict encoding, the
 //! canonical directory names it may act on, the deletion gate and the driver
 //! state machine. It has no I/O, so every decision is unit-testable.
-use crate::session_runtime::{
-    SessionNetworkPin, SessionRecoveryBinding, SessionRecoveryCoordinates,
+use crate::{
+    session_runtime::{SessionNetworkPin, SessionRecoveryBinding, SessionRecoveryCoordinates},
+    Result,
 };
-use crate::Result;
 use rtos_block::{BlockIdExt, ShardIdent, UInt256};
 use std::collections::BTreeMap;
 

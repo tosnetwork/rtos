@@ -16,12 +16,11 @@ use crate::client_api::{
 use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
 use anyhow::Context;
 use rtos_api::{
-    serialize_boxed,
+    AnyBoxedSerialize, IntoBoxed, TLObject, WireProfile, serialize_boxed,
     ton::{
         self, engine::validator::ControlQueryError as TonControlQueryError,
         rpc::engine::validator::ControlQuery as TonControlQuery,
     },
-    AnyBoxedSerialize, IntoBoxed, TLObject, WireProfile,
 };
 use rtos_block::{BlockIdExt, Deserializable, MsgAddressInt, UInt256};
 use std::str::FromStr;

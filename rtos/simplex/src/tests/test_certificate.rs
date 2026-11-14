@@ -342,9 +342,12 @@ fn test_certificate_invalid_signature() {
         ValidatorIndex::new(1), // Wrong validator!
         signed.signature().to_vec(),
     )];
-    for index in [0,2] {
+    for index in [0, 2] {
         let signature = sign_vote(&fsm_vote, &session_id, &keys[index]).unwrap();
-        signatures.push(VoteSignature::new(ValidatorIndex::new(index as u32), signature.signature().to_vec()));
+        signatures.push(VoteSignature::new(
+            ValidatorIndex::new(index as u32),
+            signature.signature().to_vec(),
+        ));
     }
 
     let cert: NotarCert = Certificate::new(vote.clone(), signatures);
@@ -574,7 +577,6 @@ fn test_unverified_certificate_weight_rejects_duplicate_and_unknown_signers() {
     }
 }
 
-
 #[test]
 fn test_certificate_structural_and_weight_checks_precede_signatures_like_cpp() {
     let (description, _) = create_test_session_desc(4);
@@ -584,17 +586,26 @@ fn test_certificate_structural_and_weight_checks_precede_signatures_like_cpp() {
     // which earlier structural/weight condition is reported.
     for (indices, expected) in [
         (vec![0], "Not enough signatures"),
-        (vec![0,0], "Duplicate validator index"),
-        (vec![0,4], "Invalid validator index"),
-        (vec![0,1,2], "Invalid vote signature"),
+        (vec![0, 0], "Duplicate validator index"),
+        (vec![0, 4], "Invalid validator index"),
+        (vec![0, 1, 2], "Invalid vote signature"),
     ] {
-        let signatures = indices.into_iter().map(|index| {
-            VoteSignature::new(ValidatorIndex::new(index), vec![0;64])
-        }).collect();
+        let signatures = indices
+            .into_iter()
+            .map(|index| VoteSignature::new(ValidatorIndex::new(index), vec![0; 64]))
+            .collect();
         let certificate: NotarCert = Certificate::new(vote.clone(), signatures);
         let error = NotarCert::from_tl_signatures(
-            &certificate.to_tl_vote_signature_set(), vote.clone(), &description, &session,
-        ).unwrap_err().to_string();
-        assert!(error.contains(expected), "fixed CPP validation order: expected {expected}, got {error}");
+            &certificate.to_tl_vote_signature_set(),
+            vote.clone(),
+            &description,
+            &session,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(expected),
+            "fixed CPP validation order: expected {expected}, got {error}"
+        );
     }
 }

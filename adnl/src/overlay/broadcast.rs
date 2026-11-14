@@ -7,6 +7,8 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
+#[cfg(test)]
+use crate::common::Version;
 use crate::{
     common::{
         add_unbound_object_to_map, hash, AdnlPeers, CountedObject, Counter, TaggedByteSlice,
@@ -44,8 +46,6 @@ use rtos_api::{
     },
     IntoBoxed,
 };
-#[cfg(test)]
-use crate::common::Version;
 use rtos_block::{base64_encode, error, fail, sha256_digest, KeyId, KeyOption, Result, UInt256};
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::AtomicU32;
@@ -384,9 +384,12 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
         // The TOS simple-broadcast actor propagates to its full neighbour set,
         // including the forwarding peer; duplicate registration stops echoes.
         let skip = if ctx.overlay.wire_profile == rtos_api::WireProfile::T0
-            && matches!(Self::broadcast_type(), BroadcastType::Simple) {
+            && matches!(Self::broadcast_type(), BroadcastType::Simple)
+        {
             None
-        } else { Some(ctx.peers.other()) };
+        } else {
+            Some(ctx.peers.other())
+        };
         Ok(self.select_broadcast_neighbours(ctx.overlay, neighbours, skip))
     }
 
@@ -575,9 +578,13 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
         );
         let local = if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
             self.local_send_delivery(&ctx)
-        } else { None };
+        } else {
+            None
+        };
         let job = self.build_broadcast(&ctx, &bcast_id, date, &mut neighbours)?;
-        if let Some(local) = local { ctx.overlay.received_rawbytes.push(local); }
+        if let Some(local) = local {
+            ctx.overlay.received_rawbytes.push(local);
+        }
         match job {
             BroadcastJob::Background(packets) => {
                 let send_to = if let Some(neighbours) = neighbours.get_ids() {
@@ -595,13 +602,22 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
                         ctx.overlay.owned_broadcasts.remove(&bcast_id);
                         let bytes = ctx.overlay.serialize_broadcast(&bcast)?;
                         let peers = AdnlPeers::with_keys(
-                            ctx.src_adnl_key_id.clone(), ctx.src_adnl_key_id.clone(),
+                            ctx.src_adnl_key_id.clone(),
+                            ctx.src_adnl_key_id.clone(),
                         );
                         let send_to = ctx.overlay.neighbours.count();
-                        BroadcastSimpleProtocol.recv(simple.clone(), BroadcastRecvContext {
-                            data: BroadcastData::Raw(&bytes), hops: None, overlay: ctx.overlay,
-                            peers: &peers, verdict: BroadcastCheckResult::Allowed,
-                        }).await?;
+                        BroadcastSimpleProtocol
+                            .recv(
+                                simple.clone(),
+                                BroadcastRecvContext {
+                                    data: BroadcastData::Raw(&bytes),
+                                    hops: None,
+                                    overlay: ctx.overlay,
+                                    peers: &peers,
+                                    verdict: BroadcastCheckResult::Allowed,
+                                },
+                            )
+                            .await?;
                         return Ok(BroadcastSendInfo { packets: 1, send_to });
                     }
                 }
@@ -733,7 +749,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                     continue;
                 }
                 match Self::process_part(
-                    &mut decoder, &bcast_id_recv, &bcast, overlay.broadcast_time(),
+                    &mut decoder,
+                    &bcast_id_recv,
+                    &bcast,
+                    overlay.broadcast_time(),
                 ) {
                     Err(e) => {
                         log::warn!(
@@ -937,7 +956,9 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                     let neighbours = relay.fixed_neighbours.clone().unwrap_or_else(|| {
                         let skip = if overlay.wire_profile == rtos_api::WireProfile::T0 {
                             None
-                        } else { Some(&part.skip) };
+                        } else {
+                            Some(&part.skip)
+                        };
                         overlay.select_broadcast_neighbours(part.count, skip)
                     });
                     (part, neighbours)
@@ -974,7 +995,10 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         overlay.serialize_broadcast(&Self::prepare_signed_part(transfer, overlay.wire_profile)?)
     }
 
-    fn prepare_signed_part(transfer: &mut SendTransferFec, profile: rtos_api::WireProfile) -> Result<Broadcast> {
+    fn prepare_signed_part(
+        transfer: &mut SendTransferFec,
+        profile: rtos_api::WireProfile,
+    ) -> Result<Broadcast> {
         let seqno_original = transfer.seqno;
         let chunk = transfer.encoder.encode(&mut transfer.seqno)?;
         let to_sign = Self::calc_to_sign(
@@ -1516,7 +1540,9 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
         }
         let skip = if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
             None
-        } else { Some(ctx.peers.other()) };
+        } else {
+            Some(ctx.peers.other())
+        };
         let neighbours = {
             let Some(guard) = ctx.overlay.owned_broadcasts.get(bcast_id) else {
                 return Ok((None, false));
@@ -1542,9 +1568,7 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
             if (flags & BROADCAST_FLAG_FIXED_NEIGHBOURS) != 0 {
                 relay
                     .fixed_neighbours
-                    .get_or_insert_with(|| {
-                        ctx.overlay.select_broadcast_neighbours(count, skip)
-                    })
+                    .get_or_insert_with(|| ctx.overlay.select_broadcast_neighbours(count, skip))
                     .clone()
             } else {
                 ctx.overlay.select_broadcast_neighbours(count, skip)
@@ -1638,7 +1662,8 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
             let tasks = overlay.tasks.clone();
             tasks.spawn_cancelable("overlay FEC source", async move {
                 let peers = AdnlPeers::with_keys(
-                    transfer.src_adnl_key_id.clone(), transfer.src_adnl_key_id.clone(),
+                    transfer.src_adnl_key_id.clone(),
+                    transfer.src_adnl_key_id.clone(),
                 );
                 while transfer.seqno < to_send {
                     // CPP completes a four-symbol wave before checking its
@@ -1646,14 +1671,24 @@ impl BroadcastProtocol<BroadcastFec> for BroadcastFecProtocol {
                     for _ in 0..Self::SIZE_WAVE {
                         let result = async {
                             let Broadcast::Overlay_BroadcastFec(part) =
-                                Self::prepare_signed_part(&mut transfer, overlay.wire_profile)? else {
-                                    fail!("Unexpected ordinary FEC carrier");
-                                };
-                            Self::for_recv().recv(part, BroadcastRecvContext {
-                                data: BroadcastData::None, hops: None, overlay: &overlay,
-                                peers: &peers, verdict: BroadcastCheckResult::Allowed,
-                            }).await
-                        }.await;
+                                Self::prepare_signed_part(&mut transfer, overlay.wire_profile)?
+                            else {
+                                fail!("Unexpected ordinary FEC carrier");
+                            };
+                            Self::for_recv()
+                                .recv(
+                                    part,
+                                    BroadcastRecvContext {
+                                        data: BroadcastData::None,
+                                        hops: None,
+                                        overlay: &overlay,
+                                        peers: &peers,
+                                        verdict: BroadcastCheckResult::Allowed,
+                                    },
+                                )
+                                .await
+                        }
+                        .await;
                         if let Err(error) = result {
                             log::warn!(target: TARGET, "Cannot process local FEC part: {error}");
                             return;
@@ -2287,15 +2322,23 @@ impl BroadcastTwostepFecProtocol {
         Self { extra: None, send_ctx: None }
     }
 
-    pub(crate) fn for_send(data: &[u8], neighbours: u32, extra: Vec<u8>, profile: rtos_api::WireProfile) -> Result<Self> {
+    pub(crate) fn for_send(
+        data: &[u8],
+        neighbours: u32,
+        extra: Vec<u8>,
+        profile: rtos_api::WireProfile,
+    ) -> Result<Self> {
         if neighbours <= 3 {
             fail!("Not enough neighbours to build {} broadcast", Self::broadcast_type());
         }
         if data.is_empty() {
             fail!("Empty payload for {} broadcast", Self::broadcast_type());
         }
-        let k = if profile == rtos_api::WireProfile::T0 { (neighbours as usize - 1) / 2 }
-            else { ((neighbours as usize) * 2 - 2) / 3 };
+        let k = if profile == rtos_api::WireProfile::T0 {
+            (neighbours as usize - 1) / 2
+        } else {
+            ((neighbours as usize) * 2 - 2) / 3
+        };
         let part_size = (data.len() + k - 1) / k;
         let ctx = BroadcastTwostepSendContext { neighbours, part_size };
         Ok(Self { extra: Some(extra), send_ctx: Some(ctx) })
@@ -2307,8 +2350,12 @@ impl BroadcastTwostep for BroadcastTwostepFecProtocol {}
 #[async_trait::async_trait]
 impl BroadcastProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
     fn local_send_delivery(&self, ctx: &BroadcastSendContext) -> Option<BroadcastRecvInfo> {
-        Some(BroadcastRecvInfo { packets: 1, data: ctx.data.object.to_vec(),
-            extra: self.extra.clone(), recv_from: ctx.src_key.id().clone() })
+        Some(BroadcastRecvInfo {
+            packets: 1,
+            data: ctx.data.object.to_vec(),
+            extra: self.extra.clone(),
+            recv_from: ctx.src_key.id().clone(),
+        })
     }
     // Common
 
@@ -2543,8 +2590,11 @@ impl FecProtocol<BroadcastTwostepFec> for BroadcastTwostepFecProtocol {
             seqno: seqno as i32,
             part: part_data.to_vec(),
         };
-        if profile == rtos_api::WireProfile::T0 { serialize_boxed(&to_sign.into_boxed()) }
-            else { serialize_bare(&to_sign) }
+        if profile == rtos_api::WireProfile::T0 {
+            serialize_boxed(&to_sign.into_boxed())
+        } else {
+            serialize_bare(&to_sign)
+        }
     }
 
     fn unwrap_transfer(wrapped: &OwnedBroadcast) -> Option<&RecvTransferFec<BroadcastTwostepFec>> {
@@ -2584,11 +2634,18 @@ impl BroadcastTwostepSimpleProtocol {
     pub(crate) fn for_send(reliable: bool, extra: Vec<u8>) -> Self {
         Self { reliable, extra: Some(extra) }
     }
-    fn calc_to_sign(bcast_id: BroadcastId, data: &[u8], profile: rtos_api::WireProfile) -> Result<Vec<u8>> {
+    fn calc_to_sign(
+        bcast_id: BroadcastId,
+        data: &[u8],
+        profile: rtos_api::WireProfile,
+    ) -> Result<Vec<u8>> {
         let to_sign =
             BroadcastTwostepSimpleToSign { id: UInt256::with_array(bcast_id), data: data.to_vec() };
-        if profile == rtos_api::WireProfile::T0 { serialize_boxed(&to_sign.into_boxed()) }
-            else { serialize_bare(&to_sign) }
+        if profile == rtos_api::WireProfile::T0 {
+            serialize_boxed(&to_sign.into_boxed())
+        } else {
+            serialize_bare(&to_sign)
+        }
     }
 }
 
@@ -2597,8 +2654,12 @@ impl BroadcastTwostep for BroadcastTwostepSimpleProtocol {}
 #[async_trait::async_trait]
 impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtocol {
     fn local_send_delivery(&self, ctx: &BroadcastSendContext) -> Option<BroadcastRecvInfo> {
-        Some(BroadcastRecvInfo { packets: 1, data: ctx.data.object.to_vec(),
-            extra: self.extra.clone(), recv_from: ctx.src_key.id().clone() })
+        Some(BroadcastRecvInfo {
+            packets: 1,
+            data: ctx.data.object.to_vec(),
+            extra: self.extra.clone(),
+            recv_from: ctx.src_key.id().clone(),
+        })
     }
     // Common
 
@@ -2668,14 +2729,16 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
             let checked = if verdict == BroadcastCheckResult::Forbidden {
                 Err(error!("Broadcast is forbidden"))
             } else {
-                Self::calc_to_sign(bcast_id, &bcast.data, ctx.overlay.wire_profile).and_then(|to_sign| {
-                    ctx.overlay.verify_broadcast_signature(
-                        &src_key,
-                        &to_sign,
-                        &bcast.signature,
-                        ctx.peers.other(),
-                    )
-                })
+                Self::calc_to_sign(bcast_id, &bcast.data, ctx.overlay.wire_profile).and_then(
+                    |to_sign| {
+                        ctx.overlay.verify_broadcast_signature(
+                            &src_key,
+                            &to_sign,
+                            &bcast.signature,
+                            ctx.peers.other(),
+                        )
+                    },
+                )
             };
             if let Err(e) = checked {
                 ctx.overlay.owned_broadcasts.remove(&bcast_id);
@@ -2728,8 +2791,11 @@ impl BroadcastProtocol<BroadcastTwostepSimple> for BroadcastTwostepSimpleProtoco
             packets: 1,
             data: bcast.data.into(),
             extra: Some(bcast.extra),
-            recv_from: if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 { src_key_id.clone() }
-                else { src_adnl_key_id },
+            recv_from: if ctx.overlay.wire_profile == rtos_api::WireProfile::T0 {
+                src_key_id.clone()
+            } else {
+                src_adnl_key_id
+            },
         };
         if ctx.verdict != BroadcastCheckResult::Allowed {
             // Relay may precede the application check, which gates delivery.

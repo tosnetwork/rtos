@@ -1893,10 +1893,7 @@ impl Engine {
             let block_n_proof = if let Some(block_data) = cached {
                 let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
                 let proof = create_new_proof_link(&block)?;
-                log::trace!(
-                    "download_and_apply_block_worker {} loaded from candidates cache",
-                    id
-                );
+                log::trace!("download_and_apply_block_worker {} loaded from candidates cache", id);
                 Some((block, proof))
             } else {
                 // for pre-apply only 10 attempts, for apply - infinity

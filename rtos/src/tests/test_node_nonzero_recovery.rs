@@ -16,7 +16,9 @@ fn forced_cursor_fixture_args(root: &Path) -> Vec<&'static str> {
     if root.join("forced-truncation-fixture").exists() {
         eprintln!("Explicit --force-check-db selected for truncation fault fixture");
         vec!["--force-check-db"]
-    } else { Vec::new() }
+    } else {
+        Vec::new()
+    }
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -148,19 +150,22 @@ async fn actual_node_resumes_repack_after_rename_retaining_height_three() -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_partial_ready_retaining_height_two() -> Result<()> {
-    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-ready-before-finish")))).await
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-ready-before-finish"))))
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_partial_ready_retaining_height_three() -> Result<()> {
-    exercise_nonzero_recovery_case(false, None, Some((3, Some("producer-ready-before-finish")))).await
+    exercise_nonzero_recovery_case(false, None, Some((3, Some("producer-ready-before-finish"))))
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary, public fixture signer, and gdb"]
 async fn actual_node_resumes_partial_selection_before_building() -> Result<()> {
-    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-selection-before-finish")))).await
+    exercise_nonzero_recovery_case(false, None, Some((2, Some("producer-selection-before-finish"))))
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -355,7 +360,13 @@ async fn actual_node_unfinished_selection_cache_loss() -> Result<()> {
     std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
     std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;
     std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?;
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("producer-selection-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("producer-selection-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -364,7 +375,13 @@ async fn actual_node_unfinished_ready_cache_loss() -> Result<()> {
     std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
     std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;
     std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?;
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("producer-ready-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("producer-ready-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -373,7 +390,13 @@ async fn actual_node_sparse_packages_cache_loss() -> Result<()> {
     std::env::var("RTOS_NODE_RECOVERY_FIXTURE_DIR")?;
     std::env::var("RTOS_TEST_LAZYFS_COMMAND")?;
     std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?;
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync-cache-loss"))), true).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("forward-after-row-sync-cache-loss"))),
+        true,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -385,13 +408,14 @@ async fn actual_node_sparse_packages_restart() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary, public fixture signer and GDB"]
 async fn actual_node_sparse_packages_interrupted_metadata() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync"))), true).await
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("forward-after-row-sync"))), true)
+        .await
 }
 
-#[path = "test_node_finality_recovery.rs"]
-mod finality_recovery;
 #[path = "test_node_finality_io.rs"]
 mod finality_io;
+#[path = "test_node_finality_recovery.rs"]
+mod finality_recovery;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires production node binary and public fixture signer"]
@@ -492,7 +516,8 @@ async fn exercise_nonzero_recovery_layout(
     truncation: Option<(u32, Option<&str>)>,
     sparse: bool,
 ) -> Result<()> {
-    exercise_nonzero_recovery_with_finality(interrupt_recovery, building, truncation, sparse, 0).await
+    exercise_nonzero_recovery_with_finality(interrupt_recovery, building, truncation, sparse, 0)
+        .await
 }
 
 async fn exercise_nonzero_recovery_with_finality(
@@ -509,22 +534,46 @@ async fn exercise_nonzero_recovery_with_finality(
     };
     let root = dir.path();
     #[cfg(feature = "isolated-consensus-signing")]
-    let active_fixture = match retained_finality { 7 => Some(Fixture::active_validator()?), 8..=13 => Some(Fixture::active_network()?), _ => None };
+    let active_fixture = match retained_finality {
+        7 => Some(Fixture::active_validator()?),
+        8..=13 => Some(Fixture::active_network()?),
+        _ => None,
+    };
     #[cfg(not(feature = "isolated-consensus-signing"))]
     let active_fixture: Option<Fixture> = None;
-    let fixture = active_fixture.unwrap_or_else(|| if retained_finality > 0 { Fixture::node_finality() } else { Fixture::node_recovery() });
+    let fixture = active_fixture.unwrap_or_else(|| {
+        if retained_finality > 0 {
+            Fixture::node_finality()
+        } else {
+            Fixture::node_recovery()
+        }
+    });
     let archives = root.join("archives");
     fixture.prepare(root, &archives).await?;
     let physical = run_import(fixture.config(root, archives)).await?;
     tokio::time::timeout(Duration::from_secs(60), wait_for_db_release(physical)).await?;
-    if matches!(retained_finality, 7..=13) || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-")) {
+    if matches!(retained_finality, 7..=13)
+        || matches!(truncation, Some((3, Some(cut))) if cut == "state-cache-loss" || cut.starts_with("state-auto-"))
+    {
         truncation_recovery::state_cache_loss::prepare_dynamic(root, &fixture).await?;
     }
-    if sparse { sparse_packages::prepare(root).await?; }
+    if sparse {
+        sparse_packages::prepare(root).await?;
+    }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
     let lease = if let Some((retained, cut)) = truncation {
-        Some(truncation_recovery::prepare(&db, &fixture, retained, cut.is_some_and(|cut| cut == "lease-acquire-cache-loss" || cut.starts_with("state-auto-"))).await?)
+        Some(
+            truncation_recovery::prepare(
+                &db,
+                &fixture,
+                retained,
+                cut.is_some_and(|cut| {
+                    cut == "lease-acquire-cache-loss" || cut.starts_with("state-auto-")
+                }),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -538,7 +587,9 @@ async fn exercise_nonzero_recovery_with_finality(
     }
     let finality = if (1..=6).contains(&retained_finality) {
         Some(finality_recovery::prepare(root, &fixture).await?)
-    } else { None };
+    } else {
+        None
+    };
     let before = package_inventory(root)?;
     let controls_before = recovery_file_inventory(root)?;
     assert!(!before.is_empty(), "node fixture must contain canonical archive packages");
@@ -582,14 +633,22 @@ async fn exercise_nonzero_recovery_with_finality(
         eprintln!("Actual active-validator fixture: {}", root.display());
         let result = if retained_finality >= 8 {
             let fault = match retained_finality {
-                9 => Some("write-enospc"), 10 => Some("sync-eio"), 11 => Some("signer-expiry"),
-                12 => Some("signer-expiry-write-enospc"), 13 => Some("signer-expiry-sync-eio"), _ => None,
+                9 => Some("write-enospc"),
+                10 => Some("sync-eio"),
+                11 => Some("signer-expiry"),
+                12 => Some("signer-expiry-write-enospc"),
+                13 => Some("signer-expiry-sync-eio"),
+                _ => None,
             };
             active_network::run(&binary, root, &fixture, fault).await
-        } else { active_validator::run(&binary, root, &zero, &fixture).await };
+        } else {
+            active_validator::run(&binary, root, &zero, &fixture).await
+        };
         if result.is_err() {
             eprintln!("Retained public active-validator fixture for diagnosis: {}", kept.display());
-        } else { fs::remove_dir_all(&kept)?; }
+        } else {
+            fs::remove_dir_all(&kept)?;
+        }
         return result;
     }
     if let Some(lease) = lease {
@@ -614,7 +673,8 @@ async fn exercise_nonzero_recovery_with_finality(
                 .arg(root)
                 .arg("--zerostate")
                 .arg(&zero)
-                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
+                .arg("--initial-sync-disabled")
+                .args(forced_cursor_fixture_args(root))
                 .current_dir(root)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -723,7 +783,9 @@ async fn exercise_nonzero_recovery_with_finality(
             assert_eq!(package_inventory(root)?, before, "interrupted recovery changed packages");
         }
     }
-    if retained_finality >= 3 { cache_loss::sync_fixture(root)?; }
+    if retained_finality >= 3 {
+        cache_loss::sync_fixture(root)?;
+    }
     if retained_finality >= 5 {
         let mode = if retained_finality == 5 { "write-enospc" } else { "sync-eio" };
         finality_io::refuse(&binary, root, &zero, mode).await?;
@@ -731,13 +793,20 @@ async fn exercise_nonzero_recovery_with_finality(
     } else if retained_finality >= 2 {
         let (cut, statement) = if retained_finality == 4 {
             ("finality-ack-committed", "match std::fs::remove_file(&path) {")
-        } else { ("finality-before-source-ack", "source.acknowledge(receipt)") };
+        } else {
+            ("finality-before-source-ack", "source.acknowledge(receipt)")
+        };
         interrupt_actual_recovery(&binary, root, &zero, cut, statement).await?;
         if retained_finality >= 3 {
             finality_recovery::discard(root, "takeover", retained_finality == 4).await?;
         } else {
-            let pending = simplex::finality_delivery::scan_pending_finality(&root.join("node_db/catchains"))?;
-            assert_eq!(pending.len(), 1, "interrupted source acknowledgement lost retained evidence");
+            let pending =
+                simplex::finality_delivery::scan_pending_finality(&root.join("node_db/catchains"))?;
+            assert_eq!(
+                pending.len(),
+                1,
+                "interrupted source acknowledgement lost retained evidence"
+            );
             assert_eq!(pending[0].record().data, finality.as_ref().unwrap().block_data);
             drop(pending);
         }
@@ -752,7 +821,8 @@ async fn exercise_nonzero_recovery_with_finality(
                 .arg(root)
                 .arg("--zerostate")
                 .arg(&zero)
-                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
+                .arg("--initial-sync-disabled")
+                .args(forced_cursor_fixture_args(root))
                 .current_dir(root)
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log))
@@ -905,18 +975,22 @@ async fn interrupt_actual_recovery(
     let mode = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE");
     let start = if (cut == "forward-committed-cache-loss" && mode.as_deref() == Ok("committed-wal"))
         || (cut == "forward-cleaned-cache-loss" && mode.as_deref() == Ok("cleaned-wal"))
-        || (cut == "root-last-cache-loss" && mode.as_deref() == Ok("root-wal")) {
+        || (cut == "root-last-cache-loss" && mode.as_deref() == Ok("root-wal"))
+    {
         let arm = std::env::var("RTOS_TEST_ROOT_WAL_ARM")?;
         let arm_statement = if cut == "root-last-cache-loss" {
             "main.database.db().delete(ROOT_KEY)?;"
         } else if cut == "forward-cleaned-cache-loss" {
             "store_successor(providers, &committed, &cleaned)?;"
-        } else { "store_successor(providers, root, &committed)?;" };
-        let matches: Vec<_> = source.lines().enumerate().filter(|(_, line)|
-            line.trim() == arm_statement).collect();
+        } else {
+            "store_successor(providers, root, &committed)?;"
+        };
+        let matches: Vec<_> =
+            source.lines().enumerate().filter(|(_, line)| line.trim() == arm_statement).collect();
         assert_eq!(matches.len(), 1, "root publication arm must identify one production statement");
         let arm_line = matches[0].0 + 1;
-        format!(r#"delete breakpoints
+        format!(
+            r#"delete breakpoints
 break {source_file}:{arm_line}
 run
 python
@@ -931,13 +1005,18 @@ print('Root WAL omission armed at verified production statement')
 end
 delete breakpoints
 break {source_file}:{line}
-continue"#)
-    } else { "run".to_owned() };
+continue"#
+        )
+    } else {
+        "run".to_owned()
+    };
     let state_check = if cut == "forward-verify-committed" {
         "state = str(gdb.parse_and_eval('root.state'))\nassert state.endswith('::Committed'), 'unexpected persisted root state: ' + state\nprint('Persisted Committed root verified before replay')"
     } else if cut == "root-verify-cleaned" {
         "state = str(gdb.parse_and_eval('root.state'))\nassert state.endswith('::Cleaned'), 'unexpected persisted root state: ' + state\nprint('Persisted Cleaned root verified before cleanup')"
-    } else { "" };
+    } else {
+        ""
+    };
     let marker = root.join(format!("cut-{cut}.reached"));
     let script = root.join(format!("cut-{cut}.gdb"));
     fs::write(
@@ -981,7 +1060,8 @@ quit
                 .arg(root)
                 .arg("--zerostate")
                 .arg(zero)
-                .arg("--initial-sync-disabled").args(forced_cursor_fixture_args(root))
+                .arg("--initial-sync-disabled")
+                .args(forced_cursor_fixture_args(root))
                 .env("TOKIO_WORKER_THREADS", "2")
                 .current_dir(root)
                 .process_group(0)
@@ -1045,246 +1125,411 @@ fn keep_evidence(root: &Path, path: &Path) -> Result<()> {
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_staged_packages_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("forward-before-prepare-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("forward-before-prepare-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_committed_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("forward-committed-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("forward-committed-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_cleaned_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("forward-cleaned-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("forward-cleaned-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_root_last_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("root-last-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("root-last-cache-loss"))), false)
+        .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_lease_release_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("lease-release-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("lease-release-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_lease_acquire_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("lease-acquire-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("lease-acquire-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_lease_custody_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("lease-custody-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("lease-custody-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_floor_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-floor-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-floor-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_retirement_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-retirement-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-retirement-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_claim_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-claim-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-claim-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_incarnation_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-incarnation-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-incarnation-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_journal_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-journal-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-journal-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_outbox_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-outbox-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-outbox-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_prune_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-prune-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-prune-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_validator_prune_empty_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("validator-prune-empty-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("validator-prune-empty-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_fast_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-fast-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-fast-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_head_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-head-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-head-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_whole_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-whole-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-whole-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_raw_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-raw-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-raw-cache-loss"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_fast_file_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-fast-file-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-fast-file-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_fast_directory_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-fast-directory-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-fast-directory-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_head_file_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-head-file-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-head-file-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_head_directory_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-head-directory-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-head-directory-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_whole_file_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-whole-file-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-whole-file-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_whole_directory_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-whole-directory-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-whole-directory-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_raw_file_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-raw-file-eio"))), false).await
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("persistent-raw-file-eio"))), false)
+        .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_raw_directory_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-raw-directory-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-raw-directory-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_fast_rename_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-fast-rename-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-fast-rename-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_head_rename_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-head-rename-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-head-rename-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_whole_rename_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-whole-rename-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-whole-rename-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_raw_rename_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-raw-rename-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-raw-rename-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_fast_published_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-fast-published-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-fast-published-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_head_published_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-head-published-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-head-published-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_whole_published_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-whole-published-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-whole-published-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "requires actual node binary, signer and isolated LazyFS fixture"]
 async fn actual_node_persistent_raw_published_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None,
-        Some((3, Some("persistent-raw-published-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("persistent-raw-published-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1296,59 +1541,109 @@ async fn actual_node_state_cache_loss() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, gdb, signer and cache-loss fixture"]
 async fn actual_node_state_auto_cache_loss() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-cache-loss"))), false).await
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-cache-loss"))), false)
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_selection_enospc() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-selection-enospc"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-selection-enospc"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_stage_enospc() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-stage-enospc"))), false).await
+    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-stage-enospc"))), false)
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_publish_rename_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-rename-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-publish-rename-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_publish_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-publish-sync-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_publish_directory_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-publish-directory-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-publish-directory-sync-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated fault fixture"]
 async fn actual_node_state_auto_wal_publish_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-wal-publish-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-wal-publish-sync-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, signer and isolated state WAL fault fixture"]
 async fn actual_node_state_auto_state_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-state-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-state-sync-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, gdb, signer and isolated WAL fault fixture"]
 async fn actual_node_state_auto_startup_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-startup-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-startup-sync-eio"))),
+        false,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual node executable, gdb, signer and isolated repeated WAL fault fixture"]
 async fn actual_node_state_auto_rebuild_startup_sync_eio() -> Result<()> {
-    exercise_nonzero_recovery_layout(false, None, Some((3, Some("state-auto-rebuild-startup-sync-eio"))), false).await
+    exercise_nonzero_recovery_layout(
+        false,
+        None,
+        Some((3, Some("state-auto-rebuild-startup-sync-eio"))),
+        false,
+    )
+    .await
 }

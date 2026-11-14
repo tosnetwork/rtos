@@ -111,8 +111,16 @@ impl PackageEntry {
         reader.read_exact(&mut header).await?;
         let header = PackageEntryHeader::deserialize(&header)?;
         // Both lengths are checked before either attacker-sized allocation.
-        let filename_size = super::bounded_read::check_length("filename", u64::from(header.filename_size), limits.filename_bytes)?;
-        let data_size = super::bounded_read::check_length("data", u64::from(header.data_size), limits.data_bytes)?;
+        let filename_size = super::bounded_read::check_length(
+            "filename",
+            u64::from(header.filename_size),
+            limits.filename_bytes,
+        )?;
+        let data_size = super::bounded_read::check_length(
+            "data",
+            u64::from(header.data_size),
+            limits.data_bytes,
+        )?;
         let mut filename = vec![0; filename_size];
         reader.read_exact(&mut filename).await?;
         let filename = String::from_utf8(filename)?;
@@ -134,7 +142,8 @@ impl PackageEntry {
     /// Sequential native scan: only EOF before the first header byte ends the
     /// stream. A partial header/body remains corruption, never a clean boundary.
     pub(super) fn read_next_bounded_sync<R: std::io::Read>(
-        reader: &mut R, limits: super::bounded_read::ArchiveReadLimits,
+        reader: &mut R,
+        limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Option<Self>> {
         let mut header = [0; PKG_ENTRY_HEADER_SIZE];
         loop {
@@ -150,15 +159,20 @@ impl PackageEntry {
     }
 
     fn read_payload_sync<R: std::io::Read>(
-        reader: &mut R, header: PackageEntryHeader,
+        reader: &mut R,
+        header: PackageEntryHeader,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Self> {
         // Validate both advertised lengths before allocating either payload.
         let filename_size = super::bounded_read::check_length(
-            "filename", u64::from(header.filename_size), limits.filename_bytes,
+            "filename",
+            u64::from(header.filename_size),
+            limits.filename_bytes,
         )?;
         let data_size = super::bounded_read::check_length(
-            "data", u64::from(header.data_size), limits.data_bytes,
+            "data",
+            u64::from(header.data_size),
+            limits.data_bytes,
         )?;
         let mut filename = vec![0; filename_size];
         reader.read_exact(&mut filename)?;
@@ -237,7 +251,8 @@ mod bounded_tests {
         for length in 0..header.len() {
             assert!(PackageEntry::read_from_bounded(&mut &header[..length], limits).await.is_err());
         }
-        let mut invalid = header; invalid[0] ^= 1;
+        let mut invalid = header;
+        invalid[0] ^= 1;
         assert!(PackageEntry::read_from_bounded(&mut invalid.as_slice(), limits).await.is_err());
         Ok(())
     }
@@ -246,7 +261,10 @@ mod bounded_tests {
 #[cfg(test)]
 mod encoding_tests {
     use super::*;
-    use std::{pin::Pin, task::{Context, Poll}};
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     #[test]
     fn checked_encoding_lengths_preserve_wire_limits() -> Result<()> {
@@ -264,9 +282,16 @@ mod encoding_tests {
     }
 
     #[derive(Default)]
-    struct CountingWriter { writes: usize, flushes: usize }
+    struct CountingWriter {
+        writes: usize,
+        flushes: usize,
+    }
     impl tokio::io::AsyncWrite for CountingWriter {
-        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             self.writes += 1;
             Poll::Ready(Ok(bytes.len()))
         }

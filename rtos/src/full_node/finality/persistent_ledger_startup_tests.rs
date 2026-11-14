@@ -10,25 +10,30 @@ use crate::{
 use std::collections::BTreeMap;
 
 fn physical_state(db: &Arc<RocksDb>) -> BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>> {
-    [storage::db::node::CELLS_CF_NAME, storage::db::node::CELLSCOUNTERS_CF_NAME, crate::internal_db::SHARDSTATE_DB_NAME]
-        .into_iter()
-        .map(|name| {
-            let table = db.clone().table::<String>(name, false).unwrap();
-            let mut records = BTreeMap::new();
-            table
-                .for_each(&mut |key, bytes| {
-                    records.insert(key.to_vec(), bytes.to_vec());
-                    Ok(true)
-                })
-                .unwrap();
-            assert!(!records.is_empty(), "actual {name} fixture must exist");
-            (name.to_owned(), records)
-        })
-        .collect()
+    [
+        storage::db::node::CELLS_CF_NAME,
+        storage::db::node::CELLSCOUNTERS_CF_NAME,
+        crate::internal_db::SHARDSTATE_DB_NAME,
+    ]
+    .into_iter()
+    .map(|name| {
+        let table = db.clone().table::<String>(name, false).unwrap();
+        let mut records = BTreeMap::new();
+        table
+            .for_each(&mut |key, bytes| {
+                records.insert(key.to_vec(), bytes.to_vec());
+                Ok(true)
+            })
+            .unwrap();
+        assert!(!records.is_empty(), "actual {name} fixture must exist");
+        (name.to_owned(), records)
+    })
+    .collect()
 }
 fn archive_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut files = BTreeMap::new();
-    let mut pending = vec![root.join(storage::archives::archive_manager::ArchiveManager::ARCHIVE_DIR)];
+    let mut pending =
+        vec![root.join(storage::archives::archive_manager::ArchiveManager::ARCHIVE_DIR)];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();

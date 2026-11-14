@@ -1,10 +1,12 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Condvar,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Condvar,
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 #[derive(Default)]
 struct Gate {

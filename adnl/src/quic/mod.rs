@@ -1013,7 +1013,8 @@ impl QuicNode {
     ) -> Result<Vec<(quinn::SendStream, quinn::RecvStream)>> {
         let state = self.local_key_state(peers.local())?;
         let addr = self.addr_by_key(peers.other())?;
-        let outbound = Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
+        let outbound =
+            Self::get_or_create_outbound_connection(&state.outbound, addr, peers.other())?;
         let conn = outbound.conn.as_ref().ok_or_else(|| error!("fixture peer is not connected"))?;
         let mut streams = Vec::new();
         // Match the real loopback peer's configured stream bound. No test gate

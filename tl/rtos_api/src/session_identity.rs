@@ -392,8 +392,10 @@ pub fn derive_session_from_decoded_bounded(
     validators: &[ValidatorDescr],
     budget: &dyn rtos_block::config_read_budget::ConfigReadBudget,
 ) -> Result<SessionIdentity> {
-    use ton::engine::validator::validator::groupmember::{GroupMember, GroupMemberPQ};
-    use ton::validator::group::{Group, GroupEx, GroupNew};
+    use ton::{
+        engine::validator::validator::groupmember::{GroupMember, GroupMemberPQ},
+        validator::group::{Group, GroupEx, GroupNew},
+    };
     rtos_block::validators::validate_validator_list_bounded(validators, budget)?;
     config.selected.config.validate_protocol_version()?;
     coordinates.new_catchain_ids = config.consensus.new_catchain_ids;

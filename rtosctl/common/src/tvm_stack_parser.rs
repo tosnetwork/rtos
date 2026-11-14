@@ -10,7 +10,7 @@
 use anyhow::Context;
 use num::Num;
 use rtos_api::ton::tvm::StackEntry;
-use rtos_block::{read_single_root_boc, Cell};
+use rtos_block::{Cell, read_single_root_boc};
 
 #[derive(Debug)]
 pub struct TvmStackParser {
@@ -172,12 +172,12 @@ impl TvmStackParser {
 mod tests {
     use super::*;
     use rtos_api::ton::tvm::{
-        cell, list,
+        List, Number, Tuple, cell, list,
         numberdecimal::NumberDecimal,
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
-        tuple, List, Number, Tuple,
+        tuple,
     };
-    use rtos_block::{write_boc, BuilderData, Cell, IBitstring};
+    use rtos_block::{BuilderData, Cell, IBitstring, write_boc};
 
     fn create_number_entry(value: &str) -> StackEntry {
         StackEntry::Tvm_StackEntryNumber(StackEntryNumber {

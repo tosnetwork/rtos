@@ -7,11 +7,11 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::history_read_budget::{HistoryReadBudget, NetworkGraphReservation};
 use crate::{
     block::BlockStuff,
     block_proof::BlockProofStuff,
     engine_traits::EngineOperations,
+    history_read_budget::{HistoryReadBudget, NetworkGraphReservation},
     network::{
         check_block_candidate_data, check_sync_for_listen_bcasts,
         decompress_and_check_candidate_data, decompress_block_broadcast,

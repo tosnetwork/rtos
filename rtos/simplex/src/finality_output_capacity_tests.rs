@@ -142,8 +142,10 @@ fn capacity(mode: u8) {
     if mode == 0 {
         assert_eq!(std::fs::read_dir(parent).unwrap().count(), MAX_COMPLETED);
     } else if mode == 1 {
-        let total: u64 = std::fs::read_dir(parent).unwrap()
-            .map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+        let total: u64 = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
         assert_eq!(total, MAX_OUTPUT_TOTAL);
     } else {
         assert!(encoded_size(rejected) > MAX_OUTPUT_BYTES);

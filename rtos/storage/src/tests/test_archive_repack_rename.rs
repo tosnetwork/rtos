@@ -1,7 +1,6 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Separate native-fault producer and cold-reader processes; see memo harness.
-use super::metadata_eio_tests as base;
-use super::*;
+use super::{metadata_eio_tests as base, *};
 use crate::{
     db::rocksdb::AccessType,
     tests::{late_index_eio_support as late, utils::create_block_handle_storage},
@@ -145,7 +144,9 @@ async fn producer() {
         std::fs::write(root.join("armed"), b"seed-synced").unwrap();
     }
     eprintln!("RENAME SEEDS_SYNCED pack={}", pack.display());
-    let result = slice.trunc(Arc::new(TruncationSelection::new(handles[2].id().clone(), Vec::new()).unwrap())).await;
+    let result = slice
+        .trunc(Arc::new(TruncationSelection::new(handles[2].id().clone(), Vec::new()).unwrap()))
+        .await;
     let api_ok = result.is_ok();
     let api_error = result.err().map(|error| error.to_string());
     let indexed = slice.package_index.get(&0).is_some();

@@ -1,8 +1,8 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Explicit per-object limits; callers own cumulative request accounting.
-use rtos_block::Result;
 #[cfg(test)]
 use rtos_block::fail;
+use rtos_block::Result;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 
@@ -35,11 +35,17 @@ impl std::error::Error for ArchiveReadLimitExceeded {}
 #[derive(Debug)]
 pub struct ArchiveReadNotStarted(std::io::Error);
 impl ArchiveReadNotStarted {
-    pub(super) fn from_open(error: std::io::Error) -> Self { Self(error) }
-    pub fn is_not_found(&self) -> bool { self.0.kind() == std::io::ErrorKind::NotFound }
+    pub(super) fn from_open(error: std::io::Error) -> Self {
+        Self(error)
+    }
+    pub fn is_not_found(&self) -> bool {
+        self.0.kind() == std::io::ErrorKind::NotFound
+    }
 }
 impl std::fmt::Display for ArchiveReadNotStarted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 impl std::error::Error for ArchiveReadNotStarted {}
 
@@ -49,7 +55,9 @@ impl std::error::Error for ArchiveReadNotStarted {}
 #[derive(Debug)]
 pub struct ArchiveArtifactMissing(&'static str);
 impl ArchiveArtifactMissing {
-    pub(super) fn new(location: &'static str) -> Self { Self(location) }
+    pub(super) fn new(location: &'static str) -> Self {
+        Self(location)
+    }
 }
 impl std::fmt::Display for ArchiveArtifactMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

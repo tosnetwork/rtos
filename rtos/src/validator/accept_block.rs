@@ -1026,14 +1026,21 @@ impl AcceptedSessionBlock {
         let Some(handle) = engine.load_block_handle(self.block.id())? else {
             return Ok(None);
         };
-        let has_proof = if self.proof.is_link() { handle.has_proof_link() } else { handle.has_proof() };
-        if !handle.has_data() || !handle.has_state() || !has_proof
+        let has_proof =
+            if self.proof.is_link() { handle.has_proof_link() } else { handle.has_proof() };
+        if !handle.has_data()
+            || !handle.has_state()
+            || !has_proof
             || (self.phase == AcceptancePhase::Applied && !handle.is_applied())
         {
             return Ok(None);
         }
         let mut receipt = self.clone();
-        receipt.phase = if handle.is_applied() { AcceptancePhase::Applied } else { AcceptancePhase::Preapplied };
+        receipt.phase = if handle.is_applied() {
+            AcceptancePhase::Applied
+        } else {
+            AcceptancePhase::Preapplied
+        };
         receipt.already_present = handle.is_applied();
         Ok(Some(receipt))
     }
@@ -1111,7 +1118,9 @@ impl AcceptedSessionBlock {
         engine: Arc<dyn EngineOperations>,
         locally_generated: bool,
     ) -> Result<()> {
-        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+        if let Some((tbd, cc_seqno)) =
+            self.shard_description(engine.clone(), locally_generated).await?
+        {
             engine.send_top_shard_block_description(tbd, cc_seqno, false).await?;
         }
         Ok(())
@@ -1124,7 +1133,9 @@ impl AcceptedSessionBlock {
         engine: Arc<dyn EngineOperations>,
         locally_generated: bool,
     ) -> Result<()> {
-        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+        if let Some((tbd, cc_seqno)) =
+            self.shard_description(engine.clone(), locally_generated).await?
+        {
             engine.register_top_shard_block_description(tbd, cc_seqno).await?;
         }
         Ok(())

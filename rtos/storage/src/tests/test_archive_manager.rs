@@ -50,7 +50,8 @@ async fn create_manager(
     let db_root_path = Arc::new(path);
     let archive_binding = db.bind_archive_domain(crate::archives::context::ArchiveDomain::new())?;
     let archive_startup = archive_binding.view()?.enter()?;
-    let db_provider = Arc::new(SingleDbProvider::new(archive_binding.clone(), db_root_path.clone()));
+    let db_provider =
+        Arc::new(SingleDbProvider::new(archive_binding.clone(), db_root_path.clone()));
     let manager = ArchiveManager::with_data(
         archive_binding,
         &archive_startup,
@@ -279,7 +280,8 @@ impl TestArchiveManager {
             let flags = if key_blocks.contains(&mc_seq_no) { FLAG_KEY_BLOCK } else { 0 };
             // Masterchain LT increases with height. Equal zero LTs overwrite
             // one native index key and cannot support a cold range rebuild.
-            let meta = BlockMeta::with_data(flags, mc_seq_no, u64::from(mc_seq_no) * 100, mc_seq_no, 0);
+            let meta =
+                BlockMeta::with_data(flags, mc_seq_no, u64::from(mc_seq_no) * 100, mc_seq_no, 0);
             let handle = self
                 .block_handle_storage
                 .create_handle(block_id.clone(), meta, None)
@@ -303,7 +305,13 @@ impl TestArchiveManager {
         let trunc_block_id = Self::master_block_id(mc_seq_no, version);
         println!("trunc on {}", trunc_block_id);
         self.archive_manager
-            .trunc(Arc::new(crate::archives::truncation_selection::TruncationSelection::new(trunc_block_id.clone(), Vec::new()).unwrap()))
+            .trunc(Arc::new(
+                crate::archives::truncation_selection::TruncationSelection::new(
+                    trunc_block_id.clone(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
             .await
             .unwrap();
 
@@ -781,7 +789,14 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
             );
             let data = format!("group={seq}, workchain={wc}").into_bytes();
             let path = Path::new(DB_PATH).join(NAME).join(format!("source-{seq}-{wc}.pack"));
-            let package = Package::open(db.test_archive_provider()?.view()?, &db.test_archive_provider()?.view()?.enter()?, path.clone(), false, true).await?;
+            let package = Package::open(
+                db.test_archive_provider()?.view()?,
+                &db.test_archive_provider()?.view()?.enter()?,
+                path.clone(),
+                false,
+                true,
+            )
+            .await?;
             let mut offset = 0;
             package
                 .append_entry(
@@ -833,7 +848,10 @@ async fn test_import_group_boundary_and_resume() -> Result<()> {
             mc?;
         }
         let expected_slice = if seq < 150 { 1 } else { 150 };
-        assert_eq!(manager.snapshot().file_maps.files().get_closest_id(seq).await, Some(expected_slice));
+        assert_eq!(
+            manager.snapshot().file_maps.files().get_closest_id(seq).await,
+            Some(expected_slice)
+        );
         for (handle, id, data) in &expected {
             assert_eq!(
                 &manager.get_file(handle, &PackageEntryId::Block(id)).await?,
@@ -965,17 +983,30 @@ async fn archive_migration_error_retry_and_live_repair_remigration() -> Result<(
     let dir = tempfile::tempdir()?;
     let (manager, db) = create_manager(dir.path().to_str().unwrap(), "remigration", false).await?;
     let (handles, _) = create_block_handle_storage(db);
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
-        UInt256::from([1; 32]), UInt256::from([2; 32]));
-    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let handle =
+        handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
     let entry = PackageEntryId::Proof(&id);
     manager.add_file(&entry, b"original-proof").await?;
     handle.set_proof();
     let loose = manager.unapplied_files_path().join(entry.filename_short());
-    let error = manager.move_to_archive(&handle, || Err(error!("injected metadata failure"))).await.unwrap_err();
+    let error = manager
+        .move_to_archive(&handle, || Err(error!("injected metadata failure")))
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("injected metadata failure"));
     assert!(loose.exists(), "failed transition must retain its loose evidence");
-    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    manager
+        .move_to_archive(&handle, || {
+            handle.set_archived();
+            Ok(())
+        })
+        .await?;
     assert!(handle.is_archived());
     assert!(!loose.exists());
     assert_eq!(manager.get_file(&handle, &entry).await?, b"original-proof");
@@ -985,7 +1016,12 @@ async fn archive_migration_error_retry_and_live_repair_remigration() -> Result<(
     manager.replace_file_durable(&entry, b"repaired-proof").await?;
     handle.reset_archived();
     assert_eq!(std::fs::read(&loose)?, b"repaired-proof");
-    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    manager
+        .move_to_archive(&handle, || {
+            handle.set_archived();
+            Ok(())
+        })
+        .await?;
     assert!(handle.is_archived());
     assert!(!loose.exists());
     assert_eq!(manager.get_file(&handle, &entry).await?, b"repaired-proof");
@@ -994,18 +1030,31 @@ async fn archive_migration_error_retry_and_live_repair_remigration() -> Result<(
 
 #[tokio::test]
 async fn archive_unleased_startup_still_recovers_uncommitted_tail_and_appends() -> Result<()> {
-    use crate::archives::{archive_slice::ArchiveSlice, package_id::{PackageId, PackageType}};
+    use crate::archives::{
+        archive_slice::ArchiveSlice,
+        package_id::{PackageId, PackageType},
+    };
     use std::io::Write;
     let dir = tempfile::tempdir()?;
     let (manager, db) = create_manager(dir.path().to_str().unwrap(), "tail-control", false).await?;
     let (handles, _) = create_block_handle_storage(db.clone());
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 1,
-        UInt256::from([1; 32]), UInt256::from([2; 32]));
-    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        1,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let handle =
+        handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
     let entry = PackageEntryId::Proof(&id);
     manager.add_file(&entry, b"original-proof").await?;
     handle.set_proof();
-    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    manager
+        .move_to_archive(&handle, || {
+            handle.set_archived();
+            Ok(())
+        })
+        .await?;
     let root = Arc::new(dir.path().join("tail-control"));
     let path = PackageId::for_block(0).full_path(root.as_path(), id.shard())?;
     let original = std::fs::read(&path)?;
@@ -1015,12 +1064,25 @@ async fn archive_unleased_startup_still_recovers_uncommitted_tail_and_appends() 
     file.sync_all()?;
     drop(file);
     assert!(std::fs::metadata(&path)?.len() > original.len() as u64);
-    let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(), root,
-        0, PackageType::Blocks, false, false,
+    let slice = ArchiveSlice::with_data(
+        db.repair_protection().clone(),
+        db.test_archive_provider().unwrap(),
+        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+        root,
+        0,
+        PackageType::Blocks,
+        false,
+        false,
         #[cfg(feature = "telemetry")]
-        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
-    assert_eq!(std::fs::read(&path)?, original, "unleased normal recovery must still trim its uncommitted tail");
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::read(&path)?,
+        original,
+        "unleased normal recovery must still trim its uncommitted tail"
+    );
     slice.add_file(&handle, &entry, b"next-proof".to_vec()).await?;
     assert_eq!(slice.get_file(&handle, &entry).await?.unwrap().data(), b"next-proof");
     Ok(())
@@ -1032,13 +1094,24 @@ async fn archive_protected_key_package_append_metadata_cold_reopen() -> Result<(
     let dir = tempfile::tempdir()?;
     let (manager, db) = create_manager(dir.path().to_str().unwrap(), "key-reopen", false).await?;
     let (handles, _) = create_block_handle_storage(db.clone());
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 3,
-        UInt256::from([3; 32]), UInt256::from([4; 32]));
-    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(FLAG_KEY_BLOCK, 0, 0, 0, 0), None)?.unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        3,
+        UInt256::from([3; 32]),
+        UInt256::from([4; 32]),
+    );
+    let handle = handles
+        .create_handle(id.clone(), BlockMeta::with_data(FLAG_KEY_BLOCK, 0, 0, 0, 0), None)?
+        .unwrap();
     let entry = PackageEntryId::Proof(&id);
     manager.add_file(&entry, b"key-proof").await?;
     handle.set_proof();
-    manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+    manager
+        .move_to_archive(&handle, || {
+            handle.set_archived();
+            Ok(())
+        })
+        .await?;
     drop(manager);
     // Storage predicate fixture only; real authenticated custody is covered by Engine.
     db.repair_protection().register(
@@ -1050,17 +1123,25 @@ async fn archive_protected_key_package_append_metadata_cold_reopen() -> Result<(
     )?;
     let root = Arc::new(dir.path().join("key-reopen"));
     for bytes in [b"key-proof".as_slice(), b"appended-key-proof".as_slice()] {
-        let slice = ArchiveSlice::with_data(db.repair_protection().clone(), db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(), root.clone(),
-            0, PackageType::KeyBlocks, false, false,
+        let slice = ArchiveSlice::with_data(
+            db.repair_protection().clone(),
+            db.test_archive_provider().unwrap(),
+            &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            root.clone(),
+            0,
+            PackageType::KeyBlocks,
+            false,
+            false,
             #[cfg(feature = "telemetry")]
-            Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default())).await?;
+            Arc::new(StorageTelemetry::default()),
+            Arc::new(StorageAlloc::default()),
+        )
+        .await?;
         assert_eq!(slice.get_file(&handle, &entry).await?.unwrap().data(), bytes);
         slice.add_file(&handle, &entry, b"appended-key-proof".to_vec()).await?;
     }
     Ok(())
 }
-
 
 #[tokio::test]
 async fn bounded_reads_keep_inherited_context_after_close_and_refuse_new_roots_before_locks(
@@ -1184,22 +1265,29 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 let domain = manager.snapshot().view.binding().domain().clone();
                 let (handles, _) = create_block_handle_storage(db);
                 let id = BlockIdExt::with_params(
-                    ShardIdent::masterchain(), 1,
-                    UInt256::from([81; 32]), UInt256::from([82; 32]),
+                    ShardIdent::masterchain(),
+                    1,
+                    UInt256::from([81; 32]),
+                    UInt256::from([82; 32]),
                 );
                 let flags = if key { FLAG_KEY_BLOCK } else { 0 };
-                let handle = handles.create_handle(
-                    id.clone(), BlockMeta::with_data(flags, 0, 0, 0, 0), None,
-                )?.unwrap();
+                let handle = handles
+                    .create_handle(id.clone(), BlockMeta::with_data(flags, 0, 0, 0, 0), None)?
+                    .unwrap();
                 manager.add_file(&PackageEntryId::Proof(&id), b"proof").await?;
                 handle.set_proof();
                 handle.set_block_applied();
                 if route != 0 {
                     if key && route == 2 {
                         // Seed only the key route: ordinary-first range lookup must miss.
-                        manager.add_block_data_to_package(
-                            b"proof".to_vec(), &handle, &PackageEntryId::Proof(&id), true,
-                        ).await?;
+                        manager
+                            .add_block_data_to_package(
+                                b"proof".to_vec(),
+                                &handle,
+                                &PackageEntryId::Proof(&id),
+                                true,
+                            )
+                            .await?;
                         assert!(manager.snapshot().file_maps.files().get(0).await.is_none());
                     } else {
                         manager.move_to_archive(&handle, || Ok(())).await?;
@@ -1207,14 +1295,18 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                     handle.set_archived();
                 }
                 let limits = ArchiveReadLimits { data_bytes: 5, filename_bytes: 1024 };
-                assert_eq!(manager.get_file_bounded(
-                    &handle, &PackageEntryId::Proof(&id), limits,
-                ).await?, b"proof");
+                assert_eq!(
+                    manager.get_file_bounded(&handle, &PackageEntryId::Proof(&id), limits,).await?,
+                    b"proof"
+                );
                 let archive_id = if route == 2 {
-                    let archive_id = manager.get_archive_id(1, &ShardIdent::masterchain()).await.unwrap();
+                    let archive_id =
+                        manager.get_archive_id(1, &ShardIdent::masterchain()).await.unwrap();
                     assert_eq!(manager.get_archive_slice(archive_id, 0, 4).await?.len(), 4);
                     archive_id
-                } else { 0 };
+                } else {
+                    0
+                };
                 let expected_path = if route == 0 {
                     manager.unapplied_files_path.join(PackageEntryId::Proof(&id).filename_short())
                 } else {
@@ -1244,17 +1336,26 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 domain.install_read_probe(ReadProbe {
                     opened: Box::new(move |file| {
                         open_fd.store(file.as_raw_fd(), Ordering::SeqCst);
-                        let actual_path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                            .map_err(|error| error.to_string());
+                        let actual_path =
+                            std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                                .map_err(|error| error.to_string());
                         let _ = opened_tx.send((file.as_raw_fd(), actual_path));
-                        open_gate.store(read_release_rx.recv_timeout(deadline).is_ok(), Ordering::SeqCst);
+                        open_gate.store(
+                            read_release_rx.recv_timeout(deadline).is_ok(),
+                            Ordering::SeqCst,
+                        );
                     }),
                     closed: Box::new(move || {
                         // Observe only; never acquire ownership or close this number.
                         let rc = unsafe { libc::fcntl(fd.load(Ordering::SeqCst), libc::F_GETFD) };
                         let errno = std::io::Error::last_os_error().raw_os_error();
                         let outstanding = weak_domain.upgrade().map(|d| d.outstanding());
-                        let _ = closed_tx.send((rc, errno, outstanding, read_gate.load(Ordering::SeqCst)));
+                        let _ = closed_tx.send((
+                            rc,
+                            errno,
+                            outstanding,
+                            read_gate.load(Ordering::SeqCst),
+                        ));
                         let released = close_release_rx.recv_timeout(deadline).is_ok();
                         let _ = released_tx.send(released);
                     }),
@@ -1265,9 +1366,9 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                     if route == 2 {
                         reader_manager.get_archive_slice(archive_id, 0, 4).await
                     } else {
-                        reader_manager.get_file_bounded(
-                            &reader_handle, &PackageEntryId::Proof(&id), limits,
-                        ).await
+                        reader_manager
+                            .get_file_bounded(&reader_handle, &PackageEntryId::Proof(&id), limits)
+                            .await
                     }
                 });
                 let (opened_fd, actual_path) = tokio::time::timeout(deadline, opened_rx).await??;
@@ -1288,7 +1389,11 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
                 let (rc, errno, retained, read_gate_ok) = receipt??;
                 let close_gate_ok = release_result??;
                 eprintln!("native_read_receipt epoch={epoch} key={key} route={route} fcntl={rc} errno={errno:?} retained={retained:?} before_close={before_close} valid_open={valid_while_held} cancelled={cancelled} pending_open={pending_open} pending_closed={pending_closed} read_gate={read_gate_ok} close_gate={close_gate_ok} read_release={read_released} close_release={close_released} actual_path={actual_path:?} expected_path={expected_path:?}");
-                assert_eq!(actual_path, Ok(expected_path), "actual native reader must use the intended route");
+                assert_eq!(
+                    actual_path,
+                    Ok(expected_path),
+                    "actual native reader must use the intended route"
+                );
                 assert!(cancelled && valid_while_held && pending_open && pending_closed);
                 assert!(read_released && close_released && read_gate_ok && close_gate_ok);
                 assert_eq!(rc, -1, "actual descriptor must be closed before custody release");
@@ -1306,14 +1411,22 @@ async fn cancelled_manager_reads_close_actual_file_before_domain_drain() -> Resu
 async fn publication_artifact_group_syncs_loose_files_and_packed_package_once() -> Result<()> {
     use crate::durability::SyncPoint;
     let dir = tempfile::tempdir()?;
-    let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-group", false).await?;
+    let (manager, db) =
+        create_manager(dir.path().to_str().unwrap(), "artifact-group", false).await?;
     let (handles, _) = create_block_handle_storage(db.clone());
-    let id = BlockIdExt::with_params(ShardIdent::masterchain(), 17,
-        UInt256::from([0x51; 32]), UInt256::from([0x52; 32]));
-    let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+    let id = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        17,
+        UInt256::from([0x51; 32]),
+        UInt256::from([0x52; 32]),
+    );
+    let handle =
+        handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
     manager.add_file(&PackageEntryId::Block(&id), b"body").await?;
     manager.add_file(&PackageEntryId::Proof(&id), b"proof").await?;
-    handle.set_data(); handle.set_proof(); handle.set_block_applied();
+    handle.set_data();
+    handle.set_proof();
+    handle.set_block_applied();
     for packed in [false, true] {
         if packed {
             manager.move_to_archive(&handle, || Ok(())).await?;
@@ -1321,12 +1434,21 @@ async fn publication_artifact_group_syncs_loose_files_and_packed_package_once() 
         }
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = events.clone();
-        manager.sync_block_artifacts(&handle, false, Some(Arc::new(move |point, path| {
-            observed.lock().unwrap().push((point, path.to_path_buf()));
-            Ok(())
-        }))).await?;
+        manager
+            .sync_block_artifacts(
+                &handle,
+                false,
+                Some(Arc::new(move |point, path| {
+                    observed.lock().unwrap().push((point, path.to_path_buf()));
+                    Ok(())
+                })),
+            )
+            .await?;
         let events = events.lock().unwrap();
-        assert_eq!(events.iter().filter(|(p, _)| *p == SyncPoint::File).count(), if packed { 1 } else { 2 });
+        assert_eq!(
+            events.iter().filter(|(p, _)| *p == SyncPoint::File).count(),
+            if packed { 1 } else { 2 }
+        );
         let mut directories = std::collections::HashSet::new();
         for (_, path) in events.iter().filter(|(p, _)| *p == SyncPoint::Directory) {
             assert!(directories.insert(path), "duplicate namespace barrier");
@@ -1340,45 +1462,76 @@ async fn publication_artifact_group_syncs_loose_files_and_packed_package_once() 
 }
 
 #[tokio::test]
-async fn publication_artifact_group_sync_failures_require_fresh_owner_and_preserve_artifacts() -> Result<()> {
+async fn publication_artifact_group_sync_failures_require_fresh_owner_and_preserve_artifacts(
+) -> Result<()> {
     use crate::durability::SyncPoint;
     for packed in [false, true] {
         let failures = if packed {
             vec![(SyncPoint::File, 1), (SyncPoint::Directory, 1), (SyncPoint::Wal, 1)]
         } else {
-            vec![(SyncPoint::File, 1), (SyncPoint::File, 2),
-                (SyncPoint::Directory, 1), (SyncPoint::Wal, 1)]
+            vec![
+                (SyncPoint::File, 1),
+                (SyncPoint::File, 2),
+                (SyncPoint::Directory, 1),
+                (SyncPoint::Wal, 1),
+            ]
         };
         for (selected, ordinal) in failures {
             let dir = tempfile::tempdir()?;
-            let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
+            let (manager, db) =
+                create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
             let (handles, _) = create_block_handle_storage(db.clone());
-            let id = BlockIdExt::with_params(ShardIdent::masterchain(), 18,
-                UInt256::from([0x61; 32]), UInt256::from([0x62; 32]));
-            let handle = handles.create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?.unwrap();
+            let id = BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                18,
+                UInt256::from([0x61; 32]),
+                UInt256::from([0x62; 32]),
+            );
+            let handle = handles
+                .create_handle(id.clone(), BlockMeta::with_data(0, 0, 0, 0, 0), None)?
+                .unwrap();
             manager.add_file(&PackageEntryId::Block(&id), b"body").await?;
             manager.add_file(&PackageEntryId::ProofLink(&id), b"proof-link").await?;
-            handle.set_data(); handle.set_proof_link(); handle.set_block_applied();
+            handle.set_data();
+            handle.set_proof_link();
+            handle.set_block_applied();
             if packed {
-                manager.move_to_archive(&handle, || { handle.set_archived(); Ok(()) }).await?;
+                manager
+                    .move_to_archive(&handle, || {
+                        handle.set_archived();
+                        Ok(())
+                    })
+                    .await?;
             }
             handles.save_handle(&handle, None)?;
             handles.sync_pending().await?;
             let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let fired = hit.clone();
             let count = std::sync::atomic::AtomicUsize::new(0);
-            let error = manager.sync_block_artifacts(&handle, true, Some(Arc::new(move |point, _| {
-                if point == selected && count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == ordinal {
-                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return Err(std::io::Error::from_raw_os_error(5).into());
-                }
-                Ok(())
-            }))).await.unwrap_err();
+            let error = manager
+                .sync_block_artifacts(
+                    &handle,
+                    true,
+                    Some(Arc::new(move |point, _| {
+                        if point == selected
+                            && count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+                                == ordinal
+                        {
+                            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Err(std::io::Error::from_raw_os_error(5).into());
+                        }
+                        Ok(())
+                    })),
+                )
+                .await
+                .unwrap_err();
             assert!(hit.load(std::sync::atomic::Ordering::SeqCst), "{error}");
             if packed && selected != SyncPoint::Wal {
                 assert!(manager.snapshot().view.binding().domain().recovery_required());
-                assert!(manager.sync_block_artifacts(&handle, true, None).await.is_err(),
-                    "uncertain package owner must remain refused");
+                assert!(
+                    manager.sync_block_artifacts(&handle, true, None).await.is_err(),
+                    "uncertain package owner must remain refused"
+                );
             }
             assert_eq!(handle.is_archived(), packed);
             assert!(handle.has_data() && handle.has_proof_link());
@@ -1387,12 +1540,16 @@ async fn publication_artifact_group_sync_failures_require_fresh_owner_and_preser
             handles.close_and_wait().await?;
             crate::tests::late_index_eio_support::close_db(db).await;
             // No previous provider or native writer may survive this cold reopen.
-            let (manager, db) = create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
+            let (manager, db) =
+                create_manager(dir.path().to_str().unwrap(), "artifact-failures", false).await?;
             let (handles, _) = create_block_handle_storage(db.clone());
             let handle = handles.load_handle_by_id(&id)?.expect("durable artifact handle");
             assert_eq!(handle.is_archived(), packed);
             assert_eq!(manager.get_file(&handle, &PackageEntryId::Block(&id)).await?, b"body");
-            assert_eq!(manager.get_file(&handle, &PackageEntryId::ProofLink(&id)).await?, b"proof-link");
+            assert_eq!(
+                manager.get_file(&handle, &PackageEntryId::ProofLink(&id)).await?,
+                b"proof-link"
+            );
             manager.sync_block_artifacts(&handle, true, None).await?;
             drop(handle);
             drop(manager);

@@ -330,17 +330,34 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
         let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
         let root = pending_archive_root_bytes(&db)?;
         if ledger != "missing" {
-            db.db().create_cf("repair_dependency_leases_v1", &storage::sst_native_test::Options::default())?;
+            db.db().create_cf(
+                "repair_dependency_leases_v1",
+                &storage::sst_native_test::Options::default(),
+            )?;
             let cf = db.db().cf_handle("repair_dependency_leases_v1").unwrap();
-            db.db().put_cf(&cf, b"next", if ledger == "corrupt" { b"bad".as_slice() } else { &[0; 8] })?;
+            db.db().put_cf(
+                &cf,
+                b"next",
+                if ledger == "corrupt" { b"bad".as_slice() } else { &[0; 8] },
+            )?;
         }
-        db.db().put(b"ArchiveTruncationRootV1", &root)?; db.sync_wal()?; drop(db);
+        db.db().put(b"ArchiveTruncationRootV1", &root)?;
+        db.sync_wal()?;
+        drop(db);
         let outcome = InternalDb::construct(
-            InternalDbConfig { db_directory: dir.path().to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
-            false, Arc::new(AtomicU8::new(0)), None,
-            #[cfg(feature = "telemetry")] create_engine_telemetry(),
+            InternalDbConfig {
+                db_directory: dir.path().to_string_lossy().into_owned(),
+                cells_db_config: small_config(),
+                ..Default::default()
+            },
+            false,
+            Arc::new(AtomicU8::new(0)),
+            None,
+            #[cfg(feature = "telemetry")]
+            create_engine_telemetry(),
             create_engine_allocated(),
-        ).await;
+        )
+        .await;
         let error = outcome.err().expect("pending root started ordinary services");
         let message = format!("{error:#}");
         match ledger {
@@ -348,8 +365,12 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
             "corrupt" => assert!(message.contains("generation length"), "{message}"),
             // Building is now supported before staging, but this fixture has
             // no selection sidecar. Its absence must preserve the pending root.
-            _ => assert!(error.downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{message}"),
+            _ => assert!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "{message}"
+            ),
         }
         assert!(!dir.path().join("catchains").exists());
         assert!(!dir.path().join("archive").exists());
@@ -362,8 +383,10 @@ async fn pending_archive_root_precedes_ledger_creation_and_other_node_services()
 
 #[tokio::test]
 async fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provider() -> Result<()> {
-    use crate::publication_dependency_leases::{DependencyLeases, sst_fixture_for_test};
-    use crate::history_read_budget::HistoryReadBudget;
+    use crate::{
+        history_read_budget::HistoryReadBudget,
+        publication_dependency_leases::{sst_fixture_for_test, DependencyLeases},
+    };
     use storage::db::node::open_node_db_for_bootstrap;
     let dir = tempfile::tempdir()?;
     let db = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
@@ -371,9 +394,12 @@ async fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provid
     let (binding, dependencies, id) = sst_fixture_for_test();
     leases.begin(&binding, dependencies, &HistoryReadBudget::new(Default::default()))?;
     let root = pending_archive_root_bytes(&db)?;
-    db.db().put(b"ArchiveTruncationRootV1", &root)?; db.sync_wal()?;
-    drop(leases); drop(db);
-    let mut bootstrap = open_node_db_for_bootstrap(dir.path(), &small_config(), AccessType::ReadWrite)?;
+    db.db().put(b"ArchiveTruncationRootV1", &root)?;
+    db.sync_wal()?;
+    drop(leases);
+    drop(db);
+    let mut bootstrap =
+        open_node_db_for_bootstrap(dir.path(), &small_config(), AccessType::ReadWrite)?;
     assert!(bootstrap.requires_recovery());
     let db = bootstrap.database().clone();
     assert!(!db.repair_protection().state(&id));
@@ -386,7 +412,8 @@ async fn pending_archive_bootstrap_rebuilds_real_lease_protection_on_same_provid
     Ok(())
 }
 
-const CLEANED_CHILD: &str = "internal_db::node_db_recovery_tests::node_cleaned_recovery_crash_writer";
+const CLEANED_CHILD: &str =
+    "internal_db::node_db_recovery_tests::node_cleaned_recovery_crash_writer";
 const CLEANED_ENV: &str = "RTOS_CLEANED_RECOVERY_FIXTURE";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -434,16 +461,21 @@ async fn node_cleaned_recovery_crash_writer() -> Result<()> {
     assert_eq!(manifest.iter().filter(|row| row.family == CELLS_CF_NAME).count(), 3);
     assert_eq!(manifest.iter().filter(|row| row.family == CELLSCOUNTERS_CF_NAME).count(), 3);
     fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
-    for name in ["files", "key_files"] { db.db().create_cf(name, &Default::default())?; }
+    for name in ["files", "key_files"] {
+        db.db().create_cf(name, &Default::default())?;
+    }
     // Independent wire fixture for the final durable state, with sidecars
     // already removed by a prior cleanup attempt. No archive rows are present.
     let mut header = pending_archive_root_bytes(&db)?;
-    header[10] = 4; header[11] = 3; // Cleaned, node policy, aborted Building.
+    header[10] = 4;
+    header[11] = 3; // Cleaned, node policy, aborted Building.
     let identity = db.db().get_db_identity()?;
     let absolute = fs::canonicalize(&root)?;
     let raw = absolute.as_os_str().as_encoded_bytes();
     let mut anchor = b"RTOS archive recovery anchor v1".to_vec();
-    anchor.push(1); anchor.extend_from_slice(&(raw.len() as u64).to_le_bytes()); anchor.extend_from_slice(raw);
+    anchor.push(1);
+    anchor.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+    anchor.extend_from_slice(raw);
     let mut descriptor = vec![0u8; 93];
     descriptor[..4].copy_from_slice(&[1, 0, 7, 1]);
     descriptor[4..36].copy_from_slice(&rtos_block::sha256_digest(anchor));
@@ -454,18 +486,27 @@ async fn node_cleaned_recovery_crash_writer() -> Result<()> {
     header[164..172].copy_from_slice(&1u64.to_le_bytes());
     header[172..204].copy_from_slice(&rtos_block::sha256_digest(providers));
     let empty = rtos_block::sha256_digest([]);
-    header[212..244].copy_from_slice(&empty); header[252..284].copy_from_slice(&empty);
-    let checksum = rtos_block::sha256_digest(&header[..284]); header[284..].copy_from_slice(&checksum);
-    let controls = root.join("archive/recovery").join(hex::encode([4u8;16]));
+    header[212..244].copy_from_slice(&empty);
+    header[252..284].copy_from_slice(&empty);
+    let checksum = rtos_block::sha256_digest(&header[..284]);
+    header[284..].copy_from_slice(&checksum);
+    let controls = root.join("archive/recovery").join(hex::encode([4u8; 16]));
     fs::create_dir_all(&controls)?;
-    for directory in [&controls, controls.parent().unwrap(), controls.parent().unwrap().parent().unwrap(), root.as_path()] {
+    for directory in [
+        &controls,
+        controls.parent().unwrap(),
+        controls.parent().unwrap().parent().unwrap(),
+        root.as_path(),
+    ] {
         fs::File::open(directory)?.sync_all()?;
     }
     db.db().put(b"recovery-sentinel", b"acknowledged-before-interruption")?;
     db.db().put(b"ArchiveTruncationRootV1", header)?;
     db.sync_wal()?;
     fs::write(root.join("child-ready"), b"ready")?;
-    loop { tokio::time::sleep(Duration::from_secs(1)).await; }
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -473,36 +514,72 @@ async fn actual_node_restart_finishes_cleaned_recovery_and_preserves_data() -> R
     let dir = tempfile::tempdir()?;
     crash_cleaned_writer(dir.path()).await?;
     let db = InternalDb::with_update(
-        InternalDbConfig { db_directory: dir.path().to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
-        false, false, false, None, &|| Ok(()), None, Arc::new(AtomicU8::new(0)), None,
-        #[cfg(feature = "telemetry")] create_engine_telemetry(), create_engine_allocated(),
-    ).await?;
+        InternalDbConfig {
+            db_directory: dir.path().to_string_lossy().into_owned(),
+            cells_db_config: small_config(),
+            ..Default::default()
+        },
+        false,
+        false,
+        false,
+        None,
+        &|| Ok(()),
+        None,
+        Arc::new(AtomicU8::new(0)),
+        None,
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    )
+    .await?;
     let physical = db.recovery_node_db.clone();
     verify(&physical, dir.path())?;
     assert!(physical.db().get(b"ArchiveTruncationRootV1")?.is_none());
     assert!(physical.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
-    assert_eq!(physical.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
-    assert!(!dir.path().join("archive/recovery").join(hex::encode([4u8;16])).exists());
-    db.stop_states_db().await?; drop(db); release(physical).await?;
+    assert_eq!(
+        physical.db().get(b"recovery-sentinel")?.as_deref(),
+        Some(b"acknowledged-before-interruption".as_slice())
+    );
+    assert!(!dir.path().join("archive/recovery").join(hex::encode([4u8; 16])).exists());
+    db.stop_states_db().await?;
+    drop(db);
+    release(physical).await?;
     let reopened = open_node_db(dir.path(), &small_config(), AccessType::ReadWrite)?;
     verify(&reopened, dir.path())?;
     assert!(reopened.db().get(b"ArchiveTruncationRootV1")?.is_none());
-    assert_eq!(reopened.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
+    assert_eq!(
+        reopened.db().get(b"recovery-sentinel")?.as_deref(),
+        Some(b"acknowledged-before-interruption".as_slice())
+    );
     Ok(())
 }
 
 async fn crash_cleaned_writer(root: &Path) -> Result<()> {
-    let mut child = KillOnDrop(Command::new(std::env::current_exe()?)
-        .args(["--exact", CLEANED_CHILD, "--ignored", "--nocapture"])
-        .env(CLEANED_ENV, root).stdout(Stdio::null())
-        .stderr(Stdio::from(fs::File::create(root.join("child.log"))?)).spawn()?);
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe()?)
+            .args(["--exact", CLEANED_CHILD, "--ignored", "--nocapture"])
+            .env(CLEANED_ENV, root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(fs::File::create(root.join("child.log"))?))
+            .spawn()?,
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !root.join("child-ready").exists() {
-        if let Some(status) = child.0.try_wait()? { fail!("Recovery fixture exited {status}: {}", fs::read_to_string(root.join("child.log"))?); }
-        if Instant::now() >= deadline { child.0.kill()?; child.0.wait()?; fail!("Recovery fixture readiness timeout"); }
+        if let Some(status) = child.0.try_wait()? {
+            fail!(
+                "Recovery fixture exited {status}: {}",
+                fs::read_to_string(root.join("child.log"))?
+            );
+        }
+        if Instant::now() >= deadline {
+            child.0.kill()?;
+            child.0.wait()?;
+            fail!("Recovery fixture readiness timeout");
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    child.0.kill()?; assert!(!child.0.wait()?.success());
+    child.0.kill()?;
+    assert!(!child.0.wait()?.success());
     Ok(())
 }
 
@@ -519,7 +596,8 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     // the node's overlay startup. Match the node zerostate template and repin
     // the resulting bytes before creating any network-bound database.
     use rtos_block::{Deserializable, HashmapType, Serializable, ShardStateUnsplit};
-    let mut genesis = ShardStateUnsplit::construct_from_bytes(&fs::read(root.join("mc-zero.boc"))?)?;
+    let mut genesis =
+        ShardStateUnsplit::construct_from_bytes(&fs::read(root.join("mc-zero.boc"))?)?;
     let mut extra = genesis.read_custom()?.expect("masterchain genesis extra");
     extra.after_key_block = true;
     let template = ShardStateUnsplit::construct_from_bytes(include_bytes!("static/zerostate.boc"))?;
@@ -533,9 +611,12 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     genesis.write_custom(Some(&extra))?;
     fs::write(root.join("mc-zero.boc"), rtos_block::write_boc(&genesis.serialize()?)?)?;
     let pin = anchor(root)?;
-    let mut global: serde_json::Value = serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
-    global["validator"]["zero_state"]["root_hash"] = serde_json::json!(pin.root_hash.as_base64(false));
-    global["validator"]["zero_state"]["file_hash"] = serde_json::json!(pin.file_hash.as_base64(false));
+    let mut global: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
+    global["validator"]["zero_state"]["root_hash"] =
+        serde_json::json!(pin.root_hash.as_base64(false));
+    global["validator"]["zero_state"]["file_hash"] =
+        serde_json::json!(pin.file_hash.as_base64(false));
     fs::write(root.join("global.json"), serde_json::to_vec(&global)?)?;
     let node_root = root.join("node_db");
     fs::create_dir(&node_root)?;
@@ -544,7 +625,8 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
 
     // Keep the process entirely on the local fixture network, without remote
     // bootstrap peers, public servers, validator signing keys or external RPC.
-    let mut global: serde_json::Value = serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
+    let mut global: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("global.json"))?)?;
     global["dht"]["static_nodes"]["nodes"] = serde_json::json!([]);
     global["liteservers"] = serde_json::json!([]);
     fs::write(root.join("global.json"), serde_json::to_vec(&global)?)?;
@@ -552,40 +634,56 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     fs::create_dir(&zero)?;
     for name in ["mc-zero.boc", "wc-zero.boc"] {
         let bytes = fs::read(root.join(name))?;
-        fs::write(zero.join(format!("{}.boc", hex::encode(rtos_block::sha256_digest(&bytes)))), bytes)?;
+        fs::write(
+            zero.join(format!("{}.boc", hex::encode(rtos_block::sha256_digest(&bytes)))),
+            bytes,
+        )?;
     }
-    fs::write(root.join("default_config.json"), serde_json::to_vec(&serde_json::json!({
-        "log_config_name": "node-log.yml",
-        "ton_global_config_name": "global.json",
-        "internal_db_path": node_root,
-        "ip_address": "127.0.0.1:0",
-        "ip_address_quic": "127.0.0.1:0",
-        "boot_from_zerostate": true,
-        "restore_db": true,
-        "workchain": 0,
-        "cells_db_config": small_config()
-    }))?)?;
+    fs::write(
+        root.join("default_config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "log_config_name": "node-log.yml",
+            "ton_global_config_name": "global.json",
+            "internal_db_path": node_root,
+            "ip_address": "127.0.0.1:0",
+            "ip_address_quic": "127.0.0.1:0",
+            "boot_from_zerostate": true,
+            "restore_db": true,
+            "workchain": 0,
+            "cells_db_config": small_config()
+        }))?,
+    )?;
     fs::write(root.join("node-log.yml"),
         "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\nroot:\n  level: info\n  appenders: [console]\n".replace("\\n", "\n"))?;
 
     for attempt in 0..2 {
         let log_path = root.join(format!("node-{attempt}.log"));
         let log = fs::File::create(&log_path)?;
-        let mut node = KillOnDrop(Command::new(&binary)
-            .env("TOKIO_WORKER_THREADS", "2")
-            .arg("--configs").arg(root)
-            .arg("--zerostate").arg(&zero)
-            .arg("--initial-sync-disabled")
-            .current_dir(root)
-            .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
+        let mut node = KillOnDrop(
+            Command::new(&binary)
+                .env("TOKIO_WORKER_THREADS", "2")
+                .arg("--configs")
+                .arg(root)
+                .arg("--zerostate")
+                .arg(&zero)
+                .arg("--initial-sync-disabled")
+                .current_dir(root)
+                .stdout(Stdio::from(log.try_clone()?))
+                .stderr(Stdio::from(log))
+                .spawn()?,
+        );
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let output = fs::read_to_string(&log_path)?;
             if let Some(status) = node.0.try_wait()? {
                 fail!("Actual node exited before boot, attempt {attempt}, {status}: {output}");
             }
-            if output.contains("Node services started.") { break; }
-            if Instant::now() >= deadline { fail!("Actual node boot timeout, attempt {attempt}: {output}"); }
+            if output.contains("Node services started.") {
+                break;
+            }
+            if Instant::now() >= deadline {
+                fail!("Actual node boot timeout, attempt {attempt}: {output}");
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         node.0.kill()?;
@@ -603,22 +701,41 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     }
     // Additional rows are legitimate: the actual node persists its configured
     // masterchain and workchain zerostates during its first full boot.
-        assert!(db.db().get(b"ArchiveTruncationRootV1")?.is_none());
-        assert!(db.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
-        assert_eq!(db.db().get(b"recovery-sentinel")?.as_deref(), Some(b"acknowledged-before-interruption".as_slice()));
-        assert!(!node_root.join("archive/recovery").join(hex::encode([4u8; 16])).exists());
+    assert!(db.db().get(b"ArchiveTruncationRootV1")?.is_none());
+    assert!(db.db().get(b"ArchiveTruncationParticipantV1")?.is_none());
+    assert_eq!(
+        db.db().get(b"recovery-sentinel")?.as_deref(),
+        Some(b"acknowledged-before-interruption".as_slice())
+    );
+    assert!(!node_root.join("archive/recovery").join(hex::encode([4u8; 16])).exists());
     drop(db);
     let db = InternalDb::with_update(
-        InternalDbConfig { db_directory: node_root.to_string_lossy().into_owned(), cells_db_config: small_config(), ..Default::default() },
-        false, false, false, None, &|| Ok(()), None, Arc::new(AtomicU8::new(0)), None,
-        #[cfg(feature = "telemetry")] create_engine_telemetry(), create_engine_allocated(),
-    ).await?;
+        InternalDbConfig {
+            db_directory: node_root.to_string_lossy().into_owned(),
+            cells_db_config: small_config(),
+            ..Default::default()
+        },
+        false,
+        false,
+        false,
+        None,
+        &|| Ok(()),
+        None,
+        Arc::new(AtomicU8::new(0)),
+        None,
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    )
+    .await?;
     let id = anchor(root)?;
     assert_eq!(db.load_full_node_state(LAST_APPLIED_MC_BLOCK)?.as_deref(), Some(&id));
     assert_eq!(db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.as_deref(), Some(&id));
     assert!(db.load_block_handle(&id)?.expect("applied zerostate handle").is_applied());
     db.load_shard_state_dynamic(&id)?.verify_zerostate(&id)?;
-    eprintln!("Recovered node head, applied handle and zerostate root match the independent fixture");
+    eprintln!(
+        "Recovered node head, applied handle and zerostate root match the independent fixture"
+    );
     // Negative control follows the successful restarts: contradictory durable
     // progress must refuse startup, preserve data and retain the restore marker.
     let mut conflicting = id.clone();
@@ -631,15 +748,28 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     release(physical).await?;
     let log_path = root.join("conflicting-progress.log");
     let log = fs::File::create(&log_path)?;
-    let mut node = KillOnDrop(Command::new(&binary)
-        .env("TOKIO_WORKER_THREADS", "2")
-        .arg("--configs").arg(root).arg("--zerostate").arg(&zero)
-        .arg("--initial-sync-disabled").current_dir(root)
-        .stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log)).spawn()?);
+    let mut node = KillOnDrop(
+        Command::new(&binary)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .arg("--configs")
+            .arg(root)
+            .arg("--zerostate")
+            .arg(&zero)
+            .arg("--initial-sync-disabled")
+            .current_dir(root)
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?,
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = node.0.try_wait()? { assert!(!status.success()); break; }
-        if Instant::now() >= deadline { fail!("Conflicting checkpoint was not rejected: {}", fs::read_to_string(&log_path)?); }
+        if let Some(status) = node.0.try_wait()? {
+            assert!(!status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            fail!("Conflicting checkpoint was not rejected: {}", fs::read_to_string(&log_path)?);
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let output = fs::read_to_string(log_path)?;
@@ -648,6 +778,8 @@ async fn node_executable_restarts_after_cleaned_recovery_with_consistent_data() 
     assert!(node_root.join("ton_node.restoring").exists());
     let db = open_node_db(&node_root, &small_config(), AccessType::ReadWrite)?;
     assert_eq!(snapshot(&db)?, actual, "rejected restart changed state rows");
-    eprintln!("Conflicting progress rejected by actual node; state rows and recovery marker preserved");
+    eprintln!(
+        "Conflicting progress rejected by actual node; state rows and recovery marker preserved"
+    );
     Ok(())
 }

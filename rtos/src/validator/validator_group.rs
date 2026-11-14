@@ -225,7 +225,10 @@ async fn candidate_validation_reference_top(
     if candidate.shard().is_masterchain() {
         Ok(Some(mc.block_id().clone()))
     } else {
-        Ok(mc.shard_state_extra()?.shards().find_shard(candidate.shard())?
+        Ok(mc
+            .shard_state_extra()?
+            .shards()
+            .find_shard(candidate.shard())?
             .map(|shard| shard.block_id().clone()))
     }
 }
@@ -635,8 +638,10 @@ impl ValidatorGroupImpl {
                 self.shard,
                 self.cc_seqno
             );
-            let (session_prevs, session_mc) = g.recovered_session_start.clone()
-                .unwrap_or_else(|| (self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone()));
+            let (session_prevs, session_mc) =
+                g.recovered_session_start.clone().unwrap_or_else(|| {
+                    (self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone())
+                });
             session.start(session_prevs, session_mc);
         }
 
@@ -1186,20 +1191,22 @@ impl ValidatorGroup {
         current: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<Self> {
         let root = std::path::PathBuf::from(self.engine.db_root_dir()?).join("catchains");
-        let namespace = current.runtime_directory(
-            root.to_str().ok_or_else(|| error!("Invalid consensus DB root"))?,
-        )?;
-        let record = simplex::finality_recovery::locate_session_start(
-            std::path::Path::new(&namespace),
-        )?;
+        let namespace = current
+            .runtime_directory(root.to_str().ok_or_else(|| error!("Invalid consensus DB root"))?)?;
+        let record =
+            simplex::finality_recovery::locate_session_start(std::path::Path::new(&namespace))?;
         let Some(record) = record else {
             return self.with_authenticated_runtime(current);
         };
         let authenticated = super::retired_session_auth::authenticate_retired_session(
-            self.engine.as_ref(), &record,
-        ).await?;
+            self.engine.as_ref(),
+            &record,
+        )
+        .await?;
         if let Some(field) = current.admission_mismatch(authenticated.runtime()) {
-            fail!("Recovered session admission differs from current authenticated admission: {field}");
+            fail!(
+                "Recovered session admission differs from current authenticated admission: {field}"
+            );
         }
         self.recovered_session_start = Some((
             authenticated.record().prev_blocks.clone(),
@@ -1615,11 +1622,12 @@ impl ValidatorGroup {
     /// that historical replay can overtake. This is only namespace ownership;
     /// the checked constructor still validates every runtime and DB invariant.
     fn reserve_namespace_before_worker(&self) -> Result<bool> {
-        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|_| self.is_simplex()) else {
+        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|_| self.is_simplex())
+        else {
             return Ok(true);
         };
-        let mut admission = self.namespace_admission.lock()
-            .map_err(|_| error!("namespace admission poisoned"))?;
+        let mut admission =
+            self.namespace_admission.lock().map_err(|_| error!("namespace admission poisoned"))?;
         if admission.reservation.is_some() {
             return Ok(true);
         }
@@ -1627,7 +1635,10 @@ impl ValidatorGroup {
             fail!("Prior normal constructor lacks its retained namespace reservation");
         }
         match self.engine.reserve_normal_session_namespace(runtime)? {
-            Some(reservation) => { admission.reservation = Some(reservation); Ok(true) }
+            Some(reservation) => {
+                admission.reservation = Some(reservation);
+                Ok(true)
+            }
             None => Ok(false),
         }
     }

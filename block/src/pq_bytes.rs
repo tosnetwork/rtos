@@ -89,32 +89,51 @@ pub fn unpack_pq_bytes(root: &Cell, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 /// Same canonical snake decoder, with admission before the declared byte buffer.
-pub fn unpack_pq_bytes_bounded(root: &Cell, max_bytes: usize,
-    budget: &dyn crate::config_read_budget::ConfigReadBudget) -> Result<Vec<u8>> {
+pub fn unpack_pq_bytes_bounded(
+    root: &Cell,
+    max_bytes: usize,
+    budget: &dyn crate::config_read_budget::ConfigReadBudget,
+) -> Result<Vec<u8>> {
     budget.step()?;
     let mut cs = SliceData::load_cell_ref(root)?;
-    if cs.remaining_bits() != 32 { fail!("pq-bytes: root bits"); }
+    if cs.remaining_bits() != 32 {
+        fail!("pq-bytes: root bits");
+    }
     let len = cs.get_next_int(32)? as usize;
-    if len > max_bytes || len > PQ_BYTES_HARD_MAX { fail!("pq-bytes: oversize"); }
+    if len > max_bytes || len > PQ_BYTES_HARD_MAX {
+        fail!("pq-bytes: oversize");
+    }
     let mut out = crate::config_read_budget::vector::<u8>(budget, len)?;
     if len == 0 {
-        if cs.remaining_references() != 0 { fail!("pq-bytes: empty with ref"); }
+        if cs.remaining_references() != 0 {
+            fail!("pq-bytes: empty with ref");
+        }
         return Ok(out);
     }
-    if cs.remaining_references() != 1 { fail!("pq-bytes: root ref"); }
+    if cs.remaining_references() != 1 {
+        fail!("pq-bytes: root ref");
+    }
     let mut cur = cs.checked_drain_reference()?;
     loop {
         budget.step()?;
         let mut dc = SliceData::load_cell(cur)?;
         let n = PQ_BYTES_CHUNK.min(len - out.len());
-        if dc.remaining_bits() != n * 8 { fail!("pq-bytes: chunk bits"); }
+        if dc.remaining_bits() != n * 8 {
+            fail!("pq-bytes: chunk bits");
+        }
         // Scalar reads avoid an unaccounted temporary get_next_bytes Vec.
-        for _ in 0..n { out.push(dc.get_next_byte()?); }
+        for _ in 0..n {
+            out.push(dc.get_next_byte()?);
+        }
         if out.len() == len {
-            if dc.remaining_references() != 0 { fail!("pq-bytes: trailing ref"); }
+            if dc.remaining_references() != 0 {
+                fail!("pq-bytes: trailing ref");
+            }
             break;
         }
-        if dc.remaining_references() != 1 { fail!("pq-bytes: chunk ref"); }
+        if dc.remaining_references() != 1 {
+            fail!("pq-bytes: chunk ref");
+        }
         cur = dc.checked_drain_reference()?;
     }
     Ok(out)

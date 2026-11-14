@@ -51,15 +51,15 @@ pub mod recovery_check;
 
 pub mod recovery_guard;
 
-pub(crate) mod recovery_root;
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_artifacts;
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_data;
 pub(crate) mod recovery_manifest;
 pub(crate) mod recovery_parent;
 pub(crate) mod recovery_participant;
 pub(crate) mod recovery_providers;
-#[cfg(target_os = "linux")]
-pub(crate) mod recovery_data;
-#[cfg(target_os = "linux")]
-pub(crate) mod recovery_artifacts;
+pub(crate) mod recovery_root;
 pub mod truncation_selection;
 
 pub mod io_owners;
@@ -75,9 +75,9 @@ pub(crate) mod recovery_worker;
 mod recovery_building;
 
 #[cfg(target_os = "linux")]
-mod recovery_stages;
-#[cfg(target_os = "linux")]
 mod recovery_forward;
+#[cfg(target_os = "linux")]
+mod recovery_stages;
 
 #[cfg(target_os = "linux")]
 mod recovery_producer;

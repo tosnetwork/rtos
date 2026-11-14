@@ -182,7 +182,8 @@ impl PendingFinalityStore {
             metadata.data.clear();
             metadata.signature_set.clear();
             CanonicalReference {
-                recovery_binding: ack.recovery_binding
+                recovery_binding: ack
+                    .recovery_binding
                     .or_else(|| self.runtime_binding.lock().unwrap().clone()),
                 schema: 1,
                 node_receipt: ack.node_receipt,
@@ -625,8 +626,10 @@ impl SourceFinalityDelivery {
     pub(crate) fn consumed(&self, draft: &FinalizedDeliveryDraft) -> Result<bool> {
         let _timing = self.operation_timer("consumed");
         let id = PendingFinalityRecord::from_draft(&self.runtime, draft)?.id()?;
-        if matches!(self.stages.lock().unwrap().get(&id),
-            Some(SourceStage::Consumed | SourceStage::AcceptanceConsumed)) {
+        if matches!(
+            self.stages.lock().unwrap().get(&id),
+            Some(SourceStage::Consumed | SourceStage::AcceptanceConsumed)
+        ) {
             return Ok(true);
         }
         if self.store.confirmed_without_backup(&id)? {
@@ -732,7 +735,9 @@ impl SourceFinalityDelivery {
             return Ok(false);
         }
         {
-            let mut state = self.closing_maintenance.lock()
+            let mut state = self
+                .closing_maintenance
+                .lock()
                 .map_err(|_| error!("Source maintenance scheduling poisoned"))?;
             let now = std::time::Instant::now();
             if state.running || now < state.next_attempt {
@@ -1003,13 +1008,15 @@ mod tests {
             let (_dir, runtime, store, record, offer) = setup();
             let id = record.id().unwrap();
             let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
-            let mut disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&ack).unwrap()).unwrap();
+            let mut disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ack).unwrap()).unwrap();
             if legacy {
                 disk.as_object_mut().unwrap().remove("recovery_binding");
             } else {
                 let mut wrong = runtime.recovery_binding().unwrap().clone();
                 wrong.governing_masterchain.root_hash = UInt256::from([99; 32]);
-                disk["recovery_binding"]["governing"] = serde_json::json!(wrong.governing_masterchain.to_string());
+                disk["recovery_binding"]["governing"] =
+                    serde_json::json!(wrong.governing_masterchain.to_string());
             }
             std::fs::write(&ack, serde_json::to_vec(&disk).unwrap()).unwrap();
             let namespace = store.directory.parent().unwrap().to_owned();
@@ -1026,8 +1033,7 @@ mod tests {
     }
 
     fn concurrent_confirmed_scan(unlocked_control: bool) {
-        use std::sync::mpsc;
-        use std::time::Duration;
+        use std::{sync::mpsc, time::Duration};
         let (_dir, runtime, store, record, offer) = setup();
         let id = record.id().unwrap();
         let namespace = store.directory.parent().unwrap().to_owned();
@@ -1315,8 +1321,10 @@ mod tests {
     }
     #[test]
     fn source_closing_maintenance_keeps_actor_responsive_and_namespace_owned() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
         let (_dir, runtime, store, _record, offer) = setup();
         let namespace = store.directory.parent().unwrap().to_owned();
         drop(store);
@@ -1325,8 +1333,12 @@ mod tests {
             Ok(())
         });
         let source = SourceFinalityDelivery::open_with_delivered(
-            runtime, &namespace, Arc::new(TerminalSink(offer)), Some(confirm),
-        ).unwrap();
+            runtime,
+            &namespace,
+            Arc::new(TerminalSink(offer)),
+            Some(confirm),
+        )
+        .unwrap();
         source.close_cursor.lock().unwrap().0 = Instant::now() - Duration::from_secs(2);
         source.closing_maintenance.lock().unwrap().next_attempt = Instant::now();
         let receipt = source.namespace_release_receipt();
@@ -1344,16 +1356,22 @@ mod tests {
         });
         let mut source = Some(source);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(returned.recv_timeout(Duration::from_secs(2))
-                .expect("actor must return while source IO is blocked").unwrap());
+            assert!(returned
+                .recv_timeout(Duration::from_secs(2))
+                .expect("actor must return while source IO is blocked")
+                .unwrap());
             scan_started.recv_timeout(Duration::from_secs(2)).unwrap();
             for _ in 0..1000 {
-                assert!(!source.as_ref().unwrap().request_closing_maintenance().unwrap(),
-                    "repeated actor wakeups must not enqueue additional scans");
+                assert!(
+                    !source.as_ref().unwrap().request_closing_maintenance().unwrap(),
+                    "repeated actor wakeups must not enqueue additional scans"
+                );
             }
             drop(source.take());
-            assert!(!receipt.load(Ordering::Acquire),
-                "an in-flight IO worker must own the source namespace after actor retirement");
+            assert!(
+                !receipt.load(Ordering::Acquire),
+                "an in-flight IO worker must own the source namespace after actor retirement"
+            );
             assert!(PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_none());
         }));
         drop(blocked_io);
@@ -1366,7 +1384,9 @@ mod tests {
         }
         assert!(receipt.load(Ordering::Acquire));
         assert!(PendingFinalityStore::lock(namespace.join(DIRECTORY)).unwrap().is_some());
-        if let Err(error) = outcome { std::panic::resume_unwind(error); }
+        if let Err(error) = outcome {
+            std::panic::resume_unwind(error);
+        }
     }
 
     #[test]
@@ -1425,28 +1445,58 @@ mod boundary_tests {
     use super::*;
     #[test]
     fn source_closing_workchain_never_scans_mc_custody() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
         for is_final in [false, true] {
             let dir = crate::authenticated_fixture::TestDirectory::new();
-            let (runtime, draft) = super::super::tests::fixture_role(is_final,
-                rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
-            let namespace = PathBuf::from(runtime.runtime_directory(dir.path().to_str().unwrap()).unwrap());
-            let source = SourceFinalityDelivery::open_with_delivered(runtime.clone(), &namespace,
+            let (runtime, draft) = super::super::tests::fixture_role(
+                is_final,
+                rtos_block::ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap(),
+            );
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(dir.path().to_str().unwrap()).unwrap());
+            let source = SourceFinalityDelivery::open_with_delivered(
+                runtime.clone(),
+                &namespace,
                 Arc::new(super::super::tests::HeldSink::default()),
-                Some(Arc::new(|_, _| panic!("WC cannot close MC custody")))).unwrap();
+                Some(Arc::new(|_, _| panic!("WC cannot close MC custody"))),
+            )
+            .unwrap();
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
             source.store.retain(&record).unwrap();
             source.store.acknowledge(&record.id().unwrap(), UInt256::from([4; 32])).unwrap();
-            let original = std::fs::read(source.store.directory.join(format!("{}.acked", record.id().unwrap().to_hex_string()))).unwrap();
+            let original = std::fs::read(
+                source
+                    .store
+                    .directory
+                    .join(format!("{}.acked", record.id().unwrap().to_hex_string())),
+            )
+            .unwrap();
             source.close_cursor.lock().unwrap().0 = Instant::now() - Duration::from_secs(2);
             source.closing_maintenance.lock().unwrap().next_attempt = Instant::now();
             let (tx, scans) = mpsc::channel();
             *source.store.scan_started.lock().unwrap() = Some(tx);
             source.maintain_closing().unwrap();
-            assert!(scans.try_recv().is_err(), "WC has no MC custody: do not scan its retained source files");
-            assert!(!source.request_closing_maintenance().unwrap(), "WC must not schedule an ineligible closure worker");
-            assert_eq!(std::fs::read(source.store.directory.join(format!("{}.acked", record.id().unwrap().to_hex_string()))).unwrap(), original);
+            assert!(
+                scans.try_recv().is_err(),
+                "WC has no MC custody: do not scan its retained source files"
+            );
+            assert!(
+                !source.request_closing_maintenance().unwrap(),
+                "WC must not schedule an ineligible closure worker"
+            );
+            assert_eq!(
+                std::fs::read(
+                    source
+                        .store
+                        .directory
+                        .join(format!("{}.acked", record.id().unwrap().to_hex_string()))
+                )
+                .unwrap(),
+                original
+            );
             assert!(!source.store.delivered_path(&record.id().unwrap()).exists());
         }
     }

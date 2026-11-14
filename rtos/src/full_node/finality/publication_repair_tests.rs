@@ -355,10 +355,8 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
     .await;
     // A deliberate regression may poison the receiver's owned worker. Drain
     // both Engines before propagating either that failure or the test panic.
-    let (receiver_stop, provider_stop) = tokio::join!(
-        pair.receiver.clone().wait_stop(),
-        pair.provider.clone().wait_stop(),
-    );
+    let (receiver_stop, provider_stop) =
+        tokio::join!(pair.receiver.clone().wait_stop(), pair.provider.clone().wait_stop(),);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

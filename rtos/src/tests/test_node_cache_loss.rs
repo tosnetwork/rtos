@@ -2,15 +2,22 @@
 //! LazyFS file-data-loss qualification and synchronous cut acknowledgement.
 use super::*;
 use std::io::Write;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::unix::pipe};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::unix::pipe,
+};
 
 pub(super) fn sync_fixture(path: &Path) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let kind = entry.file_type()?;
-        if kind.is_dir() { sync_fixture(&entry.path())?; }
-        else if kind.is_file() { fs::File::open(entry.path())?.sync_all()?; }
-        else { rtos_block::fail!("Unexpected fixture entry before cache-loss baseline"); }
+        if kind.is_dir() {
+            sync_fixture(&entry.path())?;
+        } else if kind.is_file() {
+            fs::File::open(entry.path())?.sync_all()?;
+        } else {
+            rtos_block::fail!("Unexpected fixture entry before cache-loss baseline");
+        }
     }
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -19,12 +26,16 @@ pub(super) fn sync_fixture(path: &Path) -> Result<()> {
 fn selection_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let directory = root.join("node_db/archive/recovery");
-    if !directory.try_exists()? { return Ok(paths); }
+    if !directory.try_exists()? {
+        return Ok(paths);
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         assert!(entry.file_type()?.is_dir());
         let path = entry.path().join("selection.v1");
-        if path.try_exists()? { paths.push(path); }
+        if path.try_exists()? {
+            paths.push(path);
+        }
     }
     Ok(paths)
 }
@@ -37,17 +48,17 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     manifests.extend(selection_paths(root)?.into_iter().map(|path| ("selection", path)));
     // Snapshot both physical WAL owners without opening native databases.
     for (kind, directory) in [("wal", "node_db/db"), ("validator-wal", "node_db/catchains")] {
-    for entry in fs::read_dir(root.join(directory))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(number) = name.strip_suffix(".log") {
-            if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
-                assert!(entry.file_type()?.is_file());
-                manifests.push((kind, entry.path()));
+        for entry in fs::read_dir(root.join(directory))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(number) = name.strip_suffix(".log") {
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) {
+                    assert!(entry.file_type()?.is_file());
+                    manifests.push((kind, entry.path()));
+                }
             }
         }
-    }
     }
     let mut manifest_before = Vec::new();
     for (kind, path) in &manifests {
@@ -56,9 +67,17 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
             if let Some(evidence) = std::env::var_os("RTOS_NODE_RECOVERY_EVIDENCE_DIR") {
                 let directory = PathBuf::from(evidence).join(root.file_name().unwrap());
                 fs::create_dir_all(&directory)?;
-                fs::copy(path, directory.join(format!("validator-before-{}", path.file_name().unwrap().to_string_lossy())))?;
+                fs::copy(
+                    path,
+                    directory.join(format!(
+                        "validator-before-{}",
+                        path.file_name().unwrap().to_string_lossy()
+                    )),
+                )?;
             }
-        } else { keep_evidence(root, path)?; }
+        } else {
+            keep_evidence(root, path)?;
+        }
         manifest_before.push((bytes.len(), hex::encode(rtos_block::sha256_digest(&bytes))));
     }
     let control = root.join("cache-loss-control");
@@ -75,10 +94,11 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         file.write_all(new)?;
     }
     assert_eq!(fs::read(&control)?, new, "unsynced control was not visible before cut");
-    let mut completed = pipe::OpenOptions::new().read_write(true)
+    let mut completed = pipe::OpenOptions::new()
+        .read_write(true)
         .open_receiver(std::env::var("RTOS_TEST_LAZYFS_COMPLETED")?)?;
-    let mut command = pipe::OpenOptions::new()
-        .open_sender(std::env::var("RTOS_TEST_LAZYFS_COMMAND")?)?;
+    let mut command =
+        pipe::OpenOptions::new().open_sender(std::env::var("RTOS_TEST_LAZYFS_COMMAND")?)?;
     command.write_all(b"lazyfs::clear-cache\n").await?;
     drop(command);
     let acknowledgement = tokio::time::timeout(Duration::from_secs(20), async {
@@ -86,14 +106,17 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         loop {
             let mut bytes = [0u8; 256];
             let count = completed.read(&mut bytes).await?;
-            if count == 0 { rtos_block::fail!("Cache-loss completion pipe closed"); }
+            if count == 0 {
+                rtos_block::fail!("Cache-loss completion pipe closed");
+            }
             acknowledgement.extend_from_slice(&bytes[..count]);
             assert!(acknowledgement.len() <= 4096, "unexpected cache-loss acknowledgement");
             if std::str::from_utf8(&acknowledgement)?.contains("finished::clear-cache") {
                 return Ok::<_, rtos_block::Error>(acknowledgement);
             }
         }
-    }).await??;
+    })
+    .await??;
     assert_eq!(fs::read(&control)?, old, "cache loss did not discard unsynced overwrite");
     let mut ready_files = Vec::new();
     let mut selection_files = Vec::new();
@@ -101,7 +124,12 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
     let mut validator_wal_files = Vec::new();
     for ((kind, path), (length, digest)) in manifests.iter().zip(manifest_before) {
         let bytes = fs::read(path)?;
-        let files = match *kind { "ready" => &mut ready_files, "selection" => &mut selection_files, "validator-wal" => &mut validator_wal_files, _ => &mut wal_files };
+        let files = match *kind {
+            "ready" => &mut ready_files,
+            "selection" => &mut selection_files,
+            "validator-wal" => &mut validator_wal_files,
+            _ => &mut wal_files,
+        };
         files.push(serde_json::json!({
             "path": path.strip_prefix(root)?, "bytes_before": length,
             "sha256_before": digest, "bytes_after": bytes.len(),
@@ -109,15 +137,18 @@ pub(super) async fn clear(root: &Path) -> Result<()> {
         }));
     }
     let report = root.join("cache-loss.json");
-    fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "acknowledgement": std::str::from_utf8(&acknowledgement)?,
-        "unsynced_overwrite_discarded": true,
-        "ready_files": ready_files,
-        "selection_files": selection_files,
-        "wal_files": wal_files,
-        "validator_wal_files": validator_wal_files,
-        "scope": "LazyFS file-data cache loss; directory metadata loss unproven"
-    }))?)?;
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({
+            "acknowledgement": std::str::from_utf8(&acknowledgement)?,
+            "unsynced_overwrite_discarded": true,
+            "ready_files": ready_files,
+            "selection_files": selection_files,
+            "wal_files": wal_files,
+            "validator_wal_files": validator_wal_files,
+            "scope": "LazyFS file-data cache loss; directory metadata loss unproven"
+        }))?,
+    )?;
     keep_evidence(root, &report)?;
     eprintln!("LazyFS discarded unsynced file data after actual node interruption; independent overwrite control reverted to durable bytes");
     Ok(())
@@ -137,20 +168,28 @@ pub(super) async fn unfinished_ready(root: &Path) -> Result<()> {
         "0" => false,
         _ => rtos_block::fail!("Invalid cache-loss test mode"),
     };
-    if loss { clear(root).await?; }
+    if loss {
+        clear(root).await?;
+    }
     let after = fs::read(&ready[0])?;
-    if loss { assert!(after.is_empty(), "unsynced Ready bytes survived cache loss"); }
-    else { assert_eq!(after, before, "no-loss control changed Ready bytes"); }
+    if loss {
+        assert!(after.is_empty(), "unsynced Ready bytes survived cache loss");
+    } else {
+        assert_eq!(after, before, "no-loss control changed Ready bytes");
+    }
     let mut remaining = Vec::new();
     let mut remaining_stages = 0;
     truncation_recovery::find_ready_staging(root, &mut remaining, &mut remaining_stages)?;
     assert_eq!(remaining, ready);
     assert_eq!(remaining_stages, stages, "durable staged files disappeared");
     let report = root.join("ready-cache-loss.json");
-    fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "cache_loss": loss, "ready_bytes_before": before.len(),
-        "ready_bytes_after": after.len(), "durable_stage_count": stages
-    }))?)?;
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({
+            "cache_loss": loss, "ready_bytes_before": before.len(),
+            "ready_bytes_after": after.len(), "durable_stage_count": stages
+        }))?,
+    )?;
     keep_evidence(root, &report)?;
     eprintln!("Unfinished Ready cache-loss={loss}: {} bytes before, {} bytes after; durable stages present", before.len(), after.len());
     Ok(())
@@ -173,17 +212,25 @@ pub(super) async fn unfinished_selection(root: &Path) -> Result<PathBuf> {
         "0" => false,
         _ => rtos_block::fail!("Invalid cache-loss test mode"),
     };
-    if loss { clear(root).await?; }
+    if loss {
+        clear(root).await?;
+    }
     let after = fs::read(&selection)?;
-    if loss { assert!(after.is_empty(), "unsynced Selection bytes survived cache loss"); }
-    else { assert_eq!(after, before, "no-loss control changed Selection bytes"); }
+    if loss {
+        assert!(after.is_empty(), "unsynced Selection bytes survived cache loss");
+    } else {
+        assert_eq!(after, before, "no-loss control changed Selection bytes");
+    }
     let report = root.join("selection-cache-loss.json");
-    fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "cache_loss": loss, "selection_bytes_before": before.len(),
-        "selection_bytes_after": after.len(), "ready_count": ready.len(), "stage_count": stages,
-        "sha256_before": hex::encode(rtos_block::sha256_digest(&before)),
-        "sha256_after": hex::encode(rtos_block::sha256_digest(&after)),
-    }))?)?;
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({
+            "cache_loss": loss, "selection_bytes_before": before.len(),
+            "selection_bytes_after": after.len(), "ready_count": ready.len(), "stage_count": stages,
+            "sha256_before": hex::encode(rtos_block::sha256_digest(&before)),
+            "sha256_after": hex::encode(rtos_block::sha256_digest(&after)),
+        }))?,
+    )?;
     keep_evidence(root, &report)?;
     eprintln!("Unfinished Selection cache-loss={loss}: {} bytes before, {} bytes after; no Ready or stages", before.len(), after.len());
     Ok(selection)
@@ -194,9 +241,11 @@ pub(super) async fn staged_packages(root: &Path) -> Result<()> {
     fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() { collect(&entry.path(), files)?; }
-            else if entry.file_name().to_string_lossy().starts_with("stage-")
-                && entry.file_name().to_string_lossy().ends_with(".pack") {
+            if entry.file_type()?.is_dir() {
+                collect(&entry.path(), files)?;
+            } else if entry.file_name().to_string_lossy().starts_with("stage-")
+                && entry.file_name().to_string_lossy().ends_with(".pack")
+            {
                 assert!(entry.file_type()?.is_file());
                 files.push(entry.path());
             }
@@ -219,7 +268,9 @@ pub(super) async fn staged_packages(root: &Path) -> Result<()> {
         "0" => false,
         _ => rtos_block::fail!("Invalid cache-loss test mode"),
     };
-    if loss { clear(root).await?; }
+    if loss {
+        clear(root).await?;
+    }
     let mut reports = Vec::new();
     for (path, (length, digest)) in stages.iter().zip(before) {
         let bytes = fs::read(path)?;
@@ -235,10 +286,16 @@ pub(super) async fn staged_packages(root: &Path) -> Result<()> {
         }
     }
     let report = root.join("stages-cache-loss.json");
-    fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "cache_loss": loss, "stage_files": reports,
-    }))?)?;
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({
+            "cache_loss": loss, "stage_files": reports,
+        }))?,
+    )?;
     keep_evidence(root, &report)?;
-    eprintln!("Published Ready staging cache-loss={loss}: {} replacement packages inspected", stages.len());
+    eprintln!(
+        "Published Ready staging cache-loss={loss}: {} replacement packages inspected",
+        stages.len()
+    );
     Ok(())
 }

@@ -2339,27 +2339,36 @@ fn classical_target_receiver_real_candidate_repair_for_protocols_zero_one() {
 #[path = "test_authenticated_receiver.rs"]
 mod authenticated_receiver;
 
-
 #[test]
 fn test_receiver_certificate_ingress_boundary_reopens_after_progress() {
     // Owned in-process overlay, not a packet-source authentication assertion.
     let overlay = SessionFactory::create_in_process_overlay_manager(2);
     let session = UInt256::rand();
-    let keys: Vec<_> = (0..2).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
-    let nodes: Vec<_> = keys.iter().map(|key| SessionNode {
-        public_key: key.clone(), adnl_id: key.id().clone(), weight: 1,
-    }).collect();
+    let keys: Vec<_> =
+        (0..2).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
+    let nodes: Vec<_> = keys
+        .iter()
+        .map(|key| SessionNode { public_key: key.clone(), adnl_id: key.id().clone(), weight: 1 })
+        .collect();
     let create = |index: usize| {
         let (listener, stats) = TestReceiverListener::create(index as u32);
         let erased: Arc<dyn ReceiverListener + Send + Sync> = listener.clone();
         let receiver = crate::receiver::ReceiverWrapper::create(
-            session.clone(), &ShardIdent::masterchain(), &nodes, &keys[index], overlay.clone(),
-            Arc::downgrade(&erased), Arc::new(AtomicBool::new(false)),
+            session.clone(),
+            &ShardIdent::masterchain(),
+            &nodes,
+            &keys[index],
+            overlay.clone(),
+            Arc::downgrade(&erased),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(crate::receiver::ReceiverHealthCounters::new()),
             crate::receiver::ReceiverSettings {
-                slots_per_leader_window: 4, max_leader_window_desync: 2, ..Default::default()
+                slots_per_leader_window: 4,
+                max_leader_window_desync: 2,
+                ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         (receiver, listener, stats)
     };
     let (sender, _sender_listener, _) = create(0);
@@ -2367,13 +2376,32 @@ fn test_receiver_certificate_ingress_boundary_reopens_after_progress() {
     sender.send_certificate(make_skip_certificate(12));
     sender.send_certificate(make_skip_certificate(11));
     wait_until(Duration::from_secs(3), || stats.certificates_received.load(Ordering::Acquire) >= 1);
-    assert_eq!(stats.received_certificates.lock().unwrap().iter().map(certificate_slot).collect::<Vec<_>>(), vec![11],
-        "receiver must filter the exclusive boundary before the main-thread callback");
+    assert_eq!(
+        stats
+            .received_certificates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(certificate_slot)
+            .collect::<Vec<_>>(),
+        vec![11],
+        "receiver must filter the exclusive boundary before the main-thread callback"
+    );
     receiver.set_ingress_progress_slot(4);
     sender.send_certificate(make_skip_certificate(12));
     wait_until(Duration::from_secs(3), || stats.certificates_received.load(Ordering::Acquire) >= 2);
-    assert_eq!(stats.received_certificates.lock().unwrap().iter().map(certificate_slot).collect::<Vec<_>>(), vec![11,12]);
-    sender.stop(); receiver.stop();
+    assert_eq!(
+        stats
+            .received_certificates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(certificate_slot)
+            .collect::<Vec<_>>(),
+        vec![11, 12]
+    );
+    sender.stop();
+    receiver.stop();
 }
 
 #[test]
@@ -2419,9 +2447,8 @@ fn restored_cache_delivery_case(mode: &str) {
     for protocol in [SimplexProtocol::Private, SimplexProtocol::BlockSync] {
         let profile = rtos_api::WireProfile::T0;
         let session = UInt256::rand();
-        let keys: Vec<PrivateKey> = (0..2)
-            .map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap())
-            .collect();
+        let keys: Vec<PrivateKey> =
+            (0..2).map(|_| Ed25519KeyOption::<ZeroizingBytes>::generate().unwrap()).collect();
         let nodes: Vec<_> = keys
             .iter()
             .map(|key| SessionNode {
@@ -2449,12 +2476,8 @@ fn restored_cache_delivery_case(mode: &str) {
         let root_hash = UInt256::from_slice(&sha256_digest(&body));
         let file_hash = UInt256::from_slice(&sha256_digest(&body));
         let collated_hash = UInt256::from_slice(&sha256_digest(&collated));
-        let block = BlockIdExt::with_params(
-            ShardIdent::masterchain(),
-            slot,
-            root_hash.clone(),
-            file_hash,
-        );
+        let block =
+            BlockIdExt::with_params(ShardIdent::masterchain(), slot, root_hash.clone(), file_hash);
         let hash = crate::utils::compute_candidate_id_hash_u32(
             slot,
             Some(&block),
@@ -2512,11 +2535,7 @@ fn restored_cache_delivery_case(mode: &str) {
                 }
                 local_body = profile.serialize(&wrong).unwrap();
             }
-            let local_notar = if mode == "local_bad_notar" {
-                vec![0; 12]
-            } else {
-                notar.clone()
-            };
+            let local_notar = if mode == "local_bad_notar" { vec![0; 12] } else { notar.clone() };
             receiver._listener.set_query_fallback_payloads(
                 slot,
                 hash.clone(),
@@ -2534,61 +2553,36 @@ fn restored_cache_delivery_case(mode: &str) {
             } else {
                 wire.clone()
             };
-            receiver
-                .receiver
-                .cache_candidate_bytes(slot, hash.clone(), bytes);
+            receiver.receiver.cache_candidate_bytes(slot, hash.clone(), bytes);
         }
         if mode != "body_only" && !mode.starts_with("local_") {
             receiver.receiver.cache_notarization_cert(
                 slot,
                 hash.clone(),
-                if mode == "bad_notar" {
-                    vec![0; 12]
-                } else {
-                    notar.clone()
-                },
+                if mode == "bad_notar" { vec![0; 12] } else { notar.clone() },
             );
         }
         let local_reply = || {
-            let response = TlCandidateAndCert {
-                candidate: wire.clone().into(),
-                notar: notar.clone().into(),
-            }
-            .into_boxed();
+            let response =
+                TlCandidateAndCert { candidate: wire.clone().into(), notar: notar.clone().into() }
+                    .into_boxed();
             consensus_common::ConsensusCommonFactory::create_block_payload(
                 profile.serialize(&response).unwrap(),
             )
         };
         if mode == "local_cancel" || mode == "local_timeout" {
-            receiver
-                ._listener
-                .hold_local_fallback
-                .store(true, Ordering::Release);
+            receiver._listener.hold_local_fallback.store(true, Ordering::Release);
         }
         if mode == "local_cancel" {
             for expected in [1, 2] {
                 receiver.receiver.request_candidate(slot, hash.clone());
                 let until = std::time::Instant::now() + Duration::from_secs(3);
-                while receiver
-                    ._listener
-                    .held_local_fallbacks
-                    .lock()
-                    .unwrap()
-                    .len()
-                    < expected
+                while receiver._listener.held_local_fallbacks.lock().unwrap().len() < expected
                     && std::time::Instant::now() < until
                 {
                     thread::sleep(Duration::from_millis(10));
                 }
-                assert_eq!(
-                    receiver
-                        ._listener
-                        .held_local_fallbacks
-                        .lock()
-                        .unwrap()
-                        .len(),
-                    expected
-                );
+                assert_eq!(receiver._listener.held_local_fallbacks.lock().unwrap().len(), expected);
                 if expected == 1 {
                     receiver.receiver.cancel_candidate_requests_for_slot(slot);
                 }
@@ -2602,10 +2596,7 @@ fn restored_cache_delivery_case(mode: &str) {
                 0,
                 "cancelled lookup cannot fulfill the new request for the same id"
             );
-            receiver
-                ._listener
-                .hold_local_fallback
-                .store(false, Ordering::Release);
+            receiver._listener.hold_local_fallback.store(false, Ordering::Release);
             held.remove(0)(Ok(local_reply()));
         } else {
             receiver.receiver.request_candidate(slot, hash.clone());
@@ -2654,9 +2645,7 @@ fn restored_cache_delivery_case(mode: &str) {
             "restored cache must fulfill each explicit request: {mode}"
         );
         let candidates = receiver.stats.received_candidates.lock().unwrap();
-        assert!(candidates
-            .iter()
-            .all(|candidate| profile.serialize(candidate).unwrap() == wire));
+        assert!(candidates.iter().all(|candidate| profile.serialize(candidate).unwrap() == wire));
         assert_eq!(
             *receiver.stats.received_candidate_notars.lock().unwrap(),
             vec![Some(notar.clone()), Some(notar)]

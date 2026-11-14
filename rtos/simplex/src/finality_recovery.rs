@@ -1,7 +1,9 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Retired source discovery. Persisted claims never authenticate a runtime.
-use consensus_common::session_runtime::{SessionNetworkPin, SessionRecoveryBinding};
-use consensus_common::simplex_protocol::SimplexProtocol;
+use consensus_common::{
+    session_runtime::{SessionNetworkPin, SessionRecoveryBinding},
+    simplex_protocol::SimplexProtocol,
+};
 use rtos_api::WireProfile;
 use rtos_block::{BlockIdExt, UInt256};
 use std::path::PathBuf;
@@ -98,10 +100,14 @@ struct DiskIntent {
 // session coordinates with the separate, certificate-free start locator.
 impl std::ops::Deref for DiskIntent {
     type Target = DiskSessionStart;
-    fn deref(&self) -> &Self::Target { &self.start }
+    fn deref(&self) -> &Self::Target {
+        &self.start
+    }
 }
 impl std::ops::DerefMut for DiskIntent {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.start }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.start
+    }
 }
 const SESSION_START: &str = "finality-session-start.json";
 const MAX_SESSION_START_BYTES: u64 = 16 << 10;
@@ -332,7 +338,10 @@ fn decode_intent_typed(
     Ok((record, certificate, wire))
 }
 
-fn decode_session_start(disk: &DiskSessionStart, namespace: &std::path::Path) -> Result<SessionRecoveryRecord> {
+fn decode_session_start(
+    disk: &DiskSessionStart,
+    namespace: &std::path::Path,
+) -> Result<SessionRecoveryRecord> {
     if disk.schema != 1 || disk.protocol != 2 || disk.wire_profile != 1 {
         fail!("Unknown session start domain/schema");
     }
@@ -478,8 +487,11 @@ impl FinalityIntentStore {
             if temporary.extension().and_then(|s| s.to_str()) != Some("tmp") {
                 continue;
             }
-            let original = directory.parent().unwrap()
-                .join(temporary.file_name().unwrap()).with_extension("json");
+            let original = directory
+                .parent()
+                .unwrap()
+                .join(temporary.file_name().unwrap())
+                .with_extension("json");
             if !paths.contains(&original) {
                 fail!("Completed temporary lacks its original pending proof");
             }
@@ -719,7 +731,9 @@ impl FinalityIntentStore {
         }
         let mut cached = self.durable_start.lock().unwrap();
         if let Some(existing) = cached.as_ref() {
-            if existing != &bytes { fail!("Conflicting live session start context"); }
+            if existing != &bytes {
+                fail!("Conflicting live session start context");
+            }
             return Ok(());
         }
         let path = self.namespace.join(SESSION_START);
@@ -738,8 +752,12 @@ impl FinalityIntentStore {
                     fail!("Invalid session start temporary type/size");
                 }
                 let mut prefix = Vec::new();
-                File::open(&temporary)?.take(MAX_SESSION_START_BYTES + 1).read_to_end(&mut prefix)?;
-                if !bytes.starts_with(&prefix) { fail!("Conflicting session start temporary"); }
+                File::open(&temporary)?
+                    .take(MAX_SESSION_START_BYTES + 1)
+                    .read_to_end(&mut prefix)?;
+                if !bytes.starts_with(&prefix) {
+                    fail!("Conflicting session start temporary");
+                }
                 true
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -755,7 +773,11 @@ impl FinalityIntentStore {
         } else {
             let mut options = OpenOptions::new();
             options.write(true);
-            if temporary_exists { options.truncate(true); } else { options.create_new(true); }
+            if temporary_exists {
+                options.truncate(true);
+            } else {
+                options.create_new(true);
+            }
             let mut file = options.open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
@@ -1052,7 +1074,10 @@ pub fn locate_session_start(namespace: &std::path::Path) -> Result<Option<Sessio
     Ok(locate_session_context(namespace, false)?.0)
 }
 
-fn locate_session_context(namespace: &std::path::Path, inspect_outputs: bool) -> Result<(Option<SessionRecoveryRecord>, bool)> {
+fn locate_session_context(
+    namespace: &std::path::Path,
+    inspect_outputs: bool,
+) -> Result<(Option<SessionRecoveryRecord>, bool)> {
     let store = FinalityIntentStore::new(namespace);
     let mut found = read_session_start(namespace)?;
     let mut interrupted = false;
@@ -1176,9 +1201,12 @@ mod tests {
         source.bind_start(runtime.pin().zerostate.clone()).unwrap();
         source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
         if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
-            source.resolve_intent(&crate::block::RawCandidateId {
-                slot: event.slot, hash: event.block_hash.clone(),
-            }).unwrap();
+            source
+                .resolve_intent(&crate::block::RawCandidateId {
+                    slot: event.slot,
+                    hash: event.block_hash.clone(),
+                })
+                .unwrap();
             panic!("completion crash point was not reached");
         }
         // Exit without Drop, candidate body, source Draft, node stage or receipt.
@@ -1195,7 +1223,8 @@ mod tests {
         if completion_interrupted {
             child.env("RTOS_CERT_COMPLETION_CRASH", "1");
         }
-        let result = child.args([
+        let result = child
+            .args([
                 "--exact",
                 "finality_recovery::tests::source_finality_cert_intent_process_child",
                 "--nocapture",
@@ -1203,7 +1232,12 @@ mod tests {
             .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path())
             .output()
             .unwrap();
-        assert_eq!(result.status.code(), Some(if completion_interrupted { 78 } else { 77 }), "{}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(
+            result.status.code(),
+            Some(if completion_interrupted { 78 } else { 77 }),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         let records = scan_finality_recovery(directory.path()).unwrap();
         assert_eq!(
             records.len(),
@@ -1348,7 +1382,8 @@ mod tests {
                 .unwrap();
             db.close(Some(std::time::Duration::from_secs(10))).unwrap();
             drop(db);
-            let db = crate::database::SimplexDb::open(namespace.join("db"), "torn-intent-test").unwrap();
+            let db =
+                crate::database::SimplexDb::open(namespace.join("db"), "torn-intent-test").unwrap();
             let saved =
                 db.load_final_cert_by_id(&id, std::time::Duration::from_secs(10)).unwrap().unwrap();
             assert_eq!(saved.candidate_id, id);
@@ -1424,27 +1459,56 @@ mod tests {
         for prefix_length in [0, 7, usize::MAX] {
             let root = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, event) = signed_fixture_event(1);
-            let namespace = PathBuf::from(runtime.runtime_directory(root.path().to_str().unwrap()).unwrap());
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(root.path().to_str().unwrap()).unwrap());
             std::fs::create_dir_all(&namespace).unwrap();
-            let record = SessionRecoveryRecord::from_runtime(&runtime, namespace.clone(),
-                vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone()).unwrap();
+            let record = SessionRecoveryRecord::from_runtime(
+                &runtime,
+                namespace.clone(),
+                vec![runtime.pin().zerostate.clone()],
+                runtime.pin().zerostate.clone(),
+            )
+            .unwrap();
             let bytes = serde_json::to_vec(&record.start_disk().unwrap()).unwrap();
             let temporary = namespace.join(SESSION_START).with_extension("tmp");
             std::fs::write(&temporary, &bytes[..prefix_length.min(bytes.len())]).unwrap();
-            assert!(locate_session_start(&namespace).unwrap().is_none(), "temporary is not provenance");
+            assert!(
+                locate_session_start(&namespace).unwrap().is_none(),
+                "temporary is not provenance"
+            );
             let store = FinalityIntentStore::new(&namespace);
-            store.retain(&runtime, record.prev_blocks.clone(), record.start_masterchain.clone(), &event).unwrap();
+            store
+                .retain(
+                    &runtime,
+                    record.prev_blocks.clone(),
+                    record.start_masterchain.clone(),
+                    &event,
+                )
+                .unwrap();
             assert!(!temporary.exists());
             assert_eq!(std::fs::read(namespace.join(SESSION_START)).unwrap(), bytes);
             let mut changed = record.clone();
-            changed.prev_blocks = vec![BlockIdExt::with_params(ShardIdent::masterchain(), 1,
-                UInt256::calc_file_hash(b"other parent"), UInt256::calc_file_hash(b"other file"))];
-            assert!(store.retain(&runtime, changed.prev_blocks, changed.start_masterchain, &event).is_err());
+            changed.prev_blocks = vec![BlockIdExt::with_params(
+                ShardIdent::masterchain(),
+                1,
+                UInt256::calc_file_hash(b"other parent"),
+                UInt256::calc_file_hash(b"other file"),
+            )];
+            assert!(store
+                .retain(&runtime, changed.prev_blocks, changed.start_masterchain, &event)
+                .is_err());
             assert_eq!(std::fs::read(namespace.join(SESSION_START)).unwrap(), bytes);
             drop(store);
             let reopened = FinalityIntentStore::new(&namespace);
             std::fs::write(&temporary, b"conflicting context").unwrap();
-            assert!(reopened.retain(&runtime, record.prev_blocks.clone(), record.start_masterchain.clone(), &event).is_err());
+            assert!(reopened
+                .retain(
+                    &runtime,
+                    record.prev_blocks.clone(),
+                    record.start_masterchain.clone(),
+                    &event
+                )
+                .is_err());
             assert_eq!(std::fs::read(&temporary).unwrap(), b"conflicting context");
             assert_eq!(std::fs::read(namespace.join(SESSION_START)).unwrap(), bytes);
             std::fs::remove_file(&temporary).unwrap();
@@ -1452,8 +1516,13 @@ mod tests {
             changed.profile = UInt256::calc_file_hash(b"different profile").to_hex_string();
             let wrong = serde_json::to_vec(&changed).unwrap();
             std::fs::write(namespace.join(SESSION_START), &wrong).unwrap();
-            assert!(locate_session_start(&namespace).is_err(), "committed locator must match intact records");
-            assert!(reopened.retain(&runtime, record.prev_blocks, record.start_masterchain, &event).is_err());
+            assert!(
+                locate_session_start(&namespace).is_err(),
+                "committed locator must match intact records"
+            );
+            assert!(reopened
+                .retain(&runtime, record.prev_blocks, record.start_masterchain, &event)
+                .is_err());
             assert_eq!(std::fs::read(namespace.join(SESSION_START)).unwrap(), wrong);
         }
     }
@@ -1604,7 +1673,10 @@ mod tests {
             std::fs::write(&temporary, malformed).unwrap();
             assert!(store.pending().is_err(), "torn inputs cannot be silently omitted");
             if malformed.is_empty() {
-                assert!(locate_session_start(namespace).unwrap().is_some(), "only the intact context is located");
+                assert!(
+                    locate_session_start(namespace).unwrap().is_some(),
+                    "only the intact context is located"
+                );
             } else {
                 assert!(locate_session_start(namespace).is_err());
             }
@@ -1643,9 +1715,13 @@ mod tests {
     fn source_finality_completion_temporary_requires_exact_pending_proof() {
         let directory = crate::authenticated_fixture::TestDirectory::new();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "finality_recovery::tests::source_finality_cert_intent_process_child"])
+            .args([
+                "--exact",
+                "finality_recovery::tests::source_finality_cert_intent_process_child",
+            ])
             .env("RTOS_CERT_INTENT_CRASH_ROOT", directory.path())
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert_eq!(result.status.code(), Some(77));
         let records = scan_finality_recovery(directory.path()).unwrap();
         let namespace = &records[0].namespace;
@@ -1671,7 +1747,11 @@ mod tests {
             std::fs::remove_file(&temporary).unwrap();
         }
         let orphan = temporary.with_file_name("unknown.tmp");
-        std::fs::write(&orphan, serde_json::to_vec(&CompletedIntent { schema: 1, record }).unwrap()).unwrap();
+        std::fs::write(
+            &orphan,
+            serde_json::to_vec(&CompletedIntent { schema: 1, record }).unwrap(),
+        )
+        .unwrap();
         assert!(store.prepare(true).is_err());
         assert!(orphan.exists(), "unknown temporary is retained");
         std::fs::remove_file(&orphan).unwrap();
@@ -1795,9 +1875,16 @@ mod tests {
         assert_eq!(reopened.pending_count().unwrap(), 0);
         assert_eq!(reopened.resolved_intent_count(), 1);
         reopened.resolve(&id).unwrap();
-        assert_eq!(reopened.resolved_intent_count(), 1, "idempotent resolution is not new progress");
-        assert_eq!(FinalityIntentStore::new(&namespace).resolved_intent_count(), 0,
-            "cold completed evidence is not progress by the current owner");
+        assert_eq!(
+            reopened.resolved_intent_count(),
+            1,
+            "idempotent resolution is not new progress"
+        );
+        assert_eq!(
+            FinalityIntentStore::new(&namespace).resolved_intent_count(),
+            0,
+            "cold completed evidence is not progress by the current owner"
+        );
         // Resolving the certificate does not prove that its complete output set
         // was sealed. Legacy completed evidence must remain discoverable.
         let reconstruction = scan_finality_recovery(directory.path()).unwrap();
@@ -1846,25 +1933,35 @@ mod tests {
         let required = reopened.sealed_output_requirements(&runtime, &id).unwrap().unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0].block_id, draft.block_id.to_string());
-        let output_path = namespace.join("finality-intents/outputs-v1")
-            .join(format!("{}-{}.outputs", id.slot.value(), id.hash.to_hex_string()));
+        let output_path = namespace.join("finality-intents/outputs-v1").join(format!(
+            "{}-{}.outputs",
+            id.slot.value(),
+            id.hash.to_hex_string()
+        ));
         let original_output = std::fs::read(&output_path).unwrap();
         let mut wrong_digest: serde_json::Value = serde_json::from_slice(&original_output).unwrap();
         wrong_digest["digest"] = serde_json::json!(UInt256::from([0x5e; 32]).to_hex_string());
         std::fs::write(&output_path, serde_json::to_vec(&wrong_digest).unwrap()).unwrap();
-        assert!(reopened.sealed_output_requirements(&runtime, &id).is_err(),
-            "a foreign certificate digest must not become replay requirements");
-        let mut wrong_metadata: serde_json::Value = serde_json::from_slice(&original_output).unwrap();
+        assert!(
+            reopened.sealed_output_requirements(&runtime, &id).is_err(),
+            "a foreign certificate digest must not become replay requirements"
+        );
+        let mut wrong_metadata: serde_json::Value =
+            serde_json::from_slice(&original_output).unwrap();
         wrong_metadata["metadata"]["local_adnl"] =
             serde_json::json!(UInt256::from([0x5f; 32]).to_hex_string());
         std::fs::write(&output_path, serde_json::to_vec(&wrong_metadata).unwrap()).unwrap();
-        assert!(reopened.sealed_output_requirements(&runtime, &id).is_err(),
-            "a matching digest cannot authorize changed output metadata");
+        assert!(
+            reopened.sealed_output_requirements(&runtime, &id).is_err(),
+            "a matching digest cannot authorize changed output metadata"
+        );
         std::fs::write(&output_path, &original_output).unwrap();
         assert_eq!(reopened.sealed_output_requirements(&runtime, &id).unwrap(), Some(required));
         assert_eq!(reopened.legacy_output_count().unwrap(), 0);
         assert!(scan_finality_recovery(directory.path()).unwrap().is_empty());
-        let start = locate_session_start(&namespace).unwrap().expect("completed intent preserves live session floor");
+        let start = locate_session_start(&namespace)
+            .unwrap()
+            .expect("completed intent preserves live session floor");
         start.validate_runtime(&runtime).unwrap();
         assert_eq!(start.prev_blocks, records[0].prev_blocks);
         assert_eq!(start.start_masterchain, records[0].start_masterchain);

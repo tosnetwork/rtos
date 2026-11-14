@@ -7,12 +7,12 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::async_owner::AsyncOwner;
 use crate::{
-    utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
-    ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager,
-    ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType, PrivateKey,
-    PublicKeyHash, QueryResponseCallback, Result,
+    async_owner::AsyncOwner, utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory,
+    ConsensusNode, ConsensusOverlay, ConsensusOverlayListenerPtr,
+    ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
+    ConsensusOverlayPtr, OverlayTransportType, PrivateKey, PublicKeyHash, QueryResponseCallback,
+    Result,
 };
 use adnl::{
     common::{

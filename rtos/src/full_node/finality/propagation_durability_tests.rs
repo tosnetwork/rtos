@@ -46,8 +46,9 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
         eprintln!("PUBLICATION_SYNC_BEGIN {point:?} {}", path.display());
         let selected = match failure {
             Some(Failure::File) => point == SyncPoint::File,
-            Some(Failure::ProofFile) => point == SyncPoint::File
-                && files.fetch_add(1, Ordering::SeqCst) + 1 == 2,
+            Some(Failure::ProofFile) => {
+                point == SyncPoint::File && files.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            }
             Some(Failure::Directory) => point == SyncPoint::Directory,
             // This fixture reconstructs a missing state: flush pending state,
             // then the rebuilt state, before the final handle metadata barrier.
@@ -95,12 +96,18 @@ async fn exercise_sync_boundary(failure: Option<Failure>) {
             assert!(stored.pending.is_empty());
             assert!(stored.record.effects.is_empty());
             let events = events.lock().unwrap();
-            let artifact_barrier = events.iter().position(|(point, path)|
-                *point == SyncPoint::Wal && path.file_name().is_some_and(|name| name == "db"))
+            let artifact_barrier = events
+                .iter()
+                .position(|(point, path)| {
+                    *point == SyncPoint::Wal && path.file_name().is_some_and(|name| name == "db")
+                })
                 .expect("artifact metadata WAL barrier");
             let artifacts = &events[..artifact_barrier];
-            assert_eq!(artifacts.iter().filter(|(point, _)| *point == SyncPoint::File).count(), 2,
-                "body and proof must share one artifact durability barrier");
+            assert_eq!(
+                artifacts.iter().filter(|(point, _)| *point == SyncPoint::File).count(),
+                2,
+                "body and proof must share one artifact durability barrier"
+            );
             let mut directories = std::collections::HashSet::new();
             for (_, path) in artifacts.iter().filter(|(point, _)| *point == SyncPoint::Directory) {
                 assert!(directories.insert(path.clone()), "shared artifact directory synced twice");

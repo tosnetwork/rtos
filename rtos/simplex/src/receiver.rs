@@ -55,11 +55,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::{
-    block::SlotIndex,
-    utils::ACTIVITY_THRESHOLD,
-    ActivityNodePtr, BlockPayloadPtr, ConsensusOverlayListener, ConsensusOverlayLogReplayListener,
-    ConsensusOverlayManagerPtr, MetricsHandle, PrivateKey, PublicKeyHash, RawVoteData, SessionId,
-    SessionOptions, ValidatorWeight,
+    block::SlotIndex, utils::ACTIVITY_THRESHOLD, ActivityNodePtr, BlockPayloadPtr,
+    ConsensusOverlayListener, ConsensusOverlayLogReplayListener, ConsensusOverlayManagerPtr,
+    MetricsHandle, PrivateKey, PublicKeyHash, RawVoteData, SessionId, SessionOptions,
+    ValidatorWeight,
 };
 use consensus_common::{
     check_execution_time, instrument,
@@ -378,7 +377,12 @@ pub(crate) trait ReceiverListener: Send + Sync {
     }
 
     /// Preserve transport provenance across the receiver/processor queues.
-    fn on_transport_certificate(&self, peer: PublicKeyHash, source_idx: Option<u32>, certificate: Certificate) {
+    fn on_transport_certificate(
+        &self,
+        peer: PublicKeyHash,
+        source_idx: Option<u32>,
+        certificate: Certificate,
+    ) {
         let _ = peer;
         self.on_member_certificate(source_idx, certificate);
     }
@@ -975,15 +979,20 @@ impl ReceiverImpl {
                 // C++ Pool bans a transport member that sends votes without a
                 // validator role. Certificate forwarding remains permitted.
                 if !self.bad_signature_ban_state.admit_vote(
-                    adnl_id.clone(), source_idx.is_some(), SystemTime::now(),
+                    adnl_id.clone(),
+                    source_idx.is_some(),
+                    SystemTime::now(),
                 ) {
                     log::warn!(
                         "SimplexReceiver {}: dropping vote from non-validator transport {}",
-                        self.session_id.to_hex_string(), key_to_base64(&adnl_id)
+                        self.session_id.to_hex_string(),
+                        key_to_base64(&adnl_id)
                     );
                     return;
                 }
-                let Some(source_idx) = source_idx else { return; };
+                let Some(source_idx) = source_idx else {
+                    return;
+                };
                 // Avoid logging full TL vote (includes signature bytes) on the hot path.
                 let (kind, slot, hash_prefix) = match vote.vote() {
                     UnsignedVote::Consensus_Simplex_NotarizeVote(v) => {
@@ -1803,7 +1812,12 @@ impl ReceiverImpl {
     /// * `peer` - Authenticated ADNL transport sender, including observers
     /// * `source_idx` - Optional validator index of the sender
     /// * `certificate` - Deserialized TL certificate object
-    fn process_incoming_certificate(&mut self, peer: PublicKeyHash, source_idx: Option<u32>, certificate: Certificate) {
+    fn process_incoming_certificate(
+        &mut self,
+        peer: PublicKeyHash,
+        source_idx: Option<u32>,
+        certificate: Certificate,
+    ) {
         instrument!();
 
         // C++ parity (`pool.cpp` `is_banned()` precheck): skip processing of
@@ -2224,16 +2238,18 @@ impl ReceiverImpl {
         self.bad_signature_ban_state.record(peer.clone(), SystemTime::now());
         log::warn!(
             "SimplexReceiver {}: temporarily banning transport {} for {:?}",
-            self.session_id.to_hex_string(), key_to_base64(&peer),
+            self.session_id.to_hex_string(),
+            key_to_base64(&peer),
             self.bad_signature_ban_state.ban_duration()
         );
     }
 
     fn is_source_temporarily_banned(&mut self, source_idx: u32) -> bool {
-        self.sources.get(source_idx as usize).map(|stats| stats.adnl_id.clone())
+        self.sources
+            .get(source_idx as usize)
+            .map(|stats| stats.adnl_id.clone())
             .is_some_and(|peer| self.bad_signature_ban_state.is_banned(&peer, SystemTime::now()))
     }
-
 }
 
 // ======================================================================
@@ -3169,10 +3185,8 @@ impl ReceiverImpl {
         // its result still crosses the normal identity/signature checks below.
         if let Some(listener) = self.listener.upgrade() {
             let token = Arc::new(());
-            self.pending_requests
-                .get_mut(&(slot, block_hash.clone()))
-                .unwrap()
-                .local_lookup = Some(token.clone());
+            self.pending_requests.get_mut(&(slot, block_hash.clone())).unwrap().local_lookup =
+                Some(token.clone());
             let queues = self.get_task_queues();
             let reply_hash = block_hash.clone();
             let reply_token = token.clone();
@@ -3195,17 +3209,14 @@ impl ReceiverImpl {
             // A lost listener completion must not strand peer repair. The DB
             // fallback has bounded reads; this deadline only retires the lookup
             // token, never a DB/session owner. Late/cancelled replies are ignored.
-            self.post_delayed_action(
-                SystemTime::now() + Duration::from_secs(5),
-                move |receiver| {
-                    receiver.finish_local_candidate_lookup(
-                        slot,
-                        block_hash,
-                        token,
-                        Err(error!("Local candidate lookup completion deadline")),
-                    );
-                },
-            );
+            self.post_delayed_action(SystemTime::now() + Duration::from_secs(5), move |receiver| {
+                receiver.finish_local_candidate_lookup(
+                    slot,
+                    block_hash,
+                    token,
+                    Err(error!("Local candidate lookup completion deadline")),
+                );
+            });
         } else {
             self.start_peer_candidate_request(slot, block_hash);
         }
@@ -3222,11 +3233,7 @@ impl ReceiverImpl {
         let Some(state) = self.pending_requests.get_mut(&key) else {
             return;
         };
-        if !state
-            .local_lookup
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &token))
-        {
+        if !state.local_lookup.as_ref().is_some_and(|current| Arc::ptr_eq(current, &token)) {
             return;
         }
         state.local_lookup = None;
@@ -3234,8 +3241,7 @@ impl ReceiverImpl {
             if payload.data().len() as u64 > self.max_candidate_query_answer_size {
                 fail!("Local candidate response exceeds query budget");
             }
-            self.wire_profile
-                .deserialize_typed::<CandidateAndCertBoxed>(payload.data())
+            self.wire_profile.deserialize_typed::<CandidateAndCertBoxed>(payload.data())
         });
         match response {
             Ok(response) => {
@@ -3294,13 +3300,19 @@ impl ReceiverImpl {
         // persisted or promoted and do not ban whichever peer is selected next.
         #[cfg(any(test, feature = "isolated-consensus-signing"))]
         let local_body_witness = if crate::cold_bootstrap_test_control::enabled() {
-            self.resolver_cache.get_candidate(slot, &block_hash)
+            self.resolver_cache
+                .get_candidate(slot, &block_hash)
                 .map(|bytes| (bytes.len(), UInt256::calc_file_hash(bytes)))
-        } else { None };
+        } else {
+            None
+        };
         if self.deliver_cached_candidate(slot, &block_hash) {
             #[cfg(any(test, feature = "isolated-consensus-signing"))]
             if let Err(error) = crate::cold_bootstrap_test_control::record_delivery(
-                &self.session_id, slot, &block_hash, local_body_witness,
+                &self.session_id,
+                slot,
+                &block_hash,
+                local_body_witness,
             ) {
                 log::warn!("TEST_COLD_BOOTSTRAP delivery witness failed: {error}");
             }
@@ -4040,7 +4052,9 @@ impl ReceiverImpl {
                                         notar_for_candidate,
                                     );
                                 }
-                            } else if notar_part_new && (!complete_pair || !cached_candidate_missing) {
+                            } else if notar_part_new
+                                && (!complete_pair || !cached_candidate_missing)
+                            {
                                 if let Some(listener) = self.listener.upgrade() {
                                     listener.on_candidate_notar_received(
                                         source_idx,
@@ -4096,9 +4110,14 @@ impl ReceiverImpl {
                             // Restored serving-cache bodies have not reached the requester.
                             // Bodies learned by this pending request were forwarded above or
                             // in a previous partial response; keep their callback dedup.
-                            if cached_candidate_missing && !self.deliver_cached_candidate(slot, &block_hash) {
+                            if cached_candidate_missing
+                                && !self.deliver_cached_candidate(slot, &block_hash)
+                            {
                                 self.retry_candidate_request(
-                                    slot, block_hash, false, "cached_resolution_not_delivered",
+                                    slot,
+                                    block_hash,
+                                    false,
+                                    "cached_resolution_not_delivered",
                                 );
                                 return;
                             }

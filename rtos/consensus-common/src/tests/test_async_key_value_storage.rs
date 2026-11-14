@@ -1557,23 +1557,41 @@ fn test_queued_writes_share_durable_commit_and_survive_abrupt_exit() {
     const COUNT: usize = 8;
     if let Some(path) = std::env::var_os("RTOS_GROUP_COMMIT_PROBE_DB") {
         let storage = ConsensusCommonFactory::create_async_key_value_storage(
-            PathBuf::from(path), "group-commit", create_test_options_no_callback_thread(),
-        ).unwrap();
+            PathBuf::from(path),
+            "group-commit",
+            create_test_options_no_callback_thread(),
+        )
+        .unwrap();
         let timeout = Duration::from_secs(10);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        storage.set(b"gate".to_vec(), b"durable".to_vec(), Some(Box::new(move |result| {
-            result.unwrap();
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(timeout).unwrap();
-        }))).wait_timeout(timeout).unwrap().unwrap();
+        storage
+            .set(
+                b"gate".to_vec(),
+                b"durable".to_vec(),
+                Some(Box::new(move |result| {
+                    result.unwrap();
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(timeout).unwrap();
+                })),
+            )
+            .wait_timeout(timeout)
+            .unwrap()
+            .unwrap();
         entered_rx.recv_timeout(timeout).unwrap();
         let (callback_tx, callback_rx) = std::sync::mpsc::channel();
-        let pending: Vec<_> = (0..COUNT).map(|i| {
-            let tx = callback_tx.clone();
-            storage.set(format!("queued-{i}").into_bytes(), vec![i as u8; 1024],
-                Some(Box::new(move |result| { tx.send(result.is_ok()).unwrap(); })))
-        }).collect();
+        let pending: Vec<_> = (0..COUNT)
+            .map(|i| {
+                let tx = callback_tx.clone();
+                storage.set(
+                    format!("queued-{i}").into_bytes(),
+                    vec![i as u8; 1024],
+                    Some(Box::new(move |result| {
+                        tx.send(result.is_ok()).unwrap();
+                    })),
+                )
+            })
+            .collect();
         let fault = std::env::var("RTOS_GROUP_COMMIT_FAULT").as_deref() == Ok("eio");
         if fault {
             std::fs::write(std::env::var_os("RTOS_WAL_FAIL_ARM").unwrap(), b"armed").unwrap();
@@ -1583,37 +1601,56 @@ fn test_queued_writes_share_durable_commit_and_survive_abrupt_exit() {
         for result in pending {
             assert_eq!(result.wait_timeout(timeout).unwrap().is_ok(), !fault);
         }
-        for _ in 0..COUNT { assert_eq!(callback_rx.recv_timeout(timeout).unwrap(), !fault); }
-        std::io::stderr().write_all(if fault {
-            b"GROUP_COMMIT_REJECTED\n"
-        } else {
-            b"GROUP_COMMIT_ACKNOWLEDGED\n"
-        }).unwrap();
-        unsafe extern "C" { fn _exit(status: std::ffi::c_int) -> !; }
+        for _ in 0..COUNT {
+            assert_eq!(callback_rx.recv_timeout(timeout).unwrap(), !fault);
+        }
+        std::io::stderr()
+            .write_all(if fault {
+                b"GROUP_COMMIT_REJECTED\n"
+            } else {
+                b"GROUP_COMMIT_ACKNOWLEDGED\n"
+            })
+            .unwrap();
+        unsafe extern "C" {
+            fn _exit(status: std::ffi::c_int) -> !;
+        }
         unsafe { _exit(77) }
     }
     let path = std::fs::canonicalize(create_test_db_path("queued_group_commit")).unwrap();
     let trace = path.with_extension("strace");
     let output = Command::new("strace")
         .args(["-f", "-yy", "-e", "trace=write,writev,pwrite64,fdatasync,fsync", "-o"])
-        .arg(&trace).arg(std::env::current_exe().unwrap())
+        .arg(&trace)
+        .arg(std::env::current_exe().unwrap())
         .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-        .env("RTOS_GROUP_COMMIT_PROBE_DB", &path).output().unwrap();
+        .env("RTOS_GROUP_COMMIT_PROBE_DB", &path)
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(77), "{}", String::from_utf8_lossy(&output.stderr));
     let raw = std::fs::read_to_string(&trace).unwrap();
     let begin = raw.find("GROUP_COMMIT_BEGIN").unwrap();
     let end = raw.find("GROUP_COMMIT_ACKNOWLEDGED").unwrap();
     assert!(begin < end);
-    let syncs = raw[begin..end].lines().filter(|line| {
-        (line.contains("fdatasync(") || line.contains("fsync("))
-            && line.contains(path.to_str().unwrap()) && line.contains(".log>")
-    }).count();
+    let syncs = raw[begin..end]
+        .lines()
+        .filter(|line| {
+            (line.contains("fdatasync(") || line.contains("fsync("))
+                && line.contains(path.to_str().unwrap())
+                && line.contains(".log>")
+        })
+        .count();
     let storage = ConsensusCommonFactory::create_async_key_value_storage(
-        &path, "group-commit", create_test_options_no_callback_thread(),
-    ).unwrap();
+        &path,
+        "group-commit",
+        create_test_options_no_callback_thread(),
+    )
+    .unwrap();
     for i in 0..COUNT {
-        assert_eq!(storage.get(format!("queued-{i}").into_bytes(), None).wait().unwrap(),
-            Some(vec![i as u8; 1024]), "acknowledged data lost at abrupt exit");
+        assert_eq!(
+            storage.get(format!("queued-{i}").into_bytes(), None).wait().unwrap(),
+            Some(vec![i as u8; 1024]),
+            "acknowledged data lost at abrupt exit"
+        );
     }
     storage.close(Some(Duration::from_secs(10))).unwrap();
     storage.mark_for_destroy();
@@ -1625,16 +1662,27 @@ fn test_queued_writes_share_durable_commit_and_survive_abrupt_exit() {
 fn test_queued_mutations_preserve_read_barriers_and_tombstone_order() {
     let path = create_test_db_path("queued_read_barriers");
     let storage = ConsensusCommonFactory::create_async_key_value_storage(
-        &path, "barriers", create_test_options_no_callback_thread(),
-    ).unwrap();
+        &path,
+        "barriers",
+        create_test_options_no_callback_thread(),
+    )
+    .unwrap();
     let timeout = Duration::from_secs(10);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    storage.set(b"gate".to_vec(), vec![], Some(Box::new(move |result| {
-        result.unwrap();
-        entered_tx.send(()).unwrap();
-        release_rx.recv_timeout(timeout).unwrap();
-    }))).wait_timeout(timeout).unwrap().unwrap();
+    storage
+        .set(
+            b"gate".to_vec(),
+            vec![],
+            Some(Box::new(move |result| {
+                result.unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(timeout).unwrap();
+            })),
+        )
+        .wait_timeout(timeout)
+        .unwrap()
+        .unwrap();
     entered_rx.recv_timeout(timeout).unwrap();
     let first = storage.set(b"key".to_vec(), b"first".to_vec(), None);
     let before = storage.get(b"key".to_vec(), None);
@@ -1650,8 +1698,11 @@ fn test_queued_mutations_preserve_read_barriers_and_tombstone_order() {
     storage.close(Some(timeout)).unwrap();
     drop(storage);
     let reopened = ConsensusCommonFactory::create_async_key_value_storage(
-        &path, "barriers", create_test_options_no_callback_thread(),
-    ).unwrap();
+        &path,
+        "barriers",
+        create_test_options_no_callback_thread(),
+    )
+    .unwrap();
     assert_eq!(reopened.get(b"key".to_vec(), None).wait_timeout(timeout).unwrap().unwrap(), None);
     reopened.close(Some(timeout)).unwrap();
     reopened.mark_for_destroy();

@@ -127,7 +127,10 @@ struct Store {
     fail_manifest: bool,
 }
 
-fn charge_digest_work(length: usize, budget: &crate::history_read_budget::HistoryReadBudget) -> Result<()> {
+fn charge_digest_work(
+    length: usize,
+    budget: &crate::history_read_budget::HistoryReadBudget,
+) -> Result<()> {
     // SHA-256 input blocks plus padding; work is cumulative even on rejection.
     for _ in 0..length / 64 + 2 {
         budget.step()?;
@@ -238,14 +241,18 @@ impl Store {
         self.usage_budget(Some(budget))?;
         let path = self.root.join(format!("{}.json", anchor_name(domain, id)));
         let (manifest_bytes, manifest_file) = self.budget_file_open(
-            &path, 2 << 20, crate::history_read_budget::ReadKind::Metadata, budget,
+            &path,
+            2 << 20,
+            crate::history_read_budget::ReadKind::Metadata,
+            budget,
         )?;
         if bounded_digest(&manifest_bytes, Some(budget))? != receipt.manifest_hash {
             fail!("Authenticated capsule manifest changed before durability barrier");
         }
         let mut total = 0usize;
         for (index, hash) in std::iter::once(&receipt.manifest.state)
-            .chain(receipt.manifest.proofs.iter().map(|proof| &proof.blob)).enumerate()
+            .chain(receipt.manifest.proofs.iter().map(|proof| &proof.blob))
+            .enumerate()
         {
             let (bound, kind) = if index == 0 {
                 (self.limits.state_bytes, crate::history_read_budget::ReadKind::State)
@@ -253,9 +260,13 @@ impl Store {
                 (self.limits.proof_bytes, crate::history_read_budget::ReadKind::Proof)
             };
             let (bytes, file) = self.budget_file_open(
-                &self.root.join(format!("{hash}.blob")), bound, kind, budget,
+                &self.root.join(format!("{hash}.blob")),
+                bound,
+                kind,
+                budget,
             )?;
-            total = total.checked_add(bytes.len()).ok_or_else(|| error!("Capsule size overflow"))?;
+            total =
+                total.checked_add(bytes.len()).ok_or_else(|| error!("Capsule size overflow"))?;
             if total as u64 > self.limits.total_bytes {
                 fail!("Retained history evidence exceeds memory bound");
             }
@@ -843,10 +854,13 @@ pub(crate) async fn authenticate_capsule_for_request<E: EngineOperations + ?Size
     if verified.state().state()?.global_id() != evidence.manifest.global_id {
         fail!("History global ID mismatch");
     }
-    Ok(Some((verified, CapsuleDurabilityReceipt {
-        manifest_hash: evidence.manifest_hash,
-        manifest: evidence.manifest,
-    })))
+    Ok(Some((
+        verified,
+        CapsuleDurabilityReceipt {
+            manifest_hash: evidence.manifest_hash,
+            manifest: evidence.manifest,
+        },
+    )))
 }
 
 /// Raw evidence only: callers must verify through BootstrapAuthority.
@@ -1423,7 +1437,10 @@ pub(crate) fn sync_recovered_capsule(
 ) -> Result<()> {
     let store = Store::open(root(engine)?, Limits::default())?;
     store.sync_authenticated_capsule(
-        &Domain::from_engine(engine)?, state.state().block_id(), receipt, budget,
+        &Domain::from_engine(engine)?,
+        state.state().block_id(),
+        receipt,
+        budget,
     )
 }
 
