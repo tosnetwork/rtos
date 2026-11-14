@@ -492,6 +492,7 @@ impl McBlockExtra {
     /// Structural key-block extraction, including the exact auxiliary-cell
     /// shape checked by C++ McBlockExtra::unpack. No chain authentication.
     pub fn config_from_key_block_cell(cell: Cell) -> Result<ConfigParams> {
+        crate::proof::require_proof_cell(&cell)?;
         let mut slice = SliceData::load_cell(cell)?;
         let mut extra = Self::default();
         extra.read_from_profile(&mut slice, true)?;
@@ -513,7 +514,11 @@ impl McBlockExtra {
         self.shards.read_from(cell)?;
         self.fees.read_from(cell)?;
 
-        let cell1 = &mut SliceData::load_cell(cell.checked_drain_reference()?)?;
+        let auxiliary = cell.checked_drain_reference()?;
+        if exact_aux {
+            crate::proof::require_proof_cell(&auxiliary)?;
+        }
+        let cell1 = &mut SliceData::load_cell(auxiliary)?;
         self.prev_blk_signatures.read_from(cell1)?;
         self.recover_create_msg.read_from(cell1)?;
         self.mint_msg.read_from(cell1)?;

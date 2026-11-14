@@ -115,10 +115,8 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
     let proof = read_proof(ctx, "block_proof")?;
     let (key_block, _) = header(&key_proof, &from)?;
     let (_, info) = header(&proof, &to)?;
-    let extra = rtos_block::BlockExtra::construct_from_full_cell(key_block.extra_cell())
-        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
-    let custom = extra.custom_cell().ok_or_else(|| domain_error("config_unavailable"))?;
-    let config = rtos_block::McBlockExtra::config_from_key_block_cell(custom)
+    let config = key_block
+        .read_key_block_config()
         .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
     let (catchain, consensus) = config
         .legacy_proof_consensus_parameters()

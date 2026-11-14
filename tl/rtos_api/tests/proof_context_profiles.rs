@@ -11,6 +11,9 @@ fn context(name: &str) -> serde_json::Value {
         .chain(
             include_str!("data/conformance/consensus/fixtures/pruned-config-paths.jsonl").lines(),
         )
+        .chain(
+            include_str!("data/conformance/consensus/fixtures/pruned-config-outer.jsonl").lines(),
+        )
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|row| row["metadata"]["fixture_id"] == name)
         .unwrap()["context"]
@@ -96,6 +99,19 @@ fn metadata_and_dictionary_paths_preserve_unavailable_proof_cells() {
     let cfg = config(&block(&ctx, "key_block_proof").0);
     let error = cfg.proof_config_param_cell(19).unwrap_err();
     assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+}
+
+#[test]
+fn outer_key_configuration_cells_preserve_unavailable_proofs() {
+    for name in ["pruned-7", "pruned-16", "pruned-19"] {
+        let ctx = context(name);
+        let governing = block(&ctx, "key_block_proof").0;
+        let error = governing.read_key_block_config().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<BlockError>(),
+            Some(BlockError::PrunedCellAccess(_))
+        ));
+    }
 }
 
 /// Input-only exporter; all effects must be filled with clean pinned C++.

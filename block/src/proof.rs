@@ -5,6 +5,25 @@ use crate::{
     Result, Serializable, SliceData, UInt256,
 };
 
+pub(crate) fn require_proof_cell(cell: &Cell) -> Result<()> {
+    if cell.cell_type() == crate::CellType::PrunedBranch {
+        fail!(crate::BlockError::PrunedCellAccess("proof cell is pruned".into()));
+    }
+    Ok(())
+}
+
+impl Block {
+    /// Extract structural key-block configuration without interpreting pruned
+    /// extra cells as malformed ordinary headers. No governing authority.
+    pub fn read_key_block_config(&self) -> Result<crate::ConfigParams> {
+        let cell = self.extra_cell();
+        require_proof_cell(&cell)?;
+        let extra = crate::BlockExtra::construct_from_full_cell(cell)?;
+        let custom = extra.custom_cell().ok_or_else(|| crate::error!("key block extra missing"))?;
+        crate::McBlockExtra::config_from_key_block_cell(custom)
+    }
+}
+
 impl crate::ConfigParams {
     /// Fetch a parameter from a proof, preserving unavailable dictionary paths
     /// and values as pruned-cell errors rather than interpreting special bytes.
@@ -14,8 +33,8 @@ impl crate::ConfigParams {
             .get(index.write_to_bitstring()?)?
             .map(|value| value.reference(0))
             .transpose()?;
-        if cell.as_ref().is_some_and(|cell| cell.cell_type() == crate::CellType::PrunedBranch) {
-            fail!(crate::BlockError::PrunedCellAccess("proof config is pruned".into()));
+        if let Some(cell) = &cell {
+            require_proof_cell(cell)?;
         }
         Ok(cell)
     }
