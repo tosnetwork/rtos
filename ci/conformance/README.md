@@ -128,12 +128,18 @@ not arbitrary-input, network or production runtime qualification.
 The provisional `adnl --example net_conformance` target connects native wire-key,
 signing, verification, deterministic encryption/decryption, shared-secret,
 ADNL-ID text, RaptorQ/Online/RoundRobin codecs and peer FEC-type operations.
-At the 2026-11-14 ADNL packet/admission checkpoint,1107 of1245 original network contexts
-agree and138 remain explicitly unsupported. Added101 clean-C++ controls give
-1208equal/138unsupported/0diff across1346 contexts. The Rust runner exits1 for that
+At the 2026-11-14 ADNL channel checkpoint,1123 of1245 original network contexts
+agree and122 remain explicitly unsupported. Added101 clean-C++ controls give
+1224equal/122unsupported/0diff across1346 contexts. The Rust runner exits1 for that
 partial support; unsupported operations are not passing cases. A separate
 262-coordinate probe and78wire/identity probes retain their earlier key-checkpoint
 scope, independently from the shared corpus.
+The explicit native channel API derives directional secrets and AES-key IDs, routes
+before decrypting and validates the peer identity after packet construction. Channel
+authentication does not require a packet signature. All16 original channel contexts
+and640 additional C++ comparisons agree; four native channel tests cover equal-ID
+roles, routing, digest/TL/source refusals and signature handling. This API is not yet
+installed into the asynchronous node peer/channel lifecycle.
 Network key agreement maps the unsigned Edwards-Y wire coordinate modulo the
 field before the existing X25519 multiplication. It need not be a decompressed
 Edwards verification point; zero shared results and the noninvertible coordinate

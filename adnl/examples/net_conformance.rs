@@ -6,6 +6,8 @@ use adnl::wire_keys::{
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
+#[path = "net/channel.rs"]
+mod channel;
 #[path = "net/fec.rs"]
 mod fec;
 #[path = "net/packet.rs"]
@@ -34,6 +36,9 @@ fn run(v: &Value) -> Result<Value> {
     }
     if matches!(op, "preauth_source" | "preauth_gate") {
         return preauth::run(v);
+    }
+    if op == "adnl_channel" {
+        return channel::run(v);
     }
     if matches!(op, "fec_type" | "fec_encode" | "fec_decode") {
         return fec::run(v);

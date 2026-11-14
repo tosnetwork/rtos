@@ -88,14 +88,7 @@ impl NetworkPublicKey {
     pub fn encrypt_deterministic(&self, data: &[u8]) -> Result<Vec<u8>> {
         match &self.0 {
             ton::PublicKey::Pub_Aes(key) => {
-                let digest = sha256_digest(data);
-                let mut body = data.to_vec();
-                AdnlCryptoUtils::build_cipher_secure(key.key.as_slice().try_into()?, &digest)
-                    .apply_keystream(&mut body);
-                let mut result = Vec::with_capacity(32 + body.len());
-                result.extend_from_slice(&digest);
-                result.extend_from_slice(&body);
-                Ok(result)
+                Ok(encrypt_symmetric(key.key.as_slice().try_into()?, data))
             }
             ton::PublicKey::Pub_Unenc(_) => Ok(data.to_vec()),
             ton::PublicKey::Pub_Overlay(_) => Err(refused("encryption_unsupported")),
@@ -197,7 +190,15 @@ fn peer_error(error: anyhow::Error) -> anyhow::Error {
         error
     }
 }
-fn decrypt_symmetric(secret: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn encrypt_symmetric(secret: &[u8; 32], data: &[u8]) -> Vec<u8> {
+    let digest = sha256_digest(data);
+    let mut result = Vec::with_capacity(32 + data.len());
+    result.extend_from_slice(&digest);
+    result.extend_from_slice(data);
+    AdnlCryptoUtils::build_cipher_secure(secret, &digest).apply_keystream(&mut result[32..]);
+    result
+}
+pub(super) fn decrypt_symmetric(secret: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
     if ciphertext.len() < 32 {
         return Err(refused("ciphertext_short"));
     }

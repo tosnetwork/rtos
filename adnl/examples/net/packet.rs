@@ -41,7 +41,7 @@ fn message(m: &NetworkMessage) -> Value {
     fields["size"] = json!(m.serialized_size());
     fields
 }
-fn packet(p: &Packet) -> Result<Value> {
+pub(super) fn packet(p: &Packet) -> Result<Value> {
     let signature_check = if p.source().is_some() {
         match p.verify_signature() {
             Ok(()) => json!("valid"),
@@ -53,6 +53,9 @@ fn packet(p: &Packet) -> Result<Value> {
     } else {
         Value::Null
     };
+    packet_fields(p, signature_check)
+}
+pub(super) fn packet_fields(p: &Packet, signature_check: Value) -> Result<Value> {
     let from = p.source().map(|k| k.to_wire().map(hex::encode)).transpose()?;
     Ok(
         json!({"flags":p.flags(),"priority":p.priority(),"from":from,"from_short":p.source_short().map(hex::encode),

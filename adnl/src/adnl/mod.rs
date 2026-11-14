@@ -25,3 +25,5 @@ pub mod wire_keys;
 pub(crate) mod tasks;
 
 pub mod packet;
+
+pub mod channel;
