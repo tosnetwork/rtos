@@ -35,6 +35,10 @@ if ! cargo build --release $NODE_BUILD_FLAGS
 then
     exit 1
 fi
+if ! cargo build --release $NODE_BUILD_FLAGS -p rtos --example test_net_prepare
+then
+    exit 1
+fi
 cp $NODE_TARGET/rtos $NODE_TARGET/node_singlehost
 
 cd $TEST_ROOT
@@ -43,10 +47,7 @@ NOWDATE=$(date +"%s")
 NOWIP="127.0.0.1"
 echo "  IP = $NOWIP"
 
-declare -a VALIDATOR_PUB_KEY_HEX=();
-declare -a VALIDATOR_PUB_KEY_BASE64=();
-
-# Fake config just to start nodes
+# Placeholder config for offline config generation; no node starts against it.
 cat $TEST_ROOT/ton-global.config_1.json > $NODE_TARGET/ton-global.config.json
 cat $TEST_ROOT/ton-global.config_2.json >> $NODE_TARGET/ton-global.config.json
 
@@ -83,6 +84,8 @@ do
     sed "s/0.0.0.0/$NOWIP/g" default_config$N.json > default_config.json
     PORT=$(( 3000 + $N ))
     sed "s/main_port/$PORT/g" default_config.json > default_config$N.json
+    QUIC_PORT=$(( 5000 + $N ))
+    sed -i "s/quic_port/$QUIC_PORT/g" default_config$N.json
     PORT=$(( 4920 + $N ))
     sed "s/control_port/$PORT/g" default_config$N.json > default_config.json
     PORT=$(( 4000 + $N ))
@@ -113,10 +116,6 @@ do
         echo "ERROR: node config generation failed"
         exit 1
     fi
-    ./node_singlehost --configs . > tmp_output 2>&1 &
-    PREPARATION_PID=$!
-    echo "  waiting for 5 secs"
-    sleep 5
     if [ ! -f "console_config.json" ]; then
         echo "ERROR: console_config.json does not exist"
         exit 1
@@ -131,22 +130,14 @@ do
     rm -f tmp_output_console > /dev/null 2>&1
     
     # 0 is full node
-    if [ $N -ne 0 ]; then
-        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c new-key | grep '^created new key ' | awk '{print $4}')
-        ./console -C $TEST_ROOT/tmp/console$N.json -c "add-perm-key ${CONSOLE_OUTPUT} ${NOWDATE} 1610000000" > tmp_output_console
-        CONSOLE_OUTPUT=$(./console -C $TEST_ROOT/tmp/console$N.json -c "export-pub ${CONSOLE_OUTPUT}")
-        # The answer is the serialized key: a 4-byte type, then the 32-byte key.
-        VALIDATOR_PUB_KEY_HEX[$N]=$(echo "${CONSOLE_OUTPUT}" | grep '^got public key: ' | awk '{print $4}' | base64 -d | tail -c 32 | xxd -p -c 32)
-    fi
-
     cp $NODE_TARGET/config.json $TEST_ROOT/tmp/config$N.json
-
-    # Reap this preparatory node before removing its database. It was started
-    # with the fake genesis above; its network binding must not be reused by
-    # the real network. The generated keys are retained in tmp/config$N.json.
-    kill -9 "$PREPARATION_PID" 2>/dev/null || true
-    wait "$PREPARATION_PID" 2>/dev/null || true
-    rm -rf -- "$NODE_TARGET/node_db_$N"
+    if [ $N -ne 0 ]; then
+        # Prepare public test consensus keys offline; never open a database
+        # against the placeholder genesis used only for config generation.
+        ./examples/test_net_prepare --config "$TEST_ROOT/tmp/config$N.json" \
+            --member "$N" --custody "$TEST_ROOT/tmp/custody$N" \
+            --descriptor "$TEST_ROOT/tmp/validator$N.json"
+    fi
 
 done
 
@@ -159,16 +150,15 @@ else
     sed "s/nowdate/$NOWDATE/g" $TEST_ROOT/zero_state_blanc_1.json > $TEST_ROOT/tmp/zero_state_tmp.json
 fi
 
-WEIGHT=10
-TOTAL_WEIGHT=$(( $NODES * 2 ))
-sed "s/p34_total_weight/$NODES/g" $TEST_ROOT/tmp/zero_state_tmp.json > $TEST_ROOT/tmp/zero_state_tmp_2.json
+TOTAL_WEIGHT=$(( NODES * 10 ))
+sed "s/p34_total_weight/$TOTAL_WEIGHT/g" $TEST_ROOT/tmp/zero_state_tmp.json > $TEST_ROOT/tmp/zero_state_tmp_2.json
 sed "s/p34_total/$NODES/g" $TEST_ROOT/tmp/zero_state_tmp_2.json > $TEST_ROOT/tmp/zero_state.json
 
 for (( N=1; N <= $NODES; N++ ))
 do
     echo "  Validator #$N contract processing..."
 
-    printf "{ \"public_key\": \"${VALIDATOR_PUB_KEY_HEX[$N]}\", \"weight\": \"$WEIGHT\"}" >> $TEST_ROOT/tmp/zero_state.json
+    cat "$TEST_ROOT/tmp/validator$N.json" >> "$TEST_ROOT/tmp/zero_state.json"
     if [ ! $N -eq $NODES ]
     then
         printf ",\n" >> $TEST_ROOT/tmp/zero_state.json
