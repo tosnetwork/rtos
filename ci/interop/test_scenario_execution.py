@@ -42,9 +42,7 @@ class ExecutionTest(unittest.TestCase):
     def test_unknown_adapter_refused_before_any_launch(self):
         with patch("scenario_execution.subprocess.run") as run:
             with self.assertRaisesRegex(ValueError, "not integrated"):
-                execute(
-                    SimpleNamespace(), ["rotation-control", "publication-io"], None
-                )
+                execute(SimpleNamespace(), ["rotation-control", "publication-io"], None)
             run.assert_not_called()
 
     def test_profile_does_not_inherit_old_faults_or_genesis(self):
