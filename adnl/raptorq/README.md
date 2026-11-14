@@ -202,12 +202,16 @@ to enable the Python binding features.
 
 ## License
 
-Licensed under
+The original RaptorQ implementation is licensed under
 
  * Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0)
+
+The arrival-ordered decoder in `src/ordered_decoder.rs` ports the TON/TOS
+inactivation and Gaussian pivot strategy and is licensed under LGPL-2.0-or-later
+([LICENSE.LGPL](LICENSE.LGPL)). Its copyright and SPDX notice are in that file.
 
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you shall be licensed as above, without any
+for inclusion in the work by you shall use the license of the modified component, without any
 additional terms or conditions.
