@@ -29,6 +29,12 @@ fn key(seed: u8) -> Arc<dyn KeyOption> {
     Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[seed; 32]).unwrap()
 }
 async fn node(seed: u8) -> (Arc<AdnlNode>, Arc<OverlayNode>, Arc<dyn KeyOption>) {
+    node_with_clock(seed, Arc::new(SystemBroadcastClock)).await
+}
+async fn node_with_clock(
+    seed: u8,
+    clock: Arc<dyn BroadcastClock>,
+) -> (Arc<AdnlNode>, Arc<OverlayNode>, Arc<dyn KeyOption>) {
     let (_, config) =
         AdnlNodeConfig::from_ip_address_and_private_keys("127.0.0.1:0", vec![([seed; 32], 0)])
             .unwrap();
@@ -39,9 +45,14 @@ async fn node(seed: u8) -> (Arc<AdnlNode>, Arc<OverlayNode>, Arc<dyn KeyOption>)
     )
     .await
     .unwrap();
-    let overlay =
-        OverlayNode::with_params_and_profile(adnl.clone(), &[0; 32], 0, rtos_api::WireProfile::T0)
-            .unwrap();
+    let overlay = OverlayNode::with_params_profile_and_clock(
+        adnl.clone(),
+        &[0; 32],
+        0,
+        rtos_api::WireProfile::T0,
+        clock,
+    )
+    .unwrap();
     (adnl, overlay, key(seed))
 }
 
@@ -595,4 +606,93 @@ async fn plumtree_owned_edge_publishes_native_carriers_and_cancels_pending_repai
     a.delete_private_overlay_checked(&ga).await.unwrap();
     adnl_a.stop_checked().await.unwrap();
     adnl_b.stop_checked().await.unwrap();
+}
+
+struct SignBoundaryClock(f64);
+impl BroadcastClock for SignBoundaryClock {
+    fn unix_seconds(&self) -> f64 {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn tos_broadcast_dates_cross_signed_boundary_without_overflow_or_false_age() {
+    let boundary = f64::from(i32::MAX);
+    for (source_offset, receiver_offset, accepted) in [
+        (-1.0, -1.0, true),
+        (1.0, -1.0, true),
+        (-1.0, 1.0, true),
+        (19.0, -1.0, true),
+        (20.0, -1.0, false),
+    ] {
+        let (adnl_a, a, source) =
+            node_with_clock(238, Arc::new(SignBoundaryClock(boundary + source_offset))).await;
+        let (adnl_b, b, receiver) =
+            node_with_clock(239, Arc::new(SignBoundaryClock(boundary + receiver_offset))).await;
+        let id = OverlayShortId::from_data([240; 32]);
+        let edge_a = Arc::new(Edge::default());
+        let edge_b = Arc::new(Edge::default());
+        a.install_broadcast_transport(edge_a.clone()).unwrap();
+        b.install_broadcast_transport(edge_b).unwrap();
+        for (node, local, remote) in [(&a, &source, &receiver), (&b, &receiver, &source)] {
+            node.add_fixed_member_overlay(
+                OverlayParams::with_id_only(&id),
+                local,
+                &[remote.id().clone()],
+                OverlayPrivacyRules::new(4096, 3, BTreeMap::new()),
+            )
+            .unwrap();
+        }
+        let ga = a.overlay_generation(&id).unwrap();
+        let gb = b.overlay_generation(&id).unwrap();
+        let mut subscription = b.subscribe_broadcast(&id).unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(1), subscription.recv()).await;
+        let mut observations = Vec::new();
+        for (fec, size) in [(false, 50), (true, 1500)] {
+            edge_a.messages.lock().unwrap().clear();
+            let data = vec![size as u8; size];
+            let tagged = TaggedByteSlice {
+                object: &data,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            };
+            if fec {
+                a.broadcast_fec(&id, &tagged, None, 0).await.unwrap();
+            } else {
+                a.broadcast(&id, &tagged, None, 0, AdnlSendMethod::Fast).await.unwrap();
+            }
+            // FEC publication is an owned worker; observe its completed wave
+            // before handing messages to the other node.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if edge_a.messages.lock().unwrap().len() >= if fec { 4 } else { 1 } {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let messages = edge_a.messages.lock().unwrap().clone();
+            assert!(!messages.is_empty());
+            let peers = AdnlPeers::with_keys(receiver.id().clone(), source.id().clone());
+            for message in &messages {
+                b.try_consume_custom(message, &peers).await.unwrap();
+            }
+            let received =
+                tokio::time::timeout(Duration::from_millis(100), subscription.recv()).await;
+            observations.push((data, received.ok().and_then(|v| v.unwrap())));
+        }
+        a.delete_private_overlay_checked(&ga).await.unwrap();
+        b.delete_private_overlay_checked(&gb).await.unwrap();
+        adnl_a.stop_checked().await.unwrap();
+        adnl_b.stop_checked().await.unwrap();
+        for (data, received) in observations {
+            assert_eq!(
+                received.map(|v| v.data),
+                if accepted { Some(data) } else { None },
+                "source offset {source_offset}, receiver offset {receiver_offset}"
+            );
+        }
+    }
 }

@@ -402,18 +402,21 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             );
             return Ok(());
         }
-        let now = ctx.overlay.broadcast_time();
+        // TL stores date bits in i32, but C++ checks them as uint32. Widen
+        // before adding the timeout so dates near 2038 cannot overflow.
+        let now = u64::from(ctx.overlay.broadcast_time() as u32);
+        let date = u64::from(bcast.date() as u32);
         #[cfg(feature = "xp25")]
         let flags = bcast.flags();
         let timeout_sec = Self::calc_broadcast_timeout(
             #[cfg(feature = "xp25")]
             flags,
         );
-        if bcast.date() + (timeout_sec as i32) < now {
+        if date + timeout_sec < now {
             log::warn!(
                 target: TARGET,
                 "Old {bcast_type} broadcast {} seconds old from {} in overlay {}",
-                now - bcast.date(),
+                now - date,
                 ctx.peers.other(),
                 ctx.overlay.overlay_id
             );
@@ -1223,7 +1226,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                         base64_encode(test_hash),
                     )
                 }
-                let delay = now - bcast.date();
+                let delay = i64::from(now as u32) - i64::from(bcast.date() as u32);
                 if delay > 1 {
                     log::warn!(
                         target: TARGET,

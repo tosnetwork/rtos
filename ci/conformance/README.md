@@ -663,6 +663,11 @@ refusals (invalid size or source policy) are typed separately from transport fai
 The original sender ignores IHave, including flipped signatures, before payload
 signature verification, following the reference's actual role-specific path.
 
+Broadcast date fields retain their uint32 wire meaning across the signed i32
+boundary. Timeout addition and diagnostic FEC age subtraction widen before
+arithmetic. Native source/receiver tests cover equal clocks, dates on opposite
+sides of that boundary, and20/21second future skew; the accepted window is unchanged.
+
 ## Offline candidate-validation target
 
 Build `cargo build -p rtos --example validate_conformance --locked -j32` and run
