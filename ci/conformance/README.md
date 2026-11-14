@@ -601,6 +601,14 @@ checks cover registry precedence, unknown/short destinations, four channel tests
 and12 actual node lifecycle tests. This does not qualify the separate channel
 crypto/parser API as fully installed in the asynchronous peer/channel lifecycle.
 
+OverlayNode can bind a BroadcastClock at construction. Broadcast dates, date-window
+checks, source-certificate expiry and Plumtree messages use that node-owned clock;
+the default uses system wall time. Transport deadlines and rate-limit windows
+retain monotonic time. Real UDP tests cover ordinary/FEC delivery at equal clocks,
+rejection at21seconds skew, a certificate valid at the supplied historical time
+and an expired certificate. This clock boundary prepares the broadcast adapter;
+it does not yet execute the45 additional broadcast conformance contexts.
+
 ## Offline candidate-validation target
 
 Build `cargo build -p rtos --example validate_conformance --locked -j32` and run

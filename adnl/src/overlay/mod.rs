@@ -85,6 +85,8 @@ use std::{
 };
 
 mod broadcast;
+mod clock;
+pub use clock::{BroadcastClock, SystemBroadcastClock};
 mod plumtree;
 mod privacy;
 use broadcast::{
@@ -569,6 +571,7 @@ declare_counted!(
         options: Arc<AtomicU32>,
         overlay_type: OverlayType,
         wire_profile: rtos_api::WireProfile,
+        clock: Arc<dyn BroadcastClock>,
         flags: u8,
         hops: Option<u8>,
         // All known peers in overlay (for private overlay - all peers except ourself)
@@ -627,6 +630,10 @@ declare_counted!(
 );
 
 impl Overlay {
+    fn broadcast_time(&self) -> i32 {
+        self.clock.unix_seconds() as u32 as i32
+    }
+
     const MEMBER_DO_NOT_RECEIVE_BROADCASTS: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_BROADCASTS;
     const MEMBER_DO_NOT_RECEIVE_PLUMTREE: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_PLUMTREE;
     const MEMBER_PLUMTREE_DENY: u32 =
@@ -681,7 +688,7 @@ impl Overlay {
         let Ok(certificate) = OverlayCertificate::from_tl(certificate) else {
             return BroadcastCheckResult::Forbidden;
         };
-        self.verifier.check_source_eligible(
+        self.verifier.check_source_eligible_at(
             &policy.rules(),
             false,
             self.overlay_id.data(),
@@ -691,6 +698,8 @@ impl Overlay {
             is_fec,
             is_any_sender,
             Some(from),
+            self.broadcast_time(),
+            Instant::now(),
         )
     }
 
@@ -717,7 +726,7 @@ impl Overlay {
             return Ok(());
         };
         let size = u32::try_from(data.len()).map_err(|_| error!("Broadcast is too large"))?;
-        let verdict = self.verifier.check_source_eligible(
+        let verdict = self.verifier.check_source_eligible_at(
             &policy.rules(),
             false,
             self.overlay_id.data(),
@@ -727,6 +736,8 @@ impl Overlay {
             is_fec,
             is_any_sender,
             None,
+            self.broadcast_time(),
+            Instant::now(),
         );
         match verdict {
             BroadcastCheckResult::Allowed => Ok(()),
@@ -1628,6 +1639,7 @@ pub struct OverlayNode {
     generations: std::sync::Mutex<()>,
     retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, std::sync::Weak<AdnlTasks>>>,
     wire_profile: rtos_api::WireProfile,
+    clock: Arc<dyn BroadcastClock>,
     adnl: Arc<AdnlNode>,
     consumers: lockfree::map::Map<Arc<OverlayShortId>, ConsumerObject>,
     node_key: Arc<dyn KeyOption>,
@@ -1688,6 +1700,23 @@ impl OverlayNode {
         key_tag: usize,
         wire_profile: rtos_api::WireProfile,
     ) -> Result<Arc<Self>> {
+        Self::with_params_profile_and_clock(
+            adnl,
+            zero_state_file_hash,
+            key_tag,
+            wire_profile,
+            Arc::new(SystemBroadcastClock),
+        )
+    }
+
+    /// Bind a broadcast wall clock before any overlay or owned task is created.
+    pub fn with_params_profile_and_clock(
+        adnl: Arc<AdnlNode>,
+        zero_state_file_hash: &[u8; 32],
+        key_tag: usize,
+        wire_profile: rtos_api::WireProfile,
+        clock: Arc<dyn BroadcastClock>,
+    ) -> Result<Arc<Self>> {
         let node_key = adnl.key_by_tag(key_tag)?;
         #[cfg(feature = "telemetry")]
         let telemetry = OverlayTelemetry {
@@ -1716,6 +1745,7 @@ impl OverlayNode {
             #[cfg(test)]
             receive_admission_gate: std::sync::Mutex::new(None),
             wire_profile,
+            clock,
             adnl,
             consumers: lockfree::map::Map::new(),
             node_key,
@@ -2658,6 +2688,7 @@ impl OverlayNode {
         };
         let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
+            clock: self.clock.clone(),
             consumer: OnceLock::new(),
             tasks: AdnlTasks::with_runtime(
                 params.runtime.clone().unwrap_or_else(tokio::runtime::Handle::current),
@@ -3325,7 +3356,7 @@ impl Subscriber for OverlayNode {
                         bcast,
                         None,
                         &neighbours,
-                        plumtree_now(),
+                        overlay.clock.unix_seconds(),
                         Instant::now(),
                     )?;
                     overlay.execute_plumtree(actions).await?;
@@ -3459,7 +3490,7 @@ impl Subscriber for OverlayNode {
                 let answer = overlay.plumtree_engine()?.repair_query(
                     *peers.other().data(),
                     query,
-                    plumtree_now(),
+                    overlay.clock.unix_seconds(),
                     Instant::now(),
                 )?;
                 return QueryResult::consume_boxed(
@@ -3525,6 +3556,7 @@ struct PlumtreeTransport {
     stopped: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(test)]
 fn plumtree_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3669,7 +3701,7 @@ impl Overlay {
                                                 message,
                                                 Some(key),
                                                 &neighbours,
-                                                plumtree_now(),
+                                                overlay.clock.unix_seconds(),
                                                 Instant::now(),
                                             ),
                                             Err(err) => {
@@ -3783,7 +3815,7 @@ impl OverlayNode {
                     break;
                 };
                 let actions = match overlay.plumtree_engine() {
-                    Ok(mut engine) => engine.tick(plumtree_now(), Instant::now()),
+                    Ok(mut engine) => engine.tick(overlay.clock.unix_seconds(), Instant::now()),
                     Err(err) => {
                         log::error!(target: TARGET, "Plumtree timer terminated: {err}");
                         break;
@@ -3831,7 +3863,7 @@ impl OverlayNode {
             simple_id,
             data,
             &neighbours,
-            plumtree_now(),
+            overlay.clock.unix_seconds(),
             Instant::now(),
         )?;
         if !actions.iter().any(|action| matches!(action, plumtree::Action::Send { .. })) {

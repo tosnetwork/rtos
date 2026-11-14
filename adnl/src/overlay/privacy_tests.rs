@@ -12,6 +12,11 @@ use rtos_block::{Ed25519KeyOption, ZeroizingBytes};
 
 const VECTORS: &str = include_str!("privacy_vectors.tsv");
 
+fn unix_time_now() -> i32 {
+    use crate::BroadcastClock;
+    crate::SystemBroadcastClock.unix_seconds() as u32 as i32
+}
+
 fn records(kind: &str) -> Vec<Vec<&'static str>> {
     VECTORS
         .lines()

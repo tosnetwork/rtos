@@ -93,7 +93,7 @@ async fn broadcast_outside_the_date_window_is_neither_delivered_nor_relayed() {
         .unwrap());
     let overlay = overlay_node.get_overlay(&id, "date window test").unwrap();
     let peers = AdnlPeers::with_keys(local.id().clone(), source.id().clone());
-    let now = system_clock_secs() as i64;
+    let now = overlay.clock.unix_seconds() as i64;
 
     for (name, offset, delivered) in
         [("too old", -40i64, false), ("too new", 40, false), ("current", 0, true)]

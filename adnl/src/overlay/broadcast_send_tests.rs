@@ -17,7 +17,7 @@ use crate::{
             OverlayCertificate as SourceCertificate, CERTIFICATE_FLAG_ALLOW_FEC,
             CERTIFICATE_FLAG_TRUSTED,
         },
-        BroadcastSubscription, OverlayParams, OverlayShortId,
+        BroadcastClock, BroadcastSubscription, OverlayParams, OverlayShortId, SystemBroadcastClock,
     },
 };
 
@@ -28,6 +28,14 @@ struct Endpoint {
 }
 
 async fn endpoint(seed: u8, id: &Arc<OverlayShortId>) -> Endpoint {
+    endpoint_with_clock(seed, id, Arc::new(SystemBroadcastClock)).await
+}
+
+async fn endpoint_with_clock(
+    seed: u8,
+    id: &Arc<OverlayShortId>,
+    clock: Arc<dyn BroadcastClock>,
+) -> Endpoint {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);
@@ -43,7 +51,14 @@ async fn endpoint(seed: u8, id: &Arc<OverlayShortId>) -> Endpoint {
     )
     .await
     .unwrap();
-    let node = OverlayNode::with_params(adnl.clone(), &[3; 32], 0).unwrap();
+    let node = OverlayNode::with_params_profile_and_clock(
+        adnl.clone(),
+        &[3; 32],
+        0,
+        rtos_api::WireProfile::Legacy,
+        clock,
+    )
+    .unwrap();
     adnl.start_over_udp(vec![node.clone()]).await.unwrap();
     assert!(node
         .add_public_overlay_with_rules(OverlayParams::with_id_only(id), shard_rules())
@@ -66,6 +81,67 @@ async fn pair(seed: u8) -> (Endpoint, Endpoint, Arc<OverlayShortId>) {
             .unwrap();
     }
     (a, b, id)
+}
+
+struct FixedClock(f64);
+impl BroadcastClock for FixedClock {
+    fn unix_seconds(&self) -> f64 {
+        self.0
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broadcast_owned_clocks_control_actual_udp_date_admission() {
+    let mut observations = Vec::new();
+    let mut expired_refusals = Vec::new();
+    for (seed, skew) in [(150, 0.0), (152, 21.0)] {
+        let id = OverlayShortId::from_data([seed; 32]);
+        let a = endpoint_with_clock(seed, &id, Arc::new(FixedClock(1_700_000_000.0))).await;
+        let mut b =
+            endpoint_with_clock(seed + 1, &id, Arc::new(FixedClock(1_700_000_000.0 + skew))).await;
+        for (local, remote) in [(&a, &b), (&b, &a)] {
+            let record = remote.node.get_signed_node(&id, false).unwrap();
+            local.node.add_public_peer(remote.adnl.ip_address_adnl(), &record, &id).unwrap();
+        }
+        let source = seed_key(super::privacy_tests::DIRECT);
+        for data in [b"clock controlled broadcast".to_vec(), vec![5; 900]] {
+            let sent = send(&a, &id, &source, &data, 0).await.is_ok();
+            let received = delivered(&mut b, 500).await;
+            observations.push((skew, sent, received, data));
+        }
+        let ephemeral = seed_key(155);
+        let certificate = |expire| {
+            SourceCertificate::sign(
+                &seed_key(ISSUER),
+                id.data(),
+                ephemeral.id().data(),
+                expire,
+                MAX_FEC_BROADCAST_SIZE,
+                CERTIFICATE_FLAG_TRUSTED | CERTIFICATE_FLAG_ALLOW_FEC,
+            )
+            .unwrap()
+        };
+        // A certificate valid at the node's clock has expired in real host time.
+        // Both the sender and receiver must use their own broadcast clock.
+        a.node.update_certificate(&id, ephemeral.id(), Some(certificate(1_700_003_600))).unwrap();
+        let data = b"clock controlled certificate".to_vec();
+        let sent = send(&a, &id, &ephemeral, &data, 0).await.is_ok();
+        let received = delivered(&mut b, 500).await;
+        observations.push((skew, sent, received, data));
+        a.node.update_certificate(&id, ephemeral.id(), Some(certificate(1_699_999_999))).unwrap();
+        expired_refusals.push(send(&a, &id, &ephemeral, b"expired certificate", 0).await.is_err());
+        a.adnl.stop_checked().await.unwrap();
+        b.adnl.stop_checked().await.unwrap();
+    }
+    assert!(expired_refusals.into_iter().all(|refused| refused));
+    for (skew, sent, received, data) in observations {
+        assert!(sent);
+        assert_eq!(
+            received.as_deref(),
+            if skew == 0.0 { Some(data.as_slice()) } else { None },
+            "receiver skew {skew}"
+        );
+    }
 }
 
 async fn delivered(endpoint: &mut Endpoint, wait_ms: u64) -> Option<Vec<u8>> {

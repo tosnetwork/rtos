@@ -24,7 +24,7 @@ use rtos_block::{error, fail, sha256_digest, KeyId, KeyOption, Result, UInt256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Largest payload sent as one simple broadcast; larger payloads use FEC.
@@ -345,11 +345,6 @@ impl OverlayCertificate {
     }
 }
 
-/// Unix time as the wire peer reads it: whole seconds of the system clock.
-pub(crate) fn unix_time_now() -> i32 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() as i32).unwrap_or(0)
-}
-
 /// A sliding window admitting at most `limit` events per `duration`.
 struct RateLimiterWindow {
     duration: Duration,
@@ -440,34 +435,6 @@ pub(crate) struct BroadcastVerifier {
 }
 
 impl BroadcastVerifier {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn check_source_eligible(
-        &self,
-        rules: &OverlayPrivacyRules,
-        fixed_member_list: bool,
-        overlay: &[u8; 32],
-        source: &[u8; 32],
-        cert: Option<&OverlayCertificate>,
-        size: u32,
-        is_fec: bool,
-        is_any_sender: bool,
-        message_from: Option<&Arc<KeyId>>,
-    ) -> BroadcastCheckResult {
-        self.check_source_eligible_at(
-            rules,
-            fixed_member_list,
-            overlay,
-            source,
-            cert,
-            size,
-            is_fec,
-            is_any_sender,
-            message_from,
-            unix_time_now(),
-            Instant::now(),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_source_eligible_at(
         &self,

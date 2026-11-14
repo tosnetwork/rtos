@@ -10,7 +10,7 @@
 use crate::{
     common::{
         add_unbound_object_to_map, hash, AdnlPeers, CountedObject, Counter, TaggedByteSlice,
-        UpdatedAt, Version,
+        UpdatedAt,
     },
     declare_counted,
     node::PeerHistory,
@@ -44,6 +44,8 @@ use rtos_api::{
     },
     IntoBoxed,
 };
+#[cfg(test)]
+use crate::common::Version;
 use rtos_block::{base64_encode, error, fail, sha256_digest, KeyId, KeyOption, Result, UInt256};
 #[cfg(feature = "telemetry")]
 use std::sync::atomic::AtomicU32;
@@ -54,7 +56,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 /// Half-width of the accepted broadcast date window (C++ `OverlayImpl::check_date`).
@@ -66,12 +68,6 @@ pub(crate) const BROADCAST_DATE_WINDOW_SEC: f64 = 20.0;
 pub(crate) fn broadcast_date_admissible(date: i32, now: f64) -> bool {
     let date = f64::from(date as u32);
     !(date < now - BROADCAST_DATE_WINDOW_SEC) && !(date > now + BROADCAST_DATE_WINDOW_SEC)
-}
-
-/// Fractional seconds of the system clock, as C++ `td::Clocks::system()`. A clock
-/// before the epoch reads as zero, which refuses every dated broadcast.
-fn system_clock_secs() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 pub(crate) struct BroadcastCheckInfo {
@@ -388,7 +384,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
 
     async fn recv<'a>(&mut self, bcast: T, mut ctx: BroadcastRecvContext<'a>) -> Result<()> {
         let bcast_type = Self::broadcast_type();
-        if !broadcast_date_admissible(bcast.date(), system_clock_secs()) {
+        if !broadcast_date_admissible(bcast.date(), ctx.overlay.clock.unix_seconds()) {
             log::warn!(
                 target: TARGET,
                 "{bcast_type} broadcast dated {} outside the accepted window from {} in overlay {}",
@@ -398,7 +394,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
             );
             return Ok(());
         }
-        let now = Version::get();
+        let now = ctx.overlay.broadcast_time();
         #[cfg(feature = "xp25")]
         let flags = bcast.flags();
         let timeout_sec = Self::calc_broadcast_timeout(
@@ -532,7 +528,7 @@ pub(crate) trait BroadcastProtocol<T: BroadcastParsed + Send + 'static>:
     async fn send<'a>(&mut self, ctx: BroadcastSendContext<'a>) -> Result<BroadcastSendInfo> {
         let mut neighbours = self.calc_broadcast_neighbours(ctx.overlay, ctx.overlay.hops)?;
         let bcast_type = Self::broadcast_type();
-        let date = Version::get();
+        let date = ctx.overlay.broadcast_time();
         let (bcast_id, allow_dup) = self.calc_broadcast_id(&ctx, date)?;
         let added = add_unbound_object_to_map(&ctx.overlay.owned_broadcasts, bcast_id, || {
             Ok(OwnedBroadcast::Send)
@@ -698,7 +694,9 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                     );
                     continue;
                 }
-                match Self::process_part(&mut decoder, &bcast_id_recv, &bcast) {
+                match Self::process_part(
+                    &mut decoder, &bcast_id_recv, &bcast, overlay.broadcast_time(),
+                ) {
                     Err(e) => {
                         log::warn!(
                             target: TARGET,
@@ -1129,7 +1127,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
             return Ok(None);
         }
         if Self::RECHECK_DATE_BEFORE_DECODE
-            && !broadcast_date_admissible(bcast.date(), system_clock_secs())
+            && !broadcast_date_admissible(bcast.date(), ctx.overlay.clock.unix_seconds())
         {
             log::warn!(
                 target: TARGET,
@@ -1163,6 +1161,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
         decoder: &mut RaptorqDecoder,
         bcast_id: &BroadcastId,
         bcast: &T,
+        now: i32,
     ) -> Result<Option<Vec<u8>>> {
         let bcast_type = Self::broadcast_type();
         if let Some(ret) = decoder.decode(bcast.seqno(), bcast.part_data()) {
@@ -1177,7 +1176,7 @@ trait FecProtocol<T: FecBroadcastParsed + Send + 'static>: BroadcastProtocol<T> 
                         base64_encode(test_hash),
                     )
                 }
-                let delay = Version::get() - bcast.date();
+                let delay = now - bcast.date();
                 if delay > 1 {
                     log::warn!(
                         target: TARGET,
