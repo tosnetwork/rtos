@@ -1398,6 +1398,12 @@ pub fn serialize_known_config_param(
         ConfigParamEnum::ConfigParam45(ref c) => {
             return Ok(Some(serialize_precompiled_contracts_list(c)?));
         }
+        ConfigParamEnum::ConfigParam48(ref c) => {
+            serialize_field(&mut map, "network", c.network.to_hex_string());
+            serialize_u64(&mut map, "sequence", &c.sequence, mode);
+            serialize_field(&mut map, "retired", c.retired);
+            serialize_field(&mut map, "deadline", c.deadline);
+        }
         ConfigParamEnum::ConfigParam71(ref c) => {
             return Ok(Some(serialize_oracle_bridge_params(c)?));
         }

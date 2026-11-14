@@ -16,6 +16,66 @@ use rtos_block::{
     ConfigParam36, ConfigParam37, ConfigParam39, ConfigParam4, ConfigParam6, ConfigParamEnum,
     ConfigVotingSetup, IBitstring, NoncriticalParams, Number16, SigPubKey, VarUInteger32,
 };
+
+#[test]
+fn auth_policy_json_preserves_full_unsigned_wire_fields() {
+    for sequence in [0, i64::MAX as u64 + 1, u64::MAX] {
+        let input = serde_json::json!({"p48": {
+            "network": "12".repeat(32), "sequence": sequence,
+            "retired": 2, "deadline": u32::MAX
+        }});
+        let config = parse_config_with_mandatory_params(input.as_object().unwrap(), &[48]).unwrap();
+        let expected = rtos_block::AuthPolicy {
+            network: UInt256::from([0x12; 32]),
+            sequence,
+            retired: 2,
+            deadline: u32::MAX,
+        };
+        assert_eq!(config.config(48).unwrap(), Some(ConfigParamEnum::ConfigParam48(expected)));
+        for mode in
+            [SerializationMode::Standart, SerializationMode::QServer, SerializationMode::Debug]
+        {
+            let mut output = Map::new();
+            serialize_config(&mut output, &config, mode).unwrap();
+            assert!(!output.contains_key("unknown_config"));
+            let parsed =
+                parse_config_with_mandatory_params(output["config"].as_object().unwrap(), &[48])
+                    .unwrap();
+            assert_eq!(parsed.config(48).unwrap(), config.config(48).unwrap());
+        }
+    }
+}
+
+#[test]
+fn auth_policy_json_rejects_overflow_negative_and_unknown_retirement_bits() {
+    let input = serde_json::json!({"p48": {
+        "network": "12".repeat(32), "sequence": "0", "retired": 0, "deadline": 0
+    }});
+    for (field, invalid) in [
+        ("sequence", serde_json::json!(-1)),
+        ("sequence", serde_json::json!("18446744073709551616")),
+        ("sequence", serde_json::json!(1.5)),
+        ("sequence", serde_json::json!(true)),
+        ("retired", serde_json::json!(65536)),
+        ("retired", serde_json::json!(1)),
+        ("retired", serde_json::json!(4)),
+        ("deadline", serde_json::json!(4294967296_u64)),
+        ("deadline", serde_json::json!(-1)),
+        ("network", serde_json::json!("not-a-network-tag")),
+    ] {
+        let mut bad = input.clone();
+        bad["p48"][field] = invalid;
+        assert!(
+            parse_config_with_mandatory_params(bad.as_object().unwrap(), &[48]).is_err(),
+            "{bad}"
+        );
+    }
+    for field in ["network", "sequence", "retired", "deadline"] {
+        let mut bad = input.clone();
+        bad["p48"].as_object_mut().unwrap().remove(field);
+        assert!(parse_config_with_mandatory_params(bad.as_object().unwrap(), &[48]).is_err());
+    }
+}
 use std::fmt::Debug;
 
 include!("./test_common.rs");

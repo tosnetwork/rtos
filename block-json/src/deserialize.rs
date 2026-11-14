@@ -1028,6 +1028,37 @@ impl StateParser {
             Ok(ConfigParamEnum::ConfigParam45(pl))
         })?;
 
+        self.parse_parameter(config, 48, |p| {
+            // AUTH counters are unsigned wire fields. Do not use get_num64,
+            // which reads an i64 and casts negative values to unsigned values.
+            let unsigned = |name: &str| -> Result<u64> {
+                let value = p.map.get(name).ok_or_else(|| error!("Missing AUTH {name}"))?;
+                if let Some(number) = value.as_u64() {
+                    return Ok(number);
+                }
+                if let Some(decimal) = p.map.get(&format!("{name}_dec")) {
+                    return Ok(decimal
+                        .as_str()
+                        .ok_or_else(|| error!("AUTH {name}_dec must be a decimal string"))?
+                        .parse()?);
+                }
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| error!("AUTH {name} must be an unsigned integer"))?;
+                Ok(if let Some(hex) = text.strip_prefix("0x") {
+                    u64::from_str_radix(hex, 16)?
+                } else {
+                    text.parse()?
+                })
+            };
+            Ok(ConfigParamEnum::ConfigParam48(rtos_block::AuthPolicy {
+                network: p.get_uint256("network")?,
+                sequence: unsigned("sequence")?,
+                retired: u16::try_from(unsigned("retired")?)?,
+                deadline: u32::try_from(unsigned("deadline")?)?,
+            }))
+        })?;
+
         self.parse_parameter(config, 71, |p| {
             let p = Self::parse_oracle_bridge_params(p)?;
             Ok(ConfigParamEnum::ConfigParam71(p))
