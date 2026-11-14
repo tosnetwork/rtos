@@ -182,3 +182,39 @@ pub fn check_block_header(root: &Cell, id: &BlockIdExt) -> Result<(Block, BlockI
     }
     Ok((block, info))
 }
+
+/// C++ extract_from_state structural profile: inline shard coordinates remain
+/// opaque, referenced accounts/queues are not traversed, auxiliary shapes are exact.
+pub fn read_zerostate_proof_config(root: Cell) -> Result<(i32, crate::ConfigParams)> {
+    require_proof_cell(&root)?;
+    let mut slice = SliceData::load_cell(root)?;
+    if slice.get_next_u32()? != 0x9023afe2 {
+        fail!("invalid shard state");
+    }
+    let global_id = slice.get_next_u32()? as i32;
+    slice.move_by(104 + 32 + 32 + 32 + 64 + 32)?;
+    slice.checked_drain_reference()?;
+    slice.get_next_bit()?;
+    slice.checked_drain_reference()?;
+    let auxiliary = slice.checked_drain_reference()?;
+    require_proof_cell(&auxiliary)?;
+    let mut aux = SliceData::load_cell(auxiliary)?;
+    aux.move_by(128)?;
+    crate::CurrencyCollection::construct_from(&mut aux)?;
+    crate::CurrencyCollection::construct_from(&mut aux)?;
+    if aux.get_next_bit()? {
+        aux.checked_drain_reference()?;
+    }
+    if aux.get_next_bit()? {
+        aux.checked_drain_reference()?;
+    }
+    if aux.remaining_bits() != 0 || aux.remaining_references() != 0 {
+        fail!("state auxiliary trailing data");
+    }
+    let custom = if slice.get_next_bit()? { Some(slice.checked_drain_reference()?) } else { None };
+    if slice.remaining_bits() != 0 || slice.remaining_references() != 0 || global_id == 0 {
+        fail!("invalid governing state shape or global ID");
+    }
+    let custom = custom.ok_or_else(|| crate::error!("missing state custom configuration"))?;
+    Ok((global_id, crate::McStateExtra::config_from_state_proof_cell(custom)?))
+}

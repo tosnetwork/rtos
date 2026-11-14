@@ -17,6 +17,8 @@ use std::{
 
 #[path = "consensus/finality.rs"]
 mod finality;
+#[path = "consensus/link.rs"]
+mod link;
 #[path = "consensus/proofs.rs"]
 mod proofs;
 
@@ -310,6 +312,7 @@ fn run(ctx: &Value) -> Result<Value> {
         "decode_proof" => decode_proof(ctx)?,
         "key_block_context" => proofs::key_context(ctx)?,
         "finality" => finality::run(ctx)?,
+        "proof_link" => link::run(ctx)?,
         "protocol_version" => {
             let version = rtos_block::SimplexProtocolVersion(u32_field(ctx, "protocol_version")?);
             json!({"outcome":"protocol_version", "supported":version.supported(),

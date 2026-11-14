@@ -88,10 +88,9 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
-weight, validator-set, protocol-version, session, vote, explicit finality and structural proof APIs.
-The first255 frozen controls agree with clean CPP1181; the remaining13 consensus
-contexts explicitly refuse as unsupported operations and are not passes. Run
-the whole consensus directory so those gaps remain visible. The raw numeric
+weight, validator-set, protocol-version, session, vote, explicit finality, structural
+proof and key-block proof-link APIs. All268 original consensus contexts agree
+with clean CPP1181. Run the whole consensus directory and added controls together. The raw numeric
 `quorum_weight_reached` predicate matches C++ even for total0 or signed weight
 above total. Node callers retain `has_quorum`'s nonempty and non-overcounted
 membership guards, delegating only the numeric comparison to that predicate.
@@ -108,8 +107,8 @@ while retaining raw wire coordinates at the structural boundary. Node finality
 keeps its membership, admitted-block and canonical candidate checks.
 Additional787 session/vote/version probes match C++, and the earlier2138 weight
 and set probes still agree (12 mutual protocol errors remain separately reported).
-Proof-link verification still needs an adapter; this does not qualify a
-running consensus network or proof acceptance.
+This corpus agreement does not qualify a running consensus network or
+production proof acceptance.
 The native proof envelope keeps signatures opaque until header and state-update
 checks finish. Its shard unpacker uses the C++ unpack profile (depth at most60),
 which differs from the handwritten validator profile above. Structural header
@@ -119,11 +118,11 @@ Key-block contexts derive validator subsets and both session identities through
 native APIs. Supplied key blocks are test anchors, not authenticated chain state.
 Another25 clean-C++ controls cover pruned roots, previous references, shard
 alignment, trailing data, reserved fields and versioned governing options.
-Together the original268 and added99 contexts yield354 equal, zero mismatches
-and13 explicit unsupported refusals. Param29 options expose the full uint64
+Together the original268 and added122 contexts yield390 equal, zero mismatches,
+refusals or skips. Param29 options expose the full uint64
 height-coefficient product while committing its low32 wire bits; the block-hash
 flag follows the version2 boundary. A separate raw probe pins a product above
-uint32; it is outside the shared fixture schema and is not counted in354.
+uint32; it is outside the shared fixture schema and is not counted in390.
 Twelve further C++ controls pin review findings at the structural boundary:
 BlockInfo captures the software field as104 bits without checking its nested
 constructor, while its full reader keeps that check. Key-block config extraction
@@ -154,7 +153,20 @@ proof-link validation must establish those separately. An additional input
 probe matches1612 effects and169 mutual protocol errors in1781 contexts; those
 protocol errors are not passing fixtures. Signer counts400/401/1024/1025 also
 match: unknown signer / too many / too many / protocol error. A raw extra final
-field is outside the shared schema and is excluded from the367-case corpus.
+field is outside the shared schema and is excluded from the390-case corpus.
+The native two-envelope proof-link API checks masterchain direction, Merkle roots,
+headers, governing key-block or zerostate config, validator subset and certificate.
+Its caller-supplied source is an anchor, not independently authenticated chain
+state. This input carries no source-state proof, so backward links are incomplete.
+Forward links verify actual signer weight without enforcing the separate finality
+operation's declared-weight claim. Ordinary and Simplex Ed25519 certificates share
+native signature verification; PQ certificates reuse explicit native finality.
+Twenty-three clean-C++ controls cover opaque envelope IDs/source certificates,
+missing-certificate priority, pruned fields, header-hash priority, zerostate
+anchors, classical signatures and missing validator sets. Proof selection reads
+legacy options before decoding the selected protocol and visits only recognized
+noncritical parameter keys. Strict production config accessors retain their
+contract; complete state readers retain their existing auxiliary-cell profile.
 Session JSON retains the two double tokens until binary64 conversion, preserving
 correct rounding, negative zero and C++'s finite saturation on overflow. The API
 package's dev-only serde_json features enable precise float parsing and borrowed

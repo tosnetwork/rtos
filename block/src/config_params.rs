@@ -404,6 +404,64 @@ impl ConfigParams {
         selected.map(SelectedSimplexConfig::from_cell).transpose().map(Option::flatten)
     }
 
+    /// C++ proof-selection profile: first locate the selected reference, then
+    /// read legacy options, then decode the selected config. Only enumerated
+    /// noncritical keys are visited; unknown dictionary subtrees remain opaque.
+    pub fn selected_simplex_proof_config(
+        &self,
+        masterchain: bool,
+    ) -> Result<Option<SelectedSimplexConfig>> {
+        let Some(cell) = self.proof_config_param_cell(30)? else { return Ok(None) };
+        let mut wrapper = SliceData::load_cell(cell)?;
+        let (mc, shard) = read_consensus_config_cells(&mut wrapper)?;
+        let Some(cell) = (if masterchain { mc } else { shard }) else { return Ok(None) };
+        self.legacy_proof_session_config()?;
+        crate::proof::require_proof_cell(&cell)?;
+        let mut slice = SliceData::load_cell_ref(&cell)?;
+        let tag = slice.get_next_byte()?;
+        let flags = slice.get_next_byte()?;
+        let mut config = SimplexConfig::default();
+        match tag {
+            SIMPLEX_CONFIG_TAG => {
+                if flags & !1 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
+                config.use_quic = flags & 1 != 0;
+                config.noncritical_params.target_rate_ms = slice.get_next_u32()?;
+                config.slots_per_leader_window = slice.get_next_u32()?;
+                config.noncritical_params.first_block_timeout_ms = slice.get_next_u32()?;
+                config.noncritical_params.max_leader_window_desync = slice.get_next_u32()?;
+            }
+            SIMPLEX_CONFIG_V2_TAG => {
+                if flags & !7 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
+                config.use_quic = flags & 1 != 0;
+                config.protocol_version = (flags >> 1) & 3;
+                config.slots_per_leader_window = slice.get_next_u32()?;
+                let params = if slice.get_next_bit()? {
+                    Some(slice.checked_drain_reference()?)
+                } else {
+                    None
+                };
+                let params = HashmapE::with_hashmap(8, params);
+                for index in 0u8..=16 {
+                    if let Some(mut value) = params.get(index.write_to_bitstring()?)? {
+                        // C++ prefetches the uint32 prefix and ignores trailing
+                        // data here; complete schema validation is independent.
+                        config.noncritical_params.set(index, value.get_next_u32()?);
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+        if config.slots_per_leader_window == 0 {
+            fail!("zero Simplex leader window");
+        }
+        ensure_config_slice_empty(&slice)?;
+        Ok(Some(SelectedSimplexConfig { config, original_cell: cell }))
+    }
+
     pub fn get_mc_simplex_config(&self) -> Result<Option<SimplexConfig>> {
         Ok(self.selected_simplex_config(true)?.map(|selected| selected.config))
     }

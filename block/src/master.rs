@@ -1114,6 +1114,25 @@ impl McStateExtra {
 
 impl Deserializable for McStateExtra {
     fn read_from(&mut self, cell: &mut SliceData) -> Result<()> {
+        self.read_from_profile(cell, false)
+    }
+}
+
+impl McStateExtra {
+    /// Exact structural configuration extraction from a governing state proof.
+    /// Referenced historical dictionaries remain opaque; no state authentication.
+    pub fn config_from_state_proof_cell(cell: Cell) -> Result<ConfigParams> {
+        crate::proof::require_proof_cell(&cell)?;
+        let mut slice = SliceData::load_cell(cell)?;
+        let mut extra = Self::default();
+        extra.read_from_profile(&mut slice, true)?;
+        if slice.remaining_bits() != 0 || slice.remaining_references() != 0 {
+            fail!("state custom configuration trailing data");
+        }
+        Ok(extra.config)
+    }
+
+    fn read_from_profile(&mut self, cell: &mut SliceData, exact_aux: bool) -> Result<()> {
         let tag = cell.get_next_u16()?;
         if tag != MC_STATE_EXTRA_TAG {
             fail!(BlockError::InvalidConstructorTag {
@@ -1124,7 +1143,11 @@ impl Deserializable for McStateExtra {
         self.shards.read_from(cell)?;
         self.config.read_from(cell)?;
 
-        let cell1 = &mut SliceData::load_cell(cell.checked_drain_reference()?)?;
+        let auxiliary = cell.checked_drain_reference()?;
+        if exact_aux {
+            crate::proof::require_proof_cell(&auxiliary)?;
+        }
+        let cell1 = &mut SliceData::load_cell(auxiliary)?;
         let mut flags = 0u16;
         flags.read_from(cell1)?; // 16 + 0
         if flags > 1 {
@@ -1142,6 +1165,9 @@ impl Deserializable for McStateExtra {
         } else {
             Some(BlockCreateStats::construct_from(cell1)?) // 1 + 1
         };
+        if exact_aux && (cell1.remaining_bits() != 0 || cell1.remaining_references() != 0) {
+            fail!("state custom auxiliary trailing data");
+        }
         self.global_balance.read_from(cell)?;
         Ok(())
     }

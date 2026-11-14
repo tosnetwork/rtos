@@ -140,7 +140,7 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         .proof_config_param_cell(30)
         .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?;
     let selected = config
-        .selected_simplex_config(true)
+        .selected_simplex_proof_config(true)
         .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?
         .ok_or_else(|| domain_error("consensus_config_unavailable"))?;
     let coordinates = SessionCoordinates {
