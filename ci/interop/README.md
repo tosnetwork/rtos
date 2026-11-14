@@ -240,6 +240,13 @@ IDs. First run `--prepare-genesis-only` and then pass its `frozen-profile.json`
 to the live invocation while the declared activation remains in the future.
 Each output directory must be new. The original `testnet-v16.json` stays fixed.
 
+On the latest candidate baseline, the fixture prepares signing ledgers for C++
+successors declared in the frozen Genesis before any validator starts. It uses
+the pinned key tool and only accepts never-started directories containing the
+fixture keyring and seed. Existing state or ledgers are refused; the ceremony
+receipt is retained. This is fresh fixture provisioning, not recovery of unknown
+signing history.
+
 Without Rust arguments all six processes use C++. Adding `--rust-node` and
 `--validator-preparer` uses Rust members 2, 3 and 5: each active committee then
 contains two C++ and two Rust members. Both epochs require all four members'

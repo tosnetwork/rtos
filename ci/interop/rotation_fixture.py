@@ -39,6 +39,7 @@ from quorum_profile import (
     observer_budget_plan,
     quorum_threshold,
 )
+from successor_ledger_fixture import prepare_successor_ledgers
 from workchain_history_fixture import collect_workchain_history, eligible_workchain
 
 INITIAL = [0, 1, 2, 3]
@@ -893,6 +894,7 @@ async def run(args, profile, root, artifacts):
         activation = profile["genesis_time"] + profile["activation_delay"]
         if activation - time.time() < 20:
             raise RuntimeError("Insufficient time for a real pre-rotation checkpoint")
+        prepare_successor_ledgers(args, profile, nodes, zero, root)
         await dht.run(StartOptions(threads=1, verbosity=3))
         try:
             global_config = root / "config.global.json"
@@ -2128,10 +2130,12 @@ def main():
     manifest = json.loads((args.snapshot / "manifest.json").read_text())
     require_cpp_baseline(manifest["cpp_source_commit"], profile)
     receiver_helper = Path(__file__).with_name("propagation_receiver_fixture.py")
+    successor_helper = Path(__file__).with_name("successor_ledger_fixture.py")
     baseline_policy = Path(__file__).with_name("cpp_baseline.py")
     artifacts = {
         str(args.block_checker): digest(args.block_checker),
         str(args.profile): digest(args.profile),
+        str(successor_helper): digest(successor_helper),
         str(baseline_policy): digest(baseline_policy),
         str(receiver_helper): digest(receiver_helper),
     }
