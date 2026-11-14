@@ -39,6 +39,26 @@ baseline is separate and is not upgraded or qualified by a fixture run.
 Whole-history native state replay, runtime integration, resource qualification,
 GitHub CI outcomes and independent/external reviews remain separate gates.
 
+Index original archive packages independently of reference replay output:
+
+```sh
+python3 ci/conformance/index_archives.py --root /datax/epoch/archive-packs \
+  --sha256-list /datax/epoch/archive-packs.SHA256SUMS \
+  --out /datax/rtos-conformance/archive-index --jobs 32
+```
+
+The SHA256 list defines the exact input set; extra files in the directory are not
+included. Every listed package digest and entry boundary is checked. A new output
+directory receives `index.sqlite` (packages and blocks keyed by workchain, shard,
+sequence) and `summary.json`. Identical block identities are counted as duplicates;
+conflicting identities fail. Per-chain first/last sequence, block count and internal
+gap count are reported. `complete` means indexing finished, not that replay passed:
+gaps and non-genesis starts remain visible, and BOC hashes, proof authenticity,
+transaction execution and dependency order are checked in later stages. Failed
+scans leave an incomplete index; callers must require `complete: true` before use.
+Concurrency and result buffering are limited to `--jobs` packages per batch;
+SQLite commits each batch. Original packages remain read-only.
+
 For sequential state replay, build `rtos_executor --example stateful_block_replay`
 with `cargo build --locked -j32`. Feed JSONL on stdin: initial
 `{"zerostate":"/path/to/state.boc"}` records followed by
