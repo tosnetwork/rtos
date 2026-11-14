@@ -69,6 +69,9 @@ if args.validator_preparer:
             "rust_binary": str(args.rust_node.resolve()),
             "rust_binary_sha256": rust_sha256,
             "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "sync_observer_sha256": hashlib.sha256(
+                Path(__file__).with_name("sync_observation.py").read_bytes()
+            ).hexdigest(),
             "baseline_policy_sha256": hashlib.sha256(
                 Path(__file__).with_name("cpp_baseline.py").read_bytes()
             ).hexdigest(),
@@ -85,9 +88,9 @@ for item in manifest["binaries"]:
         assert hashlib.file_digest(stream, "sha256").hexdigest() == item["sha256"]
 sys.path.insert(0, str(snapshot / "source/test/tostester/src"))
 from nacl.signing import SigningKey
+from sync_observation import SyncObservation
 from tostester.install import Install
 from tostester.key import Key
-from tostester.n6_cluster import require_agreed_masterchain_block
 from tostester.network import Network, StartOptions
 
 
@@ -305,6 +308,12 @@ async def main():
             )
             try:
                 deadline = time.monotonic() + args.timeout
+                sync_observation = SyncObservation(
+                    json.loads((rust / "global.json").read_text())["validator"][
+                        "zero_state"
+                    ],
+                    args.min_height,
+                )
                 checkpoints = {}
                 checked_blocks = set()
                 checker_sha = (
@@ -318,12 +327,6 @@ async def main():
                             f"Rust node exited {process.returncode}; see rust/node.log"
                         )
                     text = (rust / "node.log").read_text(errors="replace")
-                    heights = [
-                        int(x)
-                        for x in re.findall(
-                            r"^Processing masterblock (\d+)$", text, re.MULTILINE
-                        )
-                    ]
                     if args.require_leadership:
                         try:
                             observations = await asyncio.gather(
@@ -459,27 +462,52 @@ async def main():
                                     "cpp_alone_can_finalize": cpp_weight >= quorum,
                                     "mixed_validator_qualified": False,
                                 }
-                    elif heights and max(heights) >= args.min_height:
-                        clients = {
-                            node.name: await node.toslib_client()
-                            for node in cpp_members
-                        }
-                        common = await require_agreed_masterchain_block(
-                            clients, args.min_height
+                    else:
+                        try:
+                            observations = await asyncio.gather(
+                                *(
+                                    asyncio.to_thread(rpc, url, "getMasterchainInfo")
+                                    for url in [*cpp_rpc, rust_rpc]
+                                )
+                            )
+                        except (OSError, RuntimeError) as error:
+                            (root / "status.json").write_text(
+                                json.dumps(
+                                    {"status": "waiting_for_rpc", "error": str(error)}
+                                )
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                        sample = sync_observation.observe(
+                            observations[:-1], observations[-1]
                         )
-                        return {
-                            "status": (
-                                "rust_required_for_quorum_chain_progress"
-                                if args.validator_preparer
-                                else "rust_public_sync_observed"
-                            ),
-                            "rust_height": max(heights),
-                            "cpp_common_block_at_4": common,
-                            "cpp_process_count": len(cpp_members),
-                            "committee_size": 4,
-                            "active_rust_signing": args.validator_preparer is not None,
-                            "mixed_validator_qualified": False,
-                        }
+                        (root / "status.json").write_text(
+                            json.dumps(
+                                {
+                                    "status": "waiting_for_matching_applied_state",
+                                    "rust": observations[-1],
+                                    "references": observations[:-1],
+                                }
+                            )
+                        )
+                        if sample is not None:
+                            (root / "sync-sample.json").write_text(
+                                json.dumps(sample, indent=2) + "\n"
+                            )
+                            return {
+                                "status": (
+                                    "rust_required_for_quorum_chain_progress"
+                                    if args.validator_preparer
+                                    else "rust_public_sync_observed"
+                                ),
+                                "rust_height": sample["rust"]["last"]["seqno"],
+                                "applied_state_sample": sample,
+                                "cpp_process_count": len(cpp_members),
+                                "committee_size": 4,
+                                "active_rust_signing": args.validator_preparer
+                                is not None,
+                                "mixed_validator_qualified": False,
+                            }
                     await asyncio.sleep(0.1)
                 raise TimeoutError(
                     f"Required Rust progress/leadership not observed within {args.timeout} seconds"
