@@ -57,7 +57,7 @@ async fn test_custom_overlays_serde() -> Result<()> {
             let skip_public_msg_send = rand::random::<bool>();
             let use_quic = rand::random::<bool>();
             let overlay = CustomOverlay {
-                name,
+                name: name.into(),
                 nodes,
                 sender_shards,
                 skip_public_msg_send: skip_public_msg_send.into(),
@@ -948,7 +948,8 @@ async fn explicit_consensus_transport_has_no_validator_signing_identity() -> Res
     let mut config = scheduler_test_config();
     config.validator_key_ring = Some(HashMap::from([(base64_encode(key.id().data()), json)]));
     config.consensus_transport_bindings = vec![ConsensusTransportBindingJson {
-        validator_id: base64_encode([92; 32]), adnl_key_id: base64_encode(key.id().data()),
+        validator_id: base64_encode([92; 32]),
+        adnl_key_id: base64_encode(key.id().data()),
     }];
     let (handler, context) = NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
     handler.clone().start_sheduler(context, vec![])?;
@@ -959,32 +960,46 @@ async fn explicit_consensus_transport_has_no_validator_signing_identity() -> Res
         anyhow::ensure!(bindings.len() == 1 && bindings[0].validator_id == UInt256::from([92; 32]));
         anyhow::ensure!(handler.consensus_transport_key(key.id()).await?.id() == key.id());
         anyhow::ensure!(handler.get_validator_key(key.id()).await.is_none());
-        anyhow::ensure!(handler.consensus_transport_key(&KeyId::from_data([93; 32])).await.is_err());
+        anyhow::ensure!(handler
+            .consensus_transport_key(&KeyId::from_data([93; 32]))
+            .await
+            .is_err());
         Ok::<_, anyhow::Error>(())
-    }.await;
+    }
+    .await;
     handler.stop_and_wait().await?;
     result
 }
 
 #[tokio::test]
 async fn explicit_consensus_transport_rejects_duplicate_missing_and_wrong_keys() -> Result<()> {
-    let binding = ConsensusTransportBindingJson { validator_id: base64_encode([92; 32]), adnl_key_id: base64_encode([93; 32]) };
+    let binding = ConsensusTransportBindingJson {
+        validator_id: base64_encode([92; 32]),
+        adnl_key_id: base64_encode([93; 32]),
+    };
     for same_stable in [true, false] {
         let mut config = scheduler_test_config();
         let mut other = binding.clone();
-        if same_stable { other.adnl_key_id = base64_encode([94; 32]); }
-        else { other.validator_id = base64_encode([94; 32]); }
+        if same_stable {
+            other.adnl_key_id = base64_encode([94; 32]);
+        } else {
+            other.validator_id = base64_encode([94; 32]);
+        }
         config.consensus_transport_bindings = vec![binding.clone(), other];
-        anyhow::ensure!(NodeConfigHandler::create(config, tokio::runtime::Handle::current()).is_err());
+        anyhow::ensure!(
+            NodeConfigHandler::create(config, tokio::runtime::Handle::current()).is_err()
+        );
     }
     for wrong_key in [false, true] {
         let mut config = scheduler_test_config();
         config.consensus_transport_bindings = vec![binding.clone()];
         if wrong_key {
-            let (json, _) = Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[91; 32])?;
+            let (json, _) =
+                Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[91; 32])?;
             config.validator_key_ring = Some(HashMap::from([(binding.adnl_key_id.clone(), json)]));
         }
-        let (handler, context) = NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
+        let (handler, context) =
+            NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
         anyhow::ensure!(handler.clone().start_sheduler(context, vec![]).is_err());
         handler.stop_and_wait().await?;
     }
@@ -1019,7 +1034,11 @@ fn durable_config_replacement_preserves_old_file_on_failure() -> Result<()> {
     std::fs::write(blocked.join("sentinel"), b"retained")?;
     assert!(write_config_durable(&blocked, br#"{"version":4}"#).is_err());
     assert_eq!(std::fs::read(blocked.join("sentinel"))?, b"retained");
-    assert!(std::fs::read_dir(dir.path())?.all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    assert!(std::fs::read_dir(dir.path())?.all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".tmp")));
     Ok(())
 }
 

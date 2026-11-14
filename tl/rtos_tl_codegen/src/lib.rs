@@ -933,6 +933,18 @@ impl WireKind {
     fn as_read_method(&self) -> TokenStream {
         match *self {
             WireKind::Bare(..) | WireKind::Flags => quote!(read_bare),
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: object"
+                    || ty.tokens_canon == "crate :: ton :: Object" =>
+            {
+                quote!(read_object)
+            }
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: function"
+                    || ty.tokens_canon == "crate :: ton :: Function" =>
+            {
+                quote!(read_function)
+            }
             WireKind::Boxed(..) | WireKind::TypeParameter(..) => quote!(read_boxed),
             WireKind::ExtraDefault(..) => quote!(just_default),
             WireKind::FlaggedTrue => fail_hard(),
@@ -942,6 +954,18 @@ impl WireKind {
     fn as_write_method(&self) -> Option<TokenStream> {
         match *self {
             WireKind::Bare(..) | WireKind::Flags => Some(quote!(write_bare)),
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: object"
+                    || ty.tokens_canon == "crate :: ton :: Object" =>
+            {
+                Some(quote!(write_object))
+            }
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: function"
+                    || ty.tokens_canon == "crate :: ton :: Function" =>
+            {
+                Some(quote!(write_function))
+            }
             WireKind::Boxed(..) | WireKind::TypeParameter(..) => Some(quote!(write_boxed)),
             WireKind::ExtraDefault(..) => None,
             WireKind::FlaggedTrue => Some(fail_hard()),

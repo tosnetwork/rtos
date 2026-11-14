@@ -584,7 +584,8 @@ pub fn convert_stack(items: &[StackItem]) -> Result<Vec<StackEntry>> {
             StackItem::Integer(value) => {
                 let number = value.to_str_hex();
                 let number =
-                    rtos_api::ton::tvm::numberdecimal::NumberDecimal { number }.into_boxed();
+                    rtos_api::ton::tvm::numberdecimal::NumberDecimal { number: number.into() }
+                        .into_boxed();
                 StackEntryNumber { number }.into_boxed()
             }
             StackItem::Slice(slice) => {
@@ -664,7 +665,7 @@ pub fn convert_ton_stack(items: &[StackEntry]) -> Result<Vec<StackItem>> {
             }
             StackEntry::Tvm_StackEntryNumber(number) => {
                 let number = &number.number;
-                let value = parse_stack_number(number.number())?;
+                let value = parse_stack_number(number.number().as_str()?)?;
                 StackItem::int(value)
             }
             StackEntry::Tvm_StackEntrySlice(slice) => {

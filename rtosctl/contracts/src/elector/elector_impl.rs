@@ -51,7 +51,7 @@ impl ElectorWrapper for ElectorWrapperImpl {
     }
     async fn participates_in(&self, pubkey: &[u8]) -> anyhow::Result<Option<Participant>> {
         let n = rtos_api::ton::tvm::numberdecimal::NumberDecimal {
-            number: "0x".to_owned() + &hex::encode_upper(pubkey),
+            number: ("0x".to_owned() + &hex::encode_upper(pubkey)).into(),
         };
         let stack_number =
             StackEntry::Tvm_StackEntryNumber(rtos_api::ton::tvm::stackentry::StackEntryNumber {
@@ -65,7 +65,7 @@ impl ElectorWrapper for ElectorWrapperImpl {
     }
     async fn compute_returned_stake(&self, address: &[u8]) -> anyhow::Result<u64> {
         let n = rtos_api::ton::tvm::numberdecimal::NumberDecimal {
-            number: "0x".to_owned() + &hex::encode_upper(address),
+            number: ("0x".to_owned() + &hex::encode_upper(address)).into(),
         };
         let stack_number =
             StackEntry::Tvm_StackEntryNumber(rtos_api::ton::tvm::stackentry::StackEntryNumber {
@@ -178,16 +178,16 @@ fn parse_past_elections_stack(stack: &TvmStackParser) -> anyhow::Result<Vec<Past
 mod tests {
     use super::*;
     use rtos_api::ton::tvm::{
-        List, Number, Tuple, cell, list,
+        cell, list,
         numberdecimal::NumberDecimal,
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
-        tuple,
+        tuple, List, Number, Tuple,
     };
     use rtos_block::{BuilderData, Cell, Coins, IBitstring, Serializable, SliceData};
 
     fn create_number_entry(value: &str) -> StackEntry {
         StackEntry::Tvm_StackEntryNumber(StackEntryNumber {
-            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string() }),
+            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string().into() }),
         })
     }
 

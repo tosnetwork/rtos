@@ -206,6 +206,34 @@ impl WireProfile {
         DOMAINS.contains(&(id, schema, function))
     }
 
+    pub(crate) fn native_constructor_in_schema(
+        self,
+        id: u32,
+        schema: Option<&str>,
+        function: bool,
+    ) -> bool {
+        const DOMAINS: &[(u32, &str, bool)] =
+            include!(concat!(env!("OUT_DIR"), "/schema_domains.rs"));
+        DOMAINS.iter().any(|&(candidate, domain, is_function)| {
+            candidate == id
+                && is_function == function
+                && schema.is_none_or(|expected| domain == expected)
+        })
+    }
+
+    /// Decode with the declared schema's generic Object/Function domains.
+    pub fn deserialize_schema_with_suffix(
+        self,
+        schema: &'static str,
+        bytes: &[u8],
+    ) -> Result<(TLObject, usize)> {
+        let mut reader = bytes;
+        let mut de = Deserializer::with_profile(&mut reader, self)
+            .with_schema(schema)
+            .with_input_len(bytes.len());
+        Ok((de.read_boxed()?, de.pos))
+    }
+
     pub(crate) fn encode_constructor(self, id: u32) -> Result<u32> {
         if self == Self::Legacy {
             if TARGET_ONLY.contains(&id) {

@@ -10,7 +10,7 @@
 use anyhow::Context;
 use num::Num;
 use rtos_api::ton::tvm::StackEntry;
-use rtos_block::{Cell, read_single_root_boc};
+use rtos_block::{read_single_root_boc, Cell};
 
 #[derive(Debug)]
 pub struct TvmStackParser {
@@ -32,7 +32,7 @@ impl TvmStackParser {
                 entry
             ))?
             .number();
-        Ok(decimal)
+        Ok(decimal.as_str()?)
     }
 
     pub fn number_bytes(&self, index: usize, size: usize) -> anyhow::Result<Vec<u8>> {
@@ -172,16 +172,16 @@ impl TvmStackParser {
 mod tests {
     use super::*;
     use rtos_api::ton::tvm::{
-        List, Number, Tuple, cell, list,
+        cell, list,
         numberdecimal::NumberDecimal,
         stackentry::{StackEntryCell, StackEntryList, StackEntryNumber, StackEntryTuple},
-        tuple,
+        tuple, List, Number, Tuple,
     };
-    use rtos_block::{BuilderData, Cell, IBitstring, write_boc};
+    use rtos_block::{write_boc, BuilderData, Cell, IBitstring};
 
     fn create_number_entry(value: &str) -> StackEntry {
         StackEntry::Tvm_StackEntryNumber(StackEntryNumber {
-            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string() }),
+            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string().into() }),
         })
     }
 

@@ -64,6 +64,30 @@ fn main() {
             match item {
                 Item::Delimiter(delimiter) => function = delimiter == Delimiter::Functions,
                 Item::Constructor(constructor) => {
+                    // C++ primitive field codecs (notably Bool) are not members
+                    // of the generated Object class. Functions returning a
+                    // primitive still belong to the Function class.
+                    if !function
+                        && matches!(
+                            constructor.original_output.as_str(),
+                            "True"
+                                | "Bool"
+                                | "Int"
+                                | "Long"
+                                | "Int32"
+                                | "Int53"
+                                | "Int64"
+                                | "Double"
+                                | "Int128"
+                                | "Int256"
+                                | "String"
+                                | "Bytes"
+                                | "SecureString"
+                                | "SecureBytes"
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(id) = constructor.tl_id {
                         domains += &format!("({id}, {schema:?}, {function}),\n");
                     }

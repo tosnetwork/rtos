@@ -21,7 +21,7 @@ const OWNER_ADDR: &str = "EQBvvC5hmeO1wDG4DlqWEGFp8bgCHckcvGXgRXTVSty9_71b";
 fn mk_num(hex: &str) -> StackEntry {
     StackEntry::Tvm_StackEntryNumber(stackentry::StackEntryNumber {
         number: TvmNumber::Tvm_NumberDecimal(NumberDecimal {
-            number: hex.to_string(), // "0x0", "0x-1", "-0x1"
+            number: hex.to_string().into(), // "0x0", "0x-1", "-0x1"
         }),
     })
 }

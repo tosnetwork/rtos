@@ -337,12 +337,20 @@ impl BareDeserialize for bytes {
                     | (buf[4] as usize) << 32
                     | (buf[5] as usize) << 40
                     | (buf[6] as usize) << 48;
+                // A slice parser diagnoses missing payload before allocation caps.
+                let padded = len
+                    .checked_add(3)
+                    .map(|n| n & !3)
+                    .ok_or_else(|| error!("Too big string found"))?;
+                de.require_input(padded)?;
                 if len >= (1 << 32) {
                     fail!("Too big string of {} size is found", len)
                 }
                 (len, 8)
             }
         };
+        let padding = (4 - ((have_read + len) % 4)) % 4;
+        de.require_input(len.checked_add(padding).ok_or_else(|| error!("Too big string found"))?)?;
         if let Some(remaining) = de.bytes_budget.as_mut() {
             let limit = (*remaining).min(de.bytes_limit);
             if len > limit {
@@ -499,7 +507,7 @@ pub type Flags = u32;
 pub type lengthPrefixedTypedObject = LengthPrefixed<TypedObject>;
 pub type True = bool;
 /// String built-in type.
-pub type string = String;
+pub type string = crate::TlString;
 /// Alias of TLObject built-in type.
 pub type TypedObject = TLObject;
 /// Alias of TLObject built-in type.

@@ -123,7 +123,7 @@ fn parse_stack_index_u64(entry: &StackEntry, context: &str) -> Result<u64> {
 fn read_stack_num(entry: &StackEntry) -> Result<String> {
     let number =
         entry.number().ok_or_else(|| error!("expected tvm.stackEntryNumber, got {:?}", entry))?;
-    Ok(number.number().clone())
+    Ok(number.number().as_str()?.to_owned())
 }
 
 fn read_stack_bool(entry: &StackEntry) -> Result<bool> {

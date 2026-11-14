@@ -63,15 +63,24 @@ responses. Expected protocol refusals are not counted as passing shared fixtures
 The `rtos_api --example tl_conformance` target provides the TL wire harness.
 It checks the root schema and object/function domain from build-generated native
 schema metadata, then uses the T0 generated decoder and serializer. It reads no
-fixture effects. The pinned174 original TL cases and56 added schema/domain
+fixture effects. The pinned174 original TL cases and148 added schema/domain/primitive
 controls agree with clean CPP1181. Explicit target declarations retain the CPP
 constructor IDs while referencing the existing native tonNode types. Changed
 layouts have separate T0 types, including normalized raw message hashes; legacy
 structs remain available through Legacy, and obsolete layouts are rejected by T0.
-This is frozen-vector agreement, not arbitrary TL input or whole-node qualification.
-The focused wire-profile tests pass. The broader API library run retains the
-same sorted-size-list test failure reproduced at unchanged6fb1a144; its full
-library result is6passed/1failed/1ignored and is not reported as green.
+Native `TlString` owns raw bytes. T0 preserves malformed UTF-8; text consumers
+validate UTF-8 explicitly before parsing numbers, JSON or configuration keys.
+Legacy string decoding and encoding retain their UTF-8 contract. Numeric JSON
+conversion propagates errors, including inside lists/tuples, rather than using
+lossy text. Generic Object/Function reads retain the declared schema and kind;
+primitive codecs such as Bool are fields, not members of the C++ Object class.
+Generic object storage omits its constructor as C++ does; Function storage
+retains it. The toslib wire adapter allows only raw.extMessageInfo. Slice-backed
+reads check available padded payload before allocating or applying byte caps.
+This is measured corpus agreement, not arbitrary TL input or whole-node qualification.
+The focused wire-profile and native string tests pass. The broader API library's
+previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
+(6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed

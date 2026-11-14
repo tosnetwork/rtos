@@ -1,7 +1,7 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: GPL-3.0-only
 //! Native TL schema/profile adapter; expectations are never read.
 use anyhow::{ensure, Context, Result};
-use rtos_api::{BoxedDeserialize, WireProfile};
+use rtos_api::{BoxedDeserialize, Constructor, WireProfile};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 
@@ -9,7 +9,12 @@ fn rejected(reason: &str) -> Value {
     json!({"outcome":"rejected","reason":reason})
 }
 fn run(ctx: &Value) -> Result<Value> {
-    let schema = ctx["schema"].as_str().context("schema required")?;
+    let schema = match ctx["schema"].as_str().context("schema required")? {
+        "tos_api" => "tos_api",
+        "lite_api" => "lite_api",
+        "toslib_api" => "toslib_api",
+        _ => anyhow::bail!("unknown schema"),
+    };
     let kind = ctx["kind"].as_str().context("kind required")?;
     ensure!(matches!(schema, "tos_api" | "lite_api" | "toslib_api"), "unknown schema");
     ensure!(matches!(kind, "object" | "function"), "kind must be object or function");
@@ -22,10 +27,13 @@ fn run(ctx: &Value) -> Result<Value> {
     }
     let id = u32::from_le_bytes(bytes[..4].try_into()?);
     let profile = WireProfile::T0;
-    if !profile.constructor_in_schema(id, schema, kind == "function") {
+    if (schema == "toslib_api"
+        && id != rtos_api::ton::raw::extmessageinfo::ExtMessageInfoV2::constructor_const())
+        || !profile.constructor_in_schema(id, schema, kind == "function")
+    {
         return Ok(rejected("unknown_constructor"));
     }
-    let (value, consumed) = match profile.deserialize_with_suffix(&bytes) {
+    let (value, consumed) = match profile.deserialize_schema_with_suffix(schema, &bytes) {
         Ok(value) => value,
         Err(error) => {
             let text = error.to_string();

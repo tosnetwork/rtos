@@ -187,7 +187,7 @@ fn stack_entry_to_json(entry: &rtos_api::ton::tvm::StackEntry) -> serde_json::Va
     match entry {
         rtos_api::ton::tvm::StackEntry::Tvm_StackEntryNumber(number) => serde_json::json!({
             "type": "num",
-            "value": number.number.number(),
+            "value": number.number.number().as_str().unwrap(),
         }),
         rtos_api::ton::tvm::StackEntry::Tvm_StackEntryCell(cell) => serde_json::json!({
             "type": "cell",
@@ -338,6 +338,8 @@ fn first_external_participant_pubkey_and_wallet() -> (String, String) {
         .number()
         .expect("participant pubkey must be number")
         .number()
+        .as_str()
+        .unwrap()
         .to_owned();
 
     let args = match &participant_fields[1] {
@@ -346,8 +348,13 @@ fn first_external_participant_pubkey_and_wallet() -> (String, String) {
     };
     assert_eq!(args.len(), 4, "participant args must contain 4 fields");
 
-    let wallet_addr =
-        args[2].number().expect("participant wallet addr must be number").number().to_owned();
+    let wallet_addr = args[2]
+        .number()
+        .expect("participant wallet addr must be number")
+        .number()
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     (pubkey, wallet_addr)
 }

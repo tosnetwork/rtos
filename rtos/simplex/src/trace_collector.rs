@@ -431,7 +431,7 @@ impl TraceCollector {
     ) {
         let event = stats::event::CollateFailed {
             target_slot: slot.value() as i32,
-            reason: truncate_reason(reason),
+            reason: truncate_reason(reason).into(),
         };
         self.record(session_id, event.into_boxed());
     }
@@ -446,7 +446,7 @@ impl TraceCollector {
     ) {
         let event = stats::event::ValidationFailed {
             id: make_tl_candidate_id(id),
-            reason: truncate_reason(reason),
+            reason: truncate_reason(reason).into(),
         };
         self.record(session_id, event.into_boxed());
     }
@@ -1296,14 +1296,14 @@ pub fn event_json(event: &TraceEvent) -> serde_json::Value {
             serde_json::json!({
                 "@type": "consensus.stats.collateFailed",
                 "target_slot": e.target_slot,
-                "reason": e.reason
+                "reason": e.reason.to_string()
             })
         }
         stats::Event::Consensus_Stats_ValidationFailed(e) => {
             serde_json::json!({
                 "@type": "consensus.stats.validationFailed",
                 "id": candidate_id_json(&e.id),
-                "reason": e.reason
+                "reason": e.reason.to_string()
             })
         }
         stats::Event::Consensus_Stats_SessionEnd => {

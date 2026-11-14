@@ -166,7 +166,7 @@ async fn liteserver_absence_reference_matrix() -> Result<()> {
     let error = invalid_reply
         .downcast::<ErrorEnum>()
         .expect("invalid workchain must be rejected before zero-LT success");
-    assert!(error.message().contains("invalid workchain specified"));
+    assert!(error.message().as_str().unwrap().contains("invalid workchain specified"));
     // Wrong workchain remains an error and cannot be disguised as absence.
     let err = LiteServerQuerySubscriber::get_one_transaction(
         &(engine as Arc<dyn EngineOperations>),

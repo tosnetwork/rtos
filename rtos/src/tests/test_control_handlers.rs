@@ -262,8 +262,8 @@ async fn get_config_projects_the_node_in_the_reference_schema() {
     assert_eq!(ask(&node, 2, GetConfig::default()).await, Ok(Some((602, "not authorized".into()))));
     let answer = ask_object(&node, 1, GetConfig::default()).await.unwrap();
     let data = answer.downcast::<JsonConfigBoxed>().unwrap().only().data;
-    let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-    assert_eq!(to_td(&json).encode_pretty(), data, "the reference layout");
+    let json: serde_json::Value = serde_json::from_str(data.as_str().unwrap()).unwrap();
+    assert_eq!(to_td(&json).encode_pretty(), data.as_str().unwrap(), "the reference layout");
     // Every object type the reference engine wrote has its fields in its order.
     let reference: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(format!("{DATA}cpp-getconfig.json")).unwrap(),
@@ -373,8 +373,10 @@ async fn get_stats_reports_the_masterchain_under_the_reference_names() {
     let node = Node::start_with_engine(Arc::new(engine)).await;
     let answer = ask_object(&node, 1, GetStats::default()).await.unwrap();
     let stats = answer.downcast::<StatsBoxed>().unwrap().only().stats;
-    let stats: Vec<(String, String)> =
-        stats.into_iter().map(|stat| (stat.key, stat.value)).collect();
+    let stats: Vec<(String, String)> = stats
+        .into_iter()
+        .map(|stat| (stat.key.into_string().unwrap(), stat.value.into_string().unwrap()))
+        .collect();
     let id = state.block_id();
     let mut expected = vec![
         ("masterchainblock".to_string(), block_id_to_str(id)),
@@ -450,7 +452,7 @@ async fn get_stats_reports_the_reference_names_it_has() {
     let node = Node::start(true).await;
     let answer = ask_object(&node, 1, GetStats::default()).await.unwrap();
     let stats = answer.downcast::<StatsBoxed>().unwrap().only().stats;
-    let names: Vec<&str> = stats.iter().map(|stat| stat.key.as_str()).collect();
+    let names: Vec<&str> = stats.iter().map(|stat| stat.key.as_str().unwrap()).collect();
     // A node without a masterchain state reports the time and the serializer.
     assert_eq!(names, vec!["unixtime", "stateserializerenabled"]);
     assert_eq!(stats[1].value, "true");
@@ -479,7 +481,11 @@ impl EngineOperations for OverlayEngine {
         &self,
         configs: Option<&[rtos_api::ton::engine::validator::customoverlay::CustomOverlay]>,
     ) -> Result<()> {
-        let names = configs.unwrap_or_default().iter().map(|c| c.name.clone()).collect();
+        let names = configs
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.name.as_str().unwrap().to_owned())
+            .collect();
         self.given.lock().unwrap().push(names);
         Ok(())
     }
@@ -501,7 +507,7 @@ fn overlay(
     nodes: usize,
 ) -> rtos_api::ton::engine::validator::customoverlay::CustomOverlay {
     rtos_api::ton::engine::validator::customoverlay::CustomOverlay {
-        name: name.to_string(),
+        name: name.to_string().into(),
         nodes: (0..nodes)
             .map(|i| rtos_api::ton::engine::validator::customoverlaynode::CustomOverlayNode {
                 adnl_id: UInt256::from([i as u8 + 1; 32]),
@@ -540,14 +546,17 @@ async fn custom_overlays_change_as_in_the_reference_engine() {
         Ok(Some((0, "duplicate custom overlay name \"ov1\"".to_string())))
     );
     assert_eq!(
-        ask(&node, 15, DelCustomOverlay { name: "nosuch".to_string() }).await,
+        ask(&node, 15, DelCustomOverlay { name: "nosuch".into() }).await,
         Ok(Some(reference_failure("del-custom-overlay nosuch")))
     );
     let shown = ask_object(&node, 15, ShowCustomOverlays::default()).await.unwrap();
     let shown =
         shown.downcast::<rtos_api::ton::engine::validator::CustomOverlaysConfig>().unwrap().only();
-    assert_eq!(shown.overlays.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["ov1"]);
-    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".to_string() }).await, Ok(None));
+    assert_eq!(
+        shown.overlays.iter().map(|o| o.name.as_str().unwrap()).collect::<Vec<_>>(),
+        ["ov1"]
+    );
+    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".into() }).await, Ok(None));
     assert_eq!(*engine.given.lock().unwrap(), vec![vec!["ov1".to_string()], vec![]]);
     node.server.shutdown().await;
     node.handler.stop_and_wait().await.unwrap();
@@ -555,7 +564,7 @@ async fn custom_overlays_change_as_in_the_reference_engine() {
     let node = Node::start(false).await;
     let not_started = Ok(Some((651, "not started".to_string())));
     assert_eq!(ask(&node, 15, AddCustomOverlay { overlay: overlay("ov1", 1) }).await, not_started);
-    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".to_string() }).await, not_started);
+    assert_eq!(ask(&node, 15, DelCustomOverlay { name: "ov1".into() }).await, not_started);
     assert_eq!(ask(&node, 15, ShowCustomOverlays::default()).await, not_started);
     node.server.shutdown().await;
     node.handler.stop_and_wait().await.unwrap();

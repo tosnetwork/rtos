@@ -219,7 +219,7 @@ pub(super) async fn ask<Q: AnyBoxedSerialize>(
     let answer = ask_object(node, bits, query).await?;
     Ok(answer.downcast::<ControlQueryErrorBoxed>().ok().map(|error| {
         let error = error.only();
-        (error.code, error.message)
+        (error.code, error.message.into_string().unwrap())
     }))
 }
 

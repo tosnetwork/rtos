@@ -84,7 +84,7 @@ async fn outcome(subscriber: &ControlQuerySubscriber, client: &str, query: &[u8]
             match object.downcast::<rtos_api::ton::engine::validator::ControlQueryError>() {
                 Ok(error) => {
                     let error = error.only();
-                    Outcome::Error(error.code, error.message)
+                    Outcome::Error(error.code, error.message.into_string().unwrap())
                 }
                 Err(object) => {
                     let bytes = rtos_api::serialize_boxed(&object).unwrap();
@@ -167,7 +167,11 @@ async fn the_lite_path_reads_the_network_wire_profile() {
     let answer = client.query_raw(&query, rtos_api::WireProfile::Legacy).await.unwrap();
     let answer = rtos_api::WireProfile::T0.deserialize(&answer).unwrap();
     let error = answer.downcast::<rtos_api::ton::lite_server::Error>().unwrap().only();
-    assert!(error.message.contains("invalid BlockIdExt for getBlockHeader"), "{}", error.message);
+    assert!(
+        error.message.as_str().unwrap().contains("invalid BlockIdExt for getBlockHeader"),
+        "{}",
+        error.message
+    );
     client.shutdown().await.unwrap();
     node.server.shutdown().await;
     node.handler.stop_and_wait().await.unwrap();

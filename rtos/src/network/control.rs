@@ -104,6 +104,7 @@ pub(crate) fn required_permission(query: &TLObject) -> Option<u32> {
 }
 
 fn control_error(code: i32, message: impl Into<String>) -> Result<QueryResult> {
+    let message: String = message.into();
     QueryResult::consume_boxed(
         ControlQueryError { code, message: message.into() }.into_boxed(),
         #[cfg(feature = "telemetry")]
@@ -1003,14 +1004,14 @@ impl ControlQuerySubscriber {
     }
 
     fn add_stats(stats: &mut Vec<OneStat>, key: impl ToString, value: impl ToString) {
-        stats.push(OneStat { key: key.to_string(), value: value.to_string() })
+        stats.push(OneStat { key: key.to_string().into(), value: value.to_string().into() })
     }
 
     /// The configuration as the reference engine reports it: its schema,
     /// field order and JSON layout, every list ordered by id.
     async fn get_validator_config(&self) -> Result<JsonConfig> {
         let view = self.config.control_view().await?;
-        Ok(JsonConfig { data: config_json(&view)?.encode_pretty() })
+        Ok(JsonConfig { data: config_json(&view)?.encode_pretty().into() })
     }
 
     /// The reference engine's statistics that this node keeps, under the
@@ -1496,7 +1497,7 @@ impl ControlQuerySubscriber {
         };
 
         let query = match query.downcast::<DelCustomOverlay>() {
-            Ok(params) => return self.del_custom_overlay(params.name).await,
+            Ok(params) => return self.del_custom_overlay(params.name.into_string()?).await,
             Err(query) => query,
         };
 
@@ -1566,7 +1567,8 @@ impl ControlQuerySubscriber {
             Ok(result) => result,
             Err(err) if err.downcast_ref::<CloseConnection>().is_some() => return Err(err),
             Err(err) => QueryResult::consume_boxed(
-                ControlQueryError { code: reply_code(&err), message: err.to_string() }.into_boxed(),
+                ControlQueryError { code: reply_code(&err), message: err.to_string().into() }
+                    .into_boxed(),
                 #[cfg(feature = "telemetry")]
                 None,
             )?,

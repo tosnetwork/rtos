@@ -359,7 +359,9 @@ impl FullNodeOverlaysRouter {
         self.service.test_bounded_reply(peer, id, full, bytes);
     }
     #[cfg(test)]
-    pub(crate) fn test_clear_history_replies(&self) { self.service.test_clear_history_replies(); }
+    pub(crate) fn test_clear_history_replies(&self) {
+        self.service.test_clear_history_replies();
+    }
 
     #[cfg(test)]
     pub(crate) fn test_pss_observations(&self) -> Vec<(BlockIdExt, Option<i64>, Option<usize>)> {
@@ -367,7 +369,13 @@ impl FullNodeOverlaysRouter {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_pss_reply(&self, peer: Arc<rtos_block::KeyId>, state: rtos_api::ton::ton_node::persistentstateidv2::PersistentStateIdV2, offset: Option<i64>, bytes: Vec<u8>) {
+    pub(crate) fn test_pss_reply(
+        &self,
+        peer: Arc<rtos_block::KeyId>,
+        state: rtos_api::ton::ton_node::persistentstateidv2::PersistentStateIdV2,
+        offset: Option<i64>,
+        bytes: Vec<u8>,
+    ) {
         self.service.test_pss_reply(peer, state, offset, bytes);
     }
     #[cfg(test)]
@@ -859,7 +867,7 @@ impl FullNodeOverlaysRouter {
             for config in configs {
                 add_unbound_object_to_map_with_update(
                     &self.custom_overlays,
-                    config.name.clone(),
+                    config.name.as_str()?.to_owned(),
                     |prev| {
                         if prev.is_some() {
                             log::info!(
@@ -2122,41 +2130,61 @@ impl FullNodeOverlaysRouter {
         shard: ShardIdent,
         issuer: &Arc<dyn KeyOption>,
     ) -> Result<Arc<FastSyncOverlayClient>> {
-        let head = self.engine.load_last_applied_mc_block_id()?
+        let head = self
+            .engine
+            .load_last_applied_mc_block_id()?
             .ok_or_else(|| error!("Fixture recipient has no applied anchor"))?;
         let state = self.engine.load_state(&head).await?;
         let config = state.config_params()?;
         let mut validators = Vec::new();
-        for set in [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?] {
+        for set in
+            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?]
+        {
             validators.extend_from_slice(set.list());
         }
-        let (roots, _) = fast_sync_transport_authority(&validators,
-            self.network.context().stack.overlay.wire_profile())?;
-        let key = self.network.context().stack.adnl
-            .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
+        let (roots, _) = fast_sync_transport_authority(
+            &validators,
+            self.network.context().stack.overlay.wire_profile(),
+        )?;
+        let key = self.network.context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)?;
         if !roots.contains(issuer.id()) || roots.contains(key.id()) {
             rtos_block::fail!("Fixture must use a governing root issuer and a non-root recipient");
         }
-        let expires = rtos_block::UnixTime::now().checked_add(3600)
+        let expires = rtos_block::UnixTime::now()
+            .checked_add(3600)
             .ok_or_else(|| error!("Fixture membership expiry overflow"))?;
         let certificate_id = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
             node: rtos_api::ton::adnl::id::short::Short {
                 id: rtos_block::UInt256::from_slice(key.id().data()),
             },
-            flags: 0, slot: 0, expire_at: i32::try_from(expires)?,
+            flags: 0,
+            slot: 0,
+            expire_at: i32::try_from(expires)?,
         };
         let signature = issuer.sign(&rtos_api::serialize_boxed(
-            &rtos_api::IntoBoxed::into_boxed(certificate_id.clone()))?)?;
+            &rtos_api::IntoBoxed::into_boxed(certificate_id.clone()),
+        )?)?;
         let certificate = rtos_api::ton::overlay::membercertificate::MemberCertificate {
-            issued_by: issuer.try_into()?, flags: certificate_id.flags,
-            slot: certificate_id.slot, expire_at: certificate_id.expire_at, signature,
+            issued_by: issuer.try_into()?,
+            flags: certificate_id.flags,
+            slot: certificate_id.slot,
+            expire_at: certificate_id.expire_at,
+            signature,
         };
         let client = FastSyncOverlayClient::new(
-            shard, &validators, Some(&key), Some(certificate),
-            self.tasks.cancellation().child_token(), self.network.context().clone(),
-            self.engine.clone(), self.policy.clone(), self.network.default_rldp_roundtrip(),
-            true, self.tasks.clone(),
-        ).await?;
+            shard,
+            &validators,
+            Some(&key),
+            Some(certificate),
+            self.tasks.cancellation().child_token(),
+            self.network.context().clone(),
+            self.engine.clone(),
+            self.policy.clone(),
+            self.network.default_rldp_roundtrip(),
+            true,
+            self.tasks.clone(),
+        )
+        .await?;
         self.configure_fast_sync_propagation(&client)?;
         Ok(client)
     }

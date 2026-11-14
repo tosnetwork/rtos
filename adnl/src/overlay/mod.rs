@@ -293,7 +293,7 @@ impl OverlayUtils {
         sorted.dedup();
         let id = CustomOverlayId {
             zero_state_file_hash: UInt256::with_array(*zero_state_file_hash),
-            name: name.to_string(),
+            name: name.to_string().into(),
             nodes: sorted.into_iter().collect(),
         };
         let overlay_key = OverlayKey { name: hash(id)?.to_vec() };
@@ -3555,7 +3555,8 @@ impl Overlay {
                 // A permanent member that has not advertised itself carries the
                 // overlay's default permanent member flags.
                 !self.overlay_type.is_public()
-                    && self.permanent_member_flags.load(Ordering::Relaxed) & Self::MEMBER_PLUMTREE_DENY
+                    && self.permanent_member_flags.load(Ordering::Relaxed)
+                        & Self::MEMBER_PLUMTREE_DENY
                         == 0
             };
             if eligible && self.check_peer(&peer, None).is_ok() {

@@ -9,13 +9,13 @@
  */
 use base64::Engine;
 use rtos_api::{
-    IntoBoxed,
     ton::tvm::{
-        List, Number, StackEntry, Tuple, cell::Cell as TvmCell, list, numberdecimal::NumberDecimal,
-        slice, stackentry, tuple,
+        cell::Cell as TvmCell, list, numberdecimal::NumberDecimal, slice, stackentry, tuple, List,
+        Number, StackEntry, Tuple,
     },
+    IntoBoxed,
 };
-use rtos_block::{Result as BlockResult, base64_encode};
+use rtos_block::{base64_encode, Result as BlockResult};
 use serde::ser::SerializeSeq;
 use std::fmt::Formatter;
 
@@ -29,13 +29,14 @@ enum NumberJson {
     Decimal { number: String },
 }
 
-impl From<&Number> for NumberJson {
-    fn from(value: &Number) -> Self {
-        match value {
+impl TryFrom<&Number> for NumberJson {
+    type Error = ConversionError;
+    fn try_from(value: &Number) -> ConvResult<Self> {
+        Ok(match value {
             Number::Tvm_NumberDecimal(inner) => {
-                NumberJson::Decimal { number: inner.number.clone() }
+                NumberJson::Decimal { number: inner.number.as_str()?.to_owned() }
             }
-        }
+        })
     }
 }
 
@@ -45,7 +46,7 @@ impl TryFrom<NumberJson> for Number {
     fn try_from(value: NumberJson) -> ConvResult<Self> {
         match value {
             NumberJson::Decimal { number } => {
-                Ok(Number::Tvm_NumberDecimal(NumberDecimal { number }))
+                Ok(Number::Tvm_NumberDecimal(NumberDecimal { number: number.into() }))
             }
         }
     }
@@ -109,14 +110,19 @@ enum ListJson {
     List { elements: Vec<StackEntryJson> },
 }
 
-impl From<&List> for ListJson {
-    fn from(value: &List) -> Self {
-        match value {
+impl TryFrom<&List> for ListJson {
+    type Error = ConversionError;
+    fn try_from(value: &List) -> ConvResult<Self> {
+        Ok(match value {
             List::Tvm_List(inner) => {
-                let elements = inner.elements.iter().map(StackEntryJson::from).collect();
+                let elements = inner
+                    .elements
+                    .iter()
+                    .map(StackEntryJson::try_from)
+                    .collect::<ConvResult<Vec<_>>>()?;
                 ListJson::List { elements }
             }
-        }
+        })
     }
 }
 
@@ -142,14 +148,19 @@ enum TupleJson {
     Tuple { elements: Vec<StackEntryJson> },
 }
 
-impl From<&Tuple> for TupleJson {
-    fn from(value: &Tuple) -> Self {
-        match value {
+impl TryFrom<&Tuple> for TupleJson {
+    type Error = ConversionError;
+    fn try_from(value: &Tuple) -> ConvResult<Self> {
+        Ok(match value {
             Tuple::Tvm_Tuple(inner) => {
-                let elements = inner.elements.iter().map(StackEntryJson::from).collect();
+                let elements = inner
+                    .elements
+                    .iter()
+                    .map(StackEntryJson::try_from)
+                    .collect::<ConvResult<Vec<_>>>()?;
                 TupleJson::Tuple { elements }
             }
-        }
+        })
     }
 }
 
@@ -185,26 +196,27 @@ enum StackEntryJson {
     Unsupported,
 }
 
-impl From<&StackEntry> for StackEntryJson {
-    fn from(value: &StackEntry) -> Self {
-        match value {
+impl TryFrom<&StackEntry> for StackEntryJson {
+    type Error = ConversionError;
+    fn try_from(value: &StackEntry) -> ConvResult<Self> {
+        Ok(match value {
             StackEntry::Tvm_StackEntryNumber(inner) => {
-                StackEntryJson::Number { number: NumberJson::from(&inner.number) }
+                StackEntryJson::Number { number: NumberJson::try_from(&inner.number)? }
             }
             StackEntry::Tvm_StackEntryCell(inner) => {
                 StackEntryJson::Cell { cell: CellJson::from(&inner.cell) }
             }
             StackEntry::Tvm_StackEntryList(inner) => {
-                StackEntryJson::List { list: ListJson::from(&inner.list) }
+                StackEntryJson::List { list: ListJson::try_from(&inner.list)? }
             }
             StackEntry::Tvm_StackEntrySlice(inner) => {
                 StackEntryJson::Slice { slice: SliceJson::from(&inner.slice) }
             }
             StackEntry::Tvm_StackEntryTuple(inner) => {
-                StackEntryJson::Tuple { tuple: TupleJson::from(&inner.tuple) }
+                StackEntryJson::Tuple { tuple: TupleJson::try_from(&inner.tuple)? }
             }
             StackEntry::Tvm_StackEntryUnsupported => StackEntryJson::Unsupported,
-        }
+        })
     }
 }
 
@@ -369,7 +381,7 @@ impl<'de> serde::Deserialize<'de> for RPCStackEntry {
                         })?;
                         let inner = stackentry::StackEntryNumber {
                             number: Number::Tvm_NumberDecimal(NumberDecimal {
-                                number: value.into_string(),
+                                number: value.into_string().into(),
                             }),
                         };
                         Ok(RPCStackEntry::Tvm_StackEntryNumber(inner))
@@ -447,7 +459,7 @@ impl serde::Serialize for RPCStackEntry {
 fn serialize_stack_entry(entry: &StackEntry) -> Result<serde_json::Value, String> {
     let result = match entry {
         StackEntry::Tvm_StackEntryNumber(value) => {
-            serde_json::json!(["num", value.number.number()])
+            serde_json::json!(["num", value.number.number().as_str().map_err(|e| e.to_string())?])
         }
         StackEntry::Tvm_StackEntryCell(cell) => {
             let bytes = base64_encode(&cell.cell.bytes);

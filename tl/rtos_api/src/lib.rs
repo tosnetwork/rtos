@@ -34,7 +34,9 @@ macro_rules! _invalid_id {
 pub mod pq_finality;
 pub mod secure;
 pub mod session_identity;
+mod tl_string;
 mod wire_profile;
+pub use tl_string::TlString;
 pub use wire_profile::WireProfile;
 include!(concat!(env!("OUT_DIR"), "/ton_module.rs"));
 mod ton_prelude;
@@ -113,6 +115,8 @@ pub struct Deserializer<'r> {
     bytes_limit: usize,
     bytes_budget: Option<usize>,
     profile: WireProfile,
+    schema: Option<&'static str>,
+    input_len: Option<usize>,
 }
 
 impl<'r> Deserializer<'r> {
@@ -128,7 +132,46 @@ impl<'r> Deserializer<'r> {
             bytes_limit: ton_prelude::MAX_TL_BYTES_LEN,
             bytes_budget: None,
             profile,
+            schema: None,
+            input_len: None,
         }
+    }
+
+    /// Select a concrete generated schema for generic Object/Function fields.
+    pub fn with_schema(mut self, schema: &'static str) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    /// Exact source length for slice-backed decoding, checked before allocation.
+    pub fn with_input_len(mut self, len: usize) -> Self {
+        self.input_len = Some(len);
+        self
+    }
+
+    fn require_input(&self, bytes: usize) -> Result<()> {
+        if self.input_len.is_some_and(|len| bytes > len.saturating_sub(self.pos)) {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated TL field").into());
+        }
+        Ok(())
+    }
+
+    fn read_dynamic<D: BoxedDeserialize>(&mut self, function: bool) -> Result<D> {
+        let id = self.read_constructor()?;
+        if self.profile == WireProfile::T0
+            && !self.profile.native_constructor_in_schema(id, self.schema, function)
+        {
+            return Err(InvalidConstructor { expected: Vec::new(), received: id }.into());
+        }
+        D::deserialize_boxed(id, self)
+    }
+
+    pub fn read_object<D: BoxedDeserialize>(&mut self) -> Result<D> {
+        self.read_dynamic(false)
+    }
+
+    pub fn read_function<D: BoxedDeserialize>(&mut self) -> Result<D> {
+        self.read_dynamic(true)
     }
 
     /// Bound both a declared byte field and aggregate byte-field allocations.
@@ -250,6 +293,41 @@ impl<'w> Serializer<'w> {
     #[inline(always)]
     pub fn write_bare<S: ?Sized + BareSerialize>(&mut self, obj: &S) -> Result<()> {
         obj.serialize_bare(self)
+    }
+
+    /// C++ stores generic `object` fields without their constructor. Generic
+    /// function fields use the ordinary boxed writer, including the constructor.
+    pub fn write_object<S: ?Sized + BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
+        if self.profile == WireProfile::T0 {
+            let bare = obj.bare_object();
+            if !self.profile.native_constructor_in_schema(bare.constructor(), None, false) {
+                return Err(InvalidConstructor {
+                    expected: Vec::new(),
+                    received: bare.constructor(),
+                }
+                .into());
+            }
+            self.write_bare(bare)
+        } else {
+            self.write_boxed(obj)
+        }
+    }
+
+    pub fn write_function<S: ?Sized + BoxedSerialize>(&mut self, obj: &S) -> Result<()> {
+        if self.profile == WireProfile::T0
+            && !self.profile.native_constructor_in_schema(
+                obj.bare_object().constructor(),
+                None,
+                true,
+            )
+        {
+            return Err(InvalidConstructor {
+                expected: Vec::new(),
+                received: obj.bare_object().constructor(),
+            }
+            .into());
+        }
+        self.write_boxed(obj)
     }
 
     /// Serialize TL-object as boxed value

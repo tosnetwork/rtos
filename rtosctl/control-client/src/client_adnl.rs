@@ -16,11 +16,12 @@ use crate::client_api::{
 use adnl::client::{AdnlClient, AdnlClientConfig, AdnlClientConfigJson};
 use anyhow::Context;
 use rtos_api::{
-    AnyBoxedSerialize, IntoBoxed, TLObject, WireProfile, serialize_boxed,
+    serialize_boxed,
     ton::{
         self, engine::validator::ControlQueryError as TonControlQueryError,
         rpc::engine::validator::ControlQuery as TonControlQuery,
     },
+    AnyBoxedSerialize, IntoBoxed, TLObject, WireProfile,
 };
 use rtos_block::{BlockIdExt, Deserializable, MsgAddressInt, UInt256};
 use std::str::FromStr;
@@ -52,7 +53,8 @@ impl ToFromTL for GetValidatorConfigRqRs {
 
     fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
         let config = downcast::<rtos_api::ton::engine::validator::JsonConfig>(rs)?;
-        let engine_validator_config = serde_json::from_str::<EngineValidatorConfig>(config.data())?;
+        let engine_validator_config =
+            serde_json::from_str::<EngineValidatorConfig>(config.data().as_str()?)?;
         Ok(engine_validator_config)
     }
 }

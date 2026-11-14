@@ -163,7 +163,6 @@ async fn start_control(
     start_control_with_options(data_source, None, test_name).await
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_connect_to_control() {
     struct TestSource;
@@ -230,7 +229,7 @@ async fn test_connect_to_control_with_import_private_key() {
 
     println!("Config data: {}", answer.data());
 
-    let json = serde_json::from_str::<serde_json::Value>(answer.data()).unwrap();
+    let json = serde_json::from_str::<serde_json::Value>(answer.data().as_str().unwrap()).unwrap();
     assert_eq!(json["adnl"].as_array().unwrap().len(), 3);
     assert_eq!(json["dht"].as_array().unwrap().len(), 1);
     assert_eq!(json["validators"].as_array().unwrap().len(), 2);
@@ -379,7 +378,8 @@ async fn test_stats() {
 
         // getStats answers under the reference engine's names.
         let answer: Stats = request(&mut client, GetStats).await?;
-        let names: Vec<&str> = answer.stats().iter().map(|stat| stat.key.as_str()).collect();
+        let names: Vec<&str> =
+            answer.stats().iter().map(|stat| stat.key.as_str().unwrap()).collect();
         assert_eq!(names.first(), Some(&"unixtime"));
         assert!(names.contains(&"masterchainblock"), "{names:?}");
         assert!(names.contains(&"masterchainblocktime"), "{names:?}");
