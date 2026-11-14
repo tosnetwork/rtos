@@ -22,6 +22,12 @@ from scenario_packet import (
     packet_arguments,
     packet_artifacts,
 )
+from scenario_restart import (
+    RESTARTS,
+    check_restart_cleanup,
+    check_restart_partition,
+    restart_arguments,
+)
 
 ROTATIONS = (
     frozenset(
@@ -36,6 +42,7 @@ ROTATIONS = (
     )
     | {"restart-member2", "restart-member5"}
     | set(PACKETS)
+    | set(RESTARTS)
 )
 
 
@@ -83,6 +90,8 @@ def make_profile(name, template, now):
             initial_weights={"0": 29, "1": 11, "2": 10, "3": 10},
             initial_probe_pause=[1],
         )
+    if name == "below-quorum-restart":
+        profile["successor_weights"] = {"0": 10, "2": 30, "4": 10, "5": 10}
     if name.startswith("observer-budget-"):
         profile["observer_budget"] = {
             key: value.copy() if isinstance(value, list) else value
@@ -160,7 +169,9 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name.startswith("restart-member"):
+    if name in RESTARTS:
+        check_restart_partition(name, result.get("partition_restart"), recovery)
+    elif name.startswith("restart-member"):
         member = int(name[-1])
         if not recovery or any(
             recovery.get(key) != value
@@ -182,6 +193,8 @@ def check_result(name, result):
             raise ValueError("Restarted member lacks its vote or creators")
     elif recovery is not None:
         raise ValueError("Unexpected restart receipt")
+    if name not in RESTARTS and result.get("partition_restart") is not None:
+        raise ValueError("Unexpected restart partition receipt")
 
 
 def execute(args, names, catalog):
@@ -219,7 +232,7 @@ def execute(args, names, catalog):
         catalog,
         *source.glob("*.py"),
     ]
-    if any(name in PACKETS for name in names):
+    if any(name in PACKETS or name in RESTARTS for name in names):
         inputs.extend(packet_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
@@ -287,6 +300,8 @@ def execute(args, names, catalog):
                     run += ["--interrupt-rust-member", name[-1]]
             if name in PACKETS:
                 run += packet_arguments(name, args.socket_mark_library)
+            if name in RESTARTS:
+                run += restart_arguments(name, args.socket_mark_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -311,6 +326,8 @@ def execute(args, names, catalog):
                 check_result(name, result)
                 if name in PACKETS:
                     check_packet_cleanup(case / "runtime", result["network_fault"])
+                if name in RESTARTS:
+                    check_restart_cleanup(case / "runtime", result["partition_restart"])
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

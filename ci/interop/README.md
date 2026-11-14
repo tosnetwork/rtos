@@ -25,6 +25,19 @@ with `bytes` and `sha256`; both paths and content must match the current fixture
 source and supplied library before any suite directory is created. The suite
 hashes that C source, library and record along with its other inputs.
 
+Three partitioned restart cases use the same native library provenance:
+`partition-restart-member2`, `partition-restart-member5`, and
+`below-quorum-restart`. They keep isolation through SIGKILL and original-database
+restart, with12-second holds before survivor sampling and after restart within
+the existing180-second recovery budget. The new process must remain isolated,
+increase native drop counters, and recover its own vote and MC/WC creators with
+matching full states after restoration. Below-quorum restart gives member2
+weight30 and each other active member10: survivors have30 of60, below quorum40.
+It requires4 seconds settling and12 seconds of responsive stalled finality,
+then recovery without changing the original committee. A historical certificate
+is not counted as new finality during the stall. Generic rotation dependencies
+remain controls for rotation, not native controls for each injected restart.
+
 Packet completion additionally requires native netem counters demonstrating
 traffic effects (drops for partition/loss, traffic with zero drops for reorder),
 a fresh surviving quorum, restored own vote and both chain creators, unchanged
