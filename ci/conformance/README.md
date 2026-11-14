@@ -59,12 +59,13 @@ scans leave an incomplete index; callers must require `complete: true` before us
 Concurrency and result buffering are limited to `--jobs` packages per batch;
 SQLite commits each batch. Original packages remain read-only.
 
-Build the native replay example, then derive dependency order from original BOCs:
+Build the optimized native replay example, then derive dependency order from original BOCs:
 
 ```sh
+cargo build --release --locked -j32 -p rtos_executor --example stateful_block_replay
 python3 ci/conformance/plan_archive_replay.py \
   --index /datax/rtos-conformance/archive-index/index.sqlite \
-  --binary "$CARGO_TARGET_DIR/debug/examples/stateful_block_replay" \
+  --binary "$CARGO_TARGET_DIR/release/examples/stateful_block_replay" \
   --zerostate /datax/epoch/zerostate.boc --zerostate /datax/epoch/basestate0.boc \
   --out /datax/rtos-conformance/replay-plan --jobs 32
 ```
@@ -106,7 +107,7 @@ C++ binary reran the entire archive. Confirm process exit and seal final input,
 binary and output hashes separately before declaring a full replay qualified.
 
 For sequential state replay, build `rtos_executor --example stateful_block_replay`
-with `cargo build --locked -j32`. Feed JSONL on stdin: initial
+with `cargo build --release --locked -j32`. Feed JSONL on stdin: initial
 `{"zerostate":"/path/to/state.boc"}` records followed by
 `{"block":"/path/to/original.boc","root_hash":"UPPERCASE_HEX","file_hash":"UPPERCASE_HEX"}`.
 The hashes must come from the archive identity. Supply blocks in dependency
