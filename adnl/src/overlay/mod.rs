@@ -90,7 +90,7 @@ mod clock;
 mod transport_tests;
 pub use clock::{BroadcastClock, SystemBroadcastClock};
 mod transport;
-pub use transport::{BroadcastTransportMethod, OverlayBroadcastTransport};
+pub use transport::{BroadcastTransportMethod, FixedMemberOverlayOptions, OverlayBroadcastTransport};
 mod plumtree;
 mod privacy;
 use broadcast::{
@@ -443,6 +443,7 @@ enum OverlayType {
         use_quic: bool,
         bcast_check: Option<Arc<dyn BroadcastCheck>>,
         fixed_member_list: bool,
+        twostep_enabled: bool,
     },
     // Overlay with externally certified members
     CertifiedMembers {
@@ -523,6 +524,14 @@ impl OverlayType {
 
     fn is_fixed_member_list(&self) -> bool {
         matches!(self, OverlayType::Private { fixed_member_list: true, .. })
+    }
+
+    fn twostep_sender_enabled(&self) -> bool {
+        matches!(self, Self::Private { fixed_member_list: true, twostep_enabled: true, .. })
+    }
+
+    fn accepts_twostep(&self) -> bool {
+        !self.is_fixed_member_list() || self.twostep_sender_enabled()
     }
 
     fn has_certified_members(&self) -> bool {
@@ -874,6 +883,10 @@ impl Overlay {
             }
             neighbour = self.known_peers.next(&mut iter);
         }
+        if self.wire_profile == rtos_api::WireProfile::T0 {
+            // CPP iterates its peer DecTree in key order when assigning parts.
+            neighbours.sort_unstable_by(|a, b| a.data().cmp(b.data()));
+        }
         neighbours
     }
 
@@ -999,16 +1012,17 @@ impl Overlay {
                         let method = match method {
                             BroadcastSendMethod::Fast => BroadcastTransportMethod::Datagram,
                             BroadcastSendMethod::Safe => BroadcastTransportMethod::Stream,
-                            BroadcastSendMethod::QuicOrRldp => BroadcastTransportMethod::Reliable,
+                            BroadcastSendMethod::TwostepUnreliable => BroadcastTransportMethod::Sender { reliable: false },
+                            BroadcastSendMethod::TwostepReliable => BroadcastTransportMethod::Sender { reliable: true },
                         };
                         return Ok::<_, anyhow::Error>(
                             transport.send_message(data.object, peers, method).await.err(),
                         );
                     }
                     Ok(match method {
-                        BroadcastSendMethod::Fast => self.adnl
+                        BroadcastSendMethod::Fast | BroadcastSendMethod::TwostepUnreliable => self.adnl
                             .send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err(),
-                        BroadcastSendMethod::QuicOrRldp => {
+                        BroadcastSendMethod::TwostepReliable => {
                             if let Some(quic) = &self.quic {
                                 quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
                             } else if let Some(rldp) = &self.rldp {
@@ -1686,6 +1700,7 @@ impl Drop for OverlayNode {
 
 impl OverlayNode {
     pub const FLAG_BCAST_ANY_SENDER: u32 = 0x01;
+    pub const FLAG_BCAST_NO_TWOSTEP: u32 = 0x100;
     #[cfg(feature = "xp25")]
     pub const FLAG_BCAST_REPEATED: u32 = 0x80;
 
@@ -1980,7 +1995,7 @@ impl OverlayNode {
         bcast_check: Option<Arc<dyn BroadcastCheck>>,
     ) -> Result<bool> {
         let overlay_type = OverlayType::Private {
-            key: overlay_key.clone(), use_quic, bcast_check, fixed_member_list: false,
+            key: overlay_key.clone(), use_quic, bcast_check, fixed_member_list: false, twostep_enabled: true,
         };
         self.add_typed_private_overlay(overlay_type, params, peers)
     }
@@ -1995,8 +2010,28 @@ impl OverlayNode {
         peers: &[Arc<KeyId>],
         rules: OverlayPrivacyRules,
     ) -> Result<bool> {
+        self.add_fixed_member_overlay_with_options(
+            params, overlay_key, peers, rules, FixedMemberOverlayOptions::default(),
+        )
+    }
+
+    pub fn add_fixed_member_overlay_with_options(
+        &self,
+        params: OverlayParams,
+        overlay_key: &Arc<dyn KeyOption>,
+        peers: &[Arc<KeyId>],
+        rules: OverlayPrivacyRules,
+        options: FixedMemberOverlayOptions,
+    ) -> Result<bool> {
+        let sender_available = self.broadcast_transport.get().is_some()
+            || if options.use_quic { self.quic.get().is_some() } else { self.rldp.get().is_some() };
+        let twostep_enabled = options.twostep && sender_available;
+        if options.twostep && !sender_available {
+            log::warn!(target: TARGET, "Two-step sender is not set; retaining ordinary broadcasts");
+        }
         let overlay_type = OverlayType::Private {
-            key: overlay_key.clone(), use_quic: false, bcast_check: None, fixed_member_list: true,
+            key: overlay_key.clone(), use_quic: options.use_quic,
+            bcast_check: None, fixed_member_list: true, twostep_enabled,
         };
         self.add_typed_private_overlay_with_rules(overlay_type, params, peers, Some(rules))
     }
@@ -2194,6 +2229,15 @@ impl OverlayNode {
         log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let overlay = self.get_overlay(overlay_id, "Trying broadcast to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        let is_fec = force_fec || (matches!(&method, AdnlSendMethod::Fast)
+            && data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST);
+        if is_fec && self.wire_profile == rtos_api::WireProfile::T0
+            && overlay.overlay_type.twostep_sender_enabled() && flags & Self::FLAG_BCAST_NO_TWOSTEP == 0 {
+            return self.broadcast_twostep(overlay_id, data, src_key, flags, Vec::new()).await;
+        }
+        let flags = if self.wire_profile == rtos_api::WireProfile::T0 {
+            flags & !Self::FLAG_BCAST_NO_TWOSTEP
+        } else { flags };
         let src_key = self.calc_src_key_for_broadcast(&overlay, src_key);
         let certificate = overlay.local_certificate(src_key.id());
         let mut ctx = BroadcastSendContext {
@@ -2210,8 +2254,6 @@ impl OverlayNode {
         if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
             check.on_send(ctx.src_key.id(), data.object.len())?;
         }
-        let is_fec = force_fec || (matches!(&method, AdnlSendMethod::Fast)
-            && data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST);
         if !is_fec && self.wire_profile == rtos_api::WireProfile::Legacy {
             // Ignore ANY_SENDER flag for non-FEC broadcasts
             ctx.flags &= !Self::FLAG_BCAST_ANY_SENDER;
@@ -2264,11 +2306,18 @@ impl OverlayNode {
         if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
             check.on_send(ctx.src_key.id(), data.object.len())?;
         }
+        if self.wire_profile == rtos_api::WireProfile::T0 {
+            overlay.admit_ordinary_send(ctx.src_key, overlay.local_certificate(src_key.id()).as_ref(),
+                data.object, true, false, true).await?;
+        }
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-        let reliable = big_data || overlay.overlay_type.quic_requested();
-        if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
-            BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra)?.send(ctx).await
+        let reliable = self.wire_profile == rtos_api::WireProfile::T0
+            || big_data || overlay.overlay_type.quic_requested();
+        let min_nodes = if self.wire_profile == rtos_api::WireProfile::T0 { 5 }
+            else { Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST };
+        if big_data && neighbours >= min_nodes {
+            BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra, self.wire_profile)?.send(ctx).await
         } else {
             BroadcastTwostepSimpleProtocol::for_send(reliable, extra).send(ctx).await
         }
@@ -3462,7 +3511,7 @@ impl Subscriber for OverlayNode {
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepFec(_)
                     | Broadcast::Overlay_BroadcastTwostepSimple(_))
-                    if overlay.overlay_type.is_fixed_member_list() =>
+                    if !overlay.overlay_type.accepts_twostep() =>
                     fail!("Two-step broadcast is disabled on this overlay"),
                 Ok(Broadcast::Overlay_BroadcastTwostepFec(bcast)) => {
                     BroadcastTwostepFecProtocol::for_recv().recv(bcast, ctx).await?;
@@ -3470,7 +3519,8 @@ impl Subscriber for OverlayNode {
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepSimple(bcast)) => {
                     let big_data = bcast.data.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-                    let reliable = big_data || ctx.overlay.overlay_type.quic_requested();
+                    let reliable = self.wire_profile == rtos_api::WireProfile::T0
+                        || big_data || ctx.overlay.overlay_type.quic_requested();
                     BroadcastTwostepSimpleProtocol::for_recv(reliable).recv(bcast, ctx).await?;
                     return Ok(true);
                 }

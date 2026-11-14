@@ -4,8 +4,8 @@ use adnl::{
     common::{AdnlPeers, Subscriber, TaggedByteSlice},
     node::{AdnlNode, AdnlNodeConfig, AdnlSendMethod},
     records::overlay_public_key,
-    BroadcastClock, BroadcastTransportMethod, OverlayBroadcastTransport, OverlayNode,
-    OverlayParams, OverlayPrivacyRules, OverlayShortId, PublicBroadcastCheck,
+    BroadcastClock, BroadcastTransportMethod, FixedMemberOverlayOptions, OverlayBroadcastTransport,
+    OverlayNode, OverlayParams, OverlayPrivacyRules, OverlayShortId, PublicBroadcastCheck,
 };
 use anyhow::{ensure, Context, Result};
 use rtos_api::{ton, Constructor, WireProfile};
@@ -150,11 +150,20 @@ async fn run_async(v: &Value) -> Result<Value> {
     let now: i32 = v["now"].as_i64().context("unix time required")?.try_into()?;
     ensure!(now > 0, "positive unix time required");
     ensure!(
-        matches!(v["mode"].as_str(), Some("simple" | "fec")),
+        matches!(v["mode"].as_str(), Some("simple" | "fec" | "twostep")),
         "unsupported overlay broadcast mode"
     );
     let members = v["members"].as_array().context("members required")?;
-    ensure!(members.len() == 2, "two members required for ordinary broadcasts");
+    ensure!((2..=8).contains(&members.len()), "two to eight members required");
+    if members.len() != 2 {
+        ensure!(
+            v["mode"] == "twostep"
+                && v.get("inbound").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+                && v["broadcast"]["fec"].as_bool() == Some(true)
+                && uint(&v["broadcast"], "flags")? & OverlayNode::FLAG_BCAST_NO_TWOSTEP == 0,
+            "multiple members require a pure two-step FEC send"
+        );
+    }
     let id = OverlayShortId::from_data(
         overlay_public_key(&super::bytes(v, "name", 1 << 20)?)?.short_id()?,
     );
@@ -217,11 +226,12 @@ async fn run_async(v: &Value) -> Result<Value> {
             .map(|peer| peer.id().clone())
             .collect::<Vec<_>>();
         ensure!(
-            node.add_fixed_member_overlay(
+            node.add_fixed_member_overlay_with_options(
                 OverlayParams::with_id_only(&id),
                 key,
                 &peers,
-                rules.clone()
+                rules.clone(),
+                FixedMemberOverlayOptions { twostep: v["mode"] == "twostep", ..Default::default() },
             )?,
             "overlay already present"
         );
@@ -260,7 +270,9 @@ async fn run_async(v: &Value) -> Result<Value> {
         }
     }
     if let Some(send) = v.get("broadcast") {
-        let data = super::bytes(send, "data", 1535)?;
+        let old_fec = v["mode"] != "twostep"
+            || uint(send, "flags")? & OverlayNode::FLAG_BCAST_NO_TWOSTEP != 0;
+        let data = super::bytes(send, "data", if old_fec { 1535 } else { 1 << 20 })?;
         let fec = send["fec"].as_bool().context("fec bool required")?;
         ensure!(fec || data.len() <= 768, "simple broadcast exceeds768bytes");
         let tagged = TaggedByteSlice {
@@ -285,9 +297,16 @@ async fn run_async(v: &Value) -> Result<Value> {
     let mut seen = (0, 0);
     for _ in 0..20000 {
         tokio::task::yield_now().await;
-        let emitted = record.lock().unwrap().emitted.get(handed).cloned();
-        if let Some(message) = emitted {
-            handed += 1;
+        // The reference hands off the complete current emission batch before
+        // running another scheduler round. Preserve FIFO messages per member
+        // rather than inserting an extra scheduling round after every datagram.
+        let batch = {
+            let r = record.lock().unwrap();
+            let batch = r.emitted[handed..].to_vec();
+            handed = r.emitted.len();
+            batch
+        };
+        for message in batch {
             if let Some(dst) = keys.iter().position(|key| *key.id().data() == message.dst) {
                 let peers =
                     AdnlPeers::with_keys(keys[dst].id().clone(), KeyId::from_data(message.src));

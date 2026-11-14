@@ -7,6 +7,14 @@ pub enum BroadcastTransportMethod {
     Datagram,
     Stream,
     Reliable,
+    Sender { reliable: bool },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FixedMemberOverlayOptions {
+    pub twostep: bool,
+    /// The owned live sender backend; an explicitly installed edge may stand in.
+    pub use_quic: bool,
 }
 
 /// The network edge after broadcast construction and authorization. Implementations

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 struct Edge {
     messages: std::sync::Mutex<Vec<Vec<u8>>>,
+    methods: std::sync::Mutex<Vec<BroadcastTransportMethod>>,
 }
 #[async_trait::async_trait]
 impl OverlayBroadcastTransport for Edge {
@@ -17,9 +18,10 @@ impl OverlayBroadcastTransport for Edge {
         &self,
         data: &[u8],
         _: &AdnlPeers,
-        _: BroadcastTransportMethod,
+        method: BroadcastTransportMethod,
     ) -> Result<()> {
         self.messages.lock().unwrap().push(data.to_vec());
+        self.methods.lock().unwrap().push(method);
         Ok(())
     }
 }
@@ -268,4 +270,166 @@ async fn tos_local_simple_and_fec_check_application_once_before_delivery_and_rel
             }
         );
     }
+}
+
+async fn first_packet(edge: &Edge) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(packet) = edge.messages.lock().unwrap().first().cloned() {
+                break packet;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+fn broadcast_payload(packet: &[u8]) -> Broadcast {
+    let (_, offset) = rtos_api::WireProfile::T0.deserialize_with_suffix(packet).unwrap();
+    rtos_api::WireProfile::T0.deserialize(&packet[offset..]).unwrap().downcast().unwrap()
+}
+
+#[tokio::test]
+async fn tos_twostep_mode_gates_ingress_and_keeps_signing_source_distinct_from_adnl() {
+    use crate::common::Subscriber;
+    let (sender_adnl, sender, sender_key) = node(216).await;
+    let (receiver_adnl, receiver, receiver_key) = node(217).await;
+    let signing_key = key(218);
+    let edge = Arc::new(Edge::default());
+    sender.install_broadcast_transport(edge.clone()).unwrap();
+    receiver.install_broadcast_transport(Arc::new(Edge::default())).unwrap();
+    let id = OverlayShortId::from_data([219; 32]);
+    let rules = OverlayPrivacyRules::new(2048, 3, BTreeMap::new());
+    sender
+        .add_fixed_member_overlay_with_options(
+            OverlayParams::with_id_only(&id),
+            &sender_key,
+            &[receiver_key.id().clone()],
+            rules.clone(),
+            FixedMemberOverlayOptions { twostep: true, ..Default::default() },
+        )
+        .unwrap();
+    receiver
+        .add_fixed_member_overlay(
+            OverlayParams::with_id_only(&id),
+            &receiver_key,
+            &[sender_key.id().clone()],
+            rules.clone(),
+        )
+        .unwrap();
+    let sender_generation = sender.overlay_generation(&id).unwrap();
+    let old_generation = receiver.overlay_generation(&id).unwrap();
+    let data = TaggedByteSlice {
+        object: b"separate signing source",
+        #[cfg(feature = "telemetry")]
+        tag: 0,
+    };
+    sender.broadcast_fec(&id, &data, Some(&signing_key), 1).await.unwrap();
+    let packet = first_packet(&edge).await;
+    let peers = AdnlPeers::with_keys(receiver_key.id().clone(), sender_key.id().clone());
+    let disabled = receiver.try_consume_custom(&packet, &peers).await.is_err();
+    receiver.delete_private_overlay_checked(&old_generation).await.unwrap();
+    receiver
+        .add_fixed_member_overlay_with_options(
+            OverlayParams::with_id_only(&id),
+            &receiver_key,
+            &[sender_key.id().clone()],
+            rules,
+            FixedMemberOverlayOptions { twostep: true, ..Default::default() },
+        )
+        .unwrap();
+    let receiver_generation = receiver.overlay_generation(&id).unwrap();
+    let mut subscription = receiver.subscribe_broadcast(&id).unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(1), subscription.recv()).await;
+    let consumed = receiver.try_consume_custom(&packet, &peers).await;
+    let delivered = tokio::time::timeout(Duration::from_secs(1), subscription.recv()).await;
+    sender.delete_private_overlay_checked(&sender_generation).await.unwrap();
+    receiver.delete_private_overlay_checked(&receiver_generation).await.unwrap();
+    sender_adnl.stop_checked().await.unwrap();
+    receiver_adnl.stop_checked().await.unwrap();
+    assert!(disabled);
+    assert!(consumed.unwrap());
+    let delivered = delivered.unwrap().unwrap().unwrap();
+    assert_eq!(delivered.recv_from, *signing_key.id());
+    assert_ne!(delivered.recv_from, *sender_key.id());
+    assert_eq!(delivered.data, data.object);
+    assert!(matches!(
+        edge.methods.lock().unwrap().first(),
+        Some(BroadcastTransportMethod::Sender { reliable: true })
+    ));
+}
+
+#[tokio::test]
+async fn tos_twostep_selection_uses_five_intermediates_half_recovery_and_no_twostep_flag() {
+    let mut observations = Vec::new();
+    for (neighbours, size, flags) in [(4, 513, 0), (5, 513, 0), (7, 2000, 1), (1, 50, 256)] {
+        let (adnl, node, source) = node(220).await;
+        let edge = Arc::new(Edge::default());
+        node.install_broadcast_transport(edge.clone()).unwrap();
+        let id = OverlayShortId::from_data([221; 32]);
+        let peers = (0..neighbours).map(|i| key(222 + i).id().clone()).collect::<Vec<_>>();
+        node.add_fixed_member_overlay_with_options(
+            OverlayParams::with_id_only(&id),
+            &source,
+            &peers,
+            OverlayPrivacyRules::new(4096, 3, BTreeMap::new()),
+            FixedMemberOverlayOptions { twostep: true, ..Default::default() },
+        )
+        .unwrap();
+        let generation = node.overlay_generation(&id).unwrap();
+        let bytes = vec![size as u8; size];
+        let data = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        node.broadcast_fec(&id, &data, None, flags).await.unwrap();
+        let payload = broadcast_payload(&first_packet(&edge).await);
+        observations.push((neighbours, flags, payload));
+        node.delete_private_overlay_checked(&generation).await.unwrap();
+        adnl.stop_checked().await.unwrap();
+    }
+    for (neighbours, flags, payload) in observations {
+        match (neighbours, flags, payload) {
+            (4, 0, Broadcast::Overlay_BroadcastTwostepSimple(_)) => (),
+            (5, 0, Broadcast::Overlay_BroadcastTwostepFec(v)) => assert_eq!(v.part.len(), 257),
+            (7, 1, Broadcast::Overlay_BroadcastTwostepFec(v)) => assert_eq!(v.part.len(), 667),
+            (1, 256, Broadcast::Overlay_BroadcastFec(v)) => assert_eq!(v.flags, 0),
+            value => panic!("wrong TOS carrier/threshold: {value:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn tos_twostep_without_sender_falls_back_to_ordinary_fec() {
+    let (adnl, node, source) = node(230).await;
+    let id = OverlayShortId::from_data([231; 32]);
+    node.add_fixed_member_overlay_with_options(
+        OverlayParams::with_id_only(&id),
+        &source,
+        &[key(232).id().clone()],
+        OverlayPrivacyRules::new(1024, 3, BTreeMap::new()),
+        FixedMemberOverlayOptions { twostep: true, ..Default::default() },
+    )
+    .unwrap();
+    let generation = node.overlay_generation(&id).unwrap();
+    let enabled = node
+        .get_overlay(&id, "sender fallback test")
+        .unwrap()
+        .overlay_type
+        .twostep_sender_enabled();
+    let mut subscription = node.subscribe_broadcast(&id).unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(1), subscription.recv()).await;
+    let data = TaggedByteSlice {
+        object: &[3; 50],
+        #[cfg(feature = "telemetry")]
+        tag: 0,
+    };
+    let sent = node.broadcast_fec(&id, &data, None, 0).await;
+    let received = tokio::time::timeout(Duration::from_secs(1), subscription.recv()).await;
+    node.delete_private_overlay_checked(&generation).await.unwrap();
+    adnl.stop_checked().await.unwrap();
+    assert!(!enabled, "missing sender must disable two-step, as in CPP");
+    assert_eq!(sent.unwrap().packets, 4);
+    assert_eq!(received.unwrap().unwrap().unwrap().data, data.object);
 }

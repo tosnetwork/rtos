@@ -594,8 +594,8 @@ The latest TOS5af405d channel harness routes through the peer table. Its destina
 lookup is shared with the Rust socket receive pipeline: local identities take
 precedence over inbound channel registrations, before any decryption. An unknown
 destination is refused by that lookup. The standalone Channel API retains its
-channel-only namespace. The latest corpus now has1276 equal effects,zero mismatches
-and14 unsupported two-step/Plumtree contexts; this is not a passing whole-net run.
+channel-only namespace. The latest corpus now has1286 equal effects,zero mismatches
+and4 unsupported Plumtree contexts; this is not a passing whole-net run.
 The earlier640 additional channel comparisons against the latest C++ actor harness
 retain their ebe81eb9 source scope. Native
 checks cover registry precedence, unknown/short destinations, four channel tests
@@ -626,15 +626,31 @@ FEC API preserves a FEC carrier for small payloads. Locally generated TOS FEC pa
 also pass through native signature checks, reassembly, propagation and delivery.
 The sender completes four-symbol waves, with a10ms interval and the C++ send target;
 ordinary FEC relays use the full neighbour set. Legacy pacing remains scoped.
-TOS source admission refuses forbidden sources; the local protocol performs the
+Ordinary TOS source admission refuses forbidden sources; the local protocol performs the
 application check once before delivery/relay. Both simple/FEC approval and refusal
 are covered, including zero emissions on refusal.
 
-Of the45 additional contexts,31 match the latest C++ actor effects;zero differ and14
+Of the45 additional contexts,41 match the latest C++ actor effects;zero differ and4
 are unsupported. Six additional raw-message controls agree after five actual
 before-change differences. Native checks include transport binding/retirement,
 fixed-member certificate restrictions and small explicit FEC; three behavior
 mutations demonstrate that these checks fail when the guards are removed.
+
+FixedMemberOverlayOptions binds two-step mode and the live sender backend at
+creation. With a sender installed, native FEC dispatch selects two-step unless
+FLAG_BCAST_NO_TWOSTEP is set; that control flag is removed from the wire carrier.
+Without a configured sender, the ordinary overlay/FEC path remains available,
+following C++. TOS uses a reliable sender for small and large two-step messages;
+Legacy retains its earlier transport and signature profile.
+
+TOS two-step uses boxed signing preimages, at least513bytes and five intermediates
+for FEC, and k=(intermediates-1)/2. Part assignment follows the C++ peer-key order.
+The source delivers its validated local payload as C++ does; receiving applications
+observe the signing source identity separately from the forwarding ADNL peer.
+The adapter hands off whole emission batches before the next scheduler round,
+matching the reference without sorting recorded effects. Fifteen additional C++
+controls cover thresholds, membership count/order, source rules and flag behavior;
+an empty-inbound-array control also agrees after its prior harness refusal.
 
 ## Offline candidate-validation target
 
