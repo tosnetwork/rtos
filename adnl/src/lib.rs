@@ -23,6 +23,7 @@ mod quic;
 pub use crate::quic::*;
 mod rldp;
 pub use crate::rldp::*;
+pub mod fec;
 
 pub struct NetworkStack {
     pub adnl: Arc<AdnlNode>,

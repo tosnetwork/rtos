@@ -6,6 +6,8 @@ use adnl::wire_keys::{
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
+#[path = "net/fec.rs"]
+mod fec;
 fn bytes(v: &Value, name: &str, max: usize) -> Result<Vec<u8>> {
     let s = v[name].as_str().context("hex bytes required")?;
     ensure!(
@@ -18,6 +20,9 @@ fn bytes(v: &Value, name: &str, max: usize) -> Result<Vec<u8>> {
 }
 fn run(v: &Value) -> Result<Value> {
     let op = v["op"].as_str().context("op required")?;
+    if matches!(op, "fec_encode" | "fec_decode") {
+        return fec::run(v);
+    }
     if op == "adnl_id" {
         ensure!(v.get("id").is_some() != v.get("text").is_some(), "one identity form required");
         let id: [u8; 32] = if v.get("id").is_some() {
