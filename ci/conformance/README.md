@@ -98,7 +98,7 @@ membership guards, delegating only the numeric comparison to that predicate.
 This distinction grants no signature or membership authority. A separate2138
 input probe matches C++ effects or protocol-refusal status, including12 mutually
 refused malformed contexts; protocol errors are not passing shared fixtures.
-An additional12 C++ controls in `tl/rtos_api/tests/data/conformance/consensus`
+An additional24 C++ controls in `tl/rtos_api/tests/data/conformance/consensus`
 cover explicit double/unsigned session options, future version predicates,
 raw block coordinates, vote role/signature input and malformed candidates.
 Node Param29 conversion delegates to the same native options encoding; explicit
@@ -110,6 +110,14 @@ Additional787 session/vote/version probes match C++, and the earlier2138 weight
 and set probes still agree (12 mutual protocol errors remain separately reported).
 Finality and proof operations still need adapters; this does not qualify a
 running consensus network or proof acceptance.
+Session JSON retains the two double tokens until binary64 conversion, preserving
+correct rounding, negative zero and C++'s finite saturation on overflow. The API
+package's dev-only serde_json features enable precise float parsing and borrowed
+raw values; the node's production JSON dependency is unchanged. Twelve of the
+controls pin this conversion, including ordinary positive decimals and large
+integer tokens. The independent review found590 differences in2000 random finite
+doubles on the prior adapter; the corrected adapter matches all2000. This fixes
+the test protocol boundary, without changing the native session hash rules.
 
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed

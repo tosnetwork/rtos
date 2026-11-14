@@ -8,9 +8,45 @@ use rtos_api::session_identity::{
 use rtos_block::{PqConsensusKey, SigPubKey, UInt256, ValidatorDescr, ValidatorSet};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::{self, BufRead, Read, Write},
 };
+
+fn parse_context(line: &str) -> Result<Value> {
+    use serde_json::value::RawValue;
+    // Keep numeric tokens until the reference's double conversion boundary.
+    // Its classic iostream conversion saturates overflow to finite MAX and
+    // preserves negative zero; a Value parse alone rejects overflowing tokens.
+    let raw: BTreeMap<String, &RawValue> = serde_json::from_str(line)?;
+    if raw.get("op").map(|v| serde_json::from_str::<String>(v.get())).transpose()?.as_deref()
+        != Some("session")
+    {
+        return Ok(serde_json::from_str(line)?);
+    }
+    let mut context = serde_json::Map::new();
+    for (key, value) in raw {
+        if key != "options" {
+            context.insert(key, serde_json::from_str(value.get())?);
+            continue;
+        }
+        let options: BTreeMap<String, &RawValue> = serde_json::from_str(value.get())?;
+        let mut parsed = serde_json::Map::new();
+        for (name, value) in options {
+            let value = if matches!(name.as_str(), "idle_timeout" | "next_candidate_delay") {
+                let number = value.get().parse::<f64>()?;
+                let number = if number.is_infinite() { f64::MAX.copysign(number) } else { number };
+                Value::Number(
+                    serde_json::Number::from_f64(number).context("finite double required")?,
+                )
+            } else {
+                serde_json::from_str(value.get())?
+            };
+            parsed.insert(name, value);
+        }
+        context.insert(key, Value::Object(parsed));
+    }
+    Ok(Value::Object(context))
+}
 
 fn decimal(value: &Value) -> Result<u64> {
     let text = value.as_str().context("canonical unsigned decimal string required")?;
@@ -233,7 +269,7 @@ fn main() -> Result<()> {
         let effect = (|| -> Result<Value> {
             ensure!(size <= 16 << 20, "context too large");
             ensure!(harness == "consensus", "unsupported harness");
-            run(&serde_json::from_str::<Value>(&line)?)
+            run(&parse_context(&line)?)
         })()
         .unwrap_or_else(|e| json!({"harness_error":e.to_string()}));
         serde_json::to_writer(&mut output, &effect)?;
