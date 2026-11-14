@@ -45,6 +45,10 @@ impl crate::ConfigParams {
     pub fn legacy_proof_consensus_parameters(
         &self,
     ) -> Result<(crate::CatchainConfig, crate::ConsensusConfig)> {
+        Ok((self.legacy_proof_catchain_config()?, self.legacy_proof_session_config()?))
+    }
+
+    pub fn legacy_proof_catchain_config(&self) -> Result<crate::CatchainConfig> {
         let mut catchain = crate::CatchainConfig {
             mc_catchain_lifetime: 200,
             shard_catchain_lifetime: 200,
@@ -65,6 +69,10 @@ impl crate::ConfigParams {
                 }
             }
         }
+        Ok(catchain)
+    }
+
+    pub fn legacy_proof_session_config(&self) -> Result<crate::ConsensusConfig> {
         let mut consensus = crate::ConsensusConfig {
             round_candidates: 3,
             next_candidate_delay_ms: 2000,
@@ -82,7 +90,7 @@ impl crate::ConfigParams {
                 consensus = value;
             }
         }
-        Ok((catchain, consensus))
+        Ok(consensus)
     }
 }
 
