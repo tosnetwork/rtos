@@ -538,17 +538,53 @@ fn vote_preimage(
 ) -> Result<Vec<u8>> {
     vote_preimage_with_budget(block_id, carrier, is_final, None)
 }
+/// Explicit candidate wire data. Raw block coordinates carry no chain authority.
+pub struct SimplexVoteData {
+    pub workchain: i32,
+    pub shard: u64,
+    pub seqno: u32,
+    pub root_hash: UInt256,
+    pub file_hash: UInt256,
+    pub candidate_hash: UInt256,
+    pub data_to_sign: Vec<u8>,
+}
+
+/// Build the native Simplex signing preimage from canonical TL candidate bytes.
+/// This structural primitive neither checks membership nor admits a shard.
+pub fn build_simplex_vote_data(
+    session_id: &UInt256,
+    slot: u32,
+    candidate: &[u8],
+    is_final: bool,
+) -> Result<SimplexVoteData> {
+    rtos_block::signature::validate_candidate_tl(candidate)?;
+    let mut input = candidate;
+    let mut de = crate::Deserializer::new(&mut input);
+    let _tag = de.read_bare::<i32>()?;
+    let workchain = de.read_bare::<i32>()?;
+    let shard = de.read_bare::<i64>()? as u64;
+    let seqno = de.read_bare::<i32>()? as u32;
+    let root_hash = de.read_bare::<UInt256>()?;
+    let file_hash = de.read_bare::<UInt256>()?;
+    let candidate_hash = UInt256::calc_file_hash(candidate);
+    let data_to_sign = encode_vote_preimage(session_id, slot, &candidate_hash, is_final, None)?;
+    Ok(SimplexVoteData {
+        workchain,
+        shard,
+        seqno,
+        root_hash,
+        file_hash,
+        candidate_hash,
+        data_to_sign,
+    })
+}
+
 fn vote_preimage_with_budget(
     block_id: &BlockIdExt,
     carrier: &BlockSignaturesSimplexPq,
     is_final: bool,
     budget: Option<&dyn ConfigReadBudget>,
 ) -> Result<Vec<u8>> {
-    use crate::ton::consensus::{
-        candidateid::CandidateId,
-        datatosign::DataToSign,
-        simplex::unsignedvote::{FinalizeVote, NotarizeVote},
-    };
     let bytes = match budget {
         Some(budget) => carrier.candidate_bytes_bounded(budget)?,
         None => carrier.candidate_bytes()?,
@@ -570,8 +606,28 @@ fn vote_preimage_with_budget(
     if canonical != bytes {
         fail!("PQ candidate encoding is not canonical");
     }
-    let id = CandidateId { slot: carrier.slot as i32, hash: UInt256::calc_file_hash(&canonical) }
-        .into_boxed();
+    encode_vote_preimage(
+        &carrier.session_id,
+        carrier.slot,
+        &UInt256::calc_file_hash(&canonical),
+        is_final,
+        budget,
+    )
+}
+
+fn encode_vote_preimage(
+    session_id: &UInt256,
+    slot: u32,
+    candidate_hash: &UInt256,
+    is_final: bool,
+    budget: Option<&dyn ConfigReadBudget>,
+) -> Result<Vec<u8>> {
+    use crate::ton::consensus::{
+        candidateid::CandidateId,
+        datatosign::DataToSign,
+        simplex::unsignedvote::{FinalizeVote, NotarizeVote},
+    };
+    let id = CandidateId { slot: slot as i32, hash: candidate_hash.clone() }.into_boxed();
     let vote = if is_final {
         let vote = FinalizeVote { id }.into_boxed();
         match budget {
@@ -585,7 +641,7 @@ fn vote_preimage_with_budget(
             None => crate::serialize_boxed(&vote)?,
         }
     };
-    let data = DataToSign { session_id: carrier.session_id.clone(), data: vote }.into_boxed();
+    let data = DataToSign { session_id: session_id.clone(), data: vote }.into_boxed();
     match budget {
         Some(budget) => serialize_budgeted(&data, budget),
         None => crate::serialize_boxed(&data),

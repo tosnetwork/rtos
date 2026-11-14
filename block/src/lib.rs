@@ -86,13 +86,15 @@ pub use out_actions::*;
 pub mod merkle_proof;
 pub use merkle_proof::*;
 
-pub mod merkle_apply_budget;
 pub mod config_read_budget;
+pub mod merkle_apply_budget;
 pub mod merkle_update;
 pub use merkle_update::*;
 
 pub mod quorum;
 pub use quorum::*;
+pub mod simplex_protocol;
+pub use simplex_protocol::SimplexProtocolVersion;
 
 pub mod validators;
 pub use validators::*;

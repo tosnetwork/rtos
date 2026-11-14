@@ -35,7 +35,8 @@ impl TryFrom<u32> for SimplexProtocol {
 
 impl SimplexProtocol {
     /// The newest protocol version this build runs; a newer one is refused.
-    pub const MAX_SUPPORTED_PROTOCOL_VERSION: u32 = 2;
+    pub const MAX_SUPPORTED_PROTOCOL_VERSION: u32 =
+        rtos_block::SimplexProtocolVersion::MAX_SUPPORTED;
 
     pub fn version(self) -> u32 {
         match self {
@@ -47,17 +48,17 @@ impl SimplexProtocol {
 
     /// Observers follow the session through the separate block-sync overlay.
     pub fn enable_block_sync(self) -> bool {
-        self.version() == 1
+        rtos_block::SimplexProtocolVersion(self.version()).enable_block_sync()
     }
 
     /// Observers are members of the private consensus overlay.
     pub fn observers_in_private_overlay(self) -> bool {
-        self.version() >= 2
+        rtos_block::SimplexProtocolVersion(self.version()).observers_in_private_overlay()
     }
 
     /// Public and fast-sync overlays may use Plumtree broadcasts.
     pub fn enable_plumtree_broadcast(self) -> bool {
-        self.version() >= 2
+        rtos_block::SimplexProtocolVersion(self.version()).enable_plumtree_broadcast()
     }
 
     /// The private overlay membership is the union of the authenticated

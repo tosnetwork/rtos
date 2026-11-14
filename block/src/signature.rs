@@ -1093,7 +1093,9 @@ fn read_candidate_data(root: &Cell) -> Result<Vec<u8>> {
     pq_reject(PqBlockSignatureReasonCode::CandidateChainLength, "chain too long")
 }
 
-fn validate_candidate_tl(bytes: &[u8]) -> Result<()> {
+/// Validate the fixed CandidateHashData wire shape, without admitting its block
+/// coordinates as a chain shard or authenticating the candidate.
+pub fn validate_candidate_tl(bytes: &[u8]) -> Result<()> {
     let Some(tag) = bytes.get(..4) else {
         return pq_reject(PqBlockSignatureReasonCode::CandidateTl, "invalid TL");
     };

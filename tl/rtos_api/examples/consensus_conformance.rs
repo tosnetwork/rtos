@@ -1,6 +1,10 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: GPL-3.0-only
 //! Explicit-input consensus adapter. Unsupported operations remain harness errors.
 use anyhow::{bail, ensure, Context, Result};
+use rtos_api::session_identity::{
+    explicit_session_group_bytes, session_config_hash_from_hash, ExplicitSessionCoordinates,
+    ExplicitSessionOptions,
+};
 use rtos_block::{PqConsensusKey, SigPubKey, UInt256, ValidatorDescr, ValidatorSet};
 use serde_json::{json, Value};
 use std::{
@@ -32,12 +36,103 @@ fn bits(value: &Value) -> Result<UInt256> {
         bytes(value)?.try_into().map_err(|_| anyhow::anyhow!("32 bytes required"))?;
     Ok(bytes.into())
 }
-fn validate_shard(value: &Value) -> Result<()> {
-    let _: i32 = value["workchain"].as_i64().context("workchain required")?.try_into()?;
+fn shard(value: &Value) -> Result<(i32, u64)> {
+    let workchain: i32 = value["workchain"].as_i64().context("workchain required")?.try_into()?;
     let shard: [u8; 8] =
         bytes(&value["shard"])?.try_into().map_err(|_| anyhow::anyhow!("8-byte shard required"))?;
-    ensure!(u64::from_be_bytes(shard) != 0, "zero is not a shard");
-    Ok(())
+    let shard = u64::from_be_bytes(shard);
+    ensure!(shard != 0, "zero is not a shard");
+    Ok((workchain, shard))
+}
+fn flag(ctx: &Value, field: &str) -> Result<bool> {
+    ctx[field].as_bool().context("boolean required")
+}
+fn double(ctx: &Value, field: &str) -> Result<f64> {
+    let value = ctx[field].as_f64().context("double required")?;
+    ensure!(value.is_finite(), "finite double required");
+    Ok(value)
+}
+fn session(ctx: &Value) -> Result<Value> {
+    let global_id = i32::try_from(ctx["global_id"].as_i64().context("global_id required")?)?;
+    let opts = &ctx["options"];
+    let options = ExplicitSessionOptions {
+        proto_version: u32_field(opts, "proto_version")?,
+        new_catchain_ids: flag(opts, "new_catchain_ids")?,
+        idle_timeout: double(opts, "idle_timeout")?,
+        max_deps: u32_field(opts, "max_deps")?,
+        max_serialized_block_size: u32_field(opts, "max_serialized_block_size")?,
+        block_hash_covers_data: flag(opts, "block_hash_covers_data")?,
+        max_block_height_coeff: u32_field(opts, "max_block_height_coeff")?,
+        debug_disable_db: flag(opts, "debug_disable_db")?,
+        round_candidates: u32_field(opts, "round_candidates")?,
+        next_candidate_delay: double(opts, "next_candidate_delay")?,
+        round_attempt_duration: u32_field(opts, "round_attempt_duration")?,
+        max_round_attempts: u32_field(opts, "max_round_attempts")?,
+        max_block_size: u32_field(opts, "max_block_size")?,
+        max_collated_data_size: u32_field(opts, "max_collated_data_size")?,
+    };
+    let simplex_hash = bits(&ctx["simplex_config_hash"])?;
+    let (workchain, shard) = shard(&ctx["shard"])?;
+    let coordinates = ExplicitSessionCoordinates {
+        workchain,
+        shard,
+        catchain_seqno: u32_field(ctx, "catchain_seqno")?,
+        vertical_seqno: u32_field(ctx, "vertical_seqno")?,
+        last_key_block_seqno: u32_field(ctx, "last_key_block_seqno")?,
+        new_catchain_ids: options.new_catchain_ids,
+    };
+    let validators = validators(ctx)?;
+    let options_hash = UInt256::calc_file_hash(&options.bytes()?);
+    let config_hash = session_config_hash_from_hash(global_id, &options_hash, &simplex_hash);
+    let group = explicit_session_group_bytes(coordinates, &config_hash, &validators)?;
+    Ok(json!({"outcome":"session", "options_hash":hex::encode_upper(options_hash.as_slice()),
+        "session_config_hash":hex::encode_upper(config_hash.as_slice()),
+        "session_id":hex::encode_upper(UInt256::calc_file_hash(&group).as_slice())}))
+}
+fn vote(ctx: &Value) -> Result<Value> {
+    use rtos_api::pq_finality::build_simplex_vote_data;
+    let session_id = bits(&ctx["session_id"])?;
+    let slot = u32_field(ctx, "slot")?;
+    let raw = bytes(&ctx["candidate"])?;
+    let is_final = flag(ctx, "final")?;
+    // The explicit reference block uses raw wire coordinates, not an admitted
+    // ShardIdent. Compare them before asking the node preimage helper to act.
+    let block = &ctx["block"];
+    let (workchain, shard) = shard(block)?;
+    let seqno = u32_field(block, "seqno")?;
+    let root_hash = bits(&block["root_hash"])?;
+    let file_hash = bits(&block["file_hash"])?;
+    ensure!(
+        ctx.get("public_key").is_some() == ctx.get("signature").is_some(),
+        "public_key and signature go together"
+    );
+    let vote = match build_simplex_vote_data(&session_id, slot, &raw, is_final) {
+        Ok(value) => value,
+        Err(_) => return Ok(json!({"outcome":"refused","reason":"candidate_malformed"})),
+    };
+    if vote.workchain != workchain
+        || vote.shard != shard
+        || vote.seqno != seqno
+        || vote.root_hash != root_hash
+        || vote.file_hash != file_hash
+    {
+        return Ok(json!({"outcome":"refused","reason":"block_mismatch"}));
+    }
+    let data = vote.data_to_sign;
+    let check = if let Some(public_key) = ctx.get("public_key") {
+        let public_key = bytes(public_key)?;
+        let signature = bytes(&ctx["signature"])?;
+        Some(match rtos_pq_crypto::verify_simplex(&data, &signature, &public_key) {
+            Ok(true) => "valid",
+            Ok(false) => "invalid",
+            Err(rtos_pq_crypto::VerifyError::Backend(_)) => bail!("ML-DSA-44 backend failure"),
+            Err(_) => "malformed",
+        })
+    } else {
+        None
+    };
+    Ok(json!({"outcome":"vote", "candidate_hash":hex::encode_upper(vote.candidate_hash.as_slice()),
+        "data_to_sign":hex::encode(data), "signature_check":check}))
 }
 fn validators(ctx: &Value) -> Result<Vec<ValidatorDescr>> {
     let list = ctx["validators"].as_array().context("validators required")?;
@@ -102,11 +197,21 @@ fn run(ctx: &Value) -> Result<Value> {
         "validator_set" => {
             let validators = validators(ctx)?;
             let seqno = u32_field(ctx, "catchain_seqno")?;
-            validate_shard(&ctx["shard"])?;
+            shard(&ctx["shard"])?;
             let total =
                 rtos_block::checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
             json!({"outcome":"validator_set", "validator_set_hash":ValidatorSet::calc_subset_hash_short(&validators,seqno)?,
                 "total_weight":total.to_string(), "threshold":rtos_block::quorum_threshold(total).to_string()})
+        }
+        "session" => session(ctx)?,
+        "vote" => vote(ctx)?,
+        "protocol_version" => {
+            let version = rtos_block::SimplexProtocolVersion(u32_field(ctx, "protocol_version")?);
+            json!({"outcome":"protocol_version", "supported":version.supported(),
+                "enable_block_sync":version.enable_block_sync(), "use_new_db_names":version.use_new_db_names(),
+                "observers_in_private_overlay":version.observers_in_private_overlay(),
+                "enable_plumtree_broadcast":version.enable_plumtree_broadcast(),
+                "max_supported":rtos_block::SimplexProtocolVersion::MAX_SUPPORTED})
         }
         _ => bail!("unsupported consensus operation"),
     })

@@ -88,8 +88,8 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
-weight and validator-set APIs for `quorum`, `weight_total` and `validator_set`.
-The first74 frozen controls agree with clean CPP1181; the remaining194 consensus
+weight, validator-set, protocol-version, session and vote APIs.
+The first189 frozen controls agree with clean CPP1181; the remaining79 consensus
 contexts explicitly refuse as unsupported operations and are not passes. Run
 the whole consensus directory so those gaps remain visible. The raw numeric
 `quorum_weight_reached` predicate matches C++ even for total0 or signed weight
@@ -98,8 +98,18 @@ membership guards, delegating only the numeric comparison to that predicate.
 This distinction grants no signature or membership authority. A separate2138
 input probe matches C++ effects or protocol-refusal status, including12 mutually
 refused malformed contexts; protocol errors are not passing shared fixtures.
-Session, vote, finality, proof and protocol-version operations still need adapters;
-this does not qualify a running consensus network or proof acceptance.
+An additional12 C++ controls in `tl/rtos_api/tests/data/conformance/consensus`
+cover explicit double/unsigned session options, future version predicates,
+raw block coordinates, vote role/signature input and malformed candidates.
+Node Param29 conversion delegates to the same native options encoding; explicit
+session hashes and wire coordinates do not authenticate a governing config.
+Native vote encoding shares its preimage serializer with production finality
+while retaining raw wire coordinates at the structural boundary. Node finality
+keeps its membership, admitted-block and canonical candidate checks.
+Additional787 session/vote/version probes match C++, and the earlier2138 weight
+and set probes still agree (12 mutual protocol errors remain separately reported).
+Finality and proof operations still need adapters; this does not qualify a
+running consensus network or proof acceptance.
 
 The native configuration schema now requires both queue-limit fields in CP43 v3
 and rejects CP47, which the pinned C++ schema does not define. The older compressed
