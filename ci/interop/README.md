@@ -1,5 +1,23 @@
 # Local C++ / Rust interop runners
 
+## Fixed scenario inventory (execution integration pending)
+
+`scenario_catalog.json` records named scenarios, their assertion scope and native
+control dependencies. Inspect it with `python3 ci/interop/scenarios.py list`, or
+expand a selection with `python3 ci/interop/scenarios.py plan necessary-low-weight-mixed`.
+The planner orders controls before mixed cases and refuses unknown selections,
+cycles, missing drivers and additions/removals in the fixture-source inventory.
+New fixture sources require an explicit inventory review. This check does not
+prove that every parameter combination or assertion is represented.
+
+All entries currently remain `unintegrated`: this command does not launch nodes,
+accept previous run results, or issue a qualification verdict. Existing runners
+remain the execution path until exact profiles, resources, receipts and semantic
+result checks are connected. A plan is always `not_executed`, including a plan
+containing every entry. The seven-day follower, replay and fuzz gates are separate.
+
+## Baseline and bootstrap
+
 The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline. The candidate `5af405dcb1f523be0ff3b812e9f6945275c4945b` is available through explicit `--cpp-revision` selection for active bootstrap tests; the default active pin and frozen profile remain unchanged. Candidate selection is a test input, not a qualification verdict.
 
 The snapshot pins the executable's reported commit, copies the C++ programs,
