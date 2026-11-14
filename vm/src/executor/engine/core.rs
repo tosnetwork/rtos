@@ -1812,15 +1812,10 @@ impl Engine {
             ),
         };
         let mut t1_items = t1.as_tuple_mut()?;
-        match t1_items.get_mut(6) {
-            Some(v) => *v = StackItem::int(rand),
-            None => fail!(
-                ExceptionCode::RangeCheckError,
-                "set tuple index is {} but length is {}",
-                6,
-                t1_items.len()
-            ),
+        if t1_items.len() < 7 {
+            t1_items.resize(7, StackItem::None);
         }
+        t1_items[6] = StackItem::int(rand);
         if self.block_version >= 4 {
             self.try_use_gas(Gas::tuple_gas_price(t1_items.len()))?;
         } else {

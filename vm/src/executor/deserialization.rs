@@ -98,7 +98,10 @@ fn ld_int(engine: &mut Engine, name: &'static str, mut len: usize, how: u8) -> S
 fn ld_slice(engine: &mut Engine, name: &'static str, mut len: usize, how: u8) -> Status {
     load_slice(engine, name, &mut len, how)?;
     proc_slice(engine, len, how, |slice, _| {
-        let value = slice.get_next_slice(len)?;
+        let mut value = slice.clone();
+        value.shrink_data(..len);
+        value.shrink_references(..0)?;
+        slice.move_by(len)?;
         Ok(StackItem::Slice(value))
     })
 }

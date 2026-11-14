@@ -33,6 +33,11 @@ use std::cmp;
 
 // Stack manipulation *********************************************************
 
+fn stack_index(engine: &Engine, argument: usize) -> anyhow::Result<usize> {
+    let limit = if engine.block_version() >= 4 { (1 << 30) - 1 } else { 255 };
+    engine.cmd.var(argument).as_integer_value(0..=limit)
+}
+
 // (xi ... x1 - )
 pub(super) fn execute_blkdrop(engine: &mut Engine) -> Status {
     engine.load_instruction(
@@ -86,8 +91,8 @@ pub(super) fn execute_blkswap(engine: &mut Engine) -> Status {
 pub(super) fn execute_blkswx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("BLKSWX"))?;
     fetch_stack(engine, 2)?;
-    let j = engine.cmd.var(0).as_stack_index()?;
-    let i = engine.cmd.var(1).as_stack_index()?;
+    let j = stack_index(engine, 0)?;
+    let i = stack_index(engine, 1)?;
     if engine.cc.stack.depth() < i + j {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -102,7 +107,7 @@ pub(super) fn execute_blkswx(engine: &mut Engine) -> Status {
 pub(super) fn execute_chkdepth(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("CHKDEPTH"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     if engine.cc.stack.depth() < i {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -121,7 +126,7 @@ pub(super) fn execute_depth(engine: &mut Engine) -> Status {
 pub(super) fn execute_dropx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("DROPX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     if engine.cc.stack.depth() < i {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -154,7 +159,7 @@ pub(super) fn execute_dup2(engine: &mut Engine) -> Status {
 pub(super) fn execute_onlytopx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ONLYTOPX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     let depth = engine.cc.stack.depth();
     if depth < i {
         fail!(ExceptionCode::StackUnderflow)
@@ -170,7 +175,7 @@ pub(super) fn execute_onlytopx(engine: &mut Engine) -> Status {
 pub(super) fn execute_onlyx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ONLYX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     let depth = engine.cc.stack.depth();
     if depth < i {
         fail!(ExceptionCode::StackUnderflow)
@@ -194,7 +199,7 @@ pub(super) fn execute_over2(engine: &mut Engine) -> Status {
 pub(super) fn execute_pick(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("PICK"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     if engine.cc.stack.depth() <= i {
         fail!(ExceptionCode::StackUnderflow)
     } else {
@@ -560,8 +565,8 @@ pub(super) fn execute_reverse(engine: &mut Engine) -> Status {
 pub(super) fn execute_revx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("REVX"))?;
     fetch_stack(engine, 2)?;
-    let j = engine.cmd.var(0).as_stack_index()?;
-    let i = engine.cmd.var(1).as_stack_index()?;
+    let j = stack_index(engine, 0)?;
+    let i = stack_index(engine, 1)?;
     if engine.cc.stack.depth() < i + j {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -574,7 +579,7 @@ pub(super) fn execute_revx(engine: &mut Engine) -> Status {
 pub(super) fn execute_roll(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ROLLX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     if engine.cc.stack.depth() < i + 1 {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -588,7 +593,7 @@ pub(super) fn execute_roll(engine: &mut Engine) -> Status {
 pub(super) fn execute_rollrev(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ROLLREVX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     if engine.cc.stack.depth() < i + 1 {
         fail!(ExceptionCode::StackUnderflow)
     }
@@ -761,7 +766,7 @@ pub(super) fn execute_xchg3(engine: &mut Engine) -> Status {
 pub(super) fn execute_xchgx(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("XCHGX"))?;
     fetch_stack(engine, 1)?;
-    let i = engine.cmd.var(0).as_stack_index()?;
+    let i = stack_index(engine, 0)?;
     engine.cc.stack.swap(0, i)?;
     Ok(())
 }

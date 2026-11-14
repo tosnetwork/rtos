@@ -894,3 +894,13 @@ variable storage width before builder/value types. RTOS follows that order.
 The 156 authored cases include both successful operations and invalid operand
 combinations; 12 minimized fuzz cases preserve the original discovered classes.
 This is a finite regression corpus, not coverage-guided fuzz-budget qualification.
+
+`vm_context_edges.py` emits adjacent boundaries for variable integer stores,
+random-seed tuple extension, slice reference windows, and stack-index limits at
+versions 3/4. Fill its contexts as family `vm-context-edges` with the same pinned
+C++ runner. `vm-fuzz-context-minimized` retains nine failures from seed 141123,
+cases 10000..109999. Signed variable-integer zero uses a zero-byte payload;
+SETRAND can extend the inner c7 tuple to index 6; LDSLICE preserves an already
+consumed reference offset even when its result has no references. The old
+maximum stack index of 255 applies before version 4 only. These checks cover
+historical profiles as well as active-version behavior and are not a release gate.
