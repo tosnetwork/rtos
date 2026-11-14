@@ -89,8 +89,8 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 
 The `rtos_api --example crypto_conformance` target calls existing native
 Ed25519, ML-DSA-44, SLH-DSA-SHA2-128s, padded Falcon-512, LMS, SHA-256,
-Poseidon2, quorum, session identity and PQBytes APIs. Of9508 frozen crypto
-contexts,9474 agree and34 remain explicit unsupported operations, not passes.
+Poseidon2, quorum, session identity and PQBytes APIs. All9508 frozen crypto
+contexts agree, with zero mismatches, refusals or skips.
 All9508 frozen effects were independently checked against clean CPP1181.
 Thirteen added clean-C++ controls cover full uint64 weights, raw algorithm
 selection and validator dictionary size. The native validator decoder checks
@@ -113,8 +113,16 @@ A separate204-input probe gives189 equal effects and15 mutual protocol errors;
 those errors are not passing shared fixtures. Adapters apply bounded byte edits
 before native calls and reject edits naming an unread input. The config43 and validator-set adapters call native decoders; elector
 authorization preimages use shared native serializers with explicit byte order.
-Remaining crypto operations are signature-carrier fetching and expected-block
-Simplex signing. This is corpus agreement,
+Native expected-block signing shares raw coordinate binding with proof linkage
+and explicit finality. Cell signature-carrier parsing optionally checks supplied
+set metadata, signer membership, key commitments and claimed weight, without
+verifying signatures or authenticating that set. Network carriers validate each
+pair's algorithm and length before duplicate identities, and Lite candidate
+parsing follows signature validation. Twenty-three additional C++ controls pin
+these refusal orders, empty carriers, raw coordinates and maximal declared weight;
+empty summary lists use the reference dash marker. Together the original9508 and
+added36 controls yield9544 equal. A separate mismatched-set-hash probe is mutually
+refused at the protocol boundary and is not a passing shared fixture. This is corpus agreement,
 not arbitrary-input, network or production runtime qualification.
 
 The provisional `rtos_api --example consensus_conformance` target calls native

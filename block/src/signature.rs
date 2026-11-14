@@ -1148,6 +1148,47 @@ impl BlockSignaturesSimplexPq {
         &self,
         validators: &[PqBlockValidatorWeight],
     ) -> Result<u64> {
+        self.check_membership_with_keys(validators, |_| Ok(()))
+    }
+
+    /// Structural carrier checks against supplied descriptors, including each
+    /// signer's public-key commitment. This does not verify any signature.
+    pub fn check_structural_validator_set(&self, validators: &[ValidatorDescr]) -> Result<u64> {
+        let weights: Vec<_> = validators
+            .iter()
+            .map(|v| {
+                Ok(PqBlockValidatorWeight {
+                    validator_id: v.validator_id()?,
+                    algorithm_id: match &v.key {
+                        crate::ValidatorKey::Pq(key) => key.algorithm_id,
+                        _ => 0,
+                    },
+                    weight: v.weight,
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.check_membership_with_keys(&weights, |id| {
+            let member = validators
+                .iter()
+                .find(|v| v.validator_id().is_ok_and(|key| &key == id))
+                .ok_or_else(|| crate::error!("missing validator descriptor"))?;
+            let crate::ValidatorKey::Pq(key) = &member.key else {
+                fail!("validator is not post-quantum");
+            };
+            let derived = crate::try_derive_consensus_key_id(key.algorithm_id, &key.public_key)
+                .ok_or_else(|| crate::error!("malformed validator public key"))?;
+            if derived != key.key_id {
+                fail!("validator key_id mismatch");
+            }
+            Ok(())
+        })
+    }
+
+    fn check_membership_with_keys(
+        &self,
+        validators: &[PqBlockValidatorWeight],
+        check_key: impl Fn(&UInt256) -> Result<()>,
+    ) -> Result<u64> {
         if self.sig_count > PQ_SIGNATURE_MAX_SIGNERS
             || self.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize
         {
@@ -1205,6 +1246,7 @@ impl BlockSignaturesSimplexPq {
                     "validator algorithm mismatch",
                 );
             }
+            check_key(&signature.validator_id)?;
             total = total.checked_add(validator.weight).ok_or_else(|| PqBlockSignatureError {
                 code: PqBlockSignatureReasonCode::WeightMismatch,
                 message: "weight overflow".into(),
@@ -1226,6 +1268,47 @@ impl BlockSignaturesSimplexPq {
         bytes: &[u8],
         validators: &[PqBlockValidatorWeight],
     ) -> Result<Self> {
+        let parsed = Self::parse_pq_boc(bytes)?;
+        parsed.check_structural_membership_and_weight(validators)?;
+        Ok(parsed)
+    }
+
+    /// Parse a PQ carrier against supplied descriptor commitments, without
+    /// cryptographically verifying signatures or authenticating the supplied set.
+    pub fn construct_from_pq_boc_with_validator_set(
+        bytes: &[u8],
+        validators: &[ValidatorDescr],
+        catchain_seqno: u32,
+    ) -> Result<Self> {
+        if validators.is_empty()
+            || !validators
+                .iter()
+                .all(|v| matches!(&v.key, crate::ValidatorKey::Pq(key) if key.algorithm_id != 0))
+        {
+            fail!("validator set has no admitted PQ carrier");
+        }
+        crate::checked_validator_weight_sum(validators.iter().map(|v| v.weight))?;
+        let mut ids = HashSet::new();
+        let mut keys = HashSet::new();
+        for member in validators {
+            if !ids.insert(member.validator_id()?) || !keys.insert(member.consensus_key_id()?) {
+                fail!("duplicate governing validator identity");
+            }
+        }
+        let parsed = Self::parse_pq_boc(bytes)?;
+        if parsed.validator_info.catchain_seqno != catchain_seqno {
+            fail!("catchain seqno mismatch");
+        }
+        if parsed.validator_info.validator_list_hash_short
+            != crate::ValidatorSet::calc_subset_hash_short(validators, catchain_seqno)?
+        {
+            fail!("validator set hash mismatch");
+        }
+        parsed.check_structural_validator_set(validators)?;
+        Ok(parsed)
+    }
+
+    fn parse_pq_boc(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > PQ_SIGNATURE_BOC_MAX_BYTES {
             return pq_reject(
                 PqBlockSignatureReasonCode::CarrierOversize,
@@ -1233,6 +1316,12 @@ impl BlockSignaturesSimplexPq {
             );
         }
         let root = read_single_root_boc(bytes)?;
+        if SliceData::load_cell_ref(&root)?.get_next_byte()? != BLOCK_SIGNATURES_SIMPLEX_PQ_TAG {
+            return pq_reject(
+                PqBlockSignatureReasonCode::UnsupportedCarrier,
+                "unsupported carrier",
+            );
+        }
         let parsed = match BlockSignaturesVariant::construct_from_full_cell(root)? {
             BlockSignaturesVariant::SimplexPq(parsed) => parsed,
             _ => {
@@ -1242,7 +1331,6 @@ impl BlockSignaturesSimplexPq {
                 )
             }
         };
-        parsed.check_structural_membership_and_weight(validators)?;
         Ok(parsed)
     }
 }

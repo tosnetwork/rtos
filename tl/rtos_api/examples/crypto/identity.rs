@@ -23,7 +23,7 @@ pub(super) fn bits(value: &Value) -> Result<UInt256> {
     let bytes: [u8; 32] = hex::decode(text)?.try_into().unwrap();
     Ok(bytes.into())
 }
-fn descriptors(input: &Inputs<'_>) -> Result<Vec<ValidatorDescr>> {
+pub(super) fn descriptors(input: &Inputs<'_>) -> Result<Vec<ValidatorDescr>> {
     let list = input.values["validators"].as_array().context("validators array required")?;
     ensure!(list.len() <= 1024, "too many validators");
     list.iter()

@@ -11,6 +11,8 @@ const MAX_INPUT: usize = 1 << 20;
 mod config;
 #[path = "crypto/identity.rs"]
 mod identity;
+#[path = "crypto/signatures.rs"]
+mod signatures;
 
 struct Inputs<'a> {
     values: &'a Value,
@@ -214,6 +216,8 @@ fn run(context: &Value) -> Result<Value> {
         ("quorum", "has_quorum") => json!({"outcome":"boolean", "value":
             rtos_block::quorum_weight_reached(input.uint64("signed_weight")?, input.uint64("total_weight")?)}),
         ("validator_session", operation) => identity::run(operation, &input)?,
+        ("consensus", "simplex_data_to_sign") => signatures::signing_data(&mut input)?,
+        ("block_signatures", operation) => signatures::run(operation, &mut input)?,
         ("config43", "parse") => config::size_limits(&mut input)?,
         ("validator_set", "unpack") => config::validators(&mut input)?,
         ("elector", operation) => {

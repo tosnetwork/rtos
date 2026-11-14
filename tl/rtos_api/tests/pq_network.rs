@@ -186,3 +186,55 @@ fn export_checked_network_carriers() {
     }
     fs::write(out.join("cases.txt"), manifest).unwrap();
 }
+
+#[test]
+fn network_pair_fields_precede_duplicates_and_lite_candidate_parsing() {
+    struct Ample;
+    impl rtos_block::config_read_budget::ConfigReadBudget for Ample {
+        fn step(&self) -> Result<()> {
+            Ok(())
+        }
+        fn workspace(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+    }
+    let good = PqNetworkSignatureSet::from_final_fields(&fixture::signed(&[1], "finalize", DOMAIN))
+        .unwrap();
+    let node = good.to_node();
+    let mut short = node.signatures[0].clone();
+    short.signature.pop();
+    let mut range = node.signatures[0].clone();
+    range.algorithm_id = -1;
+    for signatures in [
+        vec![short.clone(), range],
+        vec![node.signatures[0].clone(), node.signatures[0].clone(), short],
+    ] {
+        let mut bad = node.clone();
+        bad.signatures = signatures;
+        assert_eq!(
+            PqNetworkSignatureSet::from_node(bad.clone()).unwrap_err().to_string(),
+            "PQ network signature length"
+        );
+        assert_eq!(
+            PqNetworkSignatureSet::from_node_bounded(bad, &Ample).unwrap_err().to_string(),
+            "PQ network signature length"
+        );
+    }
+    for duplicate in [false, true] {
+        let mut lite = good.to_lite().unwrap();
+        lite.candidate = vec![0; 4];
+        if duplicate {
+            lite.signatures.push(lite.signatures[0].clone());
+        } else {
+            lite.signatures[0].signature.pop();
+        }
+        assert_eq!(
+            PqNetworkSignatureSet::from_lite(lite).unwrap_err().to_string(),
+            if duplicate {
+                "PQ network duplicate validator identity"
+            } else {
+                "PQ network signature length"
+            }
+        );
+    }
+}
