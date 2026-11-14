@@ -10,7 +10,9 @@ cycles, missing drivers and additions/removals in the fixture-source inventory.
 This inventory does not prove every parameter combination is represented.
 
 The `rotation_v1` adapter runs rotation, exact-weight, necessary-low-weight
-control/mixed pairs and member2/member5 original-database restart. Other entries
+control/mixed pairs and member2/member5 original-database restart. The `matrix_v1` adapter adds all five four-member compositions, three/six-member
+healthy and threshold control/mixed cases, and six-member low-weight-majority
+cases. Other entries
 remain `unintegrated`; selecting any of them refuses the entire suite before
 creating runtime directories. An omitted selection means the entire catalog,
 so `run` currently requires an explicit supported selection.
@@ -29,7 +31,11 @@ and AUTH network tag. The adapter rebuilds scenario weights and membership,
 uses a fresh timestamp, freezes complete MC/WC Genesis identities before startup,
 and gives each invocation a fresh user/network namespace. Scenarios run serially;
 control failure prevents the dependent mixed run. The original rotation240s,
-activation120s and recovery180s budgets are fixed. No arbitrary extra flags,
+activation120s and recovery180s budgets are fixed for rotation. Matrices retain
+their original180-second total deadline, including threshold pause/observation/
+recovery. Four-member matrices with a C++ source enable WC creator history;
+three/six-member and all-Rust matrices retain their supported direct sampling.
+No arbitrary extra flags,
 existing runtime-directory reuse or automatic retries are accepted.
 
 `suite.json` retains source/binary/profile hashes and completed scenario result

@@ -8,6 +8,12 @@ from pathlib import Path
 
 from binary_identity import require_rust_revision
 from cpp_baseline import require_cpp_baseline
+from scenario_matrix import (
+    MATRICES,
+    check_matrix_result,
+    make_matrix_profile,
+    matrix_commands,
+)
 
 ROTATIONS = frozenset(
     f"{family}-{mode}"
@@ -149,7 +155,7 @@ def check_result(name, result):
 
 
 def execute(args, names, catalog):
-    missing = [name for name in names if name not in ROTATIONS]
+    missing = [name for name in names if name not in ROTATIONS and name not in MATRICES]
     if missing:
         raise ValueError(f"Execution adapters not integrated: {', '.join(missing)}")
     required = (
@@ -173,7 +179,7 @@ def execute(args, names, catalog):
     require_rust_revision(args.rust_node, args.rust_revision)
     # Materialize no runtime directories until every selected adapter/input is checked.
     for name in names:
-        make_profile(name, template, 0)
+        (make_matrix_profile if name in MATRICES else make_profile)(name, template, 0)
     inputs = [
         args.rust_node,
         args.validator_preparer,
@@ -203,44 +209,50 @@ def execute(args, names, catalog):
                 raise ValueError("A scenario suite input changed")
             case = root / name
             case.mkdir()
-            write(case / "profile.json", make_profile(name, template, time.time()))
-            common = [
-                str(args.cpp_python),
-                str(source / "rotation_fixture.py"),
-                "--snapshot",
-                str(args.snapshot),
-                "--block-checker",
-                str(args.block_checker),
-                "--base-port",
-                "59800",
-            ]
-            prepare = common + [
-                "--profile",
-                str(case / "profile.json"),
-                "--output",
-                str(case / "genesis"),
-                "--prepare-genesis-only",
-            ]
-            run = common + [
-                "--profile",
-                str(case / "genesis/frozen-profile.json"),
-                "--output",
-                str(case / "runtime"),
-                "--timeout",
-                "240",
-                "--recovery-timeout",
-                "180",
-                "--workchain-creator-history",
-            ]
-            if not name.endswith("-control"):
-                run += [
-                    "--rust-node",
-                    str(args.rust_node),
-                    "--validator-preparer",
-                    str(args.validator_preparer),
+            profile = (make_matrix_profile if name in MATRICES else make_profile)(
+                name, template, time.time()
+            )
+            write(case / "profile.json", profile)
+            if name in MATRICES:
+                prepare, run = matrix_commands(args, name, case)
+            else:
+                common = [
+                    str(args.cpp_python),
+                    str(source / "rotation_fixture.py"),
+                    "--snapshot",
+                    str(args.snapshot),
+                    "--block-checker",
+                    str(args.block_checker),
+                    "--base-port",
+                    "59800",
                 ]
-            if name.startswith("restart-member"):
-                run += ["--interrupt-rust-member", name[-1]]
+                prepare = common + [
+                    "--profile",
+                    str(case / "profile.json"),
+                    "--output",
+                    str(case / "genesis"),
+                    "--prepare-genesis-only",
+                ]
+                run = common + [
+                    "--profile",
+                    str(case / "genesis/frozen-profile.json"),
+                    "--output",
+                    str(case / "runtime"),
+                    "--timeout",
+                    "240",
+                    "--recovery-timeout",
+                    "180",
+                    "--workchain-creator-history",
+                ]
+                if not name.endswith("-control"):
+                    run += [
+                        "--rust-node",
+                        str(args.rust_node),
+                        "--validator-preparer",
+                        str(args.validator_preparer),
+                    ]
+                if name.startswith("restart-member"):
+                    run += ["--interrupt-rust-member", name[-1]]
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -258,7 +270,11 @@ def execute(args, names, catalog):
                 if process.returncode:
                     raise RuntimeError(f"{name} {label} exited {process.returncode}")
             result_path = case / "runtime/result.json"
-            check_result(name, json.loads(result_path.read_text()))
+            result = json.loads(result_path.read_text())
+            if name in MATRICES:
+                check_matrix_result(name, result, profile)
+            else:
+                check_result(name, result)
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

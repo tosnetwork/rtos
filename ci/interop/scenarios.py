@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from scenario_execution import ROTATIONS, execute
+from scenario_matrix import MATRICES
 
 CATALOG = Path(__file__).with_name("scenario_catalog.json")
 
@@ -35,9 +36,16 @@ def validate(catalog, source_root):
         driver = entry["driver"]
         if Path(driver).name != driver or not (source_root / driver).is_file():
             raise ValueError("Scenario driver must be an existing local file")
-        expected_adapter = "rotation_v1" if entry["id"] in ROTATIONS else "unintegrated"
+        expected_adapter = (
+            "rotation_v1"
+            if entry["id"] in ROTATIONS
+            else "matrix_v1"
+            if entry["id"] in MATRICES
+            else "unintegrated"
+        )
         if entry["execution"] != expected_adapter or (
-            expected_adapter == "rotation_v1" and driver != "rotation_fixture.py"
+            (expected_adapter == "rotation_v1" and driver != "rotation_fixture.py")
+            or (expected_adapter == "matrix_v1" and driver != "mixed_matrix.py")
         ):
             raise ValueError(
                 "Scenario execution adapter does not match the implementation"

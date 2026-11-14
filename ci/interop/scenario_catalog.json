@@ -28,7 +28,7 @@
       "depends_on": [
         "matrix4-cpp4"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix4-cpp1",
@@ -37,7 +37,7 @@
       "depends_on": [
         "matrix4-cpp4"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix4-cpp2",
@@ -46,7 +46,7 @@
       "depends_on": [
         "matrix4-cpp4"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix4-cpp3",
@@ -55,21 +55,21 @@
       "depends_on": [
         "matrix4-cpp4"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix4-cpp4",
       "driver": "mixed_matrix.py",
       "scope": "Four active members: 4 C++ and 0 Rust; every MC/WC creator and full states",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix3-healthy-control",
       "driver": "mixed_matrix.py",
       "scope": "3 active C++ members; all MC/WC creators and full states",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix3-healthy-mixed",
@@ -78,14 +78,14 @@
       "depends_on": [
         "matrix3-healthy-control"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix3-threshold-control",
       "driver": "mixed_matrix.py",
       "scope": "3 active C++ members; exact quorum, below quorum stall, same-PID recovery",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix3-threshold-mixed",
@@ -94,14 +94,14 @@
       "depends_on": [
         "matrix3-threshold-control"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-healthy-control",
       "driver": "mixed_matrix.py",
       "scope": "6 active C++ members; all MC/WC creators and full states",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-healthy-mixed",
@@ -110,14 +110,14 @@
       "depends_on": [
         "matrix6-healthy-control"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-threshold-control",
       "driver": "mixed_matrix.py",
       "scope": "6 active C++ members; exact quorum, below quorum stall, same-PID recovery",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-threshold-mixed",
@@ -126,14 +126,14 @@
       "depends_on": [
         "matrix6-threshold-control"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-low-weight-majority-control",
       "driver": "mixed_matrix.py",
       "scope": "Five low-weight members cannot finalize without weight30 member5",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "matrix6-low-weight-majority-mixed",
@@ -142,7 +142,7 @@
       "depends_on": [
         "matrix6-low-weight-majority-control"
       ],
-      "execution": "unintegrated"
+      "execution": "matrix_v1"
     },
     {
       "id": "rotation-control",
