@@ -22,23 +22,7 @@ fn refused(reason: &'static str) -> anyhow::Error {
 }
 
 fn wire_value<T: rtos_api::BoxedDeserialize>(bytes: &[u8]) -> Result<T> {
-    WireProfile::T0.deserialize_value_bounded(bytes, bytes.len()).map_err(|error| {
-        let reason = if error.is::<rtos_api::InvalidConstructor>() {
-            "tl_unknown_constructor"
-        } else if error.is::<rtos_api::DecodeLimitExceeded>()
-            || error.to_string().starts_with("Too big string of ")
-            || error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
-        {
-            "tl_truncated"
-        } else if error.to_string() == "Trailing bytes after wire object" {
-            "tl_trailing_data"
-        } else {
-            return error;
-        };
-        refused(reason)
-    })
+    super::wire::decode(bytes, refused)
 }
 
 /// A wire public-key profile, independent of an admitted ADNL peer identity.
