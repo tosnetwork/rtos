@@ -150,6 +150,10 @@ impl<'r> Deserializer<'r> {
         self
     }
 
+    pub(crate) fn remaining_input(&self) -> Option<usize> {
+        self.input_len.map(|len| len.saturating_sub(self.pos))
+    }
+
     fn require_input(&self, bytes: usize) -> Result<()> {
         if self.input_len.is_some_and(|len| bytes > len.saturating_sub(self.pos)) {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated TL field").into());

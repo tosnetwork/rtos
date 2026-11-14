@@ -228,7 +228,13 @@ pub trait Vectored<T> {
         Self: Sized,
     {
         let count = de.read_i32::<LittleEndian>()?;
-        if count < 0 || count > MAX_TL_VECTOR_LEN {
+        if count < 0
+            || count > MAX_TL_VECTOR_LEN
+            || (de.profile == crate::WireProfile::T0
+                && de.remaining_input().is_some_and(|remaining| remaining < count as usize))
+        {
+            // TOS/TON TlFetchVector checks multiplicity against remaining bytes
+            // before trying any element, preserving its first refusal class.
             fail!("Invalid TL vector length {count}")
         }
         let mut ret = Vec::new();

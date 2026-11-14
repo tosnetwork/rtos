@@ -45,3 +45,5 @@ impl NetworkStack {
 }
 
 include!("../../common/src/info.rs");
+
+pub mod preauth;

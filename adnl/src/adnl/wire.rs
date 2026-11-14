@@ -9,6 +9,8 @@ pub(crate) fn decode<T: rtos_api::BoxedDeserialize>(
     WireProfile::T0.deserialize_value_bounded(bytes, bytes.len()).map_err(|error| {
         let reason = if error.is::<rtos_api::InvalidConstructor>() {
             "tl_unknown_constructor"
+        } else if error.to_string().starts_with("Invalid TL vector length ") {
+            "tl_bad_length"
         } else if error.is::<rtos_api::DecodeLimitExceeded>()
             || error.to_string().starts_with("Too big string of ")
             || error

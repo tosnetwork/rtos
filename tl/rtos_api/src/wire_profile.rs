@@ -297,7 +297,7 @@ impl WireProfile {
 
     pub fn deserialize_value<T: crate::BoxedDeserialize>(self, bytes: &[u8]) -> Result<T> {
         let mut reader = bytes;
-        let mut de = Deserializer::with_profile(&mut reader, self);
+        let mut de = Deserializer::with_profile(&mut reader, self).with_input_len(bytes.len());
         let value = de.read_boxed()?;
         if de.pos != bytes.len() {
             fail!("Trailing bytes after wire object");
@@ -313,7 +313,8 @@ impl WireProfile {
     ) -> Result<T> {
         let mut reader = bytes;
         let mut de = Deserializer::with_profile(&mut reader, self)
-            .with_bytes_budget(byte_budget.min(bytes.len()));
+            .with_bytes_budget(byte_budget.min(bytes.len()))
+            .with_input_len(bytes.len());
         let value = de.read_boxed()?;
         if de.pos != bytes.len() {
             fail!("Trailing bytes after wire object");
@@ -328,7 +329,7 @@ impl WireProfile {
     /// Explicit prefix parser for framed overlay messages, not single objects.
     pub fn deserialize_with_suffix(self, bytes: &[u8]) -> Result<(TLObject, usize)> {
         let mut reader = bytes;
-        let mut de = Deserializer::with_profile(&mut reader, self);
+        let mut de = Deserializer::with_profile(&mut reader, self).with_input_len(bytes.len());
         Ok((de.read_boxed()?, de.pos))
     }
 
@@ -336,7 +337,7 @@ impl WireProfile {
     /// are fatal. An overlay prefix cannot hide an invalid target request.
     pub fn deserialize_bundle(self, bytes: &[u8]) -> Result<Vec<TLObject>> {
         let mut reader = bytes;
-        let mut de = Deserializer::with_profile(&mut reader, self);
+        let mut de = Deserializer::with_profile(&mut reader, self).with_input_len(bytes.len());
         let mut objects = Vec::new();
         while de.pos < bytes.len() {
             objects.push(de.read_boxed()?);

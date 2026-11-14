@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 #[path = "net/fec.rs"]
 mod fec;
+#[path = "net/packet.rs"]
+mod packet;
+#[path = "net/preauth.rs"]
+mod preauth;
 #[path = "net/rldp2.rs"]
 mod rldp2;
 fn bytes(v: &Value, name: &str, max: usize) -> Result<Vec<u8>> {
@@ -24,6 +28,12 @@ fn run(v: &Value) -> Result<Value> {
     let op = v["op"].as_str().context("op required")?;
     if matches!(op, "rldp2_fec_helper" | "rldp2_budget" | "rldp2_receive" | "rldp2_send") {
         return rldp2::run(v);
+    }
+    if matches!(op, "adnl_message" | "adnl_address_list" | "adnl_packet" | "adnl_datagram") {
+        return packet::run(v);
+    }
+    if matches!(op, "preauth_source" | "preauth_gate") {
+        return preauth::run(v);
     }
     if matches!(op, "fec_type" | "fec_encode" | "fec_decode") {
         return fec::run(v);
@@ -105,7 +115,8 @@ fn main() -> Result<()> {
             let reason = e
                 .downcast_ref::<KeyRefusal>()
                 .map(|code| code.0)
-                .or_else(|| e.downcast_ref::<adnl::fec::Refusal>().map(|code| code.0));
+                .or_else(|| e.downcast_ref::<adnl::fec::Refusal>().map(|code| code.0))
+                .or_else(|| e.downcast_ref::<adnl::packet::Refusal>().map(|code| code.0));
             match reason {
                 Some(code) => json!({"outcome":"refused","reason":code}),
                 None => json!({"harness_error":e.to_string()}),
