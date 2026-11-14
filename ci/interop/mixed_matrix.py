@@ -388,6 +388,48 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
     return address, prepared
 
 
+def record_workchain_creator(
+    wc_check,
+    directory,
+    anchor,
+    expected_creators,
+    rust_nodes,
+    workchain_keys,
+    workchain_creators,
+    root,
+):
+    top = wc_check["block"]
+    wc_creator = wc_check["created_by"]
+    if wc_creator not in expected_creators:
+        raise RuntimeError("Anchored workchain block has an unexpected creator")
+    wc_language, wc_member = expected_creators[wc_creator]
+    wc_evidence = {
+        "member": wc_member,
+        "language": wc_language,
+        "block_check": wc_check,
+        "masterchain_anchor": anchor,
+        "sample_directory": str(directory),
+    }
+    if wc_language == "rust":
+        node = next(node for node in rust_nodes if node["index"] == wc_member)
+        text = (node["directory"] / "node.log").read_text(errors="replace")
+        match = re.search(
+            r"^\(0:8000000000000000, "
+            + str(top["seqno"])
+            + r"\): ValidatorGroup::on_generate_slot: .*Collation successful$",
+            text,
+            re.MULTILINE,
+        )
+        if not match:
+            raise RuntimeError(
+                "Rust workchain creator lacks successful local collation evidence"
+            )
+        wc_evidence["local_collation"] = match.group(0)
+    workchain_keys.add(identity(top))
+    workchain_creators.setdefault(wc_creator, wc_evidence)
+    write(root / "workchain-creators.json", workchain_creators)
+
+
 async def run(args, root, snapshot, artifacts):
     sys.path.insert(0, str(snapshot / "source/test/tostester/src"))
     from nacl.signing import SigningKey
@@ -691,6 +733,7 @@ async def run(args, root, snapshot, artifacts):
             observations = [{} for _ in endpoints]
             checked_keys, creators = set(), {}
             workchain_keys, workchain_creators = set(), {}
+            workchain_history_cache = {}
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
                 for node in rust_nodes:
@@ -901,44 +944,53 @@ async def run(args, root, snapshot, artifacts):
                             checked = json.loads(
                                 (directory / "workchain-checked.json").read_text()
                             )
-                            wc_check = checked["workchain_check"]
-                            wc_creator = wc_check["created_by"]
-                            if wc_creator not in expected_creators:
-                                raise RuntimeError(
-                                    "Anchored workchain block has an unexpected creator"
+                            record_workchain_creator(
+                                checked["workchain_check"],
+                                directory,
+                                infos[0]["last"],
+                                expected_creators,
+                                rust_nodes,
+                                workchain_keys,
+                                workchain_creators,
+                                root,
+                            )
+                            if args.workchain_creator_history:
+                                from workchain_history_fixture import (
+                                    collect_workchain_history,
                                 )
-                            wc_language, wc_member = expected_creators[wc_creator]
-                            wc_evidence = {
-                                "member": wc_member,
-                                "language": wc_language,
-                                "block_check": wc_check,
-                                "masterchain_anchor": infos[0]["last"],
-                                "sample_directory": str(directory),
-                            }
-                            if wc_language == "rust":
-                                node = next(
-                                    node
-                                    for node in rust_nodes
-                                    if node["index"] == wc_member
+
+                                historical = await collect_workchain_history(
+                                    args,
+                                    cpp_nodes,
+                                    lite_configs,
+                                    endpoint_names,
+                                    range(member_count),
+                                    sample,
+                                    checked,
+                                    directory,
+                                    deadline,
+                                    set(expected_creators) - set(workchain_creators),
+                                    "before",
+                                    0,
+                                    0,
+                                    workchain_history_cache,
                                 )
-                                text = (node["directory"] / "node.log").read_text(
-                                    errors="replace"
-                                )
-                                match = re.search(
-                                    r"^\(0:8000000000000000, "
-                                    + str(top["seqno"])
-                                    + r"\): ValidatorGroup::on_generate_slot: .*Collation successful$",
-                                    text,
-                                    re.MULTILINE,
-                                )
-                                if not match:
-                                    raise RuntimeError(
-                                        "Rust workchain creator lacks successful local collation evidence"
+                                for wc_check, historical_directory in historical:
+                                    historical_sample = json.loads(
+                                        (
+                                            historical_directory / "sample.json"
+                                        ).read_text()
                                     )
-                                wc_evidence["local_collation"] = match.group(0)
-                            workchain_keys.add(identity(top))
-                            workchain_creators.setdefault(wc_creator, wc_evidence)
-                            write(root / "workchain-creators.json", workchain_creators)
+                                    record_workchain_creator(
+                                        wc_check,
+                                        historical_directory,
+                                        historical_sample["reference"]["last"],
+                                        expected_creators,
+                                        rust_nodes,
+                                        workchain_keys,
+                                        workchain_creators,
+                                        root,
+                                    )
                     checked_keys.add(key)
                     creator = checked["created_by"]
                     if creator not in expected_creators:
@@ -1016,6 +1068,7 @@ async def run(args, root, snapshot, artifacts):
                             "common_state_checkpoints": len(checked_keys),
                             "final_certificates_required": args.verify_certificates,
                             "workchain_states_required": args.verify_workchain,
+                            "workchain_creator_history": args.workchain_creator_history,
                             "workchain_creators": workchain_creators,
                             "workchain_state_checkpoints": len(workchain_keys),
                             "mixed_validator_qualified": False,
@@ -1043,6 +1096,18 @@ async def run(args, root, snapshot, artifacts):
                 )
 
 
+def require_history_scope(args, member_count):
+    if args.workchain_creator_history and (
+        member_count != 4
+        or args.cpp_count < 1
+        or not args.verify_certificates
+        or not args.verify_workchain
+    ):
+        raise ValueError(
+            "Historical creator checks require four members, a C++ body source, certificates and full states"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -1063,6 +1128,11 @@ def main():
     parser.add_argument("--prepare-genesis-only", action="store_true")
     parser.add_argument("--verify-certificates", action="store_true")
     parser.add_argument("--verify-workchain", action="store_true")
+    parser.add_argument(
+        "--workchain-creator-history",
+        action="store_true",
+        help="Check missed creators through authenticated full workchain ancestry",
+    )
     args = parser.parse_args()
     args.snapshot = args.snapshot.resolve()
     for name in ["rust_node", "validator_preparer", "block_checker"]:
@@ -1071,6 +1141,7 @@ def main():
     args.genesis_profile = args.genesis_profile.resolve()
     profile = json.loads(args.genesis_profile.read_text())
     member_count = matrix_committee_size(profile, args.cpp_count)
+    require_history_scope(args, member_count)
     matrix_weights(profile, args.cpp_count)
     matrix_threshold_plan(profile, args.cpp_count)
     if (
@@ -1115,6 +1186,9 @@ def main():
             raise SystemExit(f"C++ snapshot executable changed: {path}")
         artifacts[str(path)] = item["sha256"]
     artifacts[str(args.genesis_profile)] = digest(args.genesis_profile)
+    if args.workchain_creator_history:
+        history_helper = Path(__file__).with_name("workchain_history_fixture.py")
+        artifacts[str(history_helper)] = digest(history_helper)
     helper = Path(__file__).with_name("quorum_profile.py")
     artifacts[str(helper)] = digest(helper)
     if profile.get("threshold_fault") is not None:

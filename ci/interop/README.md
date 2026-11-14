@@ -214,6 +214,16 @@ masterchain inclusion in the initial frozen epoch, with the containing
 masterchain FinalCert checked. It does not independently export a workchain
 FinalCert, prove a workchain database applied cursor, or qualify set rotation.
 
+For four-member matrices with at least one C++ process, add
+`--workchain-creator-history --verify-workchain --verify-certificates` to recover
+creators missed between sampled shard tops. The existing rotation collector
+fetches full parent bodies and full states from all four endpoints; the checker
+validates the ancestry back to the certified masterchain anchor. Rust creators
+still require their local successful collation record. Historical evidence keeps
+its original sample path and anchor, and uses the original run deadline and
+64-link ancestry bound. This does not infer acceptance from candidate logs or
+extend the timeout. All-Rust matrices currently require direct tip coverage.
+
 ## Predeclared successor rotation
 
 `rotation_fixture.py` deploys six public fixture identities with initial members
