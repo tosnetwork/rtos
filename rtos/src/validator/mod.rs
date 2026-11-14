@@ -16,6 +16,7 @@ pub mod candidate_db;
 pub mod collator;
 pub mod consensus;
 pub mod consensus_overlay;
+mod dependency_deadline;
 mod fabric;
 pub(crate) mod finality_recovery_owner;
 mod log_parser;

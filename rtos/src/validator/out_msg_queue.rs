@@ -9,7 +9,7 @@
  * This file has been modified from its original version.
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use super::out_msg_queue_cleaner;
+use super::{dependency_deadline::DependencyDeadline, out_msg_queue_cleaner};
 use crate::{
     block::BlockStuff,
     engine_traits::EngineOperations,
@@ -1512,6 +1512,7 @@ pub struct StatesManager {
     block_proofs: HashMap<BlockIdExt, Cell>,
     collect_proofs: bool,
     preloaded_states_only: bool,
+    dependency_deadline: DependencyDeadline,
 }
 
 impl StatesManager {
@@ -1528,6 +1529,7 @@ impl StatesManager {
             block_proofs: Default::default(),
             collect_proofs,
             preloaded_states_only: false,
+            dependency_deadline: DependencyDeadline::default(),
         };
         for (state, block) in prev_chain {
             let usage_state = if collect_proofs && !state.shard().is_masterchain() {
@@ -1558,6 +1560,7 @@ impl StatesManager {
             block_proofs: Default::default(),
             collect_proofs: false,
             preloaded_states_only: false,
+            dependency_deadline: DependencyDeadline::default(),
         }
     }
 
@@ -1600,7 +1603,13 @@ impl StatesManager {
             block_proofs: Default::default(),
             collect_proofs: false,
             preloaded_states_only: true,
+            dependency_deadline: DependencyDeadline::default(),
         })
+    }
+
+    pub(super) fn with_dependency_deadline(mut self, deadline: DependencyDeadline) -> Self {
+        self.dependency_deadline = deadline;
+        self
     }
 
     pub async fn get_state(
@@ -1614,6 +1623,7 @@ impl StatesManager {
             fail!("State {id} not found in preloaded states");
         }
 
+        let timeout_ms = self.dependency_deadline.timeout_ms(timeout_ms)?;
         let state = self.engine.clone().wait_state(id, timeout_ms, true).await?;
         self.insert(&state).await
     }
@@ -1733,6 +1743,7 @@ impl StatesManager {
                 ),
             };
 
+            let timeout_ms = self.dependency_deadline.timeout_ms(timeout_ms)?;
             let state = self.engine.clone().wait_state(&block_id, timeout_ms, true).await?;
             entry.insert(state);
         }

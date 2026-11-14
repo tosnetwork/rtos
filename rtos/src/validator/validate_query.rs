@@ -30,6 +30,7 @@ use crate::{
     },
     validator::{
         collator::PREV_STATE_WAIT_TIMEOUT_MS,
+        dependency_deadline::DependencyDeadline,
         consensus::ResolverPurpose,
         out_msg_queue::{MsgQueueManager, StatesManager},
         state_resolver_cache::{self, StateResolverCache},
@@ -328,6 +329,7 @@ pub struct ValidateQuery {
 
     /// Simplex speculative state cache for notarized-but-not-yet-applied parents.
     state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
+    dependency_deadline: DependencyDeadline,
 
     next_block_descr: Arc<String>,
 }
@@ -341,6 +343,11 @@ enum MsgProcessedStatus {
 }
 
 impl ValidateQuery {
+    pub(super) fn with_dependency_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.dependency_deadline = DependencyDeadline::at(deadline);
+        self
+    }
+
     fn shard(&self) -> &ShardIdent {
         &self.shard
     }
@@ -349,6 +356,10 @@ impl ValidateQuery {
         &self,
         prev_id: &BlockIdExt,
     ) -> Result<Arc<ShardStateStuff>> {
+        let timeout_ms = self
+            .dependency_deadline
+            .timeout_ms(Some(PREV_STATE_WAIT_TIMEOUT_MS))?
+            .expect("previous-state waits always have a finite budget");
         match &self.state_resolver_cache {
             Some(cache) => {
                 state_resolver_cache::wait_prev_state(
@@ -356,14 +367,14 @@ impl ValidateQuery {
                     &self.engine,
                     prev_id,
                     ResolverPurpose::SimplexValidationParent,
-                    PREV_STATE_WAIT_TIMEOUT_MS,
+                    timeout_ms,
                 )
                 .await
             }
             None => {
                 self.engine
                     .clone()
-                    .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
+                    .wait_state(prev_id, Some(timeout_ms), true)
                     .await
             }
         }
@@ -400,6 +411,7 @@ impl ValidateQuery {
             block_create_total: Default::default(),
             block_create_count: Default::default(),
             state_resolver_cache,
+            dependency_deadline: DependencyDeadline::default(),
             next_block_descr,
         }
     }
@@ -855,7 +867,11 @@ impl ValidateQuery {
 
     async fn get_ref_mc_state(&mut self, base: &mut ValidateBase) -> Result<McData> {
         let (_, mc_id) = base.info.read_master_id()?.master_block_id();
-        let mc_state = self.engine.clone().wait_state(&mc_id, Some(1_000), true).await?;
+        let mc_state = self
+            .engine
+            .clone()
+            .wait_state(&mc_id, self.dependency_deadline.timeout_ms(Some(1_000))?, true)
+            .await?;
         // CPP ConfigInfo::needAccountsRoot prepares the masterchain dictionary before
         // auxiliary descriptor requests. Keep pruned-reference failures at this stage.
         if base.shard().is_masterchain() {
@@ -1258,7 +1274,7 @@ impl ValidateQuery {
             None,
             None,
             None,
-            states_manager,
+            states_manager.with_dependency_deadline(self.dependency_deadline),
         )
         .await
     }
@@ -1969,7 +1985,11 @@ impl ValidateQuery {
                                 let state = self
                                     .engine
                                     .clone()
-                                    .wait_state(&checked_id, Some(1_000), false)
+                                    .wait_state(
+                                        &checked_id,
+                                        self.dependency_deadline.timeout_ms(Some(1_000))?,
+                                        false,
+                                    )
                                     .await?;
 
                                 stack.push(RefBlockStatus::Checking(checked_id.clone()));
@@ -7002,7 +7022,11 @@ impl ValidateQuery {
             Ok(true)
         })?;
         for id in governing_ids {
-            let state = self.engine.clone().wait_state(&id, Some(1000), true).await?;
+            let state = self
+                .engine
+                .clone()
+                .wait_state(&id, self.dependency_deadline.timeout_ms(Some(1000))?, true)
+                .await?;
             base.governing_states.insert(id, state);
         }
         // stage 0

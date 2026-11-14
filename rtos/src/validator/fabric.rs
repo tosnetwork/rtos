@@ -43,6 +43,7 @@ pub async fn run_validate_query_any_candidate(
     engine: Arc<dyn EngineOperations>,
     state_resolver_cache: Arc<tokio::sync::Mutex<StateResolverCache>>,
     is_simplex: bool,
+    dependency_deadline: tokio::time::Instant,
 ) -> Result<SystemTime> {
     let block_id = block_candidate.block_id.clone();
     let block_data = block_candidate.data.clone();
@@ -92,7 +93,7 @@ pub async fn run_validate_query_any_candidate(
         true,
         is_simplex,
     );
-    let validator_result = query.try_validate().await;
+    let validator_result = query.with_dependency_deadline(dependency_deadline).try_validate().await;
 
     metrics::gauge!("rtos_node_validator_active", &labels).decrement(1.0);
 
@@ -184,6 +185,7 @@ pub async fn run_validate_query(
     set: ValidatorSet,
     engine: Arc<dyn EngineOperations>,
     is_simplex: bool,
+    dependency_deadline: tokio::time::Instant,
 ) -> Result<SystemTime> {
     let next_block_descr = fmt_next_block_descr(&block.block_id);
 
@@ -213,6 +215,7 @@ pub async fn run_validate_query(
         true,
         is_simplex,
     )
+    .with_dependency_deadline(dependency_deadline)
     .try_validate()
     .await;
 

@@ -2903,13 +2903,14 @@ impl ValidatorGroup {
         let validation_task = self.spawn_task(&tokio::runtime::Handle::current(), async move {
             // C++ parity: bounded validation deadline.
             // Simplex: 60s (block-validator.cpp), legacy: 15s (validator-group.cpp).
-            let deadline = if use_candidate_native {
+            let validation_timeout = if use_candidate_native {
                 SIMPLEX_VALIDATION_TIMEOUT
             } else {
                 LEGACY_VALIDATION_TIMEOUT
             };
 
-            let validation_result = tokio::time::timeout(deadline, async {
+            let deadline = tokio::time::Instant::now() + validation_timeout;
+            let validation_result = tokio::time::timeout_at(deadline, async {
                 if use_candidate_native {
                     // ---- Simplex candidate-native validation path ----
                     //
@@ -2988,6 +2989,7 @@ impl ValidatorGroup {
                         engine.clone(),
                         state_resolver_cache.clone(),
                         is_simplex,
+                        deadline,
                     )
                     .await?;
 
@@ -3070,6 +3072,7 @@ impl ValidatorGroup {
                         validator_set.clone(),
                         engine.clone(),
                         is_simplex,
+                        deadline,
                     )
                     .await?;
 
@@ -3101,9 +3104,9 @@ impl ValidatorGroup {
                     log::warn!(
                         target: "validator",
                         "({next_block_descr}): ValidatorGroup::on_candidate: {candidate_id}, \
-                         validation timed out after {deadline:?}"
+                         validation timed out after {validation_timeout:?}"
                     );
-                    Err(error!("validation timed out after {:?}", deadline))
+                    Err(error!("validation timed out after {:?}", validation_timeout))
                 }
             };
 
