@@ -11,13 +11,13 @@ import re
 import shutil
 import signal
 import socket
-import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+from binary_identity import require_rust_revision
 from cpp_baseline import configure_auth_namespace, require_cpp_baseline
 from quorum_profile import (
     check_committee_weights,
@@ -1098,11 +1098,7 @@ def main():
     ):
         raise SystemExit("Frozen Genesis profile does not match this baseline")
     require_cpp_baseline(manifest["cpp_source_commit"], profile)
-    banner = subprocess.run(
-        [str(args.rust_node), "--help"], capture_output=True, text=True, check=True
-    )
-    if args.rust_revision not in banner.stdout + banner.stderr:
-        raise SystemExit("Rust executable does not report the pinned source revision")
+    require_rust_revision(args.rust_node, args.rust_revision)
     artifacts = {
         str(path): digest(path)
         for path in [
@@ -1110,6 +1106,7 @@ def main():
             args.validator_preparer,
             args.block_checker,
             Path(__file__).with_name("cpp_baseline.py"),
+            Path(__file__).with_name("binary_identity.py"),
         ]
     }
     for item in manifest["binaries"]:
