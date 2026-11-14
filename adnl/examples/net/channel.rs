@@ -2,6 +2,7 @@
 use adnl::{
     channel::Channel,
     packet::Refusal,
+    routing::{route_datagram, Destination},
     wire_keys::{KeyRefusal, NetworkPrivateKey, NetworkPublicKey},
 };
 use anyhow::{ensure, Result};
@@ -26,7 +27,17 @@ pub(super) fn run(v: &Value) -> Result<Value> {
     let peer = NetworkPublicKey::from_wire(&WireProfile::T0.serialize(&public)?)?;
     let channel = Channel::from_keys(&local, &peer, bits(v, "local_id")?, bits(v, "peer_id")?)?;
     let received = if v.get("datagram").is_some() {
-        match channel.receive(&super::bytes(v, "datagram", 1 << 20)?) {
+        let channels = std::collections::HashMap::from([(channel.in_id(), &channel)]);
+        let datagram = super::bytes(v, "datagram", 1 << 20)?;
+        // The reference registers only this inbound channel, with no local IDs.
+        // Use the same destination lookup as the native socket receive pipeline.
+        let packet = route_datagram(&datagram, |_| None::<()>, |id| channels.get(id)).and_then(
+            |destination| match destination {
+                Destination::Channel(channel) => channel.decrypt(&datagram[32..]),
+                Destination::Local(()) => unreachable!("no local identity registered"),
+            },
+        );
+        match packet {
             Ok(p) => {
                 let p = super::packet::packet_fields(&p, Value::Null)?;
                 json!({"packet":p})

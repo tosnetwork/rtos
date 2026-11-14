@@ -588,6 +588,19 @@ the shared C++ path nor emulates its undefined overflow in Rust. It must not be
 described as equivalence for arbitrary accepted u64 gas contexts.
 
 
+## Latest network destination boundary
+
+The latest TOS5af405d channel harness routes through the peer table. Its destination
+lookup is shared with the Rust socket receive pipeline: local identities take
+precedence over inbound channel registrations, before any decryption. An unknown
+destination is refused by that lookup. The standalone Channel API retains its
+channel-only namespace. The latest corpus has1245 equal effects and45 unsupported
+broadcast contexts, with zero mismatches; unsupported contexts are not passes.
+An additional640 channel contexts match the latest C++ actor harness. Native
+checks cover registry precedence, unknown/short destinations, four channel tests
+and12 actual node lifecycle tests. This does not qualify the separate channel
+crypto/parser API as fully installed in the asynchronous peer/channel lifecycle.
+
 ## Offline candidate-validation target
 
 Build `cargo build -p rtos --example validate_conformance --locked -j32` and run
