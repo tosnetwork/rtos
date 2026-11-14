@@ -40,14 +40,19 @@ impl crate::ConfigParams {
     /// Fetch a parameter from a proof, preserving unavailable dictionary paths
     /// and values as pruned-cell errors rather than interpreting special bytes.
     pub fn proof_config_param_cell(&self, index: u32) -> Result<Option<Cell>> {
+        let cell = self.proof_config_param_reference(index)?;
+        if let Some(cell) = &cell {
+            require_proof_cell(cell)?;
+        }
+        Ok(cell)
+    }
+
+    pub(crate) fn proof_config_param_reference(&self, index: u32) -> Result<Option<Cell>> {
         let cell = self
             .config_params
             .get(index.write_to_bitstring()?)?
             .map(|value| value.reference(0))
             .transpose()?;
-        if let Some(cell) = &cell {
-            require_proof_cell(cell)?;
-        }
         Ok(cell)
     }
 
