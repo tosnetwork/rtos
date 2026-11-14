@@ -11,6 +11,11 @@ from scenario_execution import ROTATIONS, execute
 CATALOG = Path(__file__).with_name("scenario_catalog.json")
 
 
+def absolute_input_path(value):
+    """Keep interpreter symlinks: resolving a venv Python loses its environment."""
+    return Path(value).absolute()
+
+
 def validate(catalog, source_root):
     """Reject incomplete source inventories and invalid dependency graphs."""
     if catalog.get("schema") != 1:
@@ -81,7 +86,7 @@ def main():
         "cpp-python",
         "output",
     ):
-        parser.add_argument("--" + option, type=lambda value: Path(value).resolve())
+        parser.add_argument("--" + option, type=absolute_input_path)
     parser.add_argument("--rust-revision")
     args = parser.parse_args()
     raw = CATALOG.read_bytes()

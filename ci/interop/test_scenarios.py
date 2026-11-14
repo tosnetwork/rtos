@@ -3,13 +3,25 @@
 import copy
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from scenarios import CATALOG, order, validate
+from scenarios import CATALOG, absolute_input_path, order, validate
 
 
 class ScenarioCatalogTest(unittest.TestCase):
     def setUp(self):
         self.catalog = json.loads(CATALOG.read_text())
+
+    def test_virtualenv_interpreter_path_preserves_symlink(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "system-python"
+            binary.touch()
+            link = root / "venv-python"
+            link.symlink_to(binary)
+            self.assertEqual(absolute_input_path(link), link)
+            self.assertNotEqual(absolute_input_path(link), link.resolve())
 
     def test_committed_inventory(self):
         validate(self.catalog, CATALOG.parent)
