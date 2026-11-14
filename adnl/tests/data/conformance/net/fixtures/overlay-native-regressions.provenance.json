@@ -1,0 +1,19 @@
+{
+  "initial_fill": {
+    "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+    "reference_build_sha256": "fe6c189dac82332a4588460f9e8a04b1ca8f7bab1cf7b3ad1cfbe0bfa11fb3e2",
+    "fixture_sha256": "24b20da70074c3ac65aae383000dd02ff0e88b132fcbd0d4ac88dd1bbf3b10d2",
+    "fixture_count": 50,
+    "source": "authored",
+    "global_version": null,
+    "config_root": null,
+    "non_execution_context_reason": "ADNL/overlay contexts have explicit node clock, members and privacy rules; no VM global version or block configuration root.",
+    "filler_sources": {
+      "test/conformance/runner/conformance.py": "ee7791fc4af11a1cc76579d96a890e268e99c7d6f46890636e85c938e463d168",
+      "test/conformance/ref/harness-net.cpp": "75cbd69e82e4c4e8ea96fd9c7ea34640cc46e662a43c197c05e44ef3a34e01ba",
+      "test/conformance/ref/net-broadcast.cpp": "8494b2b58a97f6c543c43efe4dfbbf0ba57e1457ad44e21b28142f197115b9dc"
+    },
+    "command": "python3 $TOS/test/conformance/runner/conformance.py create --reference $CPP --harness net --family overlay-native-regressions --source authored contexts.jsonl overlay-native-regressions.jsonl",
+    "regeneration": "Use the pinned shared runner regenerate --reference $CPP --write on this fixture; retain new build/filler provenance when updating it. Original contexts are in each fixture."
+  }
+}

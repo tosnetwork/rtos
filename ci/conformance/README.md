@@ -1,5 +1,45 @@
 # Shared conformance target
 
+The formal conformance reference is pinned by `REFERENCE` to clean TOS
+`5af405dcb1f523be0ff3b812e9f6945275c4945b`. Use the maintained entry point to
+build all 11 adapters and execute the shared vectors plus local regressions:
+
+```sh
+python3 ci/conformance/run.py --tos "$TOS_REFERENCE" \
+  --out /datax/rtos-conformance/my-run --jobs 32 \
+  --reference-binary "$CPP_REFERENCE"
+```
+
+The output directory must be new. `--target-dir` defaults to `CARGO_TARGET_DIR`
+or this checkout's `target`. The optional C++ binary must identify itself as
+clean and at the exact pin. Without it, the run checks Rust against frozen
+fixtures, as the GitHub Conformance workflow does. That workflow reads the pin,
+checks out the public TOS repository, installs the Rust toolchain from this
+repository's toolchain file and retains the logs and JSON summary. It uses two
+workers for hosted-runner resources; local builds and tests default to 32.
+
+`--harness` selects an explicit subset; the summary marks whether all 11 ran.
+`--extra-fixtures HARNESS=PATH` adds authored/fuzz regression fixtures. Empty,
+duplicated or malformed fixture inputs fail. The runner delegates comparison
+to the pinned TOS runner and schedules independent family invocations within
+one worker budget. It fails on any mismatch, refusal, skip, zero comparison,
+process error, or a change to source, inputs or tested binaries during the run.
+The summary records commits, input/binary digests and every family command.
+`--skip-build` explicitly uses existing binaries and records that limitation.
+
+The original latest suite plus existing local regressions compares 253271 cases
+on each implementation. Another 50 native overlay regressions now freeze the
+date, unicast, FEC receipt and certificate controls, giving 253321 cases. Their
+initial-fill provenance is beside the fixture; effects were generated only by
+the clean pinned C++ CLI. Use the shared `regenerate` command on the fixture
+and retain updated build/filler provenance when refreshing it.
+
+This pin is for the shared conformance boundary. The older interop scenario
+baseline is separate and is not upgraded or qualified by a fixture run.
+Whole-history native state replay, runtime integration, resource qualification,
+GitHub CI outcomes and independent/external reviews remain separate gates.
+
+
 The target executes contexts from the TOS conformance suite and emits the effects of
 RTOS. It never reads fixture expectations. Separate targets provide `vm`, `txn`,
 `block`, `get_method` and `fee`; unsupported harnesses return `harness_error` and must not
