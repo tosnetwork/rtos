@@ -16,7 +16,7 @@ use rtos_block::{
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Seek, SeekFrom, Write},
 };
 
 struct State {
@@ -36,6 +36,47 @@ struct Replay {
 }
 
 fn load(input: &Value, key: &str) -> Result<Original> {
+    if key == "block" && input.get("package").is_some() {
+        ensure!(input.get("block").is_none(), "choose either block or package input");
+        let path = input["package"].as_str().ok_or_else(|| anyhow!("missing package path"))?;
+        let offset = input["offset"].as_u64().ok_or_else(|| anyhow!("missing entry offset"))?;
+        let name = input["name"].as_str().ok_or_else(|| anyhow!("missing entry name"))?;
+        ensure!(name.starts_with("block_(") && name.len() <= 1024, "invalid block entry name");
+        let header_offset = offset
+            .checked_sub(name.len() as u64 + 8)
+            .ok_or_else(|| anyhow!("invalid entry offset"))?;
+        ensure!(header_offset >= 4, "entry overlaps package header");
+        let mut file = std::fs::File::open(path).with_context(|| path.to_owned())?;
+        let mut magic = [0; 4];
+        file.read_exact(&mut magic)?;
+        ensure!(u32::from_le_bytes(magic) == 0xae8fdd01, "invalid package magic");
+        file.seek(SeekFrom::Start(header_offset))?;
+        let mut header = [0; 8];
+        file.read_exact(&mut header)?;
+        ensure!(u16::from_le_bytes([header[0], header[1]]) == 0x1e8b, "invalid entry tag");
+        ensure!(
+            usize::from(u16::from_le_bytes([header[2], header[3]])) == name.len(),
+            "entry name length mismatch"
+        );
+        let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        ensure!(size > 0 && size <= 256 << 20, "invalid entry size");
+        let mut actual_name = vec![0; name.len()];
+        file.read_exact(&mut actual_name)?;
+        ensure!(actual_name == name.as_bytes(), "archive entry name mismatch");
+        let root = input["root_hash"].as_str().ok_or_else(|| anyhow!("missing root hash"))?;
+        let hash = input["file_hash"].as_str().ok_or_else(|| anyhow!("missing file hash"))?;
+        ensure!(
+            root.len() == 64
+                && hash.len() == 64
+                && name.to_ascii_uppercase().ends_with(&format!(":{root}:{hash}")),
+            "archive entry identity mismatch"
+        );
+        let end = offset.checked_add(size as u64).ok_or_else(|| anyhow!("entry size overflow"))?;
+        ensure!(end <= file.metadata()?.len(), "truncated archive entry");
+        let mut bytes = vec![0; size];
+        file.read_exact(&mut bytes)?;
+        return Ok(Original { root: read_single_root_boc(&bytes)?, bytes });
+    }
     let path = input[key].as_str().ok_or_else(|| anyhow!("missing {key} path"))?;
     let bytes = std::fs::read(path).with_context(|| path.to_owned())?;
     Ok(Original { root: read_single_root_boc(&bytes)?, bytes })
@@ -72,6 +113,22 @@ impl Replay {
         );
         let block = Block::construct_from_full_cell(original.root.clone())?;
         let info = block.read_info()?;
+        if input.get("package").is_some() {
+            let name = input["name"].as_str().ok_or_else(|| anyhow!("missing entry name"))?;
+            let position = name
+                .strip_prefix("block_(")
+                .and_then(|s| s.split_once("):"))
+                .ok_or_else(|| anyhow!("invalid archive block position"))?
+                .0;
+            let fields: Vec<_> = position.split(',').collect();
+            ensure!(fields.len() == 3, "invalid archive block position");
+            ensure!(
+                fields[0].parse::<i32>()? == info.shard().workchain_id()
+                    && u64::from_str_radix(fields[1], 16)? == info.shard().shard_prefix_with_tag()
+                    && fields[2].parse::<u32>()? == info.seq_no(),
+                "archive block position mismatch"
+            );
+        }
         ensure!(!info.after_merge() && !info.after_split(), "split/merge unsupported");
         let head =
             self.heads.get(info.shard()).ok_or_else(|| anyhow!("missing chain bootstrap"))?;

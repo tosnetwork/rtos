@@ -45,6 +45,14 @@ with `cargo build --locked -j32`. Feed JSONL on stdin: initial
 `{"block":"/path/to/original.boc","root_hash":"UPPERCASE_HEX","file_hash":"UPPERCASE_HEX"}`.
 The hashes must come from the archive identity. Supply blocks in dependency
 order; all zerostates must precede them. No intermediate state input is allowed.
+To read a block directly from its original archive, replace `block` with
+`"package":"/path/to/archive.pack","offset":171,"name":"block_(...)..."`.
+`offset` is the byte position of the BOC payload and `name` is the exact archive
+entry name. Root/file hashes remain required. The reader validates package magic,
+entry tag, name/length, a 256 MiB entry limit, file bounds and the name's
+workchain/shard/sequence against the decoded block. It refuses an input that
+specifies both `block` and `package`. Package discovery and dependency ordering
+remain the caller's responsibility; this is not a whole-archive scanner.
 The tool checks archive identity, consecutive predecessor identity, native state
 updates and transaction/account roots using the block boundary. It emits each
 block's effects and exits nonzero at the first error, including empty replay.
