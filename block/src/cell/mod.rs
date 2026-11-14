@@ -2985,6 +2985,27 @@ impl Cell {
         !self.is_data_cell() && self.variant_tag() == CELL_VARIANT_LAZY_LOAD
     }
 
+    /// Load this root, preserving lazy errors and usage visits, and report
+    /// whether a cache would bypass a live proof usage tree.
+    pub(crate) fn load_usage_tracking(&self) -> Result<bool> {
+        if self.is_data_cell() {
+            return Ok(false);
+        }
+        let p = self.content_ptr();
+        match self.variant_tag() {
+            CELL_VARIANT_USAGE => {
+                if !UsageCell::visit_on_load(p) {
+                    self.visit();
+                }
+                let inner = UsageCell::inner(p).load_usage_tracking()?;
+                Ok(UsageCell::visited(p).upgrade().is_some() || inner)
+            }
+            CELL_VARIANT_VIRTUAL => VirtualCell::inner(p).load_usage_tracking(),
+            CELL_VARIANT_LAZY_LOAD => LazyLoadCell::try_load(p)?.load_usage_tracking(),
+            _ => Ok(false),
+        }
+    }
+
     pub fn to_hex_string(&self, lower: bool) -> String {
         let bit_length = self.bit_length();
         if bit_length.is_multiple_of(8) {

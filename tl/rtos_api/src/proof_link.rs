@@ -25,6 +25,13 @@ fn reject(reason: &'static str) -> anyhow::Error {
     ProofLinkRefusal(reason).into()
 }
 fn classify(error: anyhow::Error, fallback: &'static str) -> anyhow::Error {
+    if let Some(value) = error.downcast_ref::<rtos_block::ConfigParamReferenceError>() {
+        return reject(if matches!(value.0, 34 | 35) {
+            "config_unavailable"
+        } else {
+            "unclassified"
+        });
+    }
     if matches!(error.downcast_ref::<BlockError>(), Some(BlockError::PrunedCellAccess(_)))
         || matches!(error.downcast_ref::<ExceptionCode>(), Some(ExceptionCode::PrunedCellAccess))
     {

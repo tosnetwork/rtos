@@ -100,6 +100,7 @@ pub use simplex_protocol::SimplexProtocolVersion;
 
 pub mod validators;
 pub use validators::*;
+mod validator_set_cache;
 
 pub mod miscellaneous;
 pub use miscellaneous::*;

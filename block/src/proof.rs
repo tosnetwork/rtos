@@ -27,14 +27,14 @@ impl Block {
 impl crate::ConfigParams {
     /// Required current set for a structural proof. Prefer35 over34 without
     /// reading an unused fallback, preserving pruned availability errors.
-    pub fn proof_validator_set(&self) -> Result<crate::ValidatorSet> {
-        let cell = match self.proof_config_param_cell(35)? {
+    pub fn proof_validator_set(&self) -> Result<std::sync::Arc<crate::ValidatorSet>> {
+        let cell = match self.proof_config_param_reference(35)? {
             Some(cell) => cell,
             None => self
-                .proof_config_param_cell(34)?
+                .proof_config_param_reference(34)?
                 .ok_or_else(|| crate::error!("missing proof validator set"))?,
         };
-        crate::ValidatorSet::construct_from_full_cell(cell)
+        crate::ValidatorSet::unpack_with_cache(cell, true)
     }
 
     /// Fetch a parameter from a proof, preserving unavailable dictionary paths
@@ -48,12 +48,21 @@ impl crate::ConfigParams {
     }
 
     pub(crate) fn proof_config_param_reference(&self, index: u32) -> Result<Option<Cell>> {
-        let cell = self
-            .config_params
-            .get(index.write_to_bitstring()?)?
-            .map(|value| value.reference(0))
-            .transpose()?;
-        Ok(cell)
+        self.config_param_reference(index)
+    }
+
+    /// Structural Param19 metadata: C++ reports null for a short ordinary cell
+    /// and otherwise reads only the signed32-bit prefix, leaving its tail opaque.
+    pub fn proof_global_id(&self) -> Result<Option<i32>> {
+        let Some(cell) = self.proof_config_param_cell(19)? else { return Ok(None) };
+        if cell.cell_type() != crate::CellType::Ordinary {
+            fail!("invalid proof global-ID cell");
+        }
+        let mut slice = SliceData::load_cell(cell)?;
+        if slice.remaining_bits() < 32 {
+            return Ok(None);
+        }
+        Ok(Some(slice.get_next_u32()? as i32))
     }
 
     /// Legacy key-proof configuration profile. Missing or non-unpackable

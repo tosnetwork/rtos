@@ -43,6 +43,19 @@ pub struct ConfigParams {
     pub config_params: HashmapE, // <u32, SliceData>
 }
 
+#[derive(Debug)]
+pub struct ConfigParamReferenceError(pub u32);
+impl std::fmt::Display for ConfigParamReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "config parameter {}: dictionary value must contain exactly one reference",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ConfigParamReferenceError {}
+
 impl Default for ConfigParams {
     fn default() -> ConfigParams {
         Self { config_addr: AccountId::ZERO_ID, config_params: HashmapE::with_bit_len(32) }
@@ -52,10 +65,8 @@ impl Default for ConfigParams {
 impl ConfigParams {
     pub fn with_root(data: Cell) -> Result<Self> {
         let config_params = HashmapE::with_hashmap(32, Some(data));
-        let cell = config_params
-            .get(0u32.write_to_bitstring()?)?
-            .ok_or_else(|| error!("config param 0 is missing"))?
-            .reference(0)?;
+        let cell = Self::reference_from_dictionary(&config_params, 0)?
+            .ok_or_else(|| error!("config param 0 is missing"))?;
         let result = ConfigParamEnum::construct_from_cell_and_number(cell, 0)?;
         let ConfigParamEnum::ConfigParam0(ConfigParam0 { config_addr }) = result else {
             fail!("config param 0 has invalid format");
@@ -95,13 +106,21 @@ impl ConfigParams {
 
     /// get config by index
     pub fn config(&self, index: u32) -> Result<Option<ConfigParamEnum>> {
-        let key = index.write_to_bitstring()?;
-        if let Some(slice) = self.config_params.get(key)? {
-            if let Some(cell) = slice.reference_opt(0) {
-                return Ok(Some(ConfigParamEnum::construct_from_cell_and_number(cell, index)?));
-            }
+        if let Some(cell) = self.config_param_reference(index)? {
+            return Ok(Some(ConfigParamEnum::construct_from_cell_and_number(cell, index)?));
         }
         Ok(None)
+    }
+
+    pub(crate) fn config_param_reference(&self, index: u32) -> Result<Option<Cell>> {
+        Self::reference_from_dictionary(&self.config_params, index)
+    }
+    fn reference_from_dictionary(dictionary: &HashmapE, index: u32) -> Result<Option<Cell>> {
+        let Some(value) = dictionary.get(index.write_to_bitstring()?)? else { return Ok(None) };
+        if value.remaining_bits() != 0 || value.remaining_references() != 1 {
+            fail!(ConfigParamReferenceError(index));
+        }
+        Ok(Some(value.reference(0)?))
     }
 
     /// get config by index
@@ -324,36 +343,30 @@ impl ConfigParams {
         }
     }
     pub fn prev_validator_set(&self) -> Result<ValidatorSet> {
-        #[cfg(feature = "mirrornet")]
-        if let Some(ConfigParamEnum::ConfigParam33(param)) = self.config(33)? {
-            return Ok(param.prev_temp_validators);
-        }
-        Ok(match self.config(32)? {
-            Some(ConfigParamEnum::ConfigParam32(param)) => param.prev_validators,
-            _ => ValidatorSet::default(),
-        })
+        self.cached_validator_parameters(cfg!(feature = "mirrornet").then_some(33), 32)
     }
     pub fn prev_validator_set_present(&self) -> Result<bool> {
         Ok(self.config_present(33)? || self.config_present(32)?)
     }
     pub fn validator_set(&self) -> Result<ValidatorSet> {
-        if let Some(ConfigParamEnum::ConfigParam35(param)) = self.config(35)? {
-            return Ok(param.cur_temp_validators);
-        }
-        Ok(match self.config(34)? {
-            Some(ConfigParamEnum::ConfigParam34(param)) => param.cur_validators,
-            _ => ValidatorSet::default(),
-        })
+        self.cached_validator_parameters(Some(35), 34)
     }
     pub fn next_validator_set(&self) -> Result<ValidatorSet> {
-        #[cfg(feature = "mirrornet")]
-        if let Some(ConfigParamEnum::ConfigParam37(param)) = self.config(37)? {
-            return Ok(param.next_temp_validators);
+        self.cached_validator_parameters(cfg!(feature = "mirrornet").then_some(37), 36)
+    }
+    fn cached_validator_parameters(
+        &self,
+        preferred: Option<u32>,
+        fallback: u32,
+    ) -> Result<ValidatorSet> {
+        for index in preferred.into_iter().chain(std::iter::once(fallback)) {
+            if let Some(root) = self.config_param_reference(index)? {
+                return Ok(std::sync::Arc::unwrap_or_clone(ValidatorSet::unpack_with_cache(
+                    root, true,
+                )?));
+            }
         }
-        Ok(match self.config(36)? {
-            Some(ConfigParamEnum::ConfigParam36(param)) => param.next_validators,
-            _ => ValidatorSet::default(),
-        })
+        Ok(ValidatorSet::default())
     }
     pub fn next_validator_set_present(&self) -> Result<bool> {
         Ok(self.config_present(37)? || self.config_present(36)?)

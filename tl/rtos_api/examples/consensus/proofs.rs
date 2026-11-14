@@ -6,8 +6,8 @@ use rtos_api::session_identity::{
     derive_session_from_options, derive_session_identity, SessionCoordinates,
 };
 use rtos_block::{
-    BlockIdExt, BlockProofEnvelope, BlockSignaturesVariant, ConfigParamEnum, Deserializable,
-    ShardIdent, ValidatorDescr, ValidatorKey,
+    BlockIdExt, BlockProofEnvelope, BlockSignaturesVariant, Deserializable, ShardIdent,
+    ValidatorDescr, ValidatorKey,
 };
 use serde_json::{json, Value};
 
@@ -23,6 +23,9 @@ fn domain_error(reason: &'static str) -> anyhow::Error {
     ProofRefusal(reason).into()
 }
 pub(super) fn proof_error(error: &anyhow::Error, fallback: &'static str) -> &'static str {
+    if let Some(value) = error.downcast_ref::<rtos_block::ConfigParamReferenceError>() {
+        return if matches!(value.0, 34 | 35) { "config_unavailable" } else { "proof_malformed" };
+    }
     if matches!(
         error.downcast_ref::<rtos_block::BlockError>(),
         Some(rtos_block::BlockError::PrunedCellAccess(_))
@@ -151,6 +154,7 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         last_key_block_seqno: info.prev_key_block_seqno(),
         new_catchain_ids: options.new_catchain_ids,
     };
+    let config_global_id = config.proof_global_id().map_err(|_| domain_error("proof_malformed"))?;
     let options_hash = rtos_block::UInt256::calc_file_hash(&options.bytes()?);
     let identity = derive_session_identity(
         key_block.global_id(),
@@ -167,13 +171,6 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
         &validators,
     )
     .map_err(|e| domain_error(proof_error(&e, "consensus_config_unavailable")))?;
-    config
-        .proof_config_param_cell(19)
-        .map_err(|e| domain_error(proof_error(&e, "config_unavailable")))?;
-    let config_global_id = match config.config(19)? {
-        Some(ConfigParamEnum::ConfigParam19(v)) => Some(v as i32),
-        _ => None,
-    };
     let signatures = proof
         .signatures
         .map(BlockSignaturesVariant::construct_from_full_cell)
@@ -204,7 +201,8 @@ pub(super) fn key_context(ctx: &Value) -> Result<Value> {
 mod exports {
     use super::*;
     use rtos_block::{
-        Block, BuilderData, Cell, CellType, ChildCell, IBitstring, MerkleProof, Serializable,
+        Block, BuilderData, Cell, CellType, ChildCell, ConfigParamEnum, IBitstring, MerkleProof,
+        Serializable,
     };
 
     fn proof_b64(proof: &BlockProofEnvelope) -> Result<String> {

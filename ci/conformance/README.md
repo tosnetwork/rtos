@@ -148,11 +148,11 @@ Key-block contexts derive validator subsets and both session identities through
 native APIs. Supplied key blocks are test anchors, not authenticated chain state.
 Another25 clean-C++ controls cover pruned roots, previous references, shard
 alignment, trailing data, reserved fields and versioned governing options.
-Together the original268 and added152 contexts yield420 equal, zero mismatches,
+Together the original268 and added311 contexts yield579 equal, zero mismatches,
 refusals or skips. Param29 options expose the full uint64
 height-coefficient product while committing its low32 wire bits; the block-hash
 flag follows the version2 boundary. A separate raw probe pins a product above
-uint32; it is outside the shared fixture schema and is not counted in420.
+uint32; it is outside the shared fixture schema and is not counted in579.
 Twelve further C++ controls pin review findings at the structural boundary:
 BlockInfo captures the software field as104 bits without checking its nested
 constructor, while its full reader keeps that check. Key-block config extraction
@@ -183,7 +183,7 @@ proof-link validation must establish those separately. An additional input
 probe matches1612 effects and169 mutual protocol errors in1781 contexts; those
 protocol errors are not passing fixtures. Signer counts400/401/1024/1025 also
 match: unknown signer / too many / too many / protocol error. A raw extra final
-field is outside the shared schema and is excluded from the420-case corpus.
+field is outside the shared schema and is excluded from the579-case corpus.
 The native two-envelope proof-link API checks masterchain direction, Merkle roots,
 headers, governing key-block or zerostate config, validator subset and certificate.
 Its caller-supplied source is an anchor, not independently authenticated chain
@@ -204,6 +204,23 @@ unused fallback opaque. Proof linkage uses the wire uint16 member count; the
 explicit supplied-context constructor retains its1024-member bound. Pruned-value
 controls use distinct unavailable hashes so C++ cold and warm batch effects agree;
 they do not deny C++'s ability to reuse a previously validated cached set.
+The native configuration readers now share a 100-entry validator-set LRU keyed
+by representation hash. Only successfully decoded sets enter it; a root loader
+error still fails on a hit, and live usage tracking disables both lookup and
+insertion so Merkle proof generation visits the full set. Cached values own
+parsed sets, without retaining cell graphs or usage trees. Proof readers share
+immutable sets; existing owned getters return independent copies. Disabled-cache,
+wire/schema and bounded decoding remain independent. Ordered cache families must
+run in a single process per family: 108 additional controls cover cold misses,
+known pruned roots, recency refresh, eviction and cross-entry reuse.
+Another51 controls cover exact configuration dictionary reference shape and
+structural Param19 metadata. Dictionary values require zero bits and one
+reference before any cache lookup. Structural metadata reads the first signed
+32 bits of an ordinary cell, reports null if shorter, and leaves trailing bits
+and references opaque; it does not replace production governing-ID validation.
+Malformed dictionary entries preserve the reference operation's error class.
+The cache cap is an entry count inherited from the reference, not a byte budget;
+large-set memory and production hardware qualification remain separate work.
 Session JSON retains the two double tokens until binary64 conversion, preserving
 correct rounding, negative zero and C++'s finite saturation on overflow. The API
 package's dev-only serde_json features enable precise float parsing and borrowed
