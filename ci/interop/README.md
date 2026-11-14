@@ -1,6 +1,6 @@
 # Local C++ / Rust interop runners
 
-The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline.
+The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline. The candidate `5af405dcb1f523be0ff3b812e9f6945275c4945b` is available through explicit `--cpp-revision` selection for active bootstrap tests; the default active pin and frozen profile remain unchanged. Candidate selection is a test input, not a qualification verdict.
 
 The snapshot pins the executable's reported commit, copies the C++ programs,
 checks their SHA-256 values, and exports the matching test sources. Supply a
@@ -29,13 +29,16 @@ Genesis states and public deterministic PQ test identities through the existing
 C++ harness. They do not load an existing validator identity or reset an
 existing node. The bootstrap stage runs three C++ validators, reserves the
 fourth identity without starting its C++ process, and starts Rust with signing
-disabled. It records whether Rust logs processing MC4 from that network. Its result does
-not prove Rust signed, validated a candidate, produced a block, or has the same
-state root. Those are subsequent acceptance requirements; a bootstrap result
-must not close the mixed-validator gate.
+disabled. It requires Rust to serve a native masterchain state at or beyond the
+minimum height whose block identity and state root match all C++ observers,
+with every observer pinned to the generated Genesis. A bounded history of C++
+checkpoints permits a lagging Rust observer. This does not prove Rust signed,
+validated every candidate, or produced a block; bootstrap does not close the
+mixed-validator gate.
 
 To exercise active signing, build both programs with the explicit isolated
-signing feature and use the frozen `8f083dc` C++ snapshot:
+signing feature and use the default active C++ snapshot, or select the candidate
+explicitly with `--cpp-revision 5af405dcb1f523be0ff3b812e9f6945275c4945b`:
 
 ```sh
 cargo +1.100.0 build -p rtos --bin rtos --bin interop_validator_prepare \
@@ -56,8 +59,9 @@ provisioning is not an operator custody or committee-rotation implementation.
 The native Param29 carrier version 5 is admitted with T0 wire format; it remains
 distinct from the Param30 Simplex protocol version 2.
 
-An active result requires both C++ nodes to agree at MC4 and Rust to log
-processing at least MC4. This log is not an independent applied-state check. This measures required Rust participation in chain progress. It does
+An active result requires both C++ nodes and the Rust native served state to
+match the same block identity and state root at or beyond the minimum height.
+This measures required Rust participation in chain progress. It does
 not close the full mixed-validator gate or prove every transaction/state profile
 and every Rust leadership case.
 
