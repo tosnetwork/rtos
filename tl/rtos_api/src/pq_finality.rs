@@ -594,6 +594,26 @@ pub fn build_simplex_vote_data(
     })
 }
 
+/// Bind structural signing data to a supplied raw block identity. This does not
+/// authenticate the block or admit its coordinates as a governing shard.
+pub fn build_simplex_vote_data_for_block(
+    session_id: &UInt256,
+    slot: u32,
+    candidate: &[u8],
+    is_final: bool,
+    block: &ExplicitFinalityBlock,
+) -> Result<SimplexVoteData> {
+    let vote = build_simplex_vote_data(session_id, slot, candidate, is_final)
+        .map_err(|_| FinalityRefusal("candidate_malformed"))?;
+    if (vote.workchain, vote.shard, vote.seqno) != (block.workchain, block.shard, block.seqno)
+        || vote.root_hash != block.root_hash
+        || vote.file_hash != block.file_hash
+    {
+        return Err(FinalityRefusal("block_mismatch").into());
+    }
+    Ok(vote)
+}
+
 fn vote_preimage_with_budget(
     block_id: &BlockIdExt,
     carrier: &BlockSignaturesSimplexPq,

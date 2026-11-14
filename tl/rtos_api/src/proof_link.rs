@@ -3,8 +3,8 @@
 //! This verifies linkage, not block execution or the provenance of that anchor.
 use crate::{
     pq_finality::{
-        build_simplex_vote_data, ExplicitFinalityBlock, ExplicitPqFinalityContext,
-        ExplicitPqSignatureSet,
+        build_simplex_vote_data_for_block, ExplicitFinalityBlock, ExplicitPqFinalityContext,
+        ExplicitPqSignatureSet, FinalityRefusal,
     },
     session_identity::{derive_session_from_options, ExplicitSessionOptions, SessionCoordinates},
 };
@@ -187,19 +187,19 @@ pub fn verify_key_block_proof_link(
                 Block::build_data_for_sign(&to.root_hash, &to.file_hash).to_vec()
             }
             BlockSignaturesVariant::Simplex(value) => {
-                let vote = build_simplex_vote_data(
+                let vote = build_simplex_vote_data_for_block(
                     &value.session_id,
                     value.slot,
                     &value.candidate_data_bytes()?,
                     true,
+                    to,
                 )
-                .map_err(|_| reject("candidate_malformed"))?;
-                if (vote.workchain, vote.shard, vote.seqno) != (to.workchain, to.shard, to.seqno)
-                    || vote.root_hash != to.root_hash
-                    || vote.file_hash != to.file_hash
-                {
-                    return Err(reject("block_mismatch"));
-                }
+                .map_err(|e| {
+                    reject(
+                        e.downcast_ref::<FinalityRefusal>()
+                            .map_or("candidate_malformed", |reason| reason.0),
+                    )
+                })?;
                 vote.data_to_sign
             }
             _ => unreachable!(),

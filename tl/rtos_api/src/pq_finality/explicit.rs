@@ -1,7 +1,7 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! Verification against caller-supplied membership and session. These raw
 //! coordinates and successful numeric weights grant no chain admission token.
-use super::{build_simplex_vote_data, verify_all_signatures};
+use super::{build_simplex_vote_data_for_block, verify_all_signatures};
 use rtos_block::{
     checked_add_validator_weight, checked_validator_weight_sum, derive_consensus_key_id, error,
     fail, quorum_weight_reached, PqBlockSignaturePair, Result, UInt256, ValidatorBaseInfo,
@@ -153,15 +153,13 @@ impl ExplicitPqFinalityContext {
         if set.session_id != self.expected_session {
             return Err(refused("session_mismatch"));
         }
-        let vote = build_simplex_vote_data(&set.session_id, set.slot, &set.candidate, set.is_final)
-            .map_err(|_| refused("candidate_malformed"))?;
-        let block = &self.block;
-        if (vote.workchain, vote.shard, vote.seqno) != (block.workchain, block.shard, block.seqno)
-            || vote.root_hash != block.root_hash
-            || vote.file_hash != block.file_hash
-        {
-            return Err(refused("block_mismatch"));
-        }
+        let vote = build_simplex_vote_data_for_block(
+            &set.session_id,
+            set.slot,
+            &set.candidate,
+            set.is_final,
+            &self.block,
+        )?;
         let mut members = HashMap::new();
         for member in &self.validators {
             let ValidatorKey::Pq(key) = &member.key else {
