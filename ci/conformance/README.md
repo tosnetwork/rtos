@@ -86,6 +86,25 @@ final retained master-context counts. The planner uses bounded batches of 1000
 headers per worker and a reference-count map; it is an offline tool, not a node
 runtime scheduler. Planned or inspected blocks are never reported as executed.
 
+Compare the native output with a recorded canonical replay using
+`check_archive_replay.py --reference-manifest /path/to/manifest.json
+--effects /path/to/effects.jsonl --execution-log /path/to/replay.log
+--out /path/to/new-check.json`. It verifies the reference artifact digest, checks
+block identity/state roots and transaction counts in order, and requires a native
+completion summary with no retained master contexts for a final pass. Bootstrap
+file hashes must match the manifest's MC/WC zerostates. Native execution itself
+checks each transaction/account root against its on-chain value; the canonical
+block receipt contains aggregate transaction counts rather than individual effects.
+
+For a running process, `--allow-prefix` snapshots the current output byte length
+and reports compared/equal/mismatched/refused/not-compared counts and partial lines.
+This observation mode never returns a pass. Exit0 means a complete final comparison,
+exit1 a mismatch/refusal or malformed input, and exit2 an incomplete/observation
+result. The output path must be new. Reference receipts retain their own build
+provenance: comparing an older canonical replay is not evidence that the latest
+C++ binary reran the entire archive. Confirm process exit and seal final input,
+binary and output hashes separately before declaring a full replay qualified.
+
 For sequential state replay, build `rtos_executor --example stateful_block_replay`
 with `cargo build --locked -j32`. Feed JSONL on stdin: initial
 `{"zerostate":"/path/to/state.boc"}` records followed by
