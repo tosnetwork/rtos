@@ -1148,3 +1148,46 @@ fn shard_overlay_certificate_policy_is_never_written() -> Result<()> {
     assert!(!config.ext_messages_broadcast_disabled());
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_scheduler_invalid_utf8_overlay_does_not_poison_updates() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("overlays.json");
+        let mut config = scheduler_test_config();
+        config.custom_overlays_file_name = path.to_str().unwrap().into();
+        let (handler, context) =
+            NodeConfigHandler::create(config, tokio::runtime::Handle::current())?;
+        handler.clone().start_sheduler(context, vec![])?;
+        let overlay = |name| CustomOverlay {
+            name,
+            nodes: vec![],
+            sender_shards: vec![],
+            skip_public_msg_send: false.into(),
+            use_quic: false.into(),
+        };
+        handler.add_custom_overlay(overlay("before".into())).await?;
+        let before = std::fs::read(&path)?;
+        let refused = handler.add_custom_overlay(overlay(vec![0xff].into())).await;
+        let after_refusal = handler.show_custom_overlays().await?;
+        let disk_after_refusal = std::fs::read(&path)?;
+        let followup = handler.add_custom_overlay(overlay("after".into())).await;
+        let final_state = handler.show_custom_overlays().await?;
+        handler.stop_and_wait().await?;
+        assert!(refused.is_err());
+        assert_eq!(before, disk_after_refusal);
+        assert!(
+            followup.is_ok(),
+            "valid followup failed: {followup:?}; refused state: {after_refusal:?}"
+        );
+        assert_eq!(after_refusal.overlays().len(), 1);
+        assert_eq!(final_state.overlays().len(), 2);
+        assert_eq!(
+            TonNodeConfig::load_custom_overlays_json(path.to_str().unwrap())?.overlays().len(),
+            2
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}

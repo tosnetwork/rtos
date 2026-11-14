@@ -63,7 +63,7 @@ responses. Expected protocol refusals are not counted as passing shared fixtures
 The `rtos_api --example tl_conformance` target provides the TL wire harness.
 It checks the root schema and object/function domain from build-generated native
 schema metadata, then uses the T0 generated decoder and serializer. It reads no
-fixture effects. The pinned174 original TL cases and148 added schema/domain/primitive
+fixture effects. The pinned174 original TL cases and154 added schema/domain/primitive
 controls agree with clean CPP1181. Explicit target declarations retain the CPP
 constructor IDs while referencing the existing native tonNode types. Changed
 layouts have separate T0 types, including normalized raw message hashes; legacy
@@ -77,6 +77,11 @@ primitive codecs such as Bool are fields, not members of the C++ Object class.
 Generic object storage omits its constructor as C++ does; Function storage
 retains it. The toslib wire adapter allows only raw.extMessageInfo. Slice-backed
 reads check available padded payload before allocating or applying byte caps.
+Typed Bool tags use the primitive raw-int reader before constructor-profile rules,
+retaining invalid_value for every non-Bool tag, including forbidden legacy IDs.
+Configuration names are validated before actor mutation, and a full overlay batch
+is checked before any client-map update; malformed wire text cannot poison a
+subsequent valid configuration save.
 This is measured corpus agreement, not arbitrary TL input or whole-node qualification.
 The focused wire-profile and native string tests pass. The broader API library's
 previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144

@@ -184,9 +184,14 @@ impl<'r> Deserializer<'r> {
 
     /// Read `ConstructorNumber` from reader
     pub fn read_constructor(&mut self) -> Result<u32> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-        let id = self.read_u32::<LittleEndian>()?;
+        let id = self.read_raw_constructor()?;
         self.profile.decode_constructor(id)
+    }
+
+    /// Primitive Bool tags are raw int32 values, not profile-domain objects.
+    pub fn read_raw_constructor(&mut self) -> Result<u32> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+        Ok(self.read_u32::<LittleEndian>()?)
     }
 
     /// Read bare-serialized TL-object
@@ -198,7 +203,7 @@ impl<'r> Deserializer<'r> {
     /// Read boxed-serialized TL-object
     #[inline(always)]
     pub fn read_boxed<D: BoxedDeserialize>(&mut self) -> Result<D> {
-        let constructor = self.read_constructor()?;
+        let constructor = D::read_constructor(self)?;
         D::deserialize_boxed(constructor, self)
     }
 
@@ -229,6 +234,11 @@ pub trait BareDeserialize: Sized {
 
 /// Trait for boxed type deserialization
 pub trait BoxedDeserialize: Sized {
+    /// Constructor policy for this type. Primitive codecs can retain their
+    /// typed error before object-domain translation (as C++ Bool does).
+    fn read_constructor(de: &mut Deserializer) -> Result<u32> {
+        de.read_constructor()
+    }
     /// Returns all possible constructors of boxed type
     fn possible_constructors() -> Vec<u32>;
     /// Read boxed-serialized value using `Deserializer`

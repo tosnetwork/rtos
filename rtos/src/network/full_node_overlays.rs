@@ -864,6 +864,10 @@ impl FullNodeOverlaysRouter {
     pub async fn update_custom_overlays(&self, configs: Option<&[CustomOverlay]>) -> Result<()> {
         let _admission = self.tasks.enter()?;
         if let Some(configs) = configs {
+            // Check the full batch before creating or changing any client.
+            for config in configs {
+                config.name.as_str()?;
+            }
             for config in configs {
                 add_unbound_object_to_map_with_update(
                     &self.custom_overlays,

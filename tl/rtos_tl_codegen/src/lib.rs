@@ -2070,6 +2070,16 @@ impl Constructors<TypeIR, FieldIR> {
         deserialize: TokenStream,
     ) -> TokenStream {
         let tl_ids = self.as_tl_ids();
+        let constructor_reader =
+            if self.0.first().is_some_and(|Matched(c, _)| c.original_output == "Bool") {
+                quote! {
+                    fn read_constructor(_de: &mut crate::Deserializer) -> crate::Result<u32> {
+                        _de.read_raw_constructor()
+                    }
+                }
+            } else {
+                quote!()
+            };
 
         quote! {
 
@@ -2080,6 +2090,7 @@ impl Constructors<TypeIR, FieldIR> {
             }
 
             impl crate::BoxedDeserialize for #name {
+                #constructor_reader
                 fn possible_constructors() -> Vec<u32> { vec![#tl_ids] }
                 fn deserialize_boxed(_id: u32, _de: &mut crate::Deserializer) -> crate::Result<Self> {
                     #deserialize

@@ -2887,6 +2887,9 @@ impl NodeConfigHandler {
         config: &mut TonNodeConfig,
         overlay: CustomOverlay,
     ) -> Result<CustomOverlaysConfigBoxed> {
+        // Reject non-text names before mutating actor state. A rejected value
+        // must not poison subsequent valid configuration saves.
+        overlay.name.as_str()?;
         let CustomOverlaysConfigBoxed::Engine_Validator_CustomOverlaysConfig(conf) =
             &mut config.custom_overlays;
         conf.overlays.push(overlay);

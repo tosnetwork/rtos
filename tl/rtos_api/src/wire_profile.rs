@@ -354,6 +354,39 @@ mod tests {
     use crate::{ton, IntoBoxed};
 
     #[test]
+    fn typed_bool_preserves_raw_tag_errors_across_wrappers() {
+        use crate::{BoxedDeserialize, Deserializer, InvalidConstructor};
+        fn check<D: BoxedDeserialize>(tag: u32, profile: WireProfile) {
+            let bytes = tag.to_le_bytes();
+            let mut reader = bytes.as_slice();
+            let mut de = Deserializer::with_profile(&mut reader, profile);
+            let error = match de.read_boxed::<D>() {
+                Ok(_) => panic!("bad Bool accepted"),
+                Err(error) => error,
+            };
+            let error = error.downcast_ref::<InvalidConstructor>().unwrap();
+            assert_eq!(error.received, tag);
+            assert_eq!(error.expected, ton::Bool::possible_constructors());
+            assert_eq!(de.pos, 4);
+        }
+        for profile in [WireProfile::Legacy, WireProfile::T0] {
+            for tag in [0xa574ed6c, 0x34197fae, 0x88c9550b, 0x1cf255fe, 0x12345678] {
+                check::<ton::Bool>(tag, profile);
+                check::<bool>(tag, profile);
+                check::<Box<ton::Bool>>(tag, profile);
+            }
+            for (tag, expected) in [(0x997275b5u32, true), (0xbc799737, false)] {
+                let bytes = tag.to_le_bytes();
+                let mut reader = bytes.as_slice();
+                assert_eq!(
+                    Deserializer::with_profile(&mut reader, profile).read_boxed::<bool>().unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn constructor_domains_are_bijective_and_disjoint() {
         let old: std::collections::HashSet<_> = CONSTRUCTORS.iter().map(|x| x.0).collect();
         let new: std::collections::HashSet<_> = CONSTRUCTORS.iter().map(|x| x.1).collect();

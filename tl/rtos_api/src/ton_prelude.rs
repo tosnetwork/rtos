@@ -160,6 +160,9 @@ impl From<Bool> for bool {
 }
 
 impl BoxedDeserialize for bool {
+    fn read_constructor(de: &mut Deserializer) -> Result<u32> {
+        Bool::read_constructor(de)
+    }
     fn possible_constructors() -> Vec<u32> {
         Bool::possible_constructors()
     }
@@ -198,6 +201,9 @@ impl BareSerialize for String {
 }
 
 impl<T: BoxedDeserialize> BoxedDeserialize for Box<T> {
+    fn read_constructor(de: &mut Deserializer) -> Result<u32> {
+        T::read_constructor(de)
+    }
     fn possible_constructors() -> Vec<u32> {
         T::possible_constructors()
     }
