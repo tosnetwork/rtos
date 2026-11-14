@@ -121,6 +121,7 @@ impl Drop for BroadcastSubscription {
 }
 
 pub use plumtree::PlumtreeConfig;
+pub mod records;
 
 const TARGET: &str = "overlay";
 const TARGET_BROADCAST: &str = "overlay_broadcast";
@@ -320,7 +321,7 @@ impl OverlayUtils {
         overlay_id: &Arc<OverlayShortId>,
         node: &T,
     ) -> Result<()> {
-        if (node.flags() as u32) & !3 != 0 {
+        if !records::MemberFlags::valid(node.flags() as u32) {
             fail!("Unsupported overlay member flags {}", node.flags())
         }
         let key: Arc<dyn KeyOption> = node.get_key()?;
@@ -640,8 +641,11 @@ impl Overlay {
         if !self.overlay_type.is_public() {
             return configured;
         }
-        let plumtree_receiver = self.plumtree.get().is_some_and(|p| !p.original_sender);
-        configured | if plumtree_receiver { 0 } else { Self::MEMBER_DO_NOT_RECEIVE_PLUMTREE }
+        records::MemberFlags::public_flags(
+            configured,
+            self.plumtree.get().is_some(),
+            self.plumtree.get().is_some_and(|p| p.original_sender),
+        )
     }
 
     const FLAG_OVERLAY_OTHER_WORKCHAIN: u8 = 0x01;
@@ -1310,7 +1314,7 @@ impl Overlay {
     // }
 
     fn validate_certificate(&self, peer: &Arc<KeyId>, cert: &MemberCertificate) -> Result<()> {
-        let utime = UnixTime::now() as u32;
+        let utime = UnixTime::now();
         let (max_slaves, root_public_keys) =
             if let OverlayType::CertifiedMembers { max_slaves, root_public_keys, .. } =
                 &self.overlay_type
@@ -1322,7 +1326,7 @@ impl Overlay {
 
         // 1) Expire check
         // "3" is a magic gap from cpp implementation
-        if (cert.expire_at as u32) < utime - 3 {
+        if records::certificate_expired(cert.expire_at, utime as f64) {
             fail!("Certificate is expired, expire_at: {}, current time: {}", cert.expire_at, utime);
         }
 

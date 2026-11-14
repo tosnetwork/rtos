@@ -574,3 +574,52 @@ fn retained_limiters_follow_the_rules() {
     verifier.retain_authorized(&rules_named("empty"));
     assert!(verifier.limiters.lock().unwrap().is_empty());
 }
+
+#[test]
+fn cached_certificate_uses_the_same_unenc_profile_as_direct_check() {
+    let cert = OverlayCertificate::new(
+        rtos_api::ton::pub_::publickey::Unenc { data: vec![3] }.into_boxed(),
+        1000,
+        768,
+        CERTIFICATE_FLAG_TRUSTED,
+        vec![9; 7],
+    )
+    .unwrap();
+    let rules = OverlayPrivacyRules::new(0, 0, BTreeMap::from([(*cert.issuer_hash(), 768)]));
+    let verifier = BroadcastVerifier::default();
+    let now = Instant::now();
+    for _ in 0..2 {
+        assert_eq!(
+            verifier.check_source_eligible_at(
+                &rules,
+                false,
+                &[1; 32],
+                &[2; 32],
+                Some(&cert),
+                768,
+                false,
+                false,
+                None,
+                1000,
+                now,
+            ),
+            BroadcastCheckResult::Allowed
+        );
+    }
+    assert_eq!(
+        verifier.check_source_eligible_at(
+            &rules,
+            false,
+            &[1; 32],
+            &[2; 32],
+            Some(&cert),
+            768,
+            false,
+            false,
+            None,
+            1001,
+            now,
+        ),
+        BroadcastCheckResult::Forbidden
+    );
+}

@@ -10,6 +10,8 @@ use std::io::{self, BufRead, Read, Write};
 mod channel;
 #[path = "net/fec.rs"]
 mod fec;
+#[path = "net/overlay.rs"]
+mod overlay;
 #[path = "net/packet.rs"]
 mod packet;
 #[path = "net/preauth.rs"]
@@ -36,6 +38,17 @@ fn run(v: &Value) -> Result<Value> {
     }
     if matches!(op, "preauth_source" | "preauth_gate") {
         return preauth::run(v);
+    }
+    if matches!(
+        op,
+        "overlay_id"
+            | "overlay_node"
+            | "overlay_certificate"
+            | "overlay_member_certificate"
+            | "overlay_member_flags"
+            | "overlay_privacy_rules"
+    ) {
+        return overlay::run(v);
     }
     if op == "adnl_channel" {
         return channel::run(v);

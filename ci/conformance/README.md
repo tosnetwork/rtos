@@ -128,12 +128,19 @@ not arbitrary-input, network or production runtime qualification.
 The provisional `adnl --example net_conformance` target connects native wire-key,
 signing, verification, deterministic encryption/decryption, shared-secret,
 ADNL-ID text, RaptorQ/Online/RoundRobin codecs and peer FEC-type operations.
-At the 2026-11-14 ADNL channel checkpoint,1123 of1245 original network contexts
-agree and122 remain explicitly unsupported. Added101 clean-C++ controls give
-1224equal/122unsupported/0diff across1346 contexts. The Rust runner exits1 for that
-partial support; unsupported operations are not passing cases. A separate
+At the 2026-11-14 overlay checkpoint, all1245 original network contexts agree.
+Added101 clean-C++ controls give1346equal/0unsupported/0diff/0skip; the network
+runner exits0. Unsupported operations are never passing cases. A separate
 262-coordinate probe and78wire/identity probes retain their earlier key-checkpoint
 scope, independently from the shared corpus.
+Overlay records retain TOS's flags-bearing node/signature layout and validate
+flags before the Ed25519 identity. Member certificate fields and signed expiry
+with a three-second grace are preserved; signature verification alone does not
+install or authorize a member. Broadcast certificates reuse native network key
+profiles, including pub.unenc, on both direct and cached checks; they normalize
+default flags to the v1 wire form. Existing peer signature bans remain in force.
+Privacy rules retain direct-key precedence and report the maximum configured cap.
+The live member expiry check also uses the signed grace comparison.
 The explicit native channel API derives directional secrets and AES-key IDs, routes
 before decrypting and validates the peer identity after packet construction. Channel
 authentication does not require a packet signature. All16 original channel contexts
