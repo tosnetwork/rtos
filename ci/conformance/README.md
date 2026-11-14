@@ -59,6 +59,17 @@ scans leave an incomplete index; callers must require `complete: true` before us
 Concurrency and result buffering are limited to `--jobs` packages per batch;
 SQLite commits each batch. Original packages remain read-only.
 
+If an original archive contains gaps, a complete continuous replay remains
+unqualified. To verify an explicitly scoped genesis prefix while recovering the
+missing data, use `select_archive_prefix.py --index /path/to/index.sqlite
+--through=-1:8000000000000000:242333 --through=0:8000000000000000:243422
+--out /path/to/new-prefix-index`. Every indexed chain needs an explicit inclusive
+limit. A limit crossing a gap, beyond the source range, a missing/duplicate chain
+or a nested selection fails. The original index stays read-only; the new index
+records source hashes, exact limits, selected and not-selected block counts.
+The planner carries that selection into its summary. A complete plan/replay of
+this selected index does not qualify the omitted source range or missing blocks.
+
 Build the optimized native replay example, then derive dependency order from original BOCs:
 
 ```sh

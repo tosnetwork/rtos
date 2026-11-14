@@ -79,6 +79,7 @@ def run(args):
         "released": 0,
         "mc_limit": args.mc_limit,
         "input_sha256": initial,
+        "source_selection": inventory.get("selection"),
     }
     try:
         cursor = db.execute(
