@@ -33,6 +33,7 @@ struct Replay {
     started: bool,
     blocks: u64,
     transactions: u64,
+    peak_master_contexts: usize,
 }
 
 fn load(input: &Value, key: &str) -> Result<Original> {
@@ -82,6 +83,55 @@ fn load(input: &Value, key: &str) -> Result<Original> {
     Ok(Original { root: read_single_root_boc(&bytes)?, bytes })
 }
 
+fn validated_block(input: &Value) -> Result<(Original, Block)> {
+    let original = load(input, "block")?;
+    let root = original.root.hash(0).clone();
+    let file = UInt256::calc_file_hash(&original.bytes);
+    ensure!(
+        input["root_hash"].as_str() == Some(format!("{root:X}").as_str()),
+        "archive block root mismatch"
+    );
+    ensure!(
+        input["file_hash"].as_str() == Some(format!("{file:X}").as_str()),
+        "archive block file hash mismatch"
+    );
+    let block = Block::construct_from_full_cell(original.root.clone())?;
+    let info = block.read_info()?;
+    if input.get("package").is_some() {
+        let name = input["name"].as_str().ok_or_else(|| anyhow!("missing entry name"))?;
+        let position = name
+            .strip_prefix("block_(")
+            .and_then(|s| s.split_once("):"))
+            .ok_or_else(|| anyhow!("invalid archive block position"))?
+            .0;
+        let fields: Vec<_> = position.split(',').collect();
+        ensure!(fields.len() == 3, "invalid archive block position");
+        ensure!(
+            fields[0].parse::<i32>()? == info.shard().workchain_id()
+                && u64::from_str_radix(fields[1], 16)? == info.shard().shard_prefix_with_tag()
+                && fields[2].parse::<u32>()? == info.seq_no(),
+            "archive block position mismatch"
+        );
+    }
+    ensure!(!info.after_merge() && !info.after_split(), "split/merge unsupported");
+    Ok((original, block))
+}
+
+fn inspect(input: &Value) -> Result<Value> {
+    let (_, block) = validated_block(input)?;
+    let info = block.read_info()?;
+    let previous = info.read_prev_ref()?.prev1()?;
+    let master = info.read_master_ref()?.map(|_| info.read_master_id()).transpose()?;
+    Ok(json!({"workchain":info.shard().workchain_id(),
+        "shard":format!("{:016X}", info.shard().shard_prefix_with_tag()),
+        "seqno":info.seq_no(), "prev_seqno":previous.seq_no,
+        "prev_root_hash":format!("{:X}",previous.root_hash),
+        "prev_file_hash":format!("{:X}",previous.file_hash),
+        "master_seqno":master.as_ref().map(|m|m.seq_no),
+        "master_root_hash":master.as_ref().map(|m|format!("{:X}",m.root_hash)),
+        "master_file_hash":master.as_ref().map(|m|format!("{:X}",m.file_hash))}))
+}
+
 impl Replay {
     fn step(&mut self, input: &Value) -> Result<Value> {
         if input.get("zerostate").is_some() {
@@ -100,36 +150,17 @@ impl Replay {
                 "file_hash":format!("{file:X}")}));
         }
         self.started = true;
-        let original = load(input, "block")?;
+        if let Some(root) = input.get("release_master") {
+            ensure!(input.as_object().is_some_and(|o| o.len() == 1), "release must be standalone");
+            let hash: UInt256 =
+                root.as_str().ok_or_else(|| anyhow!("invalid release hash"))?.parse()?;
+            ensure!(self.masters.remove(&hash).is_some(), "master context not retained");
+            return Ok(json!({"released_master":root}));
+        }
+        let (original, block) = validated_block(input)?;
         let root = original.root.hash(0).clone();
         let file = UInt256::calc_file_hash(&original.bytes);
-        ensure!(
-            input["root_hash"].as_str() == Some(format!("{root:X}").as_str()),
-            "archive block root mismatch"
-        );
-        ensure!(
-            input["file_hash"].as_str() == Some(format!("{file:X}").as_str()),
-            "archive block file hash mismatch"
-        );
-        let block = Block::construct_from_full_cell(original.root.clone())?;
         let info = block.read_info()?;
-        if input.get("package").is_some() {
-            let name = input["name"].as_str().ok_or_else(|| anyhow!("missing entry name"))?;
-            let position = name
-                .strip_prefix("block_(")
-                .and_then(|s| s.split_once("):"))
-                .ok_or_else(|| anyhow!("invalid archive block position"))?
-                .0;
-            let fields: Vec<_> = position.split(',').collect();
-            ensure!(fields.len() == 3, "invalid archive block position");
-            ensure!(
-                fields[0].parse::<i32>()? == info.shard().workchain_id()
-                    && u64::from_str_radix(fields[1], 16)? == info.shard().shard_prefix_with_tag()
-                    && fields[2].parse::<u32>()? == info.seq_no(),
-                "archive block position mismatch"
-            );
-        }
-        ensure!(!info.after_merge() && !info.after_split(), "split/merge unsupported");
         let head =
             self.heads.get(info.shard()).ok_or_else(|| anyhow!("missing chain bootstrap"))?;
         let prev = info.read_prev_ref()?.prev1()?;
@@ -167,6 +198,7 @@ impl Replay {
         );
         if info.shard().is_masterchain() {
             self.masters.insert(original.root.hash(0).clone(), (original, next));
+            self.peak_master_contexts = self.peak_master_contexts.max(self.masters.len());
         }
         self.blocks += 1;
         self.transactions += transactions;
@@ -178,16 +210,22 @@ impl Replay {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    ensure!(args.is_empty() || args == ["--inspect"], "expected no arguments or --inspect");
+    let inspect_only = !args.is_empty();
+    let mut inspected = 0u64;
     let mut replay = Replay::default();
     let mut output = io::stdout().lock();
     for (line_no, line) in io::stdin().lock().lines().enumerate() {
         let result = serde_json::from_str::<Value>(&line?)
             .map_err(anyhow::Error::from)
-            .and_then(|input| replay.step(&input));
+            .and_then(|input| if inspect_only { inspect(&input) } else { replay.step(&input) });
         match result {
             Ok(effect) => {
+                inspected += u64::from(inspect_only);
                 serde_json::to_writer(&mut output, &effect)?;
                 writeln!(output)?;
+                output.flush()?;
             }
             Err(error) => {
                 writeln!(
@@ -201,7 +239,12 @@ fn main() -> Result<()> {
             }
         }
     }
-    ensure!(replay.blocks > 0, "empty replay");
-    eprintln!("{}", json!({"blocks":replay.blocks,"transactions":replay.transactions}));
+    ensure!(replay.blocks > 0 || inspected > 0, "empty replay");
+    eprintln!(
+        "{}",
+        json!({"blocks":replay.blocks,"transactions":replay.transactions,
+        "inspected":inspected,"peak_master_contexts":replay.peak_master_contexts,
+        "retained_master_contexts":replay.masters.len()})
+    );
     Ok(())
 }

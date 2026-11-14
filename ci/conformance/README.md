@@ -59,6 +59,33 @@ scans leave an incomplete index; callers must require `complete: true` before us
 Concurrency and result buffering are limited to `--jobs` packages per batch;
 SQLite commits each batch. Original packages remain read-only.
 
+Build the native replay example, then derive dependency order from original BOCs:
+
+```sh
+python3 ci/conformance/plan_archive_replay.py \
+  --index /datax/rtos-conformance/archive-index/index.sqlite \
+  --binary "$CARGO_TARGET_DIR/debug/examples/stateful_block_replay" \
+  --zerostate /datax/epoch/zerostate.boc --zerostate /datax/epoch/basestate0.boc \
+  --out /datax/rtos-conformance/replay-plan --jobs 32
+```
+
+The planner requires a complete index with contiguous chains starting at one.
+Native `--inspect` validates original block hashes and positions and reports
+predecessor/master references. The planner checks those identities against the
+index before emitting `inputs.jsonl`; it never asks C++ for execution order.
+`--mc-limit N` emits an explicitly counted prefix after inspecting all headers;
+otherwise every indexed block must be planned. Zero-state identities are checked
+by the actual replay against the first block of each chain, not by the planner.
+Only a plan with `summary.json` reporting `complete: true` is usable.
+
+The plan includes standalone `{"release_master":"ROOT_HASH"}` records after the
+last inspected consumer of a master context. Releasing a context does not remove
+the current chain head. Unknown releases fail; an incorrect early release causes
+later replay to fail on its missing dependency. Native stderr reports peak and
+final retained master-context counts. The planner uses bounded batches of 1000
+headers per worker and a reference-count map; it is an offline tool, not a node
+runtime scheduler. Planned or inspected blocks are never reported as executed.
+
 For sequential state replay, build `rtos_executor --example stateful_block_replay`
 with `cargo build --locked -j32`. Feed JSONL on stdin: initial
 `{"zerostate":"/path/to/state.boc"}` records followed by
@@ -82,10 +109,11 @@ The initial epoch-6 qualification covers MC 1–2000 and 2033 associated shard
 blocks, with 4124 transactions, all matching the reference. Bootstrap states and
 raw blocks were read from the recorded archive; C++ provided only selection/order
 and comparison results, never intermediate Rust states. This is an offline
-interval tool: it retains replayed master contexts in memory, refuses split/merge,
+interval tool: it retains replayed master contexts until explicit release, refuses split/merge,
 and does not verify block signatures, shard-top commitments, or every validator
-rule. Full archive indexing, bounded history retention and mismatch continuation
-remain work before using it for whole-history qualification.
+rule. Full archive indexing and native dependency planning are available; complete
+execution, signature/shard-top checks and mismatch continuation remain required
+for whole-history qualification.
 
 
 The target executes contexts from the TOS conformance suite and emits the effects of
