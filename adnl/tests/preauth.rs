@@ -53,6 +53,20 @@ fn rate_capacity_refill_and_fullness_match_strict_boundaries() {
 }
 
 #[test]
+fn native_clock_admission_owns_credit_without_explicit_test_time() {
+    let gate = PreauthGate::<()>::new(1, 2, 60.0).unwrap();
+    let process = budget(2, 2);
+    let local = budget(2, 2);
+    let first = gate.admit(addr(1), process.clone(), local.clone()).unwrap();
+    let second = gate.admit(addr(1), process.clone(), local.clone()).unwrap();
+    assert_eq!(first.source(), preauth_source(addr(1)));
+    assert_eq!((process.in_flight(), local.in_flight()), (2, 2));
+    drop((first, second));
+    assert_eq!((process.in_flight(), local.in_flight()), (0, 0));
+    assert_eq!(reason(gate.admit(addr(1), process, local)), Error::RateLimited);
+}
+
+#[test]
 fn pinned_entries_cannot_be_evicted_until_all_tickets_drop() {
     let gate = PreauthGate::<()>::new(2, 20, 60.0).unwrap();
     let p = budget(100, 100);
