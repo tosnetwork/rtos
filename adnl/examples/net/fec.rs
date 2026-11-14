@@ -71,7 +71,7 @@ pub(super) fn run(v: &Value) -> Result<Value> {
                 effect["data"] = json!(hex::encode(data));
             }
             if let Some(ids) = regenerate {
-                let mut encoder = Encoder::new(algorithm, data.to_vec(), size)?;
+                let mut encoder = decoder.take_encoder()?;
                 effect["regenerated"] = json!(symbols(&mut encoder, ids)?);
             }
         }

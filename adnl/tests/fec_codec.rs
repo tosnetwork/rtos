@@ -5,6 +5,24 @@ use adnl::{
 };
 
 #[test]
+fn regenerated_repairs_preserve_solved_tail_beyond_decoded_data() {
+    let mut decoder = Decoder::new(Algorithm::RaptorQ, Parameters::new(2, 3).unwrap()).unwrap();
+    // Clean reference fixture recovered/01, with the first repair's tail corrupted.
+    for (index, data) in
+        ["67105a", "ec4c00", "407200", "f49700", "590d00", "e94200", "1dd500", "276200", "c13200"]
+            .into_iter()
+            .enumerate()
+    {
+        decoder.add_symbol(index as u32 + 1, hex::decode(data).unwrap()).unwrap();
+    }
+    assert_eq!(decoder.try_decode().unwrap(), [0x67, 0x10]);
+    let mut encoder = decoder.take_encoder().unwrap();
+    assert_eq!(encoder.symbol(0).unwrap(), (0, vec![0x67, 0x10, 0]));
+    assert_eq!(encoder.symbol(1).unwrap(), (1, vec![0x67, 0x10, 0x5a]));
+    assert_eq!(encoder.symbol(16777215).unwrap(), (16777215, vec![0x99, 0x9b, 0xcb]));
+}
+
+#[test]
 fn native_sender_retains_cpp_repair_bytes_and_external_ids() {
     // Clean TOS 1181c08e, net fec_encode, data 00..1e, symbol_size=12.
     let data = (0..31).collect::<Vec<u8>>();

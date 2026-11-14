@@ -2,7 +2,10 @@
 //! Random-access FEC codecs, with deferred receive-side decoding.
 //! Receive ordering and round-robin semantics follow td/fec in TON/TOS.
 use anyhow::{ensure, Result};
-use raptorq::{EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder};
+use raptorq::{
+    EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder,
+    SourceBlockEncoder,
+};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +42,7 @@ pub struct Encoder {
     algorithm: Algorithm,
     parameters: Parameters,
     data: Vec<u8>,
-    engine: Option<raptorq::Encoder>,
+    engine: Option<SourceBlockEncoder>,
 }
 impl Encoder {
     pub fn new(algorithm: Algorithm, data: Vec<u8>, symbol_size: u32) -> Result<Self> {
@@ -65,10 +68,12 @@ impl Encoder {
             }
             return Ok((id, data));
         }
-        let engine =
-            self.engine.get_or_insert_with(|| raptorq::Encoder::new(&self.data, p.config()));
-        let packet =
-            engine.get_block_encoders()[0].repair_packets(id - p.symbols_count, 1).pop().unwrap();
+        let engine = self.engine.get_or_insert_with(|| {
+            let mut padded = self.data.clone();
+            padded.resize(p.symbols_count as usize * p.symbol_size as usize, 0);
+            SourceBlockEncoder::new2(0, &p.config(), &padded)
+        });
+        let packet = engine.repair_packets(id - p.symbols_count, 1).pop().unwrap();
         Ok((id, packet.data().to_vec()))
     }
 }
@@ -91,6 +96,7 @@ pub struct Decoder {
     sources: u32,
     may_decode: bool,
     result: Option<Vec<u8>>,
+    regenerator: Option<SourceBlockEncoder>,
 }
 impl Decoder {
     pub fn new(algorithm: Algorithm, parameters: Parameters) -> Result<Self> {
@@ -104,6 +110,7 @@ impl Decoder {
             sources: 0,
             may_decode: false,
             result: None,
+            regenerator: None,
         })
     }
     pub fn add_symbol(&mut self, mut id: u32, data: Vec<u8>) -> std::result::Result<(), Refusal> {
@@ -161,12 +168,21 @@ impl Decoder {
             } else {
                 self.may_decode = false;
                 let mut engine = SourceBlockDecoder::new2(0, &p.config(), p.data_size as u64);
-                let mut data =
-                    engine.decode(self.packets.clone()).ok_or(Refusal("unclassified"))?;
+                let (mut data, regenerator) = engine
+                    .decode_with_encoder(self.packets.clone())
+                    .ok_or(Refusal("unclassified"))?;
+                self.regenerator = Some(regenerator);
                 data.truncate(p.data_size);
                 self.result = Some(data);
             }
         }
         Ok(self.result.as_deref().unwrap())
+    }
+
+    pub fn take_encoder(&mut self) -> Result<Encoder> {
+        let data = self.result.as_ref().ok_or_else(|| anyhow::anyhow!("decode first"))?;
+        let mut encoder = Encoder::new(self.algorithm, data.clone(), self.parameters.symbol_size)?;
+        encoder.engine = self.regenerator.take();
+        Ok(encoder)
     }
 }

@@ -182,6 +182,22 @@ pub struct SourceBlockEncoder {
 }
 
 impl SourceBlockEncoder {
+    pub(crate) fn from_decoded(
+        source_block_id: u8,
+        config: &ObjectTransmissionInformation,
+        data: &[u8],
+        intermediate_symbols: Option<Vec<Symbol>>,
+    ) -> Self {
+        match intermediate_symbols {
+            Some(intermediate_symbols) => Self {
+                source_block_id,
+                source_symbols: Self::create_symbols(config, data),
+                intermediate_symbols,
+            },
+            None => Self::new2(source_block_id, config, data),
+        }
+    }
+
     #[deprecated(
         since = "1.3.0",
         note = "Use the new2() function instead. In version 2.0, that function will replace this one"
