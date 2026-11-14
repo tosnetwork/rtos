@@ -85,6 +85,9 @@ impl TopBlockDescrStuff {
             );
         }
 
+        // Permission to receive an unsigned descriptor does not waive a present signature.
+        let is_fake = tbd.signatures().map_or(true, |s| s.declared_signature_count() == 0);
+
         if tbd.proof_for() != block_id {
             fail!(
                 "ShardTopBlockDescr is for block {} but given id is {}",
@@ -321,7 +324,22 @@ impl TopBlockDescrStuff {
         res_flags: &mut u8,
     ) -> Result<i32> {
         *res_flags = 0;
-        self.validate_internal(last_mc_block_id, last_mc_state, res_flags, mode)
+        self.validate_internal(last_mc_block_id, last_mc_state, last_mc_state, res_flags, mode)
+    }
+
+    pub fn governing_masterchain_block_id(&self) -> Result<&BlockIdExt> {
+        self.chain_mc_blk_ids.first().ok_or_else(|| error!("empty descriptor proof chain"))
+    }
+
+    pub fn prevalidate_with_governing(
+        &self, last_mc_block_id: &BlockIdExt, last_mc_state: &ShardStateStuff,
+        governing: &ShardStateStuff, mode: Mode, res_flags: &mut u8,
+    ) -> Result<i32> {
+        if governing.block_id() != self.governing_masterchain_block_id()? {
+            fail!("governing masterchain state does not match descriptor");
+        }
+        *res_flags = 0;
+        self.validate_internal(last_mc_block_id, last_mc_state, governing, res_flags, mode)
     }
 
     pub fn validate(&self, last_mc_state: &Arc<ShardStateStuff>) -> Result<i32> {
@@ -331,6 +349,7 @@ impl TopBlockDescrStuff {
 
         self.validate_internal(
             last_mc_block_id,
+            last_mc_state,
             last_mc_state,
             &mut res_flags,
             Mode::ALLOW_NEXT_VSET,
@@ -531,6 +550,7 @@ impl TopBlockDescrStuff {
         &self,
         last_mc_block_id: &BlockIdExt,
         last_mc_state: &ShardStateStuff,
+        governing_mc_state: &ShardStateStuff,
         res_flags: &mut u8,
         mode: Mode,
     ) -> Result<i32> {
@@ -539,7 +559,7 @@ impl TopBlockDescrStuff {
         let pq_verified = if let Some(BlockSignaturesVariant::SimplexPq(carrier)) =
             self.tbd.signatures()
         {
-            let cc_seqno = last_mc_state
+            let cc_seqno = governing_mc_state
                 .shard_state_extra()?
                 .shards()
                 .calc_shard_cc_seqno(self.proof_for().shard())?;
@@ -550,8 +570,8 @@ impl TopBlockDescrStuff {
                     rtos_api::pq_finality::PqVerificationContext::from_governing_config
                 };
                 create(
-                    last_mc_state.state()?.global_id(),
-                    last_mc_state.config_params()?,
+                    governing_mc_state.state()?.global_id(),
+                    governing_mc_state.config_params()?,
                     self.proof_for().clone(),
                     self.info.vert_seq_no,
                     self.info.prev_key_block_seqno,
@@ -800,15 +820,16 @@ impl TopBlockDescrStuff {
 
         // compute and check validator set
 
-        let cur_validator_set = last_mc_state_extra.config.validator_set()?;
+        let governing_extra = governing_mc_state.shard_state_extra()?;
+        let cur_validator_set = governing_extra.config.validator_set()?;
         let cc_seqno =
-            last_mc_state_extra.shards().calc_shard_cc_seqno(self.proof_for().shard())?;
+            governing_extra.shards().calc_shard_cc_seqno(self.proof_for().shard())?;
 
         let mut vset_ok = false;
         let shard_id = self.proof_for().shard();
         let mut subset = calc_subset_for_workchain_standard(
             &cur_validator_set,
-            &last_mc_state_extra.config,
+            &governing_extra.config,
             shard_id,
             cc_seqno,
         )?;
@@ -816,9 +837,6 @@ impl TopBlockDescrStuff {
         // original t-node's code contains this check later.
         // But we have some checks there which needs signatures!!!
         // May be t-node uses valid `signatures` struct with fake signatures
-        if mode.intersects(Mode::SKIP_CHECK_SIG) {
-            return Ok(clen as i32);
-        }
 
         // Get signatures using variant-aware accessor (supports both Ordinary and Simplex)
         let signatures_variant = self
@@ -834,10 +852,10 @@ impl TopBlockDescrStuff {
             *res_flags |= 4;
             vset_ok = true;
         } else if mode.intersects(Mode::ALLOW_NEXT_VSET) {
-            let next_validator_set = last_mc_state_extra.config.next_validator_set()?;
+            let next_validator_set = governing_extra.config.next_validator_set()?;
             let next_subset = calc_subset_for_workchain_standard(
                 &next_validator_set,
-                &last_mc_state_extra.config,
+                &governing_extra.config,
                 shard_id,
                 cc_seqno,
             )?;
@@ -863,7 +881,7 @@ impl TopBlockDescrStuff {
             )
         }
 
-        if pq_verified.is_some() {
+        if pq_verified.is_some() || self.is_fake || mode.intersects(Mode::SKIP_CHECK_SIG) {
             *res_flags |= 0x10;
             return Ok(clen as i32);
         }

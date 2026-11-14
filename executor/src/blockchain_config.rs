@@ -218,6 +218,17 @@ impl BlockchainConfig {
         global_version: u32,
         config: ConfigParams,
     ) -> Result<Self> {
+        Self::with_params_for_shard(capabilities, global_version, config, true)
+    }
+
+    /// Shardchain transactions cannot treat accounts as masterchain special contracts.
+    /// Their partial configuration proofs therefore need not contain parameter31.
+    pub fn with_params_for_shard(
+        capabilities: u64,
+        global_version: u32,
+        config: ConfigParams,
+        is_masterchain: bool,
+    ) -> Result<Self> {
         log::debug!(
             "Creating BlockchainConfig: capabilities={capabilities:#x}, block_version={global_version}"
         );
@@ -233,7 +244,11 @@ impl BlockchainConfig {
             storage_prices: AccStoragePrices::with_config(&config.storage_prices()?)?,
             burning_cfg,
             limits: config.size_limits_config()?,
-            special_contracts: config.fundamental_smc_addr()?,
+            special_contracts: if is_masterchain {
+                config.fundamental_smc_addr()?
+            } else {
+                Default::default()
+            },
             capabilities,
             global_version,
             raw_config: config,

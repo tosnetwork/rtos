@@ -176,6 +176,7 @@ struct ValidateBase {
     mint_msg: Option<InMsg>,
     // from collated_data
     top_shard_descr_dict: TopBlockDescrSet,
+    governing_states: HashMap<BlockIdExt, Arc<ShardStateStuff>>,
     virt_states: HashMap<UInt256, ShardStateUnsplit>, // prev state and neighbour out msg queues proofs by block root hash
     storage_dict_proofs: HashMap<UInt256, Cell>,
     full_collated_data: bool,
@@ -292,6 +293,12 @@ fn config_from_contract(accounts: &ShardAccounts, address: &AccountId) -> Result
         )
     }
     data.reference(0)
+}
+
+/// Result of the native validation pipeline, without publishing or storing the candidate.
+pub struct ValidatedCandidate {
+    pub ok_from_utime_ms: u64,
+    pub next_state: Option<Arc<ShardStateStuff>>,
 }
 
 pub struct ValidateQuery {
@@ -519,7 +526,9 @@ impl ValidateQuery {
         base.config_params.validate_local_workchain_execution(base.shard().workchain_id())?;
         base.block_limits = base.config_params.block_limits(base.shard().is_masterchain())?;
         base.limits = base.config_params.size_limits_config()?;
-        base.special_smartcontracts = base.config_params.fundamental_smc_addr()?;
+        if base.shard().is_masterchain() {
+            base.special_smartcontracts = base.config_params.fundamental_smc_addr()?;
+        }
 
         // 3. load state(s) corresponding to previous block(s)
         for i in 0..base.prev_blocks_ids.len() {
@@ -589,7 +598,8 @@ impl ValidateQuery {
         CHECK!(!block_candidate.data.is_empty());
         // 1. deserialize block itself
         let data = Arc::new(mem::take(&mut block_candidate.data));
-        base.block = BlockStuff::deserialize_block_checked(block_candidate.block_id.clone(), data)?;
+        base.block = BlockStuff::deserialize_block_checked(block_candidate.block_id.clone(), data)
+            .map_err(|e| error!("cannot decode block candidate: {e}"))?;
         // 3. initial block parse
         Self::init_parse(&mut base)?;
         // ...
@@ -642,6 +652,9 @@ impl ValidateQuery {
         }
         if base.info.start_lt() >= base.info.end_lt() {
             reject_query!("block has start_lt greater than or equal to end_lt")
+        }
+        if base.info.start_lt() % rtos_block::LT_ALIGN != 0 {
+            reject_query!("start_lt {} is not aligned", base.info.start_lt());
         }
         if base.info.shard().is_masterchain()
             && (base.info.after_merge() || base.info.before_split() || base.info.after_split())
@@ -1032,6 +1045,14 @@ impl ValidateQuery {
             self.check_one_prev_state(base, &base.prev_states[0])?;
             base.prev_states[0].root_cell().clone()
         };
+        if prev_state_root.repr_hash() != &base.state_update.old_hash {
+            reject_query!("previous state hash mismatch for block {}", base.block_id());
+        }
+        for state in &base.prev_states {
+            if state.state()?.seq_no() != state.block_id().seq_no() || state.state()?.shard() != state.block_id().shard() {
+                reject_query!("previous state header differs from its block identity");
+            }
+        }
         log::debug!(target: "validate_query", "({}): computing next state", self.next_block_descr);
         let engine = self.engine.clone();
         let state_update = base.state_update.clone();
@@ -1061,7 +1082,7 @@ impl ValidateQuery {
             }
         }).await??;
         log::debug!(target: "validate_query", "({}): next state computed", self.next_block_descr);
-        let next_state = ShardStateStuff::from_root_cell(
+        let next_state = ShardStateStuff::from_root_cell_for_validation(
             base.block_id().clone(),
             next_state_root.clone(),
             #[cfg(feature = "telemetry")]
@@ -1260,8 +1281,14 @@ impl ValidateQuery {
         // following checks are similar to those of Collator::import_new_shard_top_blocks()
         let do_flags = TopBlockDescrMode::FAIL_NEW | TopBlockDescrMode::FAIL_TOO_NEW;
         let mut res_flags = 0;
+        let governing_id = tsbd.governing_masterchain_block_id()?;
+        let governing = if governing_id == mc_data.state.block_id() {
+            &mc_data.state
+        } else {
+            base.governing_states.get(governing_id).ok_or_else(|| error!("governing masterchain state is unavailable: {}", governing_id))?
+        };
         let chain_len = tsbd
-            .prevalidate(mc_data.state.block_id(), &mc_data.state, do_flags, &mut res_flags)
+            .prevalidate_with_governing(mc_data.state.block_id(), &mc_data.state, governing, do_flags, &mut res_flags)
             .map_err(|err| {
                 error!(
                     "ShardTopBlockDescr for {} is invalid: res_flags={}, err: {}",
@@ -2448,7 +2475,6 @@ impl ValidateQuery {
                 cc.value_imported
             );
         }
-        let fees_import = CurrencyCollection::from_coins(cc.fees_collected);
         let cc = base.out_msg_descr.full_exported();
         if cc != &base.value_flow.exported {
             reject_query!(
@@ -2459,8 +2485,6 @@ impl ValidateQuery {
                 cc
             )
         }
-        let transaction_fees = base.account_blocks.full_transaction_fees();
-        let expected_fee_burned = Self::expected_fee_burned(&base, transaction_fees, &fees_import)?;
         if !base.shard().is_masterchain() && !base.value_flow.burned.is_zero()? {
             reject_query!(
                 "ValueFlow of block {} is invalid (non-zero burned value in a non-masterchain block)",
@@ -2468,6 +2492,13 @@ impl ValidateQuery {
             )
         }
 
+        Ok(())
+    }
+
+    fn check_value_flow_fees(base: &ValidateBase) -> Result<()> {
+        let fees_import = CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
+        let transaction_fees = base.account_blocks.full_transaction_fees();
+        let expected_fee_burned = Self::expected_fee_burned(base, transaction_fees, &fees_import)?;
         let mut expected_fees = transaction_fees.clone();
         expected_fees.add(&base.value_flow.fees_imported)?;
         expected_fees.add(&base.value_flow.created)?;
@@ -5853,14 +5884,14 @@ impl ValidateQuery {
         let (capabilities, block_version) =
             base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
         let config =
-            BlockchainConfig::with_params(capabilities, block_version, base.config_params.clone())?;
+            BlockchainConfig::with_params_for_shard(capabilities, block_version, base.config_params.clone(), base.shard().is_masterchain())?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
             let libraries = libraries.clone();
-            let (mut account_root, account) = Self::unpack_account(&base, &account_addr)?;
             let config = config.clone();
             let engine = engine.clone();
             Self::add_task(tasks, move || {
+                let (mut account_root, account) = Self::unpack_account(&base, &account_addr)?;
                 Self::check_account_transactions(
                     engine,
                     &base,
@@ -6954,6 +6985,21 @@ impl ValidateQuery {
     async fn common_preparation(&mut self) -> Result<(ValidateBase, McData)> {
         let mut base = self.init_base()?;
         let mc_data = self.init_mc_data(&mut base).await?;
+        let mut governing_ids = Vec::new();
+        base.top_shard_descr_dict.collection().iterate(|item| {
+            let block_id = item.0.proof_for().clone();
+            let descriptor = TopBlockDescrStuff::new(item.0, &block_id, base.is_fake, false)
+                .map_err(|e| error!("cannot unpack ShardTopBlockDescr while loading governing state: {e}"))?;
+            let id = descriptor.governing_masterchain_block_id()?.clone();
+            if id != *mc_data.state.block_id() && !governing_ids.contains(&id) {
+                governing_ids.push(id);
+            }
+            Ok(true)
+        })?;
+        for id in governing_ids {
+            let state = self.engine.clone().wait_state(&id, Some(1000), true).await?;
+            base.governing_states.insert(id, state);
+        }
         // stage 0
         self.compute_next_state(&mut base, &mc_data).await?;
         self.unpack_prev_state(&mut base)?;
@@ -6993,7 +7039,6 @@ impl ValidateQuery {
     async fn validate(&mut self) -> Result<ValidateBase> {
         let (mut base, mc_data) = self.common_preparation().await?;
 
-        let manager = self.init_output_queue_manager(&mc_data, &mut base).await?;
         self.check_shard_layout(&base, &mc_data)?;
 
         #[cfg(feature = "xp25")]
@@ -7013,6 +7058,7 @@ impl ValidateQuery {
             base.is_fake,
         )?;
         self.check_utime_lt(&base, &mc_data)?;
+        let manager = self.init_output_queue_manager(&mc_data, &mut base).await?;
         // stage 1
         // log::debug!(target: "validate_query", "running letmated validity checks for block candidate {}", base.block_id());
         // if (!block::gen::t_Block.validate_ref(1000000, block_root_)) {
@@ -7057,6 +7103,7 @@ impl ValidateQuery {
         Self::check_all_ticktock_processed(&base)?;
         Self::check_message_processing_order(&mut base)?;
         Self::check_burned_value_flow(&base)?;
+        Self::check_value_flow_fees(&base)?;
         Self::check_new_state(&mut base, &mc_data, &manager)?;
         Self::check_mc_block_extra(&base, &mc_data)?;
         self.check_mc_state_extra(&base, &mc_data)?;
@@ -7077,6 +7124,16 @@ impl ValidateQuery {
             }
             Ok(_) => Ok(None),
         }
+    }
+
+    /// Executes the same validation core as `try_validate`, returning its validated timestamp.
+    /// Intended for offline callers with explicit state providers; this does not persist a block.
+    pub async fn validate_candidate(mut self) -> Result<ValidatedCandidate> {
+        let base = self.validate().await?;
+        Ok(ValidatedCandidate {
+            ok_from_utime_ms: base.now_ms.unwrap_or_else(|| u64::from(base.now()) * 1000),
+            next_state: if base.full_collated_data { None } else { base.next_state },
+        })
     }
 
     pub async fn try_validate(mut self) -> Result<Option<Arc<ShardStateStuff>>> {

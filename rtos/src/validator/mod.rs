@@ -20,6 +20,7 @@ mod fabric;
 pub(crate) mod finality_recovery_owner;
 mod log_parser;
 mod mutex_wrapper;
+pub mod offline;
 pub mod out_msg_queue;
 mod out_msg_queue_cleaner;
 pub mod out_msg_queue_manager;

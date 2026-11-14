@@ -879,6 +879,10 @@ impl MsgQueueManager {
         );
         for (i, nb_shard_record) in neighbor_list.iter().enumerate() {
             let nb_block_id = nb_shard_record.block_id();
+            // TOS/TON do not request other shards' zerostate queues.
+            if nb_block_id.seq_no() == 0 && nb_block_id.shard() != &shard {
+                continue;
+            }
 
             log::debug!("{}: neighbors #{} ---> {:#}", block_descr, i + 1, nb_block_id.shard());
 

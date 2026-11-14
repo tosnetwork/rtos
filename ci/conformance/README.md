@@ -158,8 +158,8 @@ The variable-key size estimate is separate from padded serialization length.
 The typed wire readers retain refusal boundaries, including oversized declared
 strings, and ADNL-ID text uses the native base32/CRC16 helper. Legacy key profiles
 and the existing ADNL cipher construction are preserved; these primitive effects
-never grant peer, packet or DHT admission. Full network transport and block
-validation harnesses remain incomplete.
+never grant peer, packet or DHT admission. Full asynchronous network transport and validator runtime qualification remain
+incomplete.
 
 RaptorQ repair APIs use relative repair indices and preserve external ESI on the
 wire. The explicit FEC decoder follows TOS/TON's arrival-order, inactivation and
@@ -586,3 +586,42 @@ recorded in memo; deployment/fork reachability and UBSan confirmation are not
 claimed. Under the workspace upstream-first rule, this batch neither changes
 the shared C++ path nor emulates its undefined overflow in Rust. It must not be
 described as equivalence for arbitrary accepted u64 gas contexts.
+
+
+## Offline candidate-validation target
+
+Build `cargo build -p rtos --example validate_conformance --locked -j32` and run
+that target with the shared runner against `$TOS_REFERENCE/test/conformance/vectors/validate`.
+All638 original contexts agree with clean CPP1181:610 accepted candidates and28
+negative outcomes, zero differences/refusals/skips. This is the fixed corpus, not
+arbitrary-block or whole-node/latest-TOS qualification.
+
+The adapter supplies original block/collated bytes and up to32 explicit state
+roots to the node's actual ValidateQuery. Merkle proofs retain virtualization and
+pruned-cell failures. Setup errors remain protocol errors; missing requested input
+is distinct from a candidate rejection. Native validation returns the accepted
+millisecond timestamp only after the entire validation core succeeds. No fixture
+expectations are read and no result is inferred from a structural header check.
+
+The core follows CPP early LT alignment, committed previous-state hash checks,
+state-header validation order, governing-state selection for shard descriptors,
+zero-state neighbour exclusion, time-before-queue-failure ordering and deferred
+transaction-account reads. Aggregate fee reconciliation follows transaction
+validation. Shard transaction configuration avoids parameter31, which CPP reads
+only for masterchain special contracts. Ordinary constructor callers retain their
+full-configuration profile. Supplied roots acquire no peer/network authority and
+successful offline validation neither publishes nor persists a block.
+
+A descriptor's permission to carry no signatures is separate from verifying a
+present signature. Only an actually empty permitted classical carrier selects the
+unsigned path; governing metadata checks precede skip-signature handling, and PQ
+authentication remains required before cache/fake/skip paths. The older descriptor
+APIs retain their default governing-state argument; this checkpoint explicitly
+loads governing states in ValidateQuery and does not qualify every other caller.
+
+Inputs are bounded to128MiB per JSON line and32MiB per BOC field. This is an adapter
+input bound, not a measured process-memory or validator-work quota. Reason classes
+are rendered from actual native errors, including Rust's nested diagnostic forms.
+Additional unsupported provider operations or panics are harness failures, not
+passing rejection outcomes. Latest-TOS regeneration, asynchronous transport wiring,
+archive/runtime/resource/CI/review/release gates remain open.
