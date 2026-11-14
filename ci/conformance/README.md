@@ -90,7 +90,7 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 The `rtos_api --example crypto_conformance` target calls existing native
 Ed25519, ML-DSA-44, SLH-DSA-SHA2-128s, padded Falcon-512, LMS, SHA-256,
 Poseidon2, quorum, session identity and PQBytes APIs. Of9508 frozen crypto
-contexts,9445 agree and63 remain explicit unsupported operations, not passes.
+contexts,9474 agree and34 remain explicit unsupported operations, not passes.
 All9508 frozen effects were independently checked against clean CPP1181.
 Twelve added clean-C++ controls cover full uint64 weights and raw algorithm
 selection. For weights, the structural
@@ -105,9 +105,10 @@ the raw helper retains its diagnostic contract. The four frozen ML-DSA authority
 domains are shared native constants, without granting key authorization.
 A separate204-input probe gives189 equal effects and15 mutual protocol errors;
 those errors are not passing shared fixtures. Adapters apply bounded byte edits
-before native calls and reject edits naming an unread input. Remaining crypto
-operations are signature-carrier fetching, config43, validator-set unpacking,
-elector preimages and expected-block Simplex signing. This is corpus agreement,
+before native calls and reject edits naming an unread input. The config43 and validator-set adapters call native decoders; elector
+authorization preimages use shared native serializers with explicit byte order.
+Remaining crypto operations are signature-carrier fetching and expected-block
+Simplex signing. This is corpus agreement,
 not arbitrary-input, network or production runtime qualification.
 
 The provisional `rtos_api --example consensus_conformance` target calls native

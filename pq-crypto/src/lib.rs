@@ -7,6 +7,7 @@
 
 use std::{error::Error, fmt, os::raw::c_int};
 
+pub mod elector;
 pub mod falcon512;
 pub mod lms_fee;
 pub mod slhdsa128s;

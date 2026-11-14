@@ -11,13 +11,13 @@ use serde_json::{json, Value};
 pub(super) fn u32_field(value: &Value, name: &str) -> Result<u32> {
     Ok(value[name].as_u64().context("unsigned integer required")?.try_into()?)
 }
-fn i32_field(value: &Value, name: &str) -> Result<i32> {
+pub(super) fn i32_field(value: &Value, name: &str) -> Result<i32> {
     Ok(value[name].as_i64().context("signed integer required")?.try_into()?)
 }
 fn flag(value: &Value, name: &str) -> Result<bool> {
     value[name].as_bool().context("boolean required")
 }
-fn bits(value: &Value) -> Result<UInt256> {
+pub(super) fn bits(value: &Value) -> Result<UInt256> {
     let text = value.as_str().context("hex identifier required")?;
     ensure!(text.len() == 64, "32-byte identifier required");
     let bytes: [u8; 32] = hex::decode(text)?.try_into().unwrap();

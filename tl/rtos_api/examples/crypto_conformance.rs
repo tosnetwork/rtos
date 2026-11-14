@@ -7,6 +7,8 @@ use std::io::{self, BufRead, Read, Write};
 
 const MAX_INPUT: usize = 1 << 20;
 
+#[path = "crypto/config.rs"]
+mod config;
 #[path = "crypto/identity.rs"]
 mod identity;
 
@@ -212,6 +214,40 @@ fn run(context: &Value) -> Result<Value> {
         ("quorum", "has_quorum") => json!({"outcome":"boolean", "value":
             rtos_block::quorum_weight_reached(input.uint64("signed_weight")?, input.uint64("total_weight")?)}),
         ("validator_session", operation) => identity::run(operation, &input)?,
+        ("config43", "parse") => config::size_limits(&mut input)?,
+        ("validator_set", "unpack") => config::validators(&mut input)?,
+        ("elector", operation) => {
+            use rtos_pq_crypto::elector;
+            let v = input.values;
+            let global = identity::i32_field(v, "global_id")?;
+            let hash =
+                |name: &str| -> Result<[u8; 32]> { Ok(*identity::bits(&v[name])?.as_slice()) };
+            bytes_effect(match operation {
+                "stake_preimage" => elector::stake_preimage(
+                    global,
+                    identity::u32_field(v, "stake_at")?,
+                    identity::u32_field(v, "max_factor")?,
+                    &hash("src_addr")?,
+                    &hash("adnl_addr")?,
+                ),
+                "config_vote_preimage" => elector::config_vote_preimage(
+                    global,
+                    &hash("validator_set_id")?,
+                    &hash("validator_id")?,
+                    identity::u32_field(v, "idx")?.try_into()?,
+                    &hash("proposal_hash")?,
+                ),
+                "complaint_vote_preimage" => elector::complaint_vote_preimage(
+                    global,
+                    &hash("validator_set_id")?,
+                    &hash("validator_id")?,
+                    identity::u32_field(v, "idx")?.try_into()?,
+                    identity::u32_field(v, "election_id")?,
+                    &hash("complaint_hash")?,
+                ),
+                _ => bail!("unsupported crypto operation"),
+            })
+        }
         ("pq_bytes", "pack") => {
             use rtos_block::{BocFlags, BocWriter};
             let data = input.bytes("data")?;
