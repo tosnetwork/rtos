@@ -563,7 +563,7 @@ pub fn execute_sturq(engine: &mut Engine) -> Status {
 fn store_x(engine: &mut Engine, name: &'static str, how: u8, limit: usize) -> Status {
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 3)?;
-    let len = engine.cmd.var(0).as_integer()?;
+    let len = engine.cmd.var(0).as_integer_value(0..=limit)?;
     let x;
     let b = if how.bit(INV) {
         x = engine.cmd.var(1).as_integer()?;
@@ -574,7 +574,6 @@ fn store_x(engine: &mut Engine, name: &'static str, how: u8, limit: usize) -> St
         x = engine.cmd.var(2).as_integer()?;
         1
     };
-    let len = len.as_integer_value(0..=limit)?;
     let x = x.as_builder(len, how.bit(SIGNED), how.bit(BE));
     store_data(engine, b, x, how.bit(QUIET), false)
 }

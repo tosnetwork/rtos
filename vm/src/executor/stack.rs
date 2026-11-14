@@ -88,6 +88,9 @@ pub(super) fn execute_blkswx(engine: &mut Engine) -> Status {
     fetch_stack(engine, 2)?;
     let j = engine.cmd.var(0).as_stack_index()?;
     let i = engine.cmd.var(1).as_stack_index()?;
+    if engine.cc.stack.depth() < i + j {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     if i > 0 && j > 0 {
         engine.use_gas((i + j).saturating_sub(255) as i64);
     }
@@ -559,6 +562,9 @@ pub(super) fn execute_revx(engine: &mut Engine) -> Status {
     fetch_stack(engine, 2)?;
     let j = engine.cmd.var(0).as_stack_index()?;
     let i = engine.cmd.var(1).as_stack_index()?;
+    if engine.cc.stack.depth() < i + j {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     engine.use_gas(i.saturating_sub(255) as i64);
     engine.cc.stack.reverse_range(j..j + i)?;
     Ok(())
@@ -569,6 +575,9 @@ pub(super) fn execute_roll(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ROLLX"))?;
     fetch_stack(engine, 1)?;
     let i = engine.cmd.var(0).as_stack_index()?;
+    if engine.cc.stack.depth() < i + 1 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     engine.use_gas(i.saturating_sub(255) as i64);
     let x = engine.cc.stack.drop(i)?;
     engine.cc.stack.push(x);
@@ -580,14 +589,13 @@ pub(super) fn execute_rollrev(engine: &mut Engine) -> Status {
     engine.load_instruction(Instruction::new("ROLLREVX"))?;
     fetch_stack(engine, 1)?;
     let i = engine.cmd.var(0).as_stack_index()?;
-    engine.use_gas(i.saturating_sub(255) as i64);
-    if engine.cc.stack.depth() <= i {
+    if engine.cc.stack.depth() < i + 1 {
         fail!(ExceptionCode::StackUnderflow)
-    } else {
-        let x = engine.cc.stack.drop(0)?;
-        engine.cc.stack.insert(i, x);
-        Ok(())
     }
+    engine.use_gas(i.saturating_sub(255) as i64);
+    let x = engine.cc.stack.drop(0)?;
+    engine.cc.stack.insert(i, x);
+    Ok(())
 }
 
 // (a b c - b c a)

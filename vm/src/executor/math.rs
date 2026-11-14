@@ -677,6 +677,9 @@ where
     T: OperationBehavior,
 {
     engine.load_instruction(Instruction::new("FITSX").set_name_prefix(T::name_prefix()))?;
+    if engine.cc.stack.depth() < 2 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     fetch_stack(engine, 1)?;
     let length = engine.cmd.var(0).as_integer_value(0..=1023)?;
     fits_in::<T>(engine, length, IntegerData::fits_in)
@@ -971,6 +974,9 @@ where
     T: OperationBehavior,
 {
     engine.load_instruction(Instruction::new("UFITSX").set_name_prefix(T::name_prefix()))?;
+    if engine.cc.stack.depth() < 2 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     fetch_stack(engine, 1)?;
     let length = engine.cmd.var(0).as_integer_value(0..=1023)?;
     fits_in::<T>(engine, length, IntegerData::ufits_in)

@@ -877,3 +877,20 @@ are rendered from actual native errors, including Rust's nested diagnostic forms
 Additional unsupported provider operations or panics are harness failures, not
 passing rejection outcomes. Latest-TOS regeneration, asynchronous transport wiring,
 archive/runtime/resource/CI/review/release gates remain open.
+
+### VM failure-order regressions
+
+`vm_failure_order_contexts.py` emits the stack-depth, dynamic-gas, FITSX/UFITSX,
+and variable-width integer-store precedence matrix. Generate contexts, then fill
+`vm/tests/data/conformance/vm/fixtures/vm-failure-order.jsonl` with the pinned TOS
+`runner/conformance.py create --harness vm --family vm-failure-order --source authored`.
+Expected effects always come from the C++ reference. The companion
+`vm-fuzz-order-minimized.jsonl` retains 12 minimized failures from grammar seed
+141123, cases 0..9999; its inline contexts can be refilled with `regenerate`.
+
+At TOS5af405d, C++ and TON857b8a57 check full operand depth before FITSX/UFITSX
+parameter types, stack availability before variable stack-movement gas, and
+variable storage width before builder/value types. RTOS follows that order.
+The 156 authored cases include both successful operations and invalid operand
+combinations; 12 minimized fuzz cases preserve the original discovered classes.
+This is a finite regression corpus, not coverage-guided fuzz-budget qualification.
