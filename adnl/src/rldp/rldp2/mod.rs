@@ -2,6 +2,8 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: LGPL-2.0-or-later
 //! RLDP2 framing and receiver admission primitives.
 pub mod budget;
+pub mod connection;
+mod timer;
 pub const PART_SIZE: u64 = super::Constraints::SLICE as u64;
 pub const SYMBOL_SIZE: u64 = super::Constraints::SYMBOL as u64;
 pub const DEFAULT_MTU: u64 = 7680;
