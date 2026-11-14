@@ -59,6 +59,24 @@ fn serialize_budgeted<T: crate::BoxedSerialize>(
 mod network;
 pub use network::{PqNetworkSignatureSet, VerifiedPqNetworkSignatures};
 
+// Shared by admitted on-chain finality and explicit verification contexts.
+// All signers are checked, including signatures after a sufficient quorum.
+fn verify_all_signatures(
+    message: &[u8],
+    signatures: &[rtos_block::PqBlockSignaturePair],
+    members: &HashMap<UInt256, &rtos_block::PqConsensusKey>,
+) -> Result<()> {
+    for signature in signatures {
+        let key =
+            members.get(&signature.validator_id).ok_or_else(|| error!("PQ unknown signer"))?;
+        if !rtos_pq_crypto::verify_simplex(message, &signature.signature, &key.public_key)? {
+            fail!("PQ invalid final signature from {}", signature.validator_id);
+        }
+    }
+    Ok(())
+}
+
+
 /// Immutable expected context, derived from the caller's governing configuration.
 /// Construction validates protocol consistency, not the origin of the config.
 #[derive(Clone, Debug)]
@@ -504,13 +522,7 @@ impl PqVerificationContext {
             members.insert(id, key);
         }
         let weight = carrier.check_structural_membership_and_weight(&weights)?;
-        for signature in &carrier.signatures {
-            let key =
-                members.get(&signature.validator_id).ok_or_else(|| error!("PQ unknown signer"))?;
-            if !rtos_pq_crypto::verify_simplex(&message, &signature.signature, &key.public_key)? {
-                fail!("PQ invalid final signature from {}", signature.validator_id);
-            }
-        }
+        verify_all_signatures(&message, &carrier.signatures, &members)?;
         if !has_quorum(weight, self.total_weight) {
             fail!("PQ insufficient verified weight: {weight} of {}", self.total_weight);
         }

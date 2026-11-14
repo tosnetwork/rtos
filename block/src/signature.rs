@@ -953,8 +953,8 @@ pub struct PqBlockSignaturePair {
     pub signature: Vec<u8>,
 }
 
-impl Serializable for PqBlockSignaturePair {
-    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+impl PqBlockSignaturePair {
+    pub fn validate(&self) -> Result<()> {
         if self.algorithm_id != MLDSA44_ALGORITHM_ID {
             return pq_reject(
                 PqBlockSignatureReasonCode::UnsupportedAlgorithm,
@@ -964,6 +964,13 @@ impl Serializable for PqBlockSignaturePair {
         if self.signature.len() != PQ_SIGNATURE_BYTES {
             return pq_reject(PqBlockSignatureReasonCode::SignatureLength, "signature length");
         }
+        Ok(())
+    }
+}
+
+impl Serializable for PqBlockSignaturePair {
+    fn write_to(&self, cell: &mut BuilderData) -> Result<()> {
+        self.validate()?;
         self.validator_id.write_to(cell)?;
         self.algorithm_id.write_to(cell)?;
         cell.checked_append_reference(pack_pq_bytes(&self.signature, PQ_SIGNATURE_BYTES)?)?;
