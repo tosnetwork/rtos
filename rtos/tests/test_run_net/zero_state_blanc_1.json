@@ -145,6 +145,9 @@
           "mc_cell_price_ps": "500000"
         }
       ],
+      "p19": {
+        "global_id": 42
+      },
       "p20": {
         "flat_gas_limit": "1000",
         "flat_gas_price": "10000000",

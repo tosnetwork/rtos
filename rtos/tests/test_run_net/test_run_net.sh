@@ -113,7 +113,8 @@ do
         echo "ERROR: node config generation failed"
         exit 1
     fi
-    (./node_singlehost --configs . > tmp_output 2>&1 & wait 2>/dev/null) &
+    ./node_singlehost --configs . > tmp_output 2>&1 &
+    PREPARATION_PID=$!
     echo "  waiting for 5 secs"
     sleep 5
     if [ ! -f "console_config.json" ]; then
@@ -140,7 +141,12 @@ do
 
     cp $NODE_TARGET/config.json $TEST_ROOT/tmp/config$N.json
 
-    pkill -9 node_singlehost > /dev/null 2>&1 || echo "No node processes"
+    # Reap this preparatory node before removing its database. It was started
+    # with the fake genesis above; its network binding must not be reused by
+    # the real network. The generated keys are retained in tmp/config$N.json.
+    kill -9 "$PREPARATION_PID" 2>/dev/null || true
+    wait "$PREPARATION_PID" 2>/dev/null || true
+    rm -rf -- "$NODE_TARGET/node_db_$N"
 
 done
 
