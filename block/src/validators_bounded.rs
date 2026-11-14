@@ -144,6 +144,9 @@ impl ValidatorSet {
             validators.read_from(cell)?;
             Some(weight)
         };
+        // The all-ones query follows only the rightmost fixed16-bit path.
+        cb::lookup(budget, 16)?;
+        check_validator_dictionary_total(&validators, total.as_u16())?;
         let mut list = cb::vector::<ValidatorDescr>(budget, total.as_usize())?;
         let mut total_weight = 0;
         for i in 0..total.as_u16() {

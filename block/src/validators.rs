@@ -482,6 +482,18 @@ validators_ext#12
 
 define_HashmapE! {ValidatorDescriptions, 16, ValidatorDescr}
 
+// Match the reference's maximal-index check before reading descriptors. The
+// subsequent dense 0..total reads prove there are no gaps or hidden entries.
+fn check_validator_dictionary_total(values: &ValidatorDescriptions, total: u16) -> Result<()> {
+    let last = values.0.find_leaf(u16::MAX.write_to_bitstring()?, false, true, false, &mut 0)?;
+    let (key, _) = last.ok_or_else(|| crate::error!("empty validator dictionary"))?;
+    let key = u16::construct_from(&mut SliceData::load_builder(key)?)?;
+    if u32::from(key) + 1 != u32::from(total) {
+        fail!("validator dictionary maximal index differs from total");
+    }
+    Ok(())
+}
+
 ///
 /// ValidatorSet
 ///
@@ -817,6 +829,7 @@ impl Deserializable for ValidatorSet {
             self.total_weight = u64::construct_from(cell)?;
             validators.read_from(cell)?; // HashmapE
         }
+        check_validator_dictionary_total(&validators, self.total.as_u16())?;
         self.list.clear();
         let mut total_weight = 0;
         for i in 0..self.total.as_u16() {

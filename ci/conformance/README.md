@@ -92,7 +92,13 @@ Ed25519, ML-DSA-44, SLH-DSA-SHA2-128s, padded Falcon-512, LMS, SHA-256,
 Poseidon2, quorum, session identity and PQBytes APIs. Of9508 frozen crypto
 contexts,9474 agree and34 remain explicit unsupported operations, not passes.
 All9508 frozen effects were independently checked against clean CPP1181.
-Twelve added clean-C++ controls cover full uint64 weights and raw algorithm
+Thirteen added clean-C++ controls cover full uint64 weights, raw algorithm
+selection and validator dictionary size. The native validator decoder checks
+the maximal dictionary index before dense membership reads; its bounded sibling
+charges the fixed16-bit rightmost lookup before that check. Both reject hidden
+entries beyond the declared total. Earlier budget tests now supply matching
+maximal indices so allocation and repeated-path guards are still exercised.
+The member controls cover raw algorithm
 selection. For weights, the structural
 TL long commits their original64 bits, while governing ValidatorSet construction
 still rejects an overweight set. Raw PQ algorithm0 follows the reference

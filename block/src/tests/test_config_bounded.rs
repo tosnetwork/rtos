@@ -88,7 +88,11 @@ fn bounded_config_declared_count_and_key_length_refuse_before_allocation() {
     u16::MAX.write_to(&mut record).unwrap();
     1u16.write_to(&mut record).unwrap();
     1u64.write_to(&mut record).unwrap();
-    record.append_bit_zero().unwrap();
+    // Pass the maximal-index shape check, then hit the declared vector budget
+    // before attempting to read the missing low indices.
+    let mut dictionary = ValidatorDescriptions::default();
+    dictionary.set(&(u16::MAX - 1), &nodes()[0]).unwrap();
+    dictionary.write_to(&mut record).unwrap();
     let e = ValidatorSet::construct_bounded(
         &mut SliceData::load_builder(record).unwrap(),
         &Budget::new(100, 1024),
@@ -113,7 +117,7 @@ fn bounded_config_shared_dictionary_paths_consume_work() {
     leaf.append_bit_zero().unwrap();
     nodes()[0].write_to(&mut leaf).unwrap();
     let mut root = leaf.into_cell().unwrap();
-    for _ in 0..16 {
+    for _ in 0..8 {
         let mut branch = BuilderData::new();
         branch.append_bit_zero().unwrap();
         branch.append_bit_zero().unwrap();
@@ -121,6 +125,16 @@ fn bounded_config_shared_dictionary_paths_consume_work() {
         branch.checked_append_reference(root).unwrap();
         root = branch.into_cell().unwrap();
     }
+    // Eight shared branch levels cover suffixes 0..255. Prefix their root
+    // label with eight zeros so the maximal index agrees with total=256.
+    let mut prefixed = BuilderData::new();
+    prefixed.append_bit_zero().unwrap();
+    prefixed.append_u8(255).unwrap();
+    prefixed.append_bit_zero().unwrap();
+    prefixed.append_u8(0).unwrap();
+    prefixed.checked_append_reference(root.reference(0).unwrap()).unwrap();
+    prefixed.checked_append_reference(root.reference(1).unwrap()).unwrap();
+    let root = prefixed.into_cell().unwrap();
     let mut record = BuilderData::new();
     record.append_u8(VALIDATOR_SET_EX_TAG).unwrap();
     1u32.write_to(&mut record).unwrap();
