@@ -594,8 +594,8 @@ The latest TOS5af405d channel harness routes through the peer table. Its destina
 lookup is shared with the Rust socket receive pipeline: local identities take
 precedence over inbound channel registrations, before any decryption. An unknown
 destination is refused by that lookup. The standalone Channel API retains its
-channel-only namespace. The latest corpus now has1286 equal effects,zero mismatches
-and4 unsupported Plumtree contexts; this is not a passing whole-net run.
+channel-only namespace. The latest corpus has1290 equal effects,zero mismatches,refusals or skips.
+This finite network corpus does not qualify every asynchronous runtime caller.
 The earlier640 additional channel comparisons against the latest C++ actor harness
 retain their ebe81eb9 source scope. Native
 checks cover registry precedence, unknown/short destinations, four channel tests
@@ -630,7 +630,7 @@ Ordinary TOS source admission refuses forbidden sources; the local protocol perf
 application check once before delivery/relay. Both simple/FEC approval and refusal
 are covered, including zero emissions on refusal.
 
-Of the45 additional contexts,41 match the latest C++ actor effects;zero differ and4
+All45 additional contexts match the latest C++ actor effects;zero differ or
 are unsupported. Six additional raw-message controls agree after five actual
 before-change differences. Native checks include transport binding/retirement,
 fixed-member certificate restrictions and small explicit FEC; three behavior
@@ -651,6 +651,17 @@ The adapter hands off whole emission batches before the next scheduler round,
 matching the reference without sorting recorded effects. Fifteen additional C++
 controls cover thresholds, membership count/order, source rules and flag behavior;
 an empty-inbound-array control also agrees after its prior harness refusal.
+
+Plumtree uses the existing native engine, fixed-member policy and node-owned clock.
+Its immutable broadcast edge now carries both messages and bounded repair queries;
+the live path continues through QUIC. A message-only edge refuses queries explicitly,
+as the reference recording edge does. Overlay retirement cancels pending queries
+and sends before joining its owned tasks. The adapter activates Plumtree only after
+its broadcast subscription is active; it supplies original-sender membership and
+validator eager limit1, then records actual native effects. Source publication
+refusals (invalid size or source policy) are typed separately from transport failures.
+The original sender ignores IHave, including flipped signatures, before payload
+signature verification, following the reference's actual role-specific path.
 
 ## Offline candidate-validation target
 

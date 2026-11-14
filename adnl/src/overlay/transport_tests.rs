@@ -433,3 +433,166 @@ async fn tos_twostep_without_sender_falls_back_to_ordinary_fec() {
     assert_eq!(sent.unwrap().packets, 4);
     assert_eq!(received.unwrap().unwrap().unwrap().data, data.object);
 }
+
+#[derive(Default)]
+struct RepairEdge {
+    edge: Edge,
+    queries: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl OverlayBroadcastTransport for RepairEdge {
+    fn has_peer(&self, _: &[u8; 32], _: &[u8; 32]) -> bool {
+        true
+    }
+    async fn send_message(
+        &self,
+        data: &[u8],
+        peers: &AdnlPeers,
+        method: BroadcastTransportMethod,
+    ) -> Result<()> {
+        self.edge.send_message(data, peers, method).await
+    }
+    async fn query(
+        &self,
+        data: &[u8],
+        _: &AdnlPeers,
+        answer_limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        assert!(!data.is_empty());
+        assert!(answer_limit > 0);
+        self.queries.fetch_add(1, Ordering::AcqRel);
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+fn edge_plumtree_policy(original_sender: bool) -> PlumtreeConfig {
+    PlumtreeConfig {
+        authorized_keys: BTreeMap::new(),
+        max_untrusted_size: 1 << 20,
+        untrusted_flags: 3,
+        fixed_members: true,
+        original_sender,
+        eager_limit: if original_sender { 1 } else { 4 },
+        max_retained_bytes: 32 << 20,
+        max_broadcasts: 1024,
+    }
+}
+
+#[tokio::test]
+async fn plumtree_owned_edge_publishes_native_carriers_and_cancels_pending_repair() {
+    let id = OverlayShortId::from_data([235; 32]);
+    let (adnl_a, a, source) = node(236).await;
+    let (adnl_b, b, receiver) = node(237).await;
+    let edge_a = Arc::new(Edge::default());
+    let edge_b = Arc::new(RepairEdge::default());
+    a.install_broadcast_transport(edge_a.clone()).unwrap();
+    b.install_broadcast_transport(edge_b.clone()).unwrap();
+    for (node, local, remote) in [(&a, &source, &receiver), (&b, &receiver, &source)] {
+        node.add_fixed_member_overlay(
+            OverlayParams::with_id_only(&id),
+            local,
+            &[remote.id().clone()],
+            OverlayPrivacyRules::new(1 << 20, 3, BTreeMap::new()),
+        )
+        .unwrap();
+    }
+    let ga = a.overlay_generation(&id).unwrap();
+    let gb = b.overlay_generation(&id).unwrap();
+    // The actual subscription must be active, not just allocated.
+    assert!(a
+        .configure_plumtree(&id, edge_plumtree_policy(true), &tokio::runtime::Handle::current())
+        .is_err());
+    let mut sa = a.subscribe_broadcast(&id).unwrap();
+    let mut sb = b.subscribe_broadcast(&id).unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(1), sa.recv()).await;
+    let _ = tokio::time::timeout(Duration::from_millis(1), sb.recv()).await;
+    a.configure_plumtree(&id, edge_plumtree_policy(true), &tokio::runtime::Handle::current())
+        .unwrap();
+    b.configure_plumtree(&id, edge_plumtree_policy(false), &tokio::runtime::Handle::current())
+        .unwrap();
+    let invalid = a
+        .broadcast_plumtree(
+            &id,
+            &source,
+            rtos_api::ton::overlay::Certificate::Overlay_EmptyCertificate,
+            0,
+            Some([1; 32]),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid.downcast_ref::<PlumtreeRefusal>(),
+        Some(PlumtreeRefusal::InvalidSendSize)
+    ));
+    let unauthorized = a
+        .broadcast_plumtree(
+            &id,
+            &source,
+            rtos_api::ton::overlay::Certificate::Overlay_EmptyCertificate,
+            1,
+            Some([1; 32]),
+            &[7; 50],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unauthorized.downcast_ref::<PlumtreeRefusal>(),
+        Some(PlumtreeRefusal::SourceNotAllowed)
+    ));
+    assert!(edge_a.messages.lock().unwrap().is_empty());
+    assert!(tokio::time::timeout(Duration::from_millis(1), sa.recv()).await.is_err());
+    for fec in [false, true] {
+        let data = vec![if fec { 9 } else { 7 }; if fec { 6000 } else { 50 }];
+        a.broadcast_plumtree(
+            &id,
+            &source,
+            rtos_api::ton::overlay::Certificate::Overlay_EmptyCertificate,
+            0,
+            if fec { None } else { Some(rtos_block::sha256_digest(&data)) },
+            &data,
+        )
+        .await
+        .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), sa.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.data, data);
+        assert_eq!(delivered.recv_from, source.id().clone());
+    }
+    let messages = edge_a.messages.lock().unwrap().clone();
+    assert_eq!(messages.len(), 46, "one simple plus45native FEC advertisements");
+    assert!(edge_a
+        .methods
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|m| matches!(m, BroadcastTransportMethod::Sender { reliable: true })));
+    for message in &messages {
+        let (_, offset) = rtos_api::WireProfile::T0.deserialize_with_suffix(message).unwrap();
+        assert!(matches!(
+            rtos_api::WireProfile::T0
+                .deserialize(&message[offset..])
+                .unwrap()
+                .downcast::<rtos_api::ton::overlay::Broadcast>()
+                .unwrap(),
+            rtos_api::ton::overlay::Broadcast::Overlay_BroadcastPlumtreeIHave(_)
+        ));
+    }
+    let peers = AdnlPeers::with_keys(receiver.id().clone(), source.id().clone());
+    b.try_consume_custom(&messages[0], &peers).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), edge_b.entered.notified()).await.unwrap();
+    assert_eq!(edge_b.queries.load(Ordering::Acquire), 1);
+    // Deleting this generation must cancel the indefinitely blocked edge query.
+    tokio::time::timeout(Duration::from_secs(1), b.delete_private_overlay_checked(&gb))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sb.recv().await.unwrap().is_none());
+    a.delete_private_overlay_checked(&ga).await.unwrap();
+    adnl_a.stop_checked().await.unwrap();
+    adnl_b.stop_checked().await.unwrap();
+}

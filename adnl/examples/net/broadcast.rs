@@ -5,7 +5,8 @@ use adnl::{
     node::{AdnlNode, AdnlNodeConfig, AdnlSendMethod},
     records::overlay_public_key,
     BroadcastClock, BroadcastTransportMethod, FixedMemberOverlayOptions, OverlayBroadcastTransport,
-    OverlayNode, OverlayParams, OverlayPrivacyRules, OverlayShortId, PublicBroadcastCheck,
+    OverlayNode, OverlayParams, OverlayPrivacyRules, OverlayShortId, PlumtreeConfig,
+    PlumtreeRefusal, PublicBroadcastCheck,
 };
 use anyhow::{ensure, Context, Result};
 use rtos_api::{ton, Constructor, WireProfile};
@@ -123,6 +124,9 @@ fn message_type(data: &[u8]) -> Result<&'static str> {
         Overlay_Fec_Completed(_) => "overlay.fec.completed",
         Overlay_BroadcastTwostepSimple(_) => "overlay.broadcastTwostepSimple",
         Overlay_BroadcastTwostepFec(_) => "overlay.broadcastTwostepFec",
+        Overlay_BroadcastPlumtreeIHave(_) => "overlay.broadcastPlumtreeIHave",
+        Overlay_BroadcastPlumtreeSimple(_) => "overlay.broadcastPlumtreeSimple",
+        Overlay_BroadcastPlumtreeFec(_) => "overlay.broadcastPlumtreeFec",
         _ => anyhow::bail!("unsupported emitted broadcast constructor"),
     })
 }
@@ -150,7 +154,7 @@ async fn run_async(v: &Value) -> Result<Value> {
     let now: i32 = v["now"].as_i64().context("unix time required")?.try_into()?;
     ensure!(now > 0, "positive unix time required");
     ensure!(
-        matches!(v["mode"].as_str(), Some("simple" | "fec" | "twostep")),
+        matches!(v["mode"].as_str(), Some("simple" | "fec" | "twostep" | "plumtree")),
         "unsupported overlay broadcast mode"
     );
     let members = v["members"].as_array().context("members required")?;
@@ -191,8 +195,11 @@ async fn run_async(v: &Value) -> Result<Value> {
             "duplicate authorized key"
         );
     }
-    let rules =
-        OverlayPrivacyRules::new(uint(v, "max_unauth_size")?, uint(v, "flags")?, authorized);
+    let rules = OverlayPrivacyRules::new(
+        uint(v, "max_unauth_size")?,
+        uint(v, "flags")?,
+        authorized.clone(),
+    );
     let record = Arc::new(Mutex::new(Record::default()));
     *LOG_RECORD.lock().unwrap() = Some(Arc::downgrade(&record));
     let mut nodes = Vec::new();
@@ -252,6 +259,27 @@ async fn run_async(v: &Value) -> Result<Value> {
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
+    if v["mode"] == "plumtree" {
+        for node in &nodes {
+            node.configure_plumtree(
+                &id,
+                PlumtreeConfig {
+                    authorized_keys: authorized
+                        .iter()
+                        .map(|(key, cap)| (*key, *cap as usize))
+                        .collect(),
+                    max_untrusted_size: uint(v, "max_unauth_size")? as usize,
+                    untrusted_flags: uint(v, "flags")?,
+                    fixed_members: true,
+                    original_sender: true,
+                    eager_limit: 1,
+                    max_retained_bytes: 32 << 20,
+                    max_broadcasts: 1024,
+                },
+                &tokio::runtime::Handle::current(),
+            )?;
+        }
+    }
     if let Some(inbound) = v.get("inbound") {
         let inbound = inbound.as_array().context("inbound array required")?;
         ensure!(inbound.len() <= 64, "too many inbound messages");
@@ -270,8 +298,9 @@ async fn run_async(v: &Value) -> Result<Value> {
         }
     }
     if let Some(send) = v.get("broadcast") {
-        let old_fec = v["mode"] != "twostep"
-            || uint(send, "flags")? & OverlayNode::FLAG_BCAST_NO_TWOSTEP != 0;
+        let old_fec = v["mode"] != "plumtree"
+            && (v["mode"] != "twostep"
+                || uint(send, "flags")? & OverlayNode::FLAG_BCAST_NO_TWOSTEP != 0);
         let data = super::bytes(send, "data", if old_fec { 1535 } else { 1 << 20 })?;
         let fec = send["fec"].as_bool().context("fec bool required")?;
         ensure!(fec || data.len() <= 768, "simple broadcast exceeds768bytes");
@@ -280,14 +309,29 @@ async fn run_async(v: &Value) -> Result<Value> {
             #[cfg(feature = "telemetry")]
             tag: 0,
         };
-        let result = if fec {
-            nodes[0].broadcast_fec(&id, &tagged, None, uint(send, "flags")?).await
+        let result = if v["mode"] == "plumtree" {
+            nodes[0]
+                .broadcast_plumtree(
+                    &id,
+                    &keys[0],
+                    ton::overlay::Certificate::Overlay_EmptyCertificate,
+                    uint(send, "flags")?,
+                    if fec { None } else { Some(sha256_digest(&data)) },
+                    &data,
+                )
+                .await
+        } else if fec {
+            nodes[0].broadcast_fec(&id, &tagged, None, uint(send, "flags")?).await.map(|_| ())
         } else {
-            nodes[0].broadcast(&id, &tagged, None, uint(send, "flags")?, AdnlSendMethod::Fast).await
+            nodes[0]
+                .broadcast(&id, &tagged, None, uint(send, "flags")?, AdnlSendMethod::Fast)
+                .await
+                .map(|_| ())
         };
         if let Err(error) = result {
             ensure!(
-                error.to_string().to_lowercase().contains("forbidden"),
+                error.downcast_ref::<PlumtreeRefusal>().is_some()
+                    || error.to_string().to_lowercase().contains("forbidden"),
                 "native send failed: {error}"
             );
         }

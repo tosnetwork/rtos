@@ -126,7 +126,7 @@ impl Drop for BroadcastSubscription {
     }
 }
 
-pub use plumtree::PlumtreeConfig;
+pub use plumtree::{PlumtreeConfig, PlumtreeRefusal};
 pub mod records;
 
 const TARGET: &str = "overlay";
@@ -3727,7 +3727,7 @@ impl Subscriber for OverlayNode {
 }
 
 struct PlumtreeTransport {
-    quic: Arc<QuicNode>,
+    quic: Option<Arc<QuicNode>>,
     engine: std::sync::Mutex<plumtree::Engine>,
     local: Arc<KeyId>,
     original_sender: bool,
@@ -3828,7 +3828,14 @@ impl Overlay {
                         let sent = tokio::select! {
                             biased;
                             _ = self.tasks.cancelled() => Err(error!("Plumtree overlay retired during send")),
-                            result = quic.message(bytes, Some(&self.adnl), &peers) => result,
+                            result = async {
+                                if let Some(edge) = &self.broadcast_transport {
+                                    edge.send_message(&bytes, &peers, BroadcastTransportMethod::Sender { reliable: true }).await
+                                } else {
+                                    quic.as_ref().ok_or_else(|| error!("Plumtree sender is unavailable"))?
+                                        .message(bytes, Some(&self.adnl), &peers).await.map(|_| ())
+                                }
+                            } => result,
                         };
                         if let Err(err) = sent {
                             if first_error.is_none() {
@@ -3839,6 +3846,7 @@ impl Overlay {
                     plumtree::Action::Query { peer, key, query, answer_limit } => {
                         let overlay = Arc::downgrade(self);
                         let quic = quic.clone();
+                        let edge = self.broadcast_transport.clone();
                         let adnl = self.adnl.clone();
                         let peers =
                             AdnlPeers::with_keys(transport.local.clone(), KeyId::from_data(peer));
@@ -3855,13 +3863,14 @@ impl Overlay {
                             // The total budget also bounds the QUIC helper's reconnect/retry.
                             let response = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                quic.query_with_answer_limit(
-                                    bytes,
-                                    Some(&adnl),
-                                    &peers,
-                                    Some(5000),
-                                    answer_limit,
-                                ),
+                                async {
+                                    if let Some(edge) = edge {
+                                        edge.query(&bytes, &peers, answer_limit).await
+                                    } else {
+                                        quic.ok_or_else(|| error!("Plumtree sender is unavailable"))?
+                                            .query_with_answer_limit(bytes, Some(&adnl), &peers, Some(5000), answer_limit).await
+                                    }
+                                },
                             )
                             .await
                             .unwrap_or_else(|_| Err(error!("Plumtree repair deadline exceeded")));
@@ -3872,6 +3881,10 @@ impl Overlay {
                             let result = (|| -> Result<Vec<plumtree::Action>> {
                                 let mut engine = overlay.plumtree_engine()?;
                                 match response {
+                                    Ok(Some(bytes)) if bytes.len() > answer_limit => {
+                                        engine.query_failed(key, peer, Instant::now());
+                                        Err(error!("Plumtree repair answer exceeds its byte limit"))
+                                    }
                                     Ok(Some(bytes)) => {
                                         match plumtree::decode_repair_response(&bytes) {
                                             Ok(message) => engine.receive(
@@ -3968,11 +3981,10 @@ impl OverlayNode {
         if !overlay.received_rawbytes.has_subscription() {
             fail!("Plumtree requires an owned broadcast consumer subscription before activation");
         }
-        let quic = self
-            .quic
-            .get()
-            .ok_or_else(|| error!("Plumtree requires an installed QUIC sender"))?
-            .clone();
+        let quic = self.quic.get().cloned();
+        if quic.is_none() && overlay.broadcast_transport.is_none() {
+            fail!("Plumtree requires an installed QUIC sender or owned broadcast edge");
+        }
         // The largest supported member-certificate prefix is 160 bytes:
         // message/query tag + overlay ID + flags + 120-byte Ed25519 certificate.
         if overlay.message_prefix.len() > 160 || overlay.query_prefix.len() > 160 {

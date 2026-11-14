@@ -26,6 +26,17 @@ pub trait OverlayBroadcastTransport: Send + Sync {
     /// This provides reachability, not overlay membership or source authority.
     fn has_peer(&self, local: &[u8; 32], peer: &[u8; 32]) -> bool;
 
+    /// Bounded repair query on the same owned edge. A message-only edge refuses
+    /// repair explicitly; the caller records failure and retains retry ownership.
+    async fn query(
+        &self,
+        _data: &[u8],
+        _peers: &AdnlPeers,
+        _answer_limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        anyhow::bail!("Queries are not served by this broadcast edge")
+    }
+
     async fn send_message(
         &self,
         data: &[u8],

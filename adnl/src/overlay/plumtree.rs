@@ -56,6 +56,22 @@ pub(crate) fn decode_repair_response(bytes: &[u8]) -> Result<Broadcast> {
     Ok(message)
 }
 
+/// A protocol publication refusal, distinct from transport or lifecycle failure.
+#[derive(Debug)]
+pub enum PlumtreeRefusal {
+    InvalidSendSize,
+    SourceNotAllowed,
+}
+impl std::fmt::Display for PlumtreeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidSendSize => "Invalid Plumtree send size",
+            Self::SourceNotAllowed => "Plumtree source is not allowed",
+        })
+    }
+}
+impl std::error::Error for PlumtreeRefusal {}
+
 pub const MAX_PLUMTREE_PAYLOAD: usize = 16 << 20;
 const K: usize = 30;
 const PARTS: usize = 45;
@@ -143,7 +159,7 @@ impl PlumtreeConfig {
             Instant::now(),
         );
         if verdict != BroadcastCheckResult::Allowed {
-            fail!("Plumtree source is not allowed");
+            return Err(PlumtreeRefusal::SourceNotAllowed.into());
         }
         Ok(())
     }
@@ -949,7 +965,7 @@ impl Engine {
         self.gc(mono);
         check_time(now, now)?;
         if data.is_empty() || data.len() > MAX_PLUMTREE_PAYLOAD {
-            fail!("Invalid Plumtree send size");
+            return Err(PlumtreeRefusal::InvalidSendSize.into());
         }
         self.policy.authorize(
             &self.verifier,
