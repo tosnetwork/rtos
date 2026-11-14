@@ -58,6 +58,10 @@ fn serialize_budgeted<T: crate::BoxedSerialize>(
 
 mod network;
 pub use network::{PqNetworkSignatureSet, VerifiedPqNetworkSignatures};
+mod explicit;
+pub use explicit::{
+    ExplicitFinalityBlock, ExplicitPqFinalityContext, ExplicitPqSignatureSet, FinalityRefusal,
+};
 
 // Shared by admitted on-chain finality and explicit verification contexts.
 // All signers are checked, including signatures after a sufficient quorum.
@@ -75,7 +79,6 @@ fn verify_all_signatures(
     }
     Ok(())
 }
-
 
 /// Immutable expected context, derived from the caller's governing configuration.
 /// Construction validates protocol consistency, not the origin of the config.

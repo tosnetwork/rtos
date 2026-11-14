@@ -88,8 +88,8 @@ previous a3eea42d run retained the sorted-size-list failure also seen at6fb1a144
 (6passed/1failed/1ignored); this increment does not claim a clean full-library run.
 
 The provisional `rtos_api --example consensus_conformance` target calls native
-weight, validator-set, protocol-version, session, vote and structural proof APIs.
-The first208 frozen controls agree with clean CPP1181; the remaining60 consensus
+weight, validator-set, protocol-version, session, vote, explicit finality and structural proof APIs.
+The first255 frozen controls agree with clean CPP1181; the remaining13 consensus
 contexts explicitly refuse as unsupported operations and are not passes. Run
 the whole consensus directory so those gaps remain visible. The raw numeric
 `quorum_weight_reached` predicate matches C++ even for total0 or signed weight
@@ -108,7 +108,7 @@ while retaining raw wire coordinates at the structural boundary. Node finality
 keeps its membership, admitted-block and canonical candidate checks.
 Additional787 session/vote/version probes match C++, and the earlier2138 weight
 and set probes still agree (12 mutual protocol errors remain separately reported).
-Finality and proof-link verification still need adapters; this does not qualify a
+Proof-link verification still needs an adapter; this does not qualify a
 running consensus network or proof acceptance.
 The native proof envelope keeps signatures opaque until header and state-update
 checks finish. Its shard unpacker uses the C++ unpack profile (depth at most60),
@@ -119,11 +119,11 @@ Key-block contexts derive validator subsets and both session identities through
 native APIs. Supplied key blocks are test anchors, not authenticated chain state.
 Another25 clean-C++ controls cover pruned roots, previous references, shard
 alignment, trailing data, reserved fields and versioned governing options.
-Together the original268 and added81 contexts yield289 equal, zero mismatches
-and60 explicit unsupported refusals. Param29 options expose the full uint64
+Together the original268 and added99 contexts yield354 equal, zero mismatches
+and13 explicit unsupported refusals. Param29 options expose the full uint64
 height-coefficient product while committing its low32 wire bits; the block-hash
 flag follows the version2 boundary. A separate raw probe pins a product above
-uint32; it is outside the shared fixture schema and is not counted in289.
+uint32; it is outside the shared fixture schema and is not counted in354.
 Twelve further C++ controls pin review findings at the structural boundary:
 BlockInfo captures the software field as104 bits without checking its nested
 constructor, while its full reader keeps that check. Key-block config extraction
@@ -140,6 +140,21 @@ forms and never decodes pruned payload bytes as a global ID. Wire signature
 parsing retains its separate carrier error boundary. Three further C++ controls
 keep the key BlockExtra root, McBlockExtra root and auxiliary cell unavailable
 when pruned; the structural key-config reader checks each before decoding.
+The explicit finality context accepts supplied membership/session and raw wire
+block coordinates without constructing an admitted-chain token. Native APIs
+check carrier compatibility, set/role/session/candidate identity, signed-member
+key identity and weight, every signature, quorum and finally a final-proof weight
+claim. The actual unbounded signature loop is shared with production finality;
+production governing-set, canonical candidate and masterchain approval admission
+guards remain. Pair field validation is also shared with the cell serializer.
+Eighteen clean-C++ controls pin ordering, mixed members, unsigned versus signed
+key faults, raw coordinates, and the certificate-only proof envelope boundary.
+This operation never authenticates the envelope's block root or declared ID;
+proof-link validation must establish those separately. An additional input
+probe matches1612 effects and169 mutual protocol errors in1781 contexts; those
+protocol errors are not passing fixtures. Signer counts400/401/1024/1025 also
+match: unknown signer / too many / too many / protocol error. A raw extra final
+field is outside the shared schema and is excluded from the367-case corpus.
 Session JSON retains the two double tokens until binary64 conversion, preserving
 correct rounding, negative zero and C++'s finite saturation on overflow. The API
 package's dev-only serde_json features enable precise float parsing and borrowed

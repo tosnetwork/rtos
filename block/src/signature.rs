@@ -954,6 +954,7 @@ pub struct PqBlockSignaturePair {
 }
 
 impl PqBlockSignaturePair {
+    /// Fixed-suite field validation, without membership or cryptographic checks.
     pub fn validate(&self) -> Result<()> {
         if self.algorithm_id != MLDSA44_ALGORITHM_ID {
             return pq_reject(
