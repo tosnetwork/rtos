@@ -252,8 +252,7 @@ impl SourceBlockDecoder {
             if self.received_esi.insert(symbol_id) {
                 if symbol_id >= num_extended_symbols {
                     // Repair symbol
-                    self.repair_packets
-                        .push(EncodingPacket::new(PayloadId::new(0, symbol_id), payload));
+                    self.repair_packets.push(EncodingPacket::new(payload_id, payload));
                 } else {
                     // Check that this is not an extended symbol (which aren't explicitly sent)
                     assert!(symbol_id < self.source_block_symbols);
@@ -296,7 +295,11 @@ impl SourceBlockDecoder {
             }
 
             for repair_packet in self.repair_packets.iter() {
-                encoded_indices.push(repair_packet.payload_id.encoding_symbol_id());
+                // Keep wire ESI in PayloadId; the padded internal ISI can exceed 24 bits.
+                encoded_indices.push(
+                    repair_packet.payload_id.encoding_symbol_id() + num_extended_symbols
+                        - self.source_block_symbols,
+                );
                 d.push(Symbol::new(repair_packet.data.clone()));
             }
 

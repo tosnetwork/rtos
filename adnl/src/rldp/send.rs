@@ -100,7 +100,11 @@ impl RaptorqEncoder {
         let packet = if let Some(packet) = self.source_packets.pop() {
             packet
         } else {
-            let mut packets = encoders[self.encoder_index].repair_packets(*seqno, 1);
+            let encoder = &encoders[self.encoder_index];
+            let repair = seqno
+                .checked_sub(encoder.source_symbol_count())
+                .ok_or_else(|| rtos_block::error!("repair symbol precedes source symbols"))?;
+            let mut packets = encoder.repair_packets(repair, 1);
             let packet = if let Some(packet) = packets.pop() {
                 packet
             } else {
