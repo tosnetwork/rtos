@@ -18,6 +18,7 @@ pub mod server;
 pub mod telemetry;
 #[cfg(feature = "node")]
 pub mod transport;
+pub mod wire_keys;
 
 #[cfg(feature = "node")]
 pub(crate) mod tasks;

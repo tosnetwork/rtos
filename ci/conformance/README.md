@@ -125,6 +125,27 @@ added36 controls yield9544 equal. A separate mismatched-set-hash probe is mutual
 refused at the protocol boundary and is not a passing shared fixture. This is corpus agreement,
 not arbitrary-input, network or production runtime qualification.
 
+The provisional `adnl --example net_conformance` target adds native wire-key,
+signing, verification, deterministic encryption/decryption, shared-secret and
+ADNL-ID text operations. Of1245 original network contexts,304 agree and941 remain
+explicit unsupported operations. Another24 clean-C++ key-agreement controls give
+328equal/941unsupported/0diff across1269 contexts. A separate262-coordinate probe
+and78wire/identity probes agree with the actual clean reference; these probes are
+retained independently from the shared corpus.
+Network key agreement maps the unsigned Edwards-Y wire coordinate modulo the
+field before the existing X25519 multiplication. It need not be a decompressed
+Edwards verification point; zero shared results and the noninvertible coordinate
+are refused. The coordinate conversion follows the existing public-integer
+strategy with OpenSSL; private scalar copies use zeroizing storage. Ordinary
+signing verification retains its own Ed25519 point checks. Wire private keys use
+existing guarded/zeroizing containers and are neither Debug nor Clone.
+The variable-key size estimate is separate from padded serialization length.
+The typed wire readers retain refusal boundaries, including oversized declared
+strings, and ADNL-ID text uses the native base32/CRC16 helper. Legacy key profiles
+and the existing ADNL cipher construction are preserved; these primitive effects
+never grant peer, packet or DHT admission. Full network transport and block
+validation harnesses remain incomplete.
+
 The provisional `rtos_api --example consensus_conformance` target calls native
 weight, validator-set, protocol-version, session, vote, explicit finality, structural
 proof and key-block proof-link APIs. All268 original consensus contexts agree
