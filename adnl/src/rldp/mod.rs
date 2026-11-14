@@ -72,6 +72,7 @@ use send::{
 mod owned_send;
 use owned_send::{SendCancelled, SendControl, SendWorkerPool};
 
+pub mod rldp2;
 mod stat;
 use stat::{StatsConfigV2, StatsV2};
 

@@ -652,21 +652,17 @@ impl SendPartV2 {
     }
 
     fn get_left_symbols_count(&self) -> Result<u32> {
-        // Find smallest (symbols_count + x + y * i) > received_symbols
-        const X: u32 = 5;
-        const Y: u32 = 5;
         let Rldp2MessagePart(chunk) = &self.chunk;
         let symbols = match &chunk.fec_type {
             FecType::Fec_RaptorQ(fec_type) => fec_type.symbols_count as u32,
             _ => fail!("INTERNAL ERROR: unsupported FEC type"),
         };
-        let symbols = if symbols + X > self.received_symbols {
-            symbols + X
-        } else {
-            let i = (self.received_symbols - (symbols + X)) / Y + 1;
-            symbols + X + i * Y
-        };
-        Ok(symbols - self.received_symbols)
+        super::rldp2::FecHelper {
+            symbols_count: symbols,
+            received_symbols_count: self.received_symbols,
+        }
+        .remaining()
+        .ok_or_else(|| rtos_block::error!("RLDP2 FEC counters overflow"))
     }
 
     fn next_seqno_min_sent(&self, mut seqno_min_sent: u32) -> Option<u32> {
