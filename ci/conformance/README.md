@@ -663,6 +663,14 @@ refusals (invalid size or source policy) are typed separately from transport fai
 The original sender ignores IHave, including flipped signatures, before payload
 signature verification, following the reference's actual role-specific path.
 
+The native overlay receiver also handles overlay.unicast as an application message:
+it checks transport membership, passes the inner bytes to the raw message callback
+with the forwarding ADNL identity, and does not apply broadcast source rules or
+deduplicate repeats. Empty, opaque and nested TL payloads remain unchanged.
+overlay.fec.received/completed are consumed without delivery or relay, as in C++.
+Nine certificate-issuer/flags controls agree with C++ under fixed-member rules;
+that probe found no certificate-parser ordering difference and changed no such code.
+
 Broadcast date fields retain their uint32 wire meaning across the signed i32
 boundary. Timeout addition and diagnostic FEC age subtraction widen before
 arithmetic. Native source/receiver tests cover equal clocks, dates on opposite

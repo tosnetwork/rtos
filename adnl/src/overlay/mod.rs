@@ -3486,6 +3486,20 @@ impl Subscriber for OverlayNode {
                 {
                     return Ok(true);
                 }
+                Ok(Broadcast::Overlay_Unicast(message)) => {
+                    let Some(consumer) = consumer else {
+                        fail!("No dedicated consumer for unicast in overlay {overlay_id}");
+                    };
+                    // Unicast is an application message, not a signed broadcast.
+                    // The authenticated peer was checked above; pass its inner
+                    // bytes unchanged, even when they contain another TL object.
+                    return consumer.try_consume_custom(&message.data, peers).await;
+                }
+                Ok(Broadcast::Overlay_Fec_Received(_) | Broadcast::Overlay_Fec_Completed(_)) => {
+                    // C++ accepts these receipt carriers without application or
+                    // relay effects. They confer no source or delivery authority.
+                    return Ok(true);
+                }
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
                     if let Err(e) = Self::check_fec_broadcast_message(&bcast) {
                         // Ignore invalid messages as early as possible

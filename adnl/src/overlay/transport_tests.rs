@@ -696,3 +696,79 @@ async fn tos_broadcast_dates_cross_signed_boundary_without_overflow_or_false_age
         }
     }
 }
+
+#[derive(Default)]
+struct UnicastApplication(std::sync::Mutex<Vec<(Vec<u8>, [u8; 32])>>);
+#[async_trait::async_trait]
+impl Subscriber for UnicastApplication {
+    async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
+        self.0.lock().unwrap().push((data.to_vec(), *peers.other().data()));
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn tos_unicast_delivers_inner_payload_and_transport_source_after_membership() {
+    use rtos_api::{
+        ton::overlay::{broadcast::Unicast, Broadcast},
+        IntoBoxed,
+    };
+    let (adnl, node, local) = node(241).await;
+    let peer = key(242);
+    let id = OverlayShortId::from_data([243; 32]);
+    node.install_broadcast_transport(Arc::new(Edge::default())).unwrap();
+    node.add_fixed_member_overlay(
+        OverlayParams::with_id_only(&id),
+        &local,
+        &[peer.id().clone()],
+        OverlayPrivacyRules::new(0, 0, BTreeMap::new()),
+    )
+    .unwrap();
+    // Neither broadcast source rules nor receive-broadcast flags apply to
+    // unicast. The authenticated transport peer must still be a member.
+    node.set_member_flags(&id, 3, 0).unwrap();
+    let generation = node.overlay_generation(&id).unwrap();
+    let app = Arc::new(UnicastApplication::default());
+    node.add_consumer(&id, app.clone()).unwrap();
+    let prefix = node.get_overlay(&id, "unicast test").unwrap().message_prefix.clone();
+    let nested = rtos_api::WireProfile::T0
+        .serialize(&Unicast { data: b"nested".to_vec() }.into_boxed())
+        .unwrap();
+    let payloads = [Vec::new(), b"opaque\0\xffpayload".to_vec(), nested];
+    let mut results = Vec::new();
+    for payload in &payloads {
+        let message: Broadcast = Unicast { data: payload.clone() }.into_boxed();
+        let mut bytes = prefix.clone();
+        bytes.extend(rtos_api::WireProfile::T0.serialize(&message).unwrap());
+        let peers = AdnlPeers::with_keys(local.id().clone(), peer.id().clone());
+        results.push(node.try_consume_custom(&bytes, &peers).await);
+        // Repeated unicasts are messages, not deduplicated broadcasts.
+        results.push(node.try_consume_custom(&bytes, &peers).await);
+        let unknown = AdnlPeers::with_keys(local.id().clone(), key(244).id().clone());
+        results.push(node.try_consume_custom(&bytes, &unknown).await);
+    }
+    for control in [
+        rtos_api::ton::overlay::fec::broadcast::Received { hash: [7; 32].into() }.into_boxed(),
+        rtos_api::ton::overlay::fec::broadcast::Completed { hash: [8; 32].into() }.into_boxed(),
+    ] {
+        let mut bytes = prefix.clone();
+        bytes.extend(rtos_api::WireProfile::T0.serialize(&control).unwrap());
+        results.push(
+            node.try_consume_custom(
+                &bytes,
+                &AdnlPeers::with_keys(local.id().clone(), peer.id().clone()),
+            )
+            .await,
+        );
+    }
+    node.delete_private_overlay_checked(&generation).await.unwrap();
+    adnl.stop_checked().await.unwrap();
+    for result in results {
+        assert!(result.unwrap());
+    }
+    let expected: Vec<_> = payloads
+        .iter()
+        .flat_map(|payload| std::iter::repeat_n((payload.clone(), *peer.id().data()), 2))
+        .collect();
+    assert_eq!(*app.0.lock().unwrap(), expected);
+}
