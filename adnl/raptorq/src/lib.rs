@@ -74,4 +74,4 @@ pub use crate::{
     systematic_constants::extended_source_block_symbols,
 };
 mod ordered_decoder;
-pub use ordered_decoder::decode_ordered;
+pub use ordered_decoder::{decode_ordered, decode_ordered_with_encoder};

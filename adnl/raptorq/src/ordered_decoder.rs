@@ -131,6 +131,18 @@ pub fn decode_ordered(
     config: &ObjectTransmissionInformation,
     packets: &[EncodingPacket],
 ) -> Option<(Vec<u8>, SourceBlockEncoder)> {
+    let (data, encoder) = decode_ordered_with_encoder(config, packets, true)?;
+    Some((data, encoder?))
+}
+
+/// Recover one block, retaining a repair encoder only when requested. With
+/// `need_encoder == false`, the solved intermediate symbols are discarded after
+/// reconstructing the data, as in td/fec's `try_decode(false)` receive path.
+pub fn decode_ordered_with_encoder(
+    config: &ObjectTransmissionInformation,
+    packets: &[EncodingPacket],
+    need_encoder: bool,
+) -> Option<(Vec<u8>, Option<SourceBlockEncoder>)> {
     if config.source_blocks() != 1
         || config.sub_blocks() != 1
         || config.symbol_alignment() != 1
@@ -261,7 +273,8 @@ pub fn decode_ordered(
         }
         decoded.extend_from_slice(&data);
     }
-    let encoder = SourceBlockEncoder::from_decoded(0, config, &decoded, Some(intermediate));
+    let encoder = need_encoder
+        .then(|| SourceBlockEncoder::from_decoded(0, config, &decoded, Some(intermediate)));
     decoded.truncate(config.transfer_length() as usize);
     Some((decoded, encoder))
 }
