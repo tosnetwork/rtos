@@ -165,7 +165,11 @@ fn bounded_read(path: &Path, bound: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn sync_ancestors(path: &Path) -> Result<()> {
-    for directory in path.ancestors() {
+    // Relative paths end with an empty ancestor, which File::open rejects.
+    // Resolve against the current directory before syncing every ancestor;
+    // retaining the full chain preserves the directory durability barrier.
+    let absolute = std::path::absolute(path)?;
+    for directory in absolute.ancestors() {
         File::open(directory)?.sync_all()?;
     }
     Ok(())
@@ -1100,6 +1104,20 @@ mod tests {
     }
     fn domain() -> Domain {
         Domain { zero: identity(0).to_string(), init: identity(0).to_string() }
+    }
+
+    #[test]
+    fn retired_history_relative_root_commits_and_reopens() {
+        // Avoid changing the process working directory shared by other tests.
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let root = directory.path().strip_prefix(&cwd).unwrap().join("history");
+        assert!(root.is_relative());
+        let store = Store::open(root.clone(), Limits::default()).unwrap();
+        store.commit(domain(), identity(1), -239, vec![1, 2, 3], vec![]).unwrap();
+        drop(store);
+        let reopened = Store::open(root, Limits::default()).unwrap();
+        assert_eq!(reopened.read(&domain(), &identity(1)).unwrap().unwrap().state, vec![1, 2, 3]);
     }
 
     #[test]
