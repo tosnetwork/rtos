@@ -1643,6 +1643,16 @@ async fn test_overlay_semiprivate() -> Result<()> {
     // check nothing received
     assert_eq!(before, root.received.load(Ordering::Relaxed));
 
+    // The UDP workers are joined by Tokio blocking tasks. Stop every node,
+    // including the replacement slave, before the test runtime is dropped.
+    peers.push(pi);
+    let stops = peers.iter().map(|peer| {
+        tokio::time::timeout(Duration::from_secs(10), peer.adnl.as_ref().unwrap().stop_checked())
+    });
+    for result in futures::future::join_all(stops).await {
+        result??;
+    }
+
     Ok(())
 }
 
