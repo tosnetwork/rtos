@@ -1073,3 +1073,26 @@ limited to 4 MiB; two native processes each have a 60-second deadline. This is
 an offline context and registry control, not native validation of the complete
 historical WC block or proof of chain authenticity. Raw exports and build logs
 stay outside Git; `receipt.json` records their hashes and the commands.
+
+
+### Truncated TL payloads and download limits
+
+The bounded download test separates malformed input from complete over-budget
+input. A declared 0x7fffff-byte proof with no payload must return the slice
+parser's `UnexpectedEof` before allocation-budget checks. A complete real
+`DataFull` reply is also decoded with a TL budget one byte below its proof
+length and must return the exact `DecodeLimitExceeded` limit/actual values.
+The peer download then repeats the complete reply with its proof BOC limit
+one byte too small and must refuse after exactly one query. Cell-count and
+depth refusals and a successful complete-reply control remain in the same test.
+
+```sh
+cd rtos
+NODE_SKIP_TEST_LOGS=yes cargo test -j32 --release -p rtos --features ci_run \
+  --bin rtos bounded_download_e2e_ -- --test-threads=1
+```
+
+This follows the native `TlParser::fetch_string` payload-length check before
+returning a string. It changes test expectations, with no decoder or downloader
+behavior change. The direct TL control isolates its allocation budget from the
+transport's separate whole-response cap.
