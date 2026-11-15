@@ -15,6 +15,12 @@ from scenario_ack import (
     check_ack_evidence,
     check_ack_result,
 )
+from scenario_ack_intent import (
+    INTENTS,
+    check_intent_evidence,
+    check_intent_result,
+    intent_arguments,
+)
 from scenario_ack_partition import (
     ACK_PARTITIONS,
     ack_partition_arguments,
@@ -57,6 +63,7 @@ ROTATIONS = (
     | set(RESTARTS)
     | set(ACKS)
     | set(ACK_PARTITIONS)
+    | set(INTENTS)
 )
 
 
@@ -183,7 +190,15 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name in ACK_PARTITIONS:
+    if name in INTENTS:
+        check_intent_result(
+            name,
+            result.get("source_ack_partition_restart"),
+            result.get("source_ack_fault"),
+            result.get("partition_restart"),
+            recovery,
+        )
+    elif name in ACK_PARTITIONS:
         check_ack_partition_result(
             name,
             result.get("source_ack_partition_restart"),
@@ -220,17 +235,20 @@ def check_result(name, result):
     if (
         name not in RESTARTS
         and name not in ACK_PARTITIONS
+        and name not in INTENTS
         and result.get("partition_restart") is not None
     ):
         raise ValueError("Unexpected restart partition receipt")
     if (
         name not in ACKS
         and name not in ACK_PARTITIONS
+        and name not in INTENTS
         and result.get("source_ack_fault") is not None
     ):
         raise ValueError("Unexpected source ACK fault receipt")
     if (
         name not in ACK_PARTITIONS
+        and name not in INTENTS
         and result.get("source_ack_partition_restart") is not None
     ):
         raise ValueError("Unexpected combined ACK partition receipt")
@@ -272,10 +290,11 @@ def execute(args, names, catalog):
         *source.glob("*.py"),
     ]
     if any(
-        name in PACKETS or name in RESTARTS or name in ACK_PARTITIONS for name in names
+        name in PACKETS or name in RESTARTS or name in ACK_PARTITIONS or name in INTENTS
+        for name in names
     ):
         inputs.extend(packet_artifacts(args, source))
-    if any(name in ACKS or name in ACK_PARTITIONS for name in names):
+    if any(name in ACKS or name in ACK_PARTITIONS or name in INTENTS for name in names):
         inputs.extend(ack_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
@@ -351,6 +370,10 @@ def execute(args, names, catalog):
                 run += ack_partition_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name in INTENTS:
+                run += intent_arguments(
+                    name, args.source_ack_fault_library, args.socket_mark_library
+                )
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -375,10 +398,18 @@ def execute(args, names, catalog):
                 check_result(name, result)
                 if name in PACKETS:
                     check_packet_cleanup(case / "runtime", result["network_fault"])
-                if name in RESTARTS or name in ACK_PARTITIONS:
+                if name in RESTARTS or name in ACK_PARTITIONS or name in INTENTS:
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
-                if name in ACKS or name in ACK_PARTITIONS:
+                if name in ACKS or name in ACK_PARTITIONS or name in INTENTS:
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name in INTENTS:
+                check_intent_evidence(
+                    case / "runtime",
+                    result["source_ack_partition_restart"],
+                    result["source_ack_fault"],
+                    result["recovery"],
+                    INTENTS[name],
+                )
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

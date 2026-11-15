@@ -54,6 +54,15 @@ arguments. They bind the ACK refusal and partition to the same original
 samples. The source IO fault is removed before restart while packet isolation
 continues through the restarted-process hold.
 
+The `source-ack-intent-before-write`, `source-ack-intent-after-partial-write`
+and `source-ack-intent-after-fsync` selections add an explicit intent cut to the
+ACK sync-EIO and partition recovery scenario. They retain the empty file, exact
+half-written prefix or complete synced record respectively, and require normal
+replay to complete the original certificate after restart. The original record,
+completed proof, stopped-process marker and disarmed injection are checked
+against the same session, slot and candidate. Supply both ACK and packet library
+arguments. All stages share the original180-second recovery budget.
+
 Packet completion additionally requires native netem counters demonstrating
 traffic effects (drops for partition/loss, traffic with zero drops for reorder),
 a fresh surviving quorum, restored own vote and both chain creators, unchanged

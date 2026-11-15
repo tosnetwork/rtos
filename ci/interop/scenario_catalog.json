@@ -413,7 +413,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-retention-before-write",
@@ -431,7 +431,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-retention-after-partial-write",
@@ -449,7 +449,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-ack-sync-eio",
