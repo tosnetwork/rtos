@@ -57,11 +57,13 @@ static std::string unhex(const std::string &value) {
   return out;
 }
 static int run(int argc, char **argv) {
-  if (argc == 2 && std::string(argv[1]) == "--check") {
-    std::string state_hex, block_hex, candidate_hex;
+  const bool history = argc == 2 && std::string(argv[1]) == "--check-history";
+  if (history || (argc == 2 && std::string(argv[1]) == "--check")) {
+    std::string state_hex, block_hex, candidate_hex, governing_hex;
     unsigned slot;
     while (token(state_hex)) {
-      if (!token(block_hex) || !token(candidate_hex) || !(std::cin >> slot))
+      if (!token(block_hex) || !token(candidate_hex) || !(std::cin >> slot) ||
+          (history && !token(governing_hex)))
         return 3;
       auto state_raw = unhex(state_hex), block_raw = unhex(block_hex);
       auto state = vm::std_boc_deserialize(state_raw),
@@ -80,12 +82,48 @@ static int run(int argc, char **argv) {
       tos::ShardIdFull shard;
       if (!(tlb::unpack_cell(root.ok(), blk) &&
             tlb::unpack_cell(blk.info, info) &&
-            block::tlb::t_ShardIdent.unpack(info.shard.write(), shard) &&
-            info.not_master && tlb::unpack_cell(info.master_ref, master)))
+            block::tlb::t_ShardIdent.unpack(info.shard.write(), shard)))
         return 12;
-      if (master.root_hash != state.ok()->get_hash().bits() ||
-          master.file_hash != td::sha256_bits256(state_raw))
-        return 13;
+      if (!history) {
+        if (!info.not_master || !tlb::unpack_cell(info.master_ref, master))
+          return 12;
+        if (master.root_hash != state.ok()->get_hash().bits() ||
+            master.file_hash != td::sha256_bits256(state_raw))
+          return 13;
+      } else if (info.not_master) {
+        if (!tlb::unpack_cell(info.master_ref, master))
+          return 12;
+        if (master.seq_no == 0) {
+          if (master.root_hash != state.ok()->get_hash().bits() ||
+              master.file_hash != td::sha256_bits256(state_raw))
+            return 13;
+        } else {
+          auto gov_raw = unhex(governing_hex);
+          auto gov = vm::std_boc_deserialize(gov_raw);
+          block::gen::Block::Record gov_block;
+          block::gen::BlockInfo::Record gov_info;
+          if (gov.is_error() || !tlb::unpack_cell(gov.ok(), gov_block) ||
+              !tlb::unpack_cell(gov_block.info, gov_info))
+            return 20;
+          if (gov_info.not_master || gov_info.seq_no != master.seq_no ||
+              master.root_hash != gov.ok()->get_hash().bits() ||
+              td::sha256_bits256(gov_raw) != master.file_hash)
+            return 21;
+          vm::CellSlice update{vm::NoVm(), gov_block.state_update};
+          if (!update.is_special() || update.prefetch_long(8) != 4 ||
+              update.size_ext() != 0x20228 ||
+              td::Bits256{update.prefetch_ref(1)->get_hash(0).bits()} !=
+                  td::Bits256{state.ok()->get_hash().bits()})
+            return 22;
+        }
+      } else {
+        vm::CellSlice update{vm::NoVm(), blk.state_update};
+        if (!update.is_special() || update.prefetch_long(8) != 4 ||
+            update.size_ext() != 0x20228 ||
+            td::Bits256{update.prefetch_ref(0)->get_hash(0).bits()} !=
+                td::Bits256{state.ok()->get_hash().bits()})
+          return 23;
+      }
       auto nodes = config.ok()->compute_validator_set(shard, info.gen_utime,
                                                       info.gen_catchain_seqno);
       if (nodes.size() != 3)
