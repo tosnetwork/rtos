@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "telemetry")] tag: 0,
             };
             let peers = AdnlPeers::with_keys(keys[direction].id().clone(), keys[1-direction].id().clone());
+            let started = std::time::Instant::now();
             let result = tokio::time::timeout(Duration::from_secs(30), rldps[direction].query(&query, Some(limit), &peers, true, None)).await;
             let (status, payload, diagnostic) = match result {
                 Ok(Ok((Some(bytes), _))) => ("answer", hex::encode(bytes), String::new()),
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
                 Ok(Err(error)) => ("error", String::new(), format!("{error:#}")),
                 Err(error) => ("harness_timeout", String::new(), error.to_string()),
             };
-            println!("{}", serde_json::json!({"id":id,"status":status,"payload_hex":payload,"diagnostic":diagnostic}));
+            println!("{}", serde_json::json!({"id":id,"status":status,"payload_hex":payload,"diagnostic":diagnostic,"elapsed_ms":started.elapsed().as_millis()}));
             anyhow::ensure!(status != "harness_timeout", "query exceeded harness deadline");
         }
         Ok(())

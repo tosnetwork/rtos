@@ -33,6 +33,7 @@
 #include "td/utils/port/signals.h"
 #include "tl-utils/tl-utils.hpp"
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -158,6 +159,7 @@ int main(int argc, char **argv) {
                             std::make_unique<Callback>());
   });
   for (const auto &c : cases) {
+    const auto started = std::chrono::steady_clock::now();
     td::Bits256 request;
     request.set_zero();
     for (unsigned i = 0; i < 4; ++i)
@@ -196,7 +198,11 @@ int main(int argc, char **argv) {
     CHECK(done);
     std::cout << "{\"id\":\"" << c.id << "\",\"status\":\"" << status
               << "\",\"payload_hex\":\"" << payload
-              << "\",\"error_code\":" << error_code << "}\n"
+              << "\",\"error_code\":" << error_code << ",\"elapsed_ms\":"
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count()
+              << "}\n"
               << std::flush;
   }
   scheduler.run_in_context([&] {
