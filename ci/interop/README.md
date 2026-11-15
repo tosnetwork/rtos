@@ -115,7 +115,7 @@ fuzz, review and release gates remain open. `plan` is always `not_executed`.
 
 ## Baseline and bootstrap
 
-The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline. The candidate `5af405dcb1f523be0ff3b812e9f6945275c4945b` is available through explicit `--cpp-revision` selection for active bootstrap tests; the default active pin and frozen profile remain unchanged. Candidate selection is a test input, not a qualification verdict.
+The active C++ reference and default version-16 profile are pinned to `5af405dcb1f523be0ff3b812e9f6945275c4945b`. The frozen profile contains the native-generated masterchain/workchain Genesis identities for this commit. Previous `8812403` and `8f083dc` snapshots require explicit matching historical profiles; their results do not qualify the current reference. The baseline selection establishes test inputs; full runtime and release qualification remain separate.
 
 The snapshot pins the executable's reported commit, copies the C++ programs,
 checks their SHA-256 values, and exports the matching test sources. Supply a
@@ -152,8 +152,8 @@ validated every candidate, or produced a block; bootstrap does not close the
 mixed-validator gate.
 
 To exercise active signing, build both programs with the explicit isolated
-signing feature and use the default active C++ snapshot, or select the candidate
-explicitly with `--cpp-revision 5af405dcb1f523be0ff3b812e9f6945275c4945b`:
+signing feature and use the default TOS5af405d C++ snapshot. The same
+reference can also be selected explicitly with `--cpp-revision 5af405dcb1f523be0ff3b812e9f6945275c4945b`:
 
 ```sh
 cargo +1.100.0 build -p rtos --bin rtos --bin interop_validator_prepare \
@@ -355,7 +355,7 @@ IDs. First run `--prepare-genesis-only` and then pass its `frozen-profile.json`
 to the live invocation while the declared activation remains in the future.
 Each output directory must be new. The original `testnet-v16.json` stays fixed.
 
-On the latest candidate baseline, the fixture prepares signing ledgers for C++
+On the current baseline, the fixture prepares signing ledgers for C++
 successors declared in the frozen Genesis before any validator starts. It uses
 the pinned key tool and only accepts never-started directories containing the
 fixture keyring and seed. Existing state or ledgers are refused; the ceremony

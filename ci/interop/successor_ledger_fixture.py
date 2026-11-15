@@ -5,11 +5,11 @@ import hashlib
 import json
 import subprocess
 
-from cpp_baseline import CANDIDATE_CPP_REVISION
+from cpp_baseline import ACTIVE_CPP_REVISION
 
 
 def prepare_successor_ledgers(args, profile, nodes, zerostate, output):
-    if profile["cpp_revision"] != CANDIDATE_CPP_REVISION:
+    if profile["cpp_revision"] != ACTIVE_CPP_REVISION:
         return
     successors = set(profile["successor_members"]) - set(profile["initial_members"])
     if args.rust_node:

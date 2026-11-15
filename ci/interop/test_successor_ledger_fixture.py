@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cpp_baseline import CANDIDATE_CPP_REVISION
+from cpp_baseline import ACTIVE_CPP_REVISION
 from successor_ledger_fixture import prepare_successor_ledgers
 
 
@@ -21,7 +21,7 @@ class SuccessorLedgerTest(unittest.TestCase):
             for i, k in enumerate(["root_hash", "file_hash"])
         }
         self.profile = {
-            "cpp_revision": CANDIDATE_CPP_REVISION,
+            "cpp_revision": ACTIVE_CPP_REVISION,
             "initial_members": [0, 1, 2, 3],
             "successor_members": [0, 2, 4, 5],
             "expected_zerostate": self.zero,
