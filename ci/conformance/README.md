@@ -1037,5 +1037,6 @@ and production decoders do not perform this conversion.
 This is a synthetic trusted-context migration for the existing pruned-subtree,
 message-queue and storage-stat regressions. It does not authenticate a rewritten
 historical chain or qualify a native full-block replay. Original trace files stay
-unchanged. Original proof/count assertions stay intact; the independent collated
-root-count mismatch remains a separate follow-up.
+unchanged. This conversion preserves the proof-coverage assertions. The separate
+proof-selection profile above derives the historical root count from native
+per-account decisions; the size-limit conversion does not supply that evidence.
