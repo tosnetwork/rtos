@@ -111,6 +111,13 @@ struct GcProgress {
 }
 
 impl AllowStateGcSmartResolver {
+    /// Observe real read/write pin ownership without conflating it with the
+    /// native store-order prefix, which can independently retain a state.
+    #[cfg(test)]
+    pub(crate) fn test_pin_count(&self, id: &BlockIdExt) -> u32 {
+        self.pinned_roots.read().get(id).copied().unwrap_or(0)
+    }
+
     /// Moves the masterchain boundary as if that progress had been committed
     /// after a durability barrier.
     #[cfg(test)]

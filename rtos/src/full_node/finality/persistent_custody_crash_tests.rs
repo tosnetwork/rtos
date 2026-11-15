@@ -37,46 +37,28 @@ async fn persistent_repair_custody_process_crash_child() {
     let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("parent-owned crash directory"));
     let phase = std::env::var(PHASE_ENV).unwrap();
     assert!(matches!(phase.as_str(), "protecting" | "durable"));
-    let fixture = fixture_backend_in(true, false, Some(&root)).await;
-    let exact = binding(&fixture);
+    let fixture = gc_fixture_in(Some(&root)).await;
+    let exact = gc_binding(&fixture);
     let Fixture { dir, engine, parent, target, request } = fixture;
-    // A distinct, genuinely signed MC1 from the same zerostate is not a lease
-    // dependency. Validate its proof and materialize its real Merkle update,
-    // then store its state as an eligible physical-GC control (not an applied fork).
-    let input: serde_json::Value =
-        serde_json::from_str(include_str!("testdata/mc-repair-dependencies.json")).unwrap();
-    let row = &input["rows"][0]["parent"];
-    let control = fixture_block(row);
-    assert_ne!(control.id(), parent.id());
-    let proof =
-        BlockProofStuff::deserialize(control.id(), decode(&row["proof_boc"]), false).unwrap();
-    proof.check_proof(engine.as_ref()).await.unwrap();
-    let zero = engine.load_state(engine.zerostate_id()).await.unwrap();
-    let (control_root, _) =
-        control.block().unwrap().read_state_update().unwrap().apply_for(zero.root_cell()).unwrap();
-    assert_eq!(
-        control_root.repr_hash(),
-        read_single_root_boc(&decode(&row["state_boc"])).unwrap().repr_hash()
-    );
-    let handle = engine.store_block(&control).await.unwrap().to_any();
-    engine.store_block_proof(control.id(), Some(handle.clone()), &proof).await.unwrap();
-    let state = ShardStateStuff::from_root_cell(
-        control.id().clone(),
-        control_root,
-        #[cfg(feature = "telemetry")]
-        engine.engine_telemetry(),
-        engine.engine_allocated(),
-    )
-    .unwrap();
-    engine.store_state(&handle, state).await.unwrap();
+    // The actual workchain zero belongs to the same pinned genesis and
+    // collectable prefix, but is not an MC repair lease dependency. Its
+    // original authenticated BOC remains separately retained after collection.
+    let control = super::super::super::super::native_gc_fixture::workchain_zero_id();
+    assert!(!control.shard().is_masterchain());
+    assert_eq!(control.seq_no(), 0);
+    assert_ne!(&control, parent.id());
+    let state = engine.db().load_shard_state_dynamic(&control).unwrap();
+    assert_eq!(state.block_id(), &control);
+    assert_eq!(state.root_cell().repr_hash(), &control.root_hash);
+    drop(state);
     engine.db().sync_publication_state().await.unwrap();
-    assert!(engine.db().test_contains_dynamic_state_record(control.id()).unwrap());
+    assert!(engine.db().test_contains_dynamic_state_record(&control).unwrap());
     write_synced(
         &root.join("fixture.json"),
         &serde_json::to_vec(&serde_json::json!({
             "directory":dir.path(), "binding":exact.encode().unwrap(),
             "parent":parent.id().to_string(), "target":target.id().to_string(),
-            "control":control.id().to_string(),
+            "control":control.to_string(),
         }))
         .unwrap(),
     );
@@ -95,8 +77,19 @@ async fn persistent_repair_custody_process_crash_child() {
             }
         }
     }));
-    let _ = obtain_durable_mc_custody(engine.clone(), request, exact).await;
-    panic!("custody child crossed its selected actual sync cut point");
+    let result = obtain_durable_mc_custody(engine.clone(), request, exact).await;
+    // Unexpected return must report its real cause and drain Engine tasks, so
+    // a failed setup cannot hang the subprocess runtime until the kill timeout.
+    let detail = match result {
+        Ok(cap) => {
+            drop(cap);
+            "unexpected successful return".to_owned()
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    close(engine).await;
+    drop(dir);
+    panic!("custody child did not stop at its selected sync cut point: {detail}");
 }
 
 async fn crash_window(phase: &str) {
@@ -173,10 +166,10 @@ async fn crash_window(phase: &str) {
             "arm the batch observation before the control becomes GC eligible"
         );
         engine.db().test_watch_state_gc_batch(&control);
+        super::super::super::super::native_gc_fixture::establish_floor(&engine);
         engine.shard_states_keeper().test_retire_history_state(&target);
         assert!(!engine.shard_states_keeper().allow_state_gc(&parent).unwrap());
         assert!(!engine.shard_states_keeper().allow_state_gc(&target).unwrap());
-        assert!(engine.shard_states_keeper().allow_state_gc(&control).unwrap());
         tokio::time::timeout(Duration::from_secs(30), async {
             while engine.db().test_contains_dynamic_state_record(&control).unwrap()
                 || !engine.db().test_watched_state_gc_batch_completed()
@@ -186,6 +179,7 @@ async fn crash_window(phase: &str) {
         })
         .await
         .expect("same-cutoff control must be physically deleted and its exact GC batch completed");
+        assert!(engine.shard_states_keeper().allow_state_gc(&control).unwrap());
         engine.db().archive_gc(&target).await.unwrap();
         for id in [&parent, &target] {
             assert!(

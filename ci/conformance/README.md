@@ -1134,6 +1134,21 @@ advancement lag of 1024 blocks. Tests must establish a valid persisted/startup f
 or provide sufficient authenticated history; the floor policy must not be
 relaxed. Original source/repair failures remain failures until those tests run.
 
+Repair fixtures use the same authenticated successors and cold Engine setup.
+A controlled MC2 floor keeps target MC2 while its nonzero parent MC1 is
+collected; an MC3 floor makes both eligible for custody and crash tests. The
+session in this history is governed by original zero, not non-key MC1. A
+missing-parent refusal first validates that source identity. The two WAL crash
+windows retain an unleased WC-zero control and require its actual GC batch to
+finish before authenticating the recovered MC dependencies.
+
+The bounded writer test distinguishes pin ownership from stored-state order.
+It observes the real target pin at the paused WAL boundary, its transfer to
+custody and its release. Reconstructed MC2 is appended after retained MC3 and
+therefore stays readable without a pin. A released older parent is actually
+collected in a completed batch as the positive GC control. The earlier guard
+test separately requires actual target deletion when its index precedes MC3.
+
 ### Zero-state cells and permanent BOC files
 
 State GC follows the native stored-state order and admits MC sequence zero

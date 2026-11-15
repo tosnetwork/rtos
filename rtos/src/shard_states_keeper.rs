@@ -706,6 +706,11 @@ impl ShardStatesKeeper {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_state_gc_pin_count(&self, id: &BlockIdExt) -> u32 {
+        self.gc_resolver.test_pin_count(id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_retire_history_state(&self, id: &BlockIdExt) {
         self.states.remove(id);
         self.gc_resolver.test_advance_expired_mc_boundary(id.seq_no() + 1);

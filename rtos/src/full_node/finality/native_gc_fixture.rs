@@ -27,6 +27,10 @@ fn wc_row(row: &serde_json::Value) -> serde_json::Value {
 }
 
 pub(super) async fn pair() -> Pair {
+    pair_in(None).await
+}
+
+pub(super) async fn pair_in(parent_dir: Option<&std::path::Path>) -> Pair {
     let _ = env_logger::builder().is_test(true).try_init();
     let data = history();
     assert_eq!(
@@ -39,7 +43,10 @@ pub(super) async fn pair() -> Pair {
     let wc_bytes = decode(&data["wc_zerostate"]);
     let anchor = zero_id(&mc_bytes);
     let mc_root = read_single_root_boc(&mc_bytes).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = match parent_dir {
+        Some(path) => tempfile::tempdir_in(path).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     let receiver_dir = dir.path().join("receiver");
     let provider_dir = dir.path().join("provider");
     for (path, seed) in [(&provider_dir, 0x60), (&receiver_dir, 0x70)] {
@@ -180,13 +187,24 @@ pub(super) async fn pair() -> Pair {
 /// MC4. All blocks/states were received and authenticated by normal clients.
 /// This is a controlled GC boundary, not natural floor advancement on 4 blocks.
 pub(super) fn establish_floor(engine: &Arc<Engine>) {
+    establish_floor_at(engine, 3);
+}
+
+pub(super) fn workchain_zero_id() -> BlockIdExt {
+    zero_id(&decode(&history()["wc_zerostate"]))
+}
+
+/// A controlled, durably pinned boundary at an authenticated MC2 or MC3.
+/// MC2 is used when only its parent should become collectable.
+pub(super) fn establish_floor_at(engine: &Arc<Engine>, seqno: usize) {
+    assert!(matches!(seqno, 2 | 3));
     let data = history();
     let rows = data["cases"].as_array().unwrap();
-    let floor = fixture_block(&rows[2]);
+    let floor = fixture_block(&rows[seqno - 1]);
     let head = fixture_block(&rows[3]);
     assert_eq!(engine.load_last_applied_mc_block_id().unwrap().as_deref(), Some(head.id()));
     assert_eq!(engine.load_shard_client_mc_block_id().unwrap().as_deref(), Some(head.id()));
-    for (row, block) in [(&rows[2], &floor), (&rows[3], &head)] {
+    for (row, block) in [(&rows[seqno - 1], &floor), (&rows[3], &head)] {
         let handle = engine.load_block_handle(block.id()).unwrap().unwrap();
         assert!(handle.is_applied() && handle.has_data() && handle.has_proof());
         let state = engine.db().load_shard_state_dynamic(block.id()).unwrap();
