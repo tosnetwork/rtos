@@ -1286,8 +1286,12 @@ mod tests {
         store.compact(&record, offer.request.canonical.node_receipt.clone()).unwrap();
         let directory = store.directory.clone();
         drop(store);
-        let mut locators = scan_finality_closures(dir.path()).unwrap();
-        assert_eq!(locators.len(), 1);
+        let mut locators = crate::authenticated_fixture::wait_for_source_release(|| {
+            let locators = scan_finality_closures(dir.path())?;
+            Ok((!locators.is_empty()).then_some(locators))
+        })
+        .unwrap();
+        assert_eq!(locators.len(), 1, "closure scan {}", dir.path().display());
         let locator = locators.pop().unwrap();
         assert!(locator.metadata().unwrap().data.is_empty());
         let held = Arc::new(Mutex::new(None::<DeliveredCompletion>));

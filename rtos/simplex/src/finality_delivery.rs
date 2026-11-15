@@ -2081,8 +2081,12 @@ pub(crate) mod tests {
         );
         let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
         complete(Err(error!("WAL failed")));
-        let recovered = scan_pending_finality(temp.path()).unwrap();
-        assert_eq!(recovered.len(), 1);
+        let recovered = crate::authenticated_fixture::wait_for_source_release(|| {
+            let recovered = scan_pending_finality(temp.path())?;
+            Ok((!recovered.is_empty()).then_some(recovered))
+        })
+        .unwrap();
+        assert_eq!(recovered.len(), 1, "released source scan {}", temp.path().display());
         assert_eq!(recovered[0].record().created_at_unix_secs, 123456);
         recovered.into_iter().next().unwrap().acknowledge(UInt256::from([3; 32])).unwrap();
         assert!(scan_pending_finality(temp.path()).unwrap().is_empty());

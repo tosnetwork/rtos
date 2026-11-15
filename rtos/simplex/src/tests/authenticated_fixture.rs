@@ -194,6 +194,23 @@ impl Drop for TestDirectory {
     }
 }
 
+/// Use only after the fixture's owner/continuation has been released. Parallel
+/// subprocess startup briefly inherits open flock descriptions until exec,
+/// even with CLOEXEC. Assertions about a still-held owner must call the real
+/// API directly; non-busy errors must not be retried.
+pub fn wait_for_source_release<T>(mut operation: impl FnMut() -> Result<Option<T>>) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if let Some(value) = operation()? {
+            return Ok(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            fail!("released source fixture remained busy");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn authenticated_observer_fsm_never_emits_timeout_votes() {
     use crate::simplex_state::{SimplexEvent, SimplexState};
