@@ -1291,8 +1291,8 @@ fn read_dict_proof(root: Cell) -> Result<MerkleProof> {
     MerkleProof::construct_from_cell(AccountStorageDictProof::construct_from_cell(root)?.proof)
 }
 
-async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
-    let mut bundle = CollatorTestBundle::load(bundle).unwrap();
+async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bool) {
+    let mut bundle = CollatorTestBundle::load(bundle_path).unwrap();
     let config =
         bundle.load_last_applied_mc_state().await.unwrap().config_params().unwrap().clone();
     let capabilities = config.capabilities();
@@ -1306,7 +1306,14 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
         try_collate_by_bundle_reference(Arc::new(bundle), true, reference).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
-    assert_eq!(collated_data_roots.len(), collated_roots + 1);
+    if let Some(root) = std::env::var_os("RTOS_COLLATOR_PROOF_EXPORT") {
+        let name = std::path::Path::new(bundle_path).file_name().unwrap();
+        let output = std::path::PathBuf::from(root).join(name);
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("block.boc"), &candidate.data).unwrap();
+        std::fs::write(output.join("collated.boc"), &candidate.collated_data).unwrap();
+    }
+    assert_eq!(collated_data_roots.len(), collated_roots + 1, "{bundle_path}");
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
     let accounts = state.read_accounts().unwrap();

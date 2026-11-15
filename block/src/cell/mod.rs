@@ -3292,8 +3292,24 @@ impl ProofStorageStat {
         Ok(())
     }
 
+    /// Includes another proof's full cells and pruned boundaries without downgrading loaded cells.
+    pub fn add_loaded_cells(&mut self, other: &Self) {
+        for (hash, status) in &other.cells {
+            self.cells
+                .entry(hash.clone())
+                .and_modify(|current| {
+                    if *status == CellStatus::Loaded {
+                        *current = CellStatus::Loaded;
+                    }
+                })
+                .or_insert(*status);
+        }
+    }
+
     /// Commits `roots`' `is_include_subtree` cells and their descendants as `Loaded` and returns `true`
-    /// if that grows the proof by at most `dict_proof_size`; otherwise leaves the stat untouched and returns `false`.
+    /// if every preorder prefix grows the proof by at most `dict_proof_size`; otherwise leaves
+    /// the stat untouched and returns `false`. Pruned-boundary refunds can make deltas negative,
+    /// so checking only the final total is not equivalent to the native collator's budget walk.
     pub fn try_load_branches(
         &mut self,
         roots: &[Cell],
@@ -3305,14 +3321,14 @@ impl ProofStorageStat {
         let limit = dict_proof_size.min(isize::MAX as usize) as isize;
         let mut size = 0;
         for root in roots {
-            size += self.size_diff_traverse(
+            if !self.size_diff_traverse(
                 root.clone(),
                 &mut visited,
                 &mut to_load,
+                &mut size,
                 limit,
                 is_include_subtree,
-            )?;
-            if size > limit {
+            )? {
                 return Ok(false);
             }
         }
@@ -3323,38 +3339,26 @@ impl ProofStorageStat {
         Ok(true)
     }
 
-    /// Size the proof would grow by including this subtree's `is_include` cells as full, queueing
-    /// them into `to_load`. Once it exceeds `limit` the walk bails and the result is only `> limit`:
-    /// the size doubles as the early-exit marker (its exact value is then irrelevant).
+    /// Walks in native collator preorder, charging against a shared running size before children.
+    /// Statuses remain frozen until the entire walk succeeds, including across multiple roots.
     fn size_diff_traverse(
         &self,
         cell: Cell,
         visited: &mut ahash::AHashSet<UInt256>,
         to_load: &mut Vec<UInt256>,
+        size: &mut isize,
         limit: isize,
         is_include_subtree: &impl Fn(&UInt256) -> bool,
-    ) -> Result<isize> {
+    ) -> Result<bool> {
         let hash = cell.repr_hash();
         if !visited.insert(hash.clone()) {
-            return Ok(0);
+            return Ok(true);
         }
         let is_include = is_include_subtree(hash);
-        let mut size = 0;
-        for i in 0..cell.references_count() {
-            let child = cell.reference_without_usage(i)?;
-            size += if is_include {
-                self.size_diff_traverse(child, visited, to_load, limit, &Self::include_all)?
-            } else {
-                self.size_diff_traverse(child, visited, to_load, limit, is_include_subtree)?
-            };
-            if size > limit {
-                return Ok(size);
-            }
-        }
         if is_include {
             // Cost by frozen status: absent → +full, pruned boundary → +full − PRUNNED (replaces
             // the placeholder), loaded → 0.
-            size += match self.cells.get(hash) {
+            *size += match self.cells.get(hash) {
                 Some(CellStatus::Loaded) => 0,
                 Some(CellStatus::Pruned) => {
                     let cost = UsageTree::estimate_serialized_size(&cell) as isize
@@ -3368,8 +3372,22 @@ impl ProofStorageStat {
                     cost
                 }
             };
+            if *size > limit {
+                return Ok(false);
+            }
         }
-        Ok(size)
+        for i in 0..cell.references_count() {
+            let child = cell.reference_without_usage(i)?;
+            let accepted = if is_include {
+                self.size_diff_traverse(child, visited, to_load, size, limit, &Self::include_all)?
+            } else {
+                self.size_diff_traverse(child, visited, to_load, size, limit, is_include_subtree)?
+            };
+            if !accepted {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 

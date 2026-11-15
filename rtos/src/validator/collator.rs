@@ -5391,6 +5391,9 @@ impl Collator {
                         &|hash| dict.contains(hash),
                         dict_proof_size,
                     )? {
+                        // Like native add_loaded_cells(dict.proof_stat), account for the proof
+                        // already selected before measuring later accounts' shared cells.
+                        stat.add_loaded_cells(&dict_usage.build_proof_stat()?);
                         let proof = MerkleProof::create_by_usage_tree(
                             &dict_usage.original_root(),
                             dict_usage,

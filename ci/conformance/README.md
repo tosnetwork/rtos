@@ -947,3 +947,35 @@ preserves the original spool fixture byte for byte because the separately signed
 `v2-publication-history.json` chain commits to that zerostate. The historical test
 uses this anchor without a retired consensus key; do not mix that signed chain
 with the regenerated custody fixture's zerostate.
+
+Reproduce the collator proof-budget traversal controls:
+
+```sh
+python3 ci/conformance/proof_budget_reference.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --out /datax/rtos-conformance/proof-budget-reference
+```
+
+This focused probe uses native `vm::ProofStorageStat` with the preorder budget
+walk from pinned TOS `validator/impl/collator.cpp:3075-3122` (also present in
+TON `857b8a57`). Its fixed graphs model cells that all belong to the original
+storage dictionary; it does not execute native full-block collation. Ten
+controls cover a pruned parent's refund before an absent child, refusal before
+a later refund, and a cumulative budget across roots. The prefix peak, rather
+than only the final size delta, determines acceptance. Rust regression
+`proof_storage_stat_native_preorder_budget_boundaries` also checks that rejected
+walks leave the original statistic intact. Build commands and native
+source/binary hashes are retained in the output receipt.
+
+Four additional native controls exercise `ProofStorageStat::add_loaded_cells`:
+a dictionary proof selected for an earlier account contributes its loaded cells
+and pruned boundaries to later accounts' budgets, without downgrading full cells.
+The Rust regression `proof_storage_stat_merge_selected_dictionary_proof` checks
+the same merge and budget boundaries. The collator now includes selected
+dictionary proofs in its running statistic, as pinned TOS does at line 3130.
+
+For offline inspection of `test_collated_data2`, set
+`RTOS_COLLATOR_PROOF_EXPORT=/datax/rtos-conformance/<run>/export` when running the
+exact node test. The helper writes regenerated `block.boc` and `collated.boc`
+under each fixture basename before checking the original proof-count assertion.
+These are public synthetic test outputs, not an authenticated historical replay.
