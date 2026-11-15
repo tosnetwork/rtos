@@ -63,6 +63,16 @@ completed proof, stopped-process marker and disarmed injection are checked
 against the same session, slot and candidate. Supply both ACK and packet library
 arguments. All stages share the original180-second recovery budget.
 
+Source retention cases `source-retention-before-write`,
+`source-retention-after-partial-write` and `source-retention-after-fsync` stop
+one owned source write before its commit rename. Supply
+`--source-retention-cut-library` and `--source-retention-cut-build-record` with
+verified native source/library provenance. The adapter checks the interrupted
+prefix, original source identity, recovered ACK/reference and fresh participation
+after reopening the original database. Only the existing three replay hints may
+be reconstructed for writes that had not completed; the source body and certificate
+remain exact. Recovery retains the original180-second budget.
+
 Packet completion additionally requires native netem counters demonstrating
 traffic effects (drops for partition/loss, traffic with zero drops for reorder),
 a fresh surviving quorum, restored own vote and both chain creators, unchanged

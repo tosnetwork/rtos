@@ -404,7 +404,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-ack-intent-after-fsync",
@@ -422,7 +422,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-ack-intent-before-write",
@@ -440,7 +440,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-ack-intent-after-partial-write",

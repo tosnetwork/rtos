@@ -97,6 +97,8 @@ def main():
         "socket-mark-build-record",
         "source-ack-fault-library",
         "source-ack-fault-build-record",
+        "source-retention-cut-library",
+        "source-retention-cut-build-record",
     ):
         parser.add_argument("--" + option, type=absolute_input_path)
     parser.add_argument("--rust-revision")

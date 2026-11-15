@@ -46,6 +46,13 @@ from scenario_restart import (
     check_restart_partition,
     restart_arguments,
 )
+from scenario_retention import (
+    RETENTIONS,
+    check_retention_evidence,
+    check_retention_result,
+    retention_arguments,
+    retention_artifacts,
+)
 
 ROTATIONS = (
     frozenset(
@@ -64,6 +71,7 @@ ROTATIONS = (
     | set(ACKS)
     | set(ACK_PARTITIONS)
     | set(INTENTS)
+    | set(RETENTIONS)
 )
 
 
@@ -190,7 +198,9 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name in INTENTS:
+    if name in RETENTIONS:
+        check_retention_result(name, result.get("source_retention_cut"), recovery)
+    elif name in INTENTS:
         check_intent_result(
             name,
             result.get("source_ack_partition_restart"),
@@ -253,6 +263,9 @@ def check_result(name, result):
     ):
         raise ValueError("Unexpected combined ACK partition receipt")
 
+    if name not in RETENTIONS and result.get("source_retention_cut") is not None:
+        raise ValueError("Unexpected source retention cut")
+
 
 def execute(args, names, catalog):
     missing = [name for name in names if name not in ROTATIONS and name not in MATRICES]
@@ -296,6 +309,8 @@ def execute(args, names, catalog):
         inputs.extend(packet_artifacts(args, source))
     if any(name in ACKS or name in ACK_PARTITIONS or name in INTENTS for name in names):
         inputs.extend(ack_artifacts(args, source))
+    if any(name in RETENTIONS for name in names):
+        inputs.extend(retention_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -374,6 +389,8 @@ def execute(args, names, catalog):
                 run += intent_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name in RETENTIONS:
+                run += retention_arguments(name, args.source_retention_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -409,6 +426,10 @@ def execute(args, names, catalog):
                     result["source_ack_fault"],
                     result["recovery"],
                     INTENTS[name],
+                )
+            if name in RETENTIONS:
+                check_retention_evidence(
+                    case / "runtime", result["source_retention_cut"], RETENTIONS[name]
                 )
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
