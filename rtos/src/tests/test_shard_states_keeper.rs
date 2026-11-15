@@ -364,15 +364,13 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     store_mc_state(&keeper, &floor, None).await?;
     store_mc_state(&keeper, &successor, Some(&floor)).await?;
     store_mc_state(&keeper, &fork, None).await?;
-    keeper.adopt_cleanup_floor(
-        &floor,
-        wait_pin(&keeper, &floor).await?,
-        keeper.cleanup_floor_epoch(),
-    )?;
+    // These states are deliberately used after the floor advances past them.
+    // Pin them before advancing; a later physical read can race legitimate GC.
+    let older_pin = wait_pin(&keeper, &older).await?;
+    let floor_pin = wait_pin(&keeper, &floor).await?;
+    keeper.adopt_cleanup_floor(&floor, floor_pin.clone(), keeper.cleanup_floor_epoch())?;
     // No regression, and no fork that does not record the current floor.
-    assert!(keeper
-        .adopt_cleanup_floor(&older, wait_pin(&keeper, &older).await?, keeper.cleanup_floor_epoch())
-        .is_err());
+    assert!(keeper.adopt_cleanup_floor(&older, older_pin, keeper.cleanup_floor_epoch()).is_err());
     assert!(keeper
         .adopt_cleanup_floor(&fork, wait_pin(&keeper, &fork).await?, keeper.cleanup_floor_epoch())
         .is_err());
@@ -408,9 +406,7 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     assert!(!keeper.cleanup_floor_unset());
     keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch())?;
     assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
-    assert!(keeper
-        .adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?, keeper.cleanup_floor_epoch())
-        .is_err());
+    assert!(keeper.adopt_cleanup_floor(&floor, floor_pin, keeper.cleanup_floor_epoch()).is_err());
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())
