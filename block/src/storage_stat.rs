@@ -235,25 +235,44 @@ impl AccountStorageStat {
             return;
         }
         fn dfs(
+            stat: &mut AccountStorageStat,
             cell: &Cell,
             loaded: &std::collections::HashSet<UInt256>,
             hint: &mut ahash::AHashSet<UInt256>,
+            is_root: bool,
         ) {
             let hash = cell.repr_hash().clone();
             if !hint.insert(hash.clone()) {
                 return;
             }
+            // Native add_hint seeds known existence before a later dictionary
+            // lookup can encounter an intentionally pruned, unchanged entry.
+            if is_root {
+                if !stat.cache.contains_key(&hash) {
+                    if let Ok(Some(data)) = stat.dict.get(&hash) {
+                        stat.cache.insert(hash.clone(), data);
+                    }
+                }
+                if stat.cache.get(&hash).is_some_and(|data| data.max_merkle_depth != 0) {
+                    return;
+                }
+            }
+            stat.cache.entry(hash.clone()).or_insert(StorageStatCellInfo {
+                ref_count: None,
+                max_merkle_depth: 0,
+                ref_count_diff: 0,
+            });
             if loaded.contains(&hash) {
                 for i in 0..cell.references_count() {
                     if let Ok(child) = cell.reference_without_usage(i) {
-                        dfs(&child, loaded, hint);
+                        dfs(stat, &child, loaded, hint, false);
                     }
                 }
             }
         }
         let mut hint = std::mem::take(&mut self.hint);
         for root in self.roots.clone() {
-            dfs(&root, loaded, &mut hint);
+            dfs(self, &root, loaded, &mut hint, true);
         }
         self.hint = hint;
     }
@@ -279,26 +298,26 @@ impl AccountStorageStat {
 
             fn map_entry<'a>(
                 (hash, data): (&'a UInt256, &mut StorageStatCellInfo),
-            ) -> (FixedBitsKey<'a>, Option<SliceData>) {
-                data.ref_count_diff = 0;
+            ) -> Result<(FixedBitsKey<'a>, Option<SliceData>)> {
                 let key = FixedBitsKey::new(hash.as_slice());
-                if data.ref_count == Some(0) {
-                    (key, None)
-                } else {
-                    (key, data.write_to_bitstring().ok())
-                }
+                let value =
+                    if data.ref_count == Some(0) { None } else { Some(data.write_to_bitstring()?) };
+                data.ref_count_diff = 0;
+                Ok((key, value))
             }
 
             if self.dict.is_empty() {
                 // no filter when dict is filled from scratch - `collect` will use size hint for allocation
-                self.dict.0.hashmap_multiset(self.cache.iter_mut().map(map_entry))?;
+                let entries = self.cache.iter_mut().map(map_entry).collect::<Result<Vec<_>>>()?;
+                self.dict.0.hashmap_multiset(entries)?;
             } else {
-                self.dict.0.hashmap_multiset(
-                    self.cache
-                        .iter_mut()
-                        .filter(|(_, data)| data.ref_count_diff != 0)
-                        .map(map_entry),
-                )?;
+                let entries = self
+                    .cache
+                    .iter_mut()
+                    .filter(|(_, data)| data.ref_count_diff != 0)
+                    .map(map_entry)
+                    .collect::<Result<Vec<_>>>()?;
+                self.dict.0.hashmap_multiset(entries)?;
             }
 
             self.dict_updated = true;
@@ -449,7 +468,31 @@ impl AccountStorageStat {
         for root in &to_remove {
             self.remove_cell(root)?;
         }
+        // Like native finalize_entry, only a zero net change may retain an
+        // unknown hinted count. Changed entries require the actual dictionary.
+        for (hash, data) in &mut self.cache {
+            Self::resolve_hint_count(&self.dict, hash, data)?;
+        }
         self.roots = roots;
+        Ok(())
+    }
+
+    fn resolve_hint_count(
+        dict: &StorageStatDict,
+        hash: &UInt256,
+        data: &mut StorageStatCellInfo,
+    ) -> Result<()> {
+        if data.ref_count.is_none() && data.ref_count_diff != 0 {
+            let previous = dict.get(hash)?.ok_or_else(|| {
+                error!("Hinted cell with hash {} not found in storage stat dictionary", hash)
+            })?;
+            let count = previous.ref_count.ok_or_else(|| error!("Unknown stored ref_count"))?;
+            data.ref_count = Some(
+                u32::try_from(i64::from(count) + i64::from(data.ref_count_diff))
+                    .map_err(|_| error!("Storage stat reference count out of range"))?,
+            );
+            data.max_merkle_depth = previous.max_merkle_depth;
+        }
         Ok(())
     }
 
@@ -509,6 +552,9 @@ impl AccountStorageStat {
             // known count decreased; unknown (hint) stays unknown, never "removed" → no double-count
             data.ref_count = data.ref_count.map(|c| c - 1);
             data.ref_count_diff -= 1;
+            if data.ref_count.is_none() && data.ref_count_diff < 0 {
+                Self::resolve_hint_count(&self.dict, &hash, data)?;
+            }
             data.ref_count == Some(0)
         } else {
             let data = self.dict.get(&hash)?.ok_or_else(|| {

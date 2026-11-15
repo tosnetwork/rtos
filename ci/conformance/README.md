@@ -27,17 +27,30 @@ process error, or a change to source, inputs or tested binaries during the run.
 The summary records commits, input/binary digests and every family command.
 `--skip-build` explicitly uses existing binaries and records that limitation.
 
-The original latest suite plus existing local regressions compares 253271 cases
-on each implementation. Another 50 native overlay regressions now freeze the
-date, unicast, FEC receipt and certificate controls, giving 253321 cases. Their
-initial-fill provenance is beside the fixture; effects were generated only by
+The suite contains 253910 cases across all 11 harnesses, including local
+regressions. Initial-fill provenance is beside the fixtures; effects were generated only by
 the clean pinned C++ CLI. Use the shared `regenerate` command on the fixture
 and retain updated build/filler provenance when refreshing it.
 
-This pin is for the shared conformance boundary. The older interop scenario
-baseline is separate and is not upgraded or qualified by a fixture run.
+The shared pin and active interop baseline both use TOS 5af405d. A fixture run
+does not qualify the runtime scenarios; historical baselines require explicit selection.
 Whole-history native state replay, runtime integration, resource qualification,
 GitHub CI outcomes and independent/external reviews remain separate gates.
+
+Reproduce the account-storage hint proof controls against a clean, pinned TOS
+Ninja build:
+
+```sh
+python3 ci/conformance/storage_hint_reference.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --out /datax/rtos-conformance/storage-hint-reference
+```
+
+The probe calls native `AccountStorageStat`, comparing successful partial-proof
+updates with full native reconstruction. It checks that a zero-net-change hint
+can retain pruned dictionary entries, while missing paths or changed reference
+counts require real entries. The Rust unit tests retain the resulting hashes.
+The output includes build commands, source/binary hashes and the native log.
 
 Index original archive packages independently of reference replay output:
 

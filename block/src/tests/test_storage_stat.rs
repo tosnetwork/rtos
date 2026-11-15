@@ -7,8 +7,8 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 use crate::{
-    Account, AccountStorageStat, BuilderData, Cell, Deserializable, IBitstring, MerkleProof,
-    StorageStatDict, UInt256, UsageTree, DICT_HASH_MIN_CELLS,
+    Account, AccountStorageStat, BuilderData, Cell, Deserializable, ExceptionCode, IBitstring,
+    MerkleProof, Serializable, StorageStatDict, UInt256, UsageTree, DICT_HASH_MIN_CELLS,
 };
 use std::collections::HashSet;
 
@@ -136,20 +136,23 @@ fn test_add_hint_treats_pruned_shared_cell_as_preexisting() {
     let full_cells = full.total_cells();
     let full_bits = full.total_bits();
 
-    // Prune the whole `shared` subtree (both `shared` and `gc`) out of the dict: look up only
-    // `old_parent` through a usage tree, then build the proof from it. `dict.get(shared)` /
-    // `dict.get(gc)` then walk into a pruned branch and return None. (`gc` must be pruned too,
+    // Retain the changed old-root entry and prove the new root absent; the unchanged
+    // `shared` and `gc` entries may remain pruned. Their lookup must fail, not report
+    // absence. (`gc` must be pruned too,
     // otherwise it would resolve as a dict hit and the overcount would cancel — the real bug
     // overcounts the *children* of the shared cell, not the shared cell itself.)
     let usage = UsageTree::with_root(full_dict.clone());
     let tracked = StorageStatDict::with_hashmap(Some(usage.root_cell()));
     tracked.get(old_parent.repr_hash()).unwrap();
+    assert!(tracked.get(new_parent.repr_hash()).unwrap().is_none());
     let pruned_dict =
         MerkleProof::create_by_usage_tree(&full_dict, &usage).unwrap().proof.virtualize(1);
     let probe = StorageStatDict::with_hashmap(Some(pruned_dict.clone()));
     assert!(probe.get(old_parent.repr_hash()).unwrap().is_some(), "old root entry survives");
-    assert!(probe.get(&shared_hash).unwrap().is_none(), "shared entry is pruned from the dict");
-    assert!(probe.get(gc.repr_hash()).unwrap().is_none(), "shared child entry is pruned too");
+    for hash in [&shared_hash, gc.repr_hash()] {
+        let error = probe.get(hash).expect_err("shared entries remain unknown in this proof");
+        assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+    }
 
     // Prune `shared` out of the old stored state too: old_parent now references a pruned branch.
     let old_parent_pruned =
@@ -173,7 +176,7 @@ fn test_add_hint_treats_pruned_shared_cell_as_preexisting() {
     let mut without_hint = AccountStorageStat::default();
     seed(&mut without_hint);
     let error = without_hint.replace_roots([new_parent.clone()].as_slice().into()).unwrap_err();
-    assert!(error.to_string().contains("incomplete old-state proof"));
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
 
     // With the hint: `shared` is recognised as pre-existing → totals unchanged.
     let mut with_hint = AccountStorageStat::default();
@@ -185,9 +188,91 @@ fn test_add_hint_treats_pruned_shared_cell_as_preexisting() {
     assert_eq!(with_hint.total_cells(), full_cells, "with hint: shared subtree not re-counted");
     assert_eq!(with_hint.total_bits(), full_bits, "hint preserves complete subtree bit count");
     let mut rebuilt = AccountStorageStat::default();
-    rebuilt.replace_roots([new_parent].as_slice().into()).unwrap();
+    rebuilt.replace_roots([new_parent.clone()].as_slice().into()).unwrap();
     let expected = rebuilt.calc_dict().unwrap().unwrap().repr_hash().clone();
     assert_eq!(with_hint.calc_dict().unwrap().unwrap().repr_hash(), &expected);
+    // Independently reproduced by TOS 5af405d AccountStorageStat with the same
+    // forced-pruned leaves: three cells, 96 bits and this committed dictionary.
+    assert_eq!(
+        expected.to_hex_string(),
+        "cded6e98b8c8cc52e4d5c8ce8bacda63bd67f4578c6f98f2d72ea723f9314b38"
+    );
+
+    // A hinted cell whose reference count changes needs its actual dictionary
+    // entry; the hint proves existence, not a reference count.
+    let mut changed_count = AccountStorageStat::default();
+    seed(&mut changed_count);
+    changed_count.add_hint(&loaded);
+    let error = changed_count
+        .replace_roots([new_parent.clone(), shared.clone()].as_slice().into())
+        .unwrap_err();
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+
+    let missing_new_parent = node(12, &[shared.clone()]);
+    let error = probe.get(missing_new_parent.repr_hash()).unwrap_err();
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+    let mut missing_path = AccountStorageStat::default();
+    seed(&mut missing_path);
+    missing_path.add_hint(&loaded);
+    let error = missing_path.replace_roots([missing_new_parent].as_slice().into()).unwrap_err();
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+
+    let mut missing_removal_count = AccountStorageStat::default();
+    seed(&mut missing_removal_count);
+    missing_removal_count.add_hint(&loaded);
+    let error = missing_removal_count.remove_cell(&old_parent_pruned).unwrap_err();
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+
+    // Providing that entry makes the same nonzero change valid.
+    let mut complete = AccountStorageStat::default();
+    seed(&mut complete);
+    complete.dict = StorageStatDict::with_hashmap(Some(full_dict));
+    complete.add_hint(&loaded);
+    complete.replace_roots([new_parent.clone(), shared.clone()].as_slice().into()).unwrap();
+    let mut rebuilt = AccountStorageStat::default();
+    rebuilt.replace_roots([new_parent, shared].as_slice().into()).unwrap();
+    assert_eq!(complete.total_cells(), rebuilt.total_cells());
+    assert_eq!(complete.total_bits(), rebuilt.total_bits());
+    assert_eq!(complete.calc_dict().unwrap(), rebuilt.calc_dict().unwrap());
+    assert_eq!(
+        complete.calc_dict().unwrap().unwrap().repr_hash().to_hex_string(),
+        "ed55b9a98fe55894157039e9c494fb1a84324e6a17b717067037c286fa029be5"
+    );
+}
+
+#[test]
+fn storage_stat_unknown_count_cannot_be_flushed_as_a_deletion() {
+    let root = leaf(1);
+    let mut stat = AccountStorageStat::default();
+    stat.replace_roots([root.clone()].as_slice().into()).unwrap();
+    let before = stat.calc_dict().unwrap().cloned();
+    let entry = stat.cache.get_mut(root.repr_hash()).unwrap();
+    entry.ref_count = None;
+    entry.ref_count_diff = 1;
+    stat.dict_updated = false;
+    let error = stat.calc_dict().unwrap_err();
+    assert!(error.to_string().contains("unknown ref_count"));
+    assert_eq!(stat.dict.root(), before.as_ref());
+}
+
+#[test]
+fn storage_stat_hint_preserves_nonzero_merkle_depth() {
+    let proof = MerkleProof::create(&leaf(1), |_| true).unwrap().serialize().unwrap();
+    let old = node(2, &[proof.clone()]);
+    let next = node(3, &[proof.clone()]);
+    let mut stat = AccountStorageStat::default();
+    stat.replace_roots([old.clone()].as_slice().into()).unwrap();
+    stat.calc_dict().unwrap();
+    stat.cache.clear();
+    stat.add_hint(&[old.repr_hash().clone()].into_iter().collect());
+    assert!(stat.hint.contains(old.repr_hash()));
+    assert!(!stat.hint.contains(proof.repr_hash()));
+    stat.replace_roots([next.clone()].as_slice().into()).unwrap();
+    let dict = stat.calc_dict().unwrap().cloned();
+    assert_eq!(stat.dict.get(next.repr_hash()).unwrap().unwrap().max_merkle_depth, 1);
+    let mut rebuilt = AccountStorageStat::default();
+    rebuilt.replace_roots([next].as_slice().into()).unwrap();
+    assert_eq!(dict.as_ref(), rebuilt.calc_dict().unwrap());
 }
 
 // Independent C++ reference vectors cover every ordered list of up to three roots.
