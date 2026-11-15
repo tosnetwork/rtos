@@ -9,17 +9,33 @@ pub(super) fn read(
     id: &BlockIdExt,
     budget: Option<&Arc<HistoryReadBudget>>,
 ) -> Result<Arc<ShardStateStuff>> {
+    read_with_archive_permit(keeper, id, budget, None)
+}
+
+pub(super) fn read_with_archive_permit(
+    keeper: &ShardStatesKeeper,
+    id: &BlockIdExt,
+    budget: Option<&Arc<HistoryReadBudget>>,
+    permit: Option<crate::sync::ArchiveReadPermit>,
+) -> Result<Arc<ShardStateStuff>> {
     if id.seq_no() != 0 {
         fail!("Persistent zero-state reader requires sequence zero");
     }
-    keeper.check_stop()?;
+    let check_stop = || {
+        if permit.as_ref().is_some_and(|permit| permit.permits(&keeper.db)) {
+            Ok(())
+        } else {
+            keeper.check_stop()
+        }
+    };
+    check_stop()?;
     let mut input = keeper
         .db
         .load_shard_state_persistent_obj(&PersistentStatePartId::WholeState(id.clone()))
         .map_err(|error| {
             error.context(format!("Persistent zero-state file unavailable for {id}"))
         })?;
-    read_input(keeper, id, budget, &mut input).map_err(|error| {
+    read_input(keeper, id, budget, &mut input, &check_stop).map_err(|error| {
         if budget.is_some() && !crate::history_read_budget::stops_fallback(&error) {
             error.context(storage::bounded_cell::InvalidBoundedState("persistent zero-state file"))
         } else {
@@ -33,6 +49,7 @@ fn read_input<R: Read + Seek>(
     id: &BlockIdExt,
     budget: Option<&Arc<HistoryReadBudget>>,
     input: &mut R,
+    check_stop: &impl Fn() -> Result<()>,
 ) -> Result<Arc<ShardStateStuff>> {
     let length = usize::try_from(input.seek(SeekFrom::End(0))?)?;
     input.seek(SeekFrom::Start(0))?;
@@ -51,7 +68,7 @@ fn read_input<R: Read + Seek>(
         let mut buffer = [0u8; 64 << 10];
         let mut remaining = length;
         while remaining != 0 {
-            keeper.check_stop()?;
+            check_stop()?;
             let size = remaining.min(buffer.len());
             input.read_exact(&mut buffer[..size])?;
             hash.update(&buffer[..size]);
@@ -71,7 +88,7 @@ fn read_input<R: Read + Seek>(
     bytes.resize(length, 0);
     let mut hash = rtos_block::Sha256::new();
     for chunk in bytes.chunks_mut(64 << 10) {
-        keeper.check_stop()?;
+        check_stop()?;
         input.read_exact(chunk)?;
         hash.update(chunk);
     }

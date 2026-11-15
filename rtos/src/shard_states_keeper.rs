@@ -730,9 +730,12 @@ impl ShardStatesKeeper {
         if block_id.seq_no() == 0 {
             let keeper = self.clone();
             let id = block_id.clone();
-            return tokio::task::spawn_blocking(move || zerostate::read(&keeper, &id, None))
-                .await
-                .map_err(|error| error!("Zero-state reader failed: {error}"))?;
+            let permit = crate::sync::archive_read_permit();
+            return tokio::task::spawn_blocking(move || {
+                zerostate::read_with_archive_permit(&keeper, &id, None, permit)
+            })
+            .await
+            .map_err(|error| error!("Zero-state reader failed: {error}"))?;
         }
         if let Some(state) = self.states.get(block_id) {
             log::trace!("load_state {} FROM CACHE", block_id);

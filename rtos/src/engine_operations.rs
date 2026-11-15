@@ -1778,6 +1778,10 @@ impl EngineOperations for Engine {
         self.db().adjust_states_gc_interval(interval_ms)
     }
 
+    fn archive_read_database(&self) -> Option<Arc<crate::internal_db::InternalDb>> {
+        Some(self.db().clone())
+    }
+
     fn register_service_task(
         &self,
         name: &'static str,

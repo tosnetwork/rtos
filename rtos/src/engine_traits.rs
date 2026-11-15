@@ -1414,6 +1414,12 @@ pub trait EngineOperations: Sync + Send {
 
     // Engine stopping
 
+    /// Database whose reads belong to admitted archive work. Unbacked engines
+    /// receive no shutdown read authority.
+    fn archive_read_database(&self) -> Option<Arc<crate::internal_db::InternalDb>> {
+        None
+    }
+
     /// Atomically register a service before starting its actual worker.
     fn register_service_task(
         &self,
