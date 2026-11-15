@@ -1174,13 +1174,17 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
     .await;
     // Keep all four Engines and their directories alive until every owner
     // drains, including when setup or an assertion above panics.
-    stop_fixture_engines(vec![
-        pair.receiver.clone(),
-        pair.provider.clone(),
-        relays.receiver.clone(),
-        relays.provider.clone(),
-    ])
-    .await;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stop_fixture_engines(vec![
+            pair.receiver.clone(),
+            pair.provider.clone(),
+            relays.receiver.clone(),
+            relays.provider.clone(),
+        ]),
+    )
+    .await
+    .expect("all four real Engine services must drain");
     let (master, shards) = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     master.await.unwrap();
     shards.await.unwrap();
