@@ -103,7 +103,35 @@ async fn mc_live_repair_real_peer_restores_missing_artifacts_and_reopens() {
             let handle = pair.receiver.load_block_handle(pair.master.id()).unwrap().unwrap();
             assert!(handle.is_applied() && handle.has_data() && handle.has_proof());
             let before = pair.provider.overlays_router().unwrap().test_block_download_queries();
+            let waiter_engine = pair.receiver.clone();
+            let waiter_id = pair.master.id().clone();
+            let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut waiter = tokio::spawn(async move {
+                waiter_engine
+                    .shard_states_awaiters()
+                    .wait(&waiter_id, None, || {
+                        registered_tx.send(()).unwrap();
+                        Ok(false)
+                    })
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), registered_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
             let custody = repair_mc_final(pair.receiver.clone(), expected.clone()).await.unwrap();
+            let notified = tokio::time::timeout(Duration::from_secs(2), &mut waiter).await;
+            if notified.is_err() {
+                waiter.abort();
+                let _ = waiter.await;
+            }
+            let state = notified
+                .expect("repair omitted state availability notification")
+                .unwrap()
+                .unwrap()
+                .expect("repair notification must include its state");
+            assert_eq!(state.block_id(), pair.master.id());
+            assert_eq!(state.root_cell().repr_hash(), &pair.master_state_root);
             assert_eq!(custody.block_id(), pair.master.id());
             assert_eq!(custody.state_root(), &pair.master_state_root);
             assert_eq!(custody.parent_id(), &pair.anchor);
@@ -355,10 +383,8 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
     .await;
     // A deliberate regression may poison the receiver's owned worker. Drain
     // both Engines before propagating either that failure or the test panic.
-    let (receiver_stop, provider_stop) = tokio::join!(
-        pair.receiver.clone().wait_stop(),
-        pair.provider.clone().wait_stop(),
-    );
+    let (receiver_stop, provider_stop) =
+        tokio::join!(pair.receiver.clone().wait_stop(), pair.provider.clone().wait_stop(),);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

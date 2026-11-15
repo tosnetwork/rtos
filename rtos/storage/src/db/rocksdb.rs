@@ -57,7 +57,8 @@ impl RocksDb {
     /// Binds this opened writable provider once; cached/epoch callers must pass
     /// the same explicit domain. This does not migrate existing archive IO.
     pub fn bind_archive_domain(
-        self: &Arc<Self>, domain: Arc<crate::archives::context::ArchiveDomain>,
+        self: &Arc<Self>,
+        domain: Arc<crate::archives::context::ArchiveDomain>,
     ) -> Result<crate::archives::context::ArchiveProvider> {
         use crate::archives::context::{ArchiveContextError, ArchiveProvider};
         if !self.archive_binding_writable || self.db.is_none() {
@@ -73,8 +74,12 @@ impl RocksDb {
     /// Test factories must establish a binding explicitly; retrieval never
     /// allocates a domain or silently rebinds a provider.
     #[cfg(test)]
-    pub(crate) fn test_archive_provider(self: &Arc<Self>) -> Result<crate::archives::context::ArchiveProvider> {
-        let domain = self.archive_domain.get()
+    pub(crate) fn test_archive_provider(
+        self: &Arc<Self>,
+    ) -> Result<crate::archives::context::ArchiveProvider> {
+        let domain = self
+            .archive_domain
+            .get()
             .ok_or_else(|| error!("Archive fixture provider was not explicitly bound"))?;
         self.bind_archive_domain(domain.clone())
     }
@@ -93,7 +98,9 @@ impl RocksDb {
         let requested = path.as_ref().join(name);
         let reservation = if matches!(access_type, AccessType::ReadWrite) {
             Some(super::provider_reservation::ProviderReservation::open(&requested)?)
-        } else { None };
+        } else {
+            None
+        };
         Self::open_reserved(requested, spec_cf_opts.into(), access_type, reservation, false)
     }
 
@@ -107,7 +114,13 @@ impl RocksDb {
     ) -> Result<Arc<Self>> {
         owner.verify_existing()?;
         let requested = owner.path().to_path_buf();
-        Self::open_reserved(requested, spec_cf_opts.into(), AccessType::ReadWrite, Some(owner), true)
+        Self::open_reserved(
+            requested,
+            spec_cf_opts.into(),
+            AccessType::ReadWrite,
+            Some(owner),
+            true,
+        )
     }
 
     /// Initial node inspection preserves ordinary configured aliases while
@@ -120,10 +133,18 @@ impl RocksDb {
         let owner = owner.into_owner();
         owner.verify()?;
         let requested = owner.path().to_path_buf();
-        Self::open_reserved(requested, spec_cf_opts.into(), AccessType::ReadWrite, Some(owner), true)
+        Self::open_reserved(
+            requested,
+            spec_cf_opts.into(),
+            AccessType::ReadWrite,
+            Some(owner),
+            true,
+        )
     }
     pub(crate) fn require_strict_recovery_path(&mut self) -> Result<()> {
-        self.reservation.as_mut().ok_or_else(|| error!("Missing recovery provider owner"))?
+        self.reservation
+            .as_mut()
+            .ok_or_else(|| error!("Missing recovery provider owner"))?
             .require_strict_path()?;
         Ok(())
     }
@@ -135,7 +156,9 @@ impl RocksDb {
         reservation: Option<super::provider_reservation::ProviderReservation>,
         existing_only: bool,
     ) -> Result<Arc<Self>> {
-        let path = reservation.as_ref().map_or_else(|| requested.clone(), |guard| guard.path().to_path_buf());
+        let path = reservation
+            .as_ref()
+            .map_or_else(|| requested.clone(), |guard| guard.path().to_path_buf());
         let mut spec_cf_opts = spec_cf_opts.unwrap_or_default();
         let mut options = Self::build_db_options();
         if existing_only {
@@ -158,7 +181,9 @@ impl RocksDb {
             let opt = spec_cf_opts.remove(&cf).unwrap_or_default();
             rocksdb::ColumnFamilyDescriptor::new(cf, opt)
         });
-        if let Some(guard) = &reservation { guard.verify()?; }
+        if let Some(guard) = &reservation {
+            guard.verify()?;
+        }
         let db = match &access_type {
             AccessType::ReadWrite => {
                 DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&options, &path, cfs_opt)?
@@ -180,15 +205,21 @@ impl RocksDb {
 
         // Clean up CFs from old archives in-place.
         if let Some(guard) = &reservation {
-            if let Err(error) = guard.verify() { drop(db); return Err(error.into()); }
+            if let Err(error) = guard.verify() {
+                drop(db);
+                return Err(error.into());
+            }
         }
 
-        if !existing_only && !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
+        if !existing_only
+            && !matches!(access_type, AccessType::ReadOnly | AccessType::Secondary(_))
             && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1")
             && cfs.len() > 100
         {
             match crate::archives::recovery_guard::ensure_provider_clear(
-                &db, path.parent().ok_or_else(|| error!("Missing database parent"))?, &cfs,
+                &db,
+                path.parent().ok_or_else(|| error!("Missing database parent"))?,
+                &cfs,
             ) {
                 Ok(()) => {
                     Self::clean_up_old_cf(&db, &cfs)
@@ -212,17 +243,27 @@ impl RocksDb {
     /// Resume the ordinary legacy-cleanup policy after bootstrap has established
     /// there is no pending root. Recovery opens themselves never call this.
     pub(crate) fn finish_ordinary_bootstrap(&self) -> Result<()> {
-        if !self.archive_binding_writable { return Ok(()); }
-        if let Some(owner) = &self.reservation { owner.verify()?; }
+        if !self.archive_binding_writable {
+            return Ok(());
+        }
+        if let Some(owner) = &self.reservation {
+            owner.verify()?;
+        }
         crate::archives::recovery_guard::ensure_root_controls_clear(self.db())?;
         let path = self.db().path();
         let cfs = DBWithThreadMode::<MultiThreaded>::list_cf(&Options::default(), path)?;
         if cfs.len() > 100 && !cfs.iter().any(|cf| cf == "repair_dependency_leases_v1") {
             match crate::archives::recovery_guard::ensure_provider_clear(
-                self.db(), path.parent().ok_or_else(|| error!("Missing database parent"))?, &cfs,
+                self.db(),
+                path.parent().ok_or_else(|| error!("Missing database parent"))?,
+                &cfs,
             ) {
-                Ok(()) => { Self::clean_up_old_cf(self.db(), &cfs)?; }
-                Err(error) => log::warn!(target: TARGET, "Preserving archive CFs before recovery: {error}"),
+                Ok(()) => {
+                    Self::clean_up_old_cf(self.db(), &cfs)?;
+                }
+                Err(error) => {
+                    log::warn!(target: TARGET, "Preserving archive CFs before recovery: {error}")
+                }
             }
         }
         Ok(())
@@ -410,7 +451,8 @@ impl RocksDb {
     }
 
     pub fn destroy_db(path: impl AsRef<Path>) -> Result<bool> {
-        let Some(guard) = super::provider_reservation::ProviderReservation::destroy(path.as_ref())? else {
+        let Some(guard) = super::provider_reservation::ProviderReservation::destroy(path.as_ref())?
+        else {
             return Ok(false);
         };
         Self::destroy_reserved(&guard)
@@ -951,16 +993,22 @@ pub async fn destroy_rocks_db(path: &str, name: &str) -> rtos_block::Result<()> 
         let result = tokio::task::spawn_blocking(move || -> Result<()> {
             #[cfg(test)]
             let mut _cleanup_completion = None;
-            let Some(guard) = super::provider_reservation::ProviderReservation::destroy(&attempt_path)? else {
+            let Some(guard) =
+                super::provider_reservation::ProviderReservation::destroy(&attempt_path)?
+            else {
                 return Ok(());
             };
             #[cfg(test)]
-            { _cleanup_completion = super::provider_reservation::test_pause_cleanup(guard.path()); }
+            {
+                _cleanup_completion = super::provider_reservation::test_pause_cleanup(guard.path());
+            }
             RocksDb::destroy_reserved(&guard)?;
             guard.remove_directory_if_present()?;
             // Ancestors may belong to another pending Open intent. Leave them.
             Ok(())
-        }).await.map_err(|error| error!("Database cleanup owner failed: {error}"))?;
+        })
+        .await
+        .map_err(|error| error!("Database cleanup owner failed: {error}"))?;
         match result {
             Ok(()) => return Ok(()),
             Err(error) if retryable_destroy_error(&error) => {
@@ -973,17 +1021,26 @@ pub async fn destroy_rocks_db(path: &str, name: &str) -> rtos_block::Result<()> 
 }
 
 fn retryable_destroy_error(error: &anyhow::Error) -> bool {
-    if matches!(error.downcast_ref::<super::provider_reservation::ReservationError>(),
-        Some(super::provider_reservation::ReservationError::Busy(_))) { return true; }
-    let Some(native) = error.downcast_ref::<rocksdb::Error>() else { return false; };
+    if matches!(
+        error.downcast_ref::<super::provider_reservation::ReservationError>(),
+        Some(super::provider_reservation::ReservationError::Busy(_))
+    ) {
+        return true;
+    }
+    let Some(native) = error.downcast_ref::<rocksdb::Error>() else {
+        return false;
+    };
     match native.kind() {
-        rocksdb::ErrorKind::Busy | rocksdb::ErrorKind::TryAgain | rocksdb::ErrorKind::TimedOut => true,
+        rocksdb::ErrorKind::Busy | rocksdb::ErrorKind::TryAgain | rocksdb::ErrorKind::TimedOut => {
+            true
+        }
         rocksdb::ErrorKind::IOError => {
             // RocksDb 0.23 exposes native lock errno only in its message. Do not
             // retry unrelated corruption, permission or disk errors forever.
             let message = native.to_string();
             message.contains("lock hold by current process")
-                || (message.contains("While lock file") && message.contains("Resource temporarily unavailable"))
+                || (message.contains("While lock file")
+                    && message.contains("Resource temporarily unavailable"))
         }
         _ => false,
     }

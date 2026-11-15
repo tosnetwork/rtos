@@ -1,11 +1,13 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Retained OS thread handles. Completion means join, including thread-local destructors.
 use rtos_block::{error, Result};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Condvar, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread::{Builder, JoinHandle, ThreadId},
 };
-use std::thread::{Builder, JoinHandle, ThreadId};
 
 #[derive(Default)]
 struct State {

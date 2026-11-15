@@ -114,7 +114,16 @@ async fn endpoint(seed: u8, profile: WireProfile) -> Endpoint {
     );
     quic.add_key(&[seed; 32], key.id(), quic_addr).unwrap();
     overlay.set_quic(quic.clone()).unwrap();
-    let rldp = RldpNode::with_params(adnl.clone(), vec![observed.clone()], None).unwrap();
+    let rldp = RldpNode::with_params(
+        adnl.clone(),
+        vec![observed.clone()],
+        None,
+        #[cfg(feature = "debug")]
+        None,
+        #[cfg(feature = "debug")]
+        None,
+    )
+    .unwrap();
     overlay.set_rldp(rldp.clone()).unwrap();
     adnl.start_over_udp(vec![rldp, observed]).await.unwrap();
     Endpoint { adnl, overlay, quic, key, udp, quic_addr, token, rejected }

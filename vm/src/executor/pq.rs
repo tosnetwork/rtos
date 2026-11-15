@@ -7,7 +7,6 @@ use super::{
 use crate::stack::StackItem;
 use rtos_block::{fail, Cell, CellType, ExceptionCode, Result, Status};
 use rtos_pq_crypto::{MAX_CONTEXT_BYTES, MAX_MESSAGE_BYTES, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
-const BASE_GAS: i64 = 50_000;
 const CHUNK_BYTES: usize = 127;
 
 /// First global version with PQCHECKSIG_MLDSA44 (F93100).
@@ -21,7 +20,7 @@ pub const PQ_SUITE_MIN_VERSION: u32 = 16;
 pub const PQ_LMS_FEE_HASH_MIN_VERSION: u32 = 16;
 
 fn read_bytes(engine: &mut Engine, cell: Cell, limit: usize) -> Result<Vec<u8>> {
-    read_bytes_priced(engine, cell, limit, 1)
+    read_bytes_priced(engine, cell, limit, 0)
 }
 
 pub(super) fn read_bytes_priced(
@@ -75,7 +74,6 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     if engine.cc.stack.depth() < 4 {
         fail!(ExceptionCode::StackUnderflow);
     }
-    engine.try_use_gas(BASE_GAS)?;
     fetch_stack(engine, 4)?;
     // Type-check all four values before decoding any, in top-to-bottom order.
     let key = engine.cmd.var(0).as_cell()?.clone();
@@ -86,6 +84,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
     let signature = read_bytes(engine, signature, SIGNATURE_BYTES)?;
     let context = read_bytes(engine, context, MAX_CONTEXT_BYTES)?;
     let message = read_bytes(engine, message, MAX_MESSAGE_BYTES)?;
+    engine.register_signature_call()?;
     if key.len() != PUBLIC_KEY_BYTES || signature.len() != SIGNATURE_BYTES {
         fail!(ExceptionCode::CellUnderflow, "incorrect ML-DSA-44 input length");
     }
@@ -96,7 +95,7 @@ pub(super) fn execute_pq_mldsa44(engine: &mut Engine) -> Status {
         }
         Err(_) => fail!(ExceptionCode::CellUnderflow, "incorrect ML-DSA-44 input length"),
     };
-    // Deliberately do not consult chksig_always_succeed or the classic free-call allowance.
+    // The signature override flag does not bypass the PQ verifier.
     engine.cc.stack.push(StackItem::boolean(valid));
     Ok(())
 }
@@ -116,9 +115,9 @@ pub(super) fn execute_pq_falcon512(engine: &mut Engine) -> Status {
     let key = engine.cmd.var(0).as_cell()?.clone();
     let signature = engine.cmd.var(1).as_cell()?.clone();
     let message = engine.cmd.var(2).as_cell()?.clone();
-    let key = read_bytes(engine, key, PUBLIC_KEY_BYTES)?;
-    let signature = read_bytes(engine, signature, SIGNATURE_BYTES)?;
-    let message = read_bytes(engine, message, MAX_MESSAGE_BYTES)?;
+    let key = read_bytes_priced(engine, key, PUBLIC_KEY_BYTES, 1)?;
+    let signature = read_bytes_priced(engine, signature, SIGNATURE_BYTES, 1)?;
+    let message = read_bytes_priced(engine, message, MAX_MESSAGE_BYTES, 1)?;
     if key.len() != PUBLIC_KEY_BYTES || signature.len() != SIGNATURE_BYTES {
         fail!(ExceptionCode::CellUnderflow, "incorrect Falcon-512 input length");
     }
@@ -129,7 +128,7 @@ pub(super) fn execute_pq_falcon512(engine: &mut Engine) -> Status {
         }
         Err(_) => fail!(ExceptionCode::CellUnderflow, "incorrect Falcon-512 input length"),
     };
-    // Deliberately do not consult chksig_always_succeed or the classic free-call allowance.
+    // The signature override flag does not bypass the PQ verifier.
     engine.cc.stack.push(StackItem::boolean(valid));
     Ok(())
 }

@@ -815,8 +815,12 @@ impl PendingFinalityStore {
         let mut owner = None;
         for entry in entries {
             let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("tmp") { continue; }
-            let text = path.file_stem().and_then(|s| s.to_str())
+            if path.extension().and_then(|s| s.to_str()) != Some("tmp") {
+                continue;
+            }
+            let text = path
+                .file_stem()
+                .and_then(|s| s.to_str())
                 .ok_or_else(|| error!("Invalid interrupted canonical reference name"))?;
             let id: UInt256 = text.parse()?;
             if text != id.to_hex_string() || owner.is_some() {
@@ -827,7 +831,7 @@ impl PendingFinalityStore {
             }
             let acknowledged = self.directory.join(format!("{text}.acked"));
             match std::fs::symlink_metadata(&acknowledged) {
-                Ok(metadata) if metadata.file_type().is_file() => {},
+                Ok(metadata) if metadata.file_type().is_file() => {}
                 _ => fail!("Interrupted canonical reference lacks original acknowledged source"),
             }
             if PendingFinalityRecord::read(&acknowledged)?.id()? != id {
@@ -1172,9 +1176,13 @@ pub fn scan_pending_finality_for_bootstrap(root: &Path) -> Result<PendingFinalit
     scan_pending_finality_inner(root, true)
 }
 
-fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> Result<PendingFinalityBootstrapScan> {
+fn scan_pending_finality_inner(
+    root: &Path,
+    allow_certificate_replay: bool,
+) -> Result<PendingFinalityBootstrapScan> {
     let base = root.join("consensus/v2");
-    let mut result = PendingFinalityBootstrapScan { ready: Vec::new(), deferred_certificate_replay: Vec::new() };
+    let mut result =
+        PendingFinalityBootstrapScan { ready: Vec::new(), deferred_certificate_replay: Vec::new() };
     if !base.exists() {
         return Ok(result);
     }
@@ -1211,9 +1219,19 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
                 false
             };
             let resume_compaction = path.extension().and_then(|s| s.to_str()) == Some("acked")
-                && interrupted_reference.as_ref().is_some_and(|id|
-                    path.file_stem().and_then(|s| s.to_str()) == Some(id.to_hex_string().as_str()));
-            paths.push((if resume_compaction { 0u8 } else if resume_ack { 1u8 } else { 2u8 }, path));
+                && interrupted_reference.as_ref().is_some_and(|id| {
+                    path.file_stem().and_then(|s| s.to_str()) == Some(id.to_hex_string().as_str())
+                });
+            paths.push((
+                if resume_compaction {
+                    0u8
+                } else if resume_ack {
+                    1u8
+                } else {
+                    2u8
+                },
+                path,
+            ));
         }
         // paths() has already enforced regular-file and physical temporary
         // quotas. Only a complete, exact source identity can be offered to the
@@ -1223,7 +1241,9 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
             if path.extension().and_then(|s| s.to_str()) != Some("tmp") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if stem.len() != 64 || !stem.bytes().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
@@ -1235,9 +1255,12 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
             // Its retained certificate must be reconstructed through the normal
             // checked session, not by trusting or deleting that JSON prefix.
             if let Err(error) = PendingFinalityRecord::read(&path) {
-                let interrupted_json = error.downcast_ref::<serde_json::Error>()
-                    .is_some_and(|error| error.is_eof());
-                if allow_certificate_replay && interrupted_json && !store.intents.pending()?.is_empty() {
+                let interrupted_json =
+                    error.downcast_ref::<serde_json::Error>().is_some_and(|error| error.is_eof());
+                if allow_certificate_replay
+                    && interrupted_json
+                    && !store.intents.pending()?.is_empty()
+                {
                     result.deferred_certificate_replay.push(namespace.path());
                     continue 'namespaces;
                 }
@@ -1269,7 +1292,8 @@ fn scan_pending_finality_inner(root: &Path, allow_certificate_replay: bool) -> R
                     continue;
                 }
             } else if path.extension().and_then(|s| s.to_str()) == Some("json")
-                && interrupted_reference.as_ref() == Some(&record.id()?) {
+                && interrupted_reference.as_ref() == Some(&record.id()?)
+            {
                 // The ACK branch above already checked this duplicate pending
                 // record byte for byte. Offer the original source only once.
                 continue;
@@ -1371,7 +1395,9 @@ enum SourceStage {
 }
 impl SourceFinalityDelivery {
     pub(super) fn notify_ready(&self) {
-        if let Some(callback) = &self.ready_callback { callback(); }
+        if let Some(callback) = &self.ready_callback {
+            callback();
+        }
     }
     fn operation_timer(&self, operation: &'static str) -> SourceOperationTimer<'_> {
         SourceOperationTimer { source: self, operation, started: std::time::Instant::now() }
@@ -1433,7 +1459,10 @@ impl SourceFinalityDelivery {
         let _timing = self.operation_timer("prepare_intents");
         self.intents.prepare(has_existing_certificates)
     }
-    pub(crate) fn prepare_database_intents(&self, certificates: &[crate::database::FinalCertRecord]) -> Result<()> {
+    pub(crate) fn prepare_database_intents(
+        &self,
+        certificates: &[crate::database::FinalCertRecord],
+    ) -> Result<()> {
         self.intents.prepare_database_replay(&self.runtime, certificates)
     }
     pub(crate) fn bind_start(&self, anchor: BlockIdExt) -> Result<()> {
@@ -1464,7 +1493,8 @@ impl SourceFinalityDelivery {
         )
     }
     pub(crate) fn sealed_output_requirements(
-        &self, id: &crate::block::RawCandidateId,
+        &self,
+        id: &crate::block::RawCandidateId,
     ) -> Result<Option<Vec<crate::finality_recovery::ExpectedFinalityOutput>>> {
         self.intents.sealed_output_requirements(&self.runtime, id)
     }
@@ -1519,34 +1549,41 @@ impl SourceFinalityDelivery {
             // output record. A past body wait alone cannot identify a later
             // stall once ResolveCandidate has returned its payload.
             log::debug!(target: "simplex_resolver",
-                "FINALITY_OUTPUT_STAGE: session={} record_id={} block_id={} final={} stage={}",
-                self.runtime.session_id().to_hex_string(), id.to_hex_string(), record.block_id,
-                record.is_final,
-                match stages.get(&id) {
-                    None => "new",
-                    Some(SourceStage::Consumed) => "consumed",
-                    Some(SourceStage::AcceptanceConsumed) => "acceptance_consumed",
-                    Some(SourceStage::Running) => "running",
-                    Some(SourceStage::Retry(_)) => "retry",
-                    Some(SourceStage::Durable(_, _)) => "durable",
-                    Some(SourceStage::Accepting) => "accepting",
-                    Some(SourceStage::AcceptanceRetry(_, _, _)) => "acceptance_retry",
-                    Some(SourceStage::Accepted(_, _)) => "accepted",
-                    Some(SourceStage::Acknowledging(_, _)) => "acknowledging",
-                });
+            "FINALITY_OUTPUT_STAGE: session={} record_id={} block_id={} final={} stage={}",
+            self.runtime.session_id().to_hex_string(), id.to_hex_string(), record.block_id,
+            record.is_final,
+            match stages.get(&id) {
+                None => "new",
+                Some(SourceStage::Consumed) => "consumed",
+                Some(SourceStage::AcceptanceConsumed) => "acceptance_consumed",
+                Some(SourceStage::Running) => "running",
+                Some(SourceStage::Retry(_)) => "retry",
+                Some(SourceStage::Durable(_, _)) => "durable",
+                Some(SourceStage::Accepting) => "accepting",
+                Some(SourceStage::AcceptanceRetry(_, _, _)) => "acceptance_retry",
+                Some(SourceStage::Accepted(_, _)) => "accepted",
+                Some(SourceStage::Acknowledging(_, _)) => "acknowledging",
+            });
             match stages.get(&id) {
                 Some(SourceStage::AcceptanceConsumed) => return Ok(None),
                 Some(SourceStage::Running) => return Ok(None),
                 Some(SourceStage::Accepting) => return Ok(None),
-                Some(SourceStage::AcceptanceRetry(at, _, _)) if std::time::Instant::now() < *at => return Ok(None),
+                Some(SourceStage::AcceptanceRetry(at, _, _)) if std::time::Instant::now() < *at => {
+                    return Ok(None)
+                }
                 Some(SourceStage::AcceptanceRetry(_, _, _)) => {
-                    let Some(SourceStage::AcceptanceRetry(_, receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    let Some(SourceStage::AcceptanceRetry(_, receipt, draft)) = stages.remove(&id)
+                    else {
+                        unreachable!()
+                    };
                     stages.insert(id.clone(), SourceStage::Accepting);
                     drop(stages);
                     return self.begin_acceptance(id, receipt, draft);
                 }
                 Some(SourceStage::Accepted(_, _)) => {
-                    let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+                    let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else {
+                        unreachable!()
+                    };
                     stages.insert(id.clone(), SourceStage::AcceptanceConsumed);
                     return Ok(Some((receipt, draft)));
                 }
@@ -1667,7 +1704,8 @@ impl SourceFinalityDelivery {
         receipt: UInt256,
         draft: FinalizedDeliveryDraft,
     ) -> Result<Option<(UInt256, FinalizedDeliveryDraft)>> {
-        let request = PendingFinalityRecord::from_draft(&self.runtime, &draft)?.request(receipt.clone());
+        let request =
+            PendingFinalityRecord::from_draft(&self.runtime, &draft)?.request(receipt.clone());
         let owner = self.clone();
         let callback_id = id.clone();
         let callback_receipt = receipt.clone();
@@ -1700,7 +1738,9 @@ impl SourceFinalityDelivery {
         }
         let mut stages = self.stages.lock().unwrap();
         if matches!(stages.get(&id), Some(SourceStage::Accepted(_, _))) {
-            let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else { unreachable!() };
+            let Some(SourceStage::Accepted(receipt, draft)) = stages.remove(&id) else {
+                unreachable!()
+            };
             stages.insert(id.clone(), SourceStage::AcceptanceConsumed);
             return Ok(Some((receipt, draft)));
         }
@@ -1851,13 +1891,19 @@ pub(crate) mod tests {
     use consensus_common::finality_delivery::{DurableFinalitySink, FinalizedDeliveryCompletion};
     use rtos_block::*;
 
+    type HeldAcceptances = Vec<(CanonicalFinalityRequest, Box<dyn FnOnce(Result<()>) + Send>)>;
+
     #[derive(Default)]
     pub(crate) struct HeldSink(
         pub(crate) Mutex<Vec<(FinalizedDeliveryDraft, FinalizedDeliveryCompletion)>>,
-        pub(crate) Mutex<Option<Vec<(CanonicalFinalityRequest, Box<dyn FnOnce(Result<()>) + Send>)>>>,
+        pub(crate) Mutex<Option<HeldAcceptances>>,
     );
     impl DurableFinalitySink for HeldSink {
-        fn await_accepted(&self, request: CanonicalFinalityRequest, done: Box<dyn FnOnce(Result<()>) + Send>) -> Result<()> {
+        fn await_accepted(
+            &self,
+            request: CanonicalFinalityRequest,
+            done: Box<dyn FnOnce(Result<()>) + Send>,
+        ) -> Result<()> {
             let mut pending = self.1.lock().unwrap();
             if let Some(pending) = pending.as_mut() {
                 pending.push((request, done));
@@ -2035,8 +2081,12 @@ pub(crate) mod tests {
         );
         let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
         complete(Err(error!("WAL failed")));
-        let recovered = scan_pending_finality(temp.path()).unwrap();
-        assert_eq!(recovered.len(), 1);
+        let recovered = crate::authenticated_fixture::wait_for_source_release(|| {
+            let recovered = scan_pending_finality(temp.path())?;
+            Ok((!recovered.is_empty()).then_some(recovered))
+        })
+        .unwrap();
+        assert_eq!(recovered.len(), 1, "released source scan {}", temp.path().display());
         assert_eq!(recovered[0].record().created_at_unix_secs, 123456);
         recovered.into_iter().next().unwrap().acknowledge(UInt256::from([3; 32])).unwrap();
         assert!(scan_pending_finality(temp.path()).unwrap().is_empty());
@@ -2047,36 +2097,59 @@ pub(crate) mod tests {
             let temp = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
             let (_, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
-            let mut records = [PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
-                PendingFinalityRecord::from_draft(&runtime, &second).unwrap()];
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let mut records = [
+                PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
+                PendingFinalityRecord::from_draft(&runtime, &second).unwrap(),
+            ];
             records.sort_by_key(|record| record.id().unwrap().to_hex_string());
-            let record = &records[1]; let id = record.id().unwrap();
+            let record = &records[1];
+            let id = record.id().unwrap();
             let store = PendingFinalityStore::open(&namespace).unwrap();
-            for source in &records { store.retain(source).unwrap(); }
+            for source in &records {
+                store.retain(source).unwrap();
+            }
             let old_receipt = UInt256::from([3; 32]);
             store.acknowledge(&id, old_receipt.clone()).unwrap();
             let ack = store.directory.join(format!("{}.acked", id.to_hex_string()));
             let original_ack = std::fs::read(&ack).unwrap();
             let reference = store.reference_path(&id);
             std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
-            let mut metadata: DiskRecord = serde_json::from_slice(&record.encode().unwrap()).unwrap();
-            metadata.data.clear(); metadata.signature_set.clear();
+            let mut metadata: DiskRecord =
+                serde_json::from_slice(&record.encode().unwrap()).unwrap();
+            metadata.data.clear();
+            metadata.signature_set.clear();
             let expected = serde_json::to_vec(&CanonicalReference {
-                recovery_binding: None, schema: 1, node_receipt: old_receipt.to_hex_string(),
-                digest: UInt256::calc_file_hash(&record.encode().unwrap()).to_hex_string(), metadata,
-            }).unwrap();
-            let bytes = match mode { 0 => Vec::new(), 1 => expected[..expected.len()/2].to_vec(), _ => expected };
-            let unfinished = reference.with_extension("tmp"); std::fs::write(&unfinished, &bytes).unwrap();
+                recovery_binding: None,
+                schema: 1,
+                node_receipt: old_receipt.to_hex_string(),
+                digest: UInt256::calc_file_hash(&record.encode().unwrap()).to_hex_string(),
+                metadata,
+            })
+            .unwrap();
+            let bytes = match mode {
+                0 => Vec::new(),
+                1 => expected[..expected.len() / 2].to_vec(),
+                _ => expected,
+            };
+            let unfinished = reference.with_extension("tmp");
+            std::fs::write(&unfinished, &bytes).unwrap();
             drop(store);
             let recovered = scan_pending_finality(temp.path()).unwrap();
             assert_eq!(recovered.len(), 2, "unfinished reference must offer its full original ACK for authenticated node takeover");
-            assert_eq!(recovered[0].record().id().unwrap(), id, "resume the owner of the reference temporary first");
+            assert_eq!(
+                recovered[0].record().id().unwrap(),
+                id,
+                "resume the owner of the reference temporary first"
+            );
             assert_eq!(std::fs::read(&unfinished).unwrap(), bytes);
             assert_eq!(std::fs::read(&ack).unwrap(), original_ack);
             assert!(!reference.exists(), "scanning must not commit an uncertain reference");
             let fresh_receipt = UInt256::from([4; 32]);
-            for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
+            for source in recovered {
+                source.acknowledge(fresh_receipt.clone()).unwrap();
+            }
             assert!(!unfinished.exists() && !ack.exists());
             let store = PendingFinalityStore::open(&namespace).unwrap();
             let compacted = store.reference(&id).unwrap().unwrap();
@@ -2090,33 +2163,52 @@ pub(crate) mod tests {
         for conflict in [false, true] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, draft) = fixture();
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
-            let id = record.id().unwrap(); let store = PendingFinalityStore::open(&namespace).unwrap();
-            store.retain(&record).unwrap(); store.acknowledge(&id, UInt256::from([3;32])).unwrap();
-            let reference = store.reference_path(&id); std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
-            let temporary = reference.with_extension("tmp"); std::fs::write(&temporary, b"{interrupted").unwrap();
-            if conflict { std::fs::write(&reference, b"untrusted committed conflict").unwrap(); }
-            else { std::fs::remove_file(store.directory.join(format!("{}.acked", id.to_hex_string()))).unwrap(); }
+            let id = record.id().unwrap();
+            let store = PendingFinalityStore::open(&namespace).unwrap();
+            store.retain(&record).unwrap();
+            store.acknowledge(&id, UInt256::from([3; 32])).unwrap();
+            let reference = store.reference_path(&id);
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            let temporary = reference.with_extension("tmp");
+            std::fs::write(&temporary, b"{interrupted").unwrap();
+            if conflict {
+                std::fs::write(&reference, b"untrusted committed conflict").unwrap();
+            } else {
+                std::fs::remove_file(store.directory.join(format!("{}.acked", id.to_hex_string())))
+                    .unwrap();
+            }
             drop(store);
-            assert!(scan_pending_finality(temp.path()).is_err(), "missing ACK or committed conflict must not become recovery authority");
+            assert!(
+                scan_pending_finality(temp.path()).is_err(),
+                "missing ACK or committed conflict must not become recovery authority"
+            );
             assert_eq!(std::fs::read(&temporary).unwrap(), b"{interrupted");
         }
     }
 
     #[test]
     fn source_finality_interrupted_ack_replays_first_without_promoting_temporary() {
-        for temporary_bytes in [Vec::new(), b"{torn".to_vec(), b"untrusted complete-looking ACK".to_vec()] {
+        for temporary_bytes in
+            [Vec::new(), b"{torn".to_vec(), b"untrusted complete-looking ACK".to_vec()]
+        {
             let temp = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
             let (other_runtime, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
             assert_eq!(runtime.session_id(), other_runtime.session_id());
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
-            let mut records = [PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
-                PendingFinalityRecord::from_draft(&runtime, &second).unwrap()];
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let mut records = [
+                PendingFinalityRecord::from_draft(&runtime, &first).unwrap(),
+                PendingFinalityRecord::from_draft(&runtime, &second).unwrap(),
+            ];
             records.sort_by_key(|record| record.id().unwrap().to_hex_string());
             let store = PendingFinalityStore::open(&namespace).unwrap();
-            for record in &records { store.retain(record).unwrap(); }
+            for record in &records {
+                store.retain(record).unwrap();
+            }
             let last = records[1].id().unwrap();
             let pending = store.directory.join(format!("{}.json", last.to_hex_string()));
             let original = std::fs::read(&pending).unwrap();
@@ -2131,8 +2223,12 @@ pub(crate) mod tests {
             assert_eq!(std::fs::read(&pending).unwrap(), original);
             assert!(!pending.with_extension("acked").exists(), "scan is not an acknowledgement");
             let fresh_receipt = UInt256::from([3; 32]);
-            for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
-            let ack: AcknowledgedRecord = serde_json::from_slice(&std::fs::read(pending.with_extension("acked")).unwrap()).unwrap();
+            for source in recovered {
+                source.acknowledge(fresh_receipt.clone()).unwrap();
+            }
+            let ack: AcknowledgedRecord =
+                serde_json::from_slice(&std::fs::read(pending.with_extension("acked")).unwrap())
+                    .unwrap();
             assert_eq!(ack.node_receipt, fresh_receipt.to_hex_string());
             assert_eq!(serde_json::to_vec(&ack.record).unwrap(), original);
             assert!(!temporary.exists());
@@ -2146,7 +2242,8 @@ pub(crate) mod tests {
         let (runtime, first) = fixture_seqno(true, ShardIdent::masterchain(), 1);
         let (_, second) = fixture_seqno(true, ShardIdent::masterchain(), 2);
         let (_, third) = fixture_seqno(true, ShardIdent::masterchain(), 3);
-        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let namespace =
+            PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
         let store = PendingFinalityStore::open(&namespace).unwrap();
         for draft in [&first, &second] {
             store.retain(&PendingFinalityRecord::from_draft(&runtime, draft).unwrap()).unwrap();
@@ -2168,9 +2265,12 @@ pub(crate) mod tests {
         drop(recovered);
         let recovered = scan_pending_finality(temp.path()).unwrap();
         let fresh_receipt = UInt256::from([3; 32]);
-        for source in recovered { source.acknowledge(fresh_receipt.clone()).unwrap(); }
-        let ack: AcknowledgedRecord = serde_json::from_slice(
-            &std::fs::read(pending.with_extension("acked")).unwrap()).unwrap();
+        for source in recovered {
+            source.acknowledge(fresh_receipt.clone()).unwrap();
+        }
+        let ack: AcknowledgedRecord =
+            serde_json::from_slice(&std::fs::read(pending.with_extension("acked")).unwrap())
+                .unwrap();
         assert_eq!(ack.node_receipt, fresh_receipt.to_hex_string());
         assert_eq!(serde_json::to_vec(&ack.record).unwrap(), bytes);
         assert!(!temporary.exists() && !pending.exists());
@@ -2182,31 +2282,58 @@ pub(crate) mod tests {
         for empty in [false, true] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, draft) = fixture();
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let sink = Arc::new(HeldSink::default());
-            let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            let source =
+                SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
             source.prepare_intents(false).unwrap();
             source.bind_start(runtime.pin().zerostate.clone()).unwrap();
-            let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
-            let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof).unwrap().to_node().candidate;
+            let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                proof,
+            )) = &draft.finality
+            else {
+                unreachable!()
+            };
+            let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof)
+                .unwrap()
+                .to_node()
+                .candidate;
             let hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate).unwrap());
             let event = crate::simplex_state::BlockFinalizedEvent {
-                slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash.clone(), block_id: None,
+                slot: crate::block::SlotIndex::new(proof.slot),
+                block_hash: hash.clone(),
+                block_id: None,
                 certificate: Arc::new(crate::certificate::Certificate {
-                    vote: crate::simplex_state::FinalizeVote { slot: crate::block::SlotIndex::new(proof.slot), block_hash: hash },
-                    signatures: proof.signatures.iter().enumerate().map(|(i, signature)| crate::certificate::VoteSignature {
-                        validator_idx: crate::block::ValidatorIndex::new(i as u32), signature: signature.signature.clone(),
-                    }).collect(),
+                    vote: crate::simplex_state::FinalizeVote {
+                        slot: crate::block::SlotIndex::new(proof.slot),
+                        block_hash: hash,
+                    },
+                    signatures: proof
+                        .signatures
+                        .iter()
+                        .enumerate()
+                        .map(|(i, signature)| crate::certificate::VoteSignature {
+                            validator_idx: crate::block::ValidatorIndex::new(i as u32),
+                            signature: signature.signature.clone(),
+                        })
+                        .collect(),
                 }),
             };
             source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
             let original = record.encode().unwrap();
-            let temporary = source.store.directory.join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
-            let prefix = if empty { &original[..0] } else { &original[..original.len()/2] };
+            let temporary = source
+                .store
+                .directory
+                .join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
+            let prefix = if empty { &original[..0] } else { &original[..original.len() / 2] };
             std::fs::write(&temporary, prefix).unwrap();
             drop(source);
-            assert!(scan_pending_finality(temp.path()).is_err(), "strict scanner must not hide unfinished evidence");
+            assert!(
+                scan_pending_finality(temp.path()).is_err(),
+                "strict scanner must not hide unfinished evidence"
+            );
             let report = scan_pending_finality_for_bootstrap(temp.path()).unwrap();
             assert!(report.ready.is_empty());
             assert_eq!(report.deferred_certificate_replay, vec![namespace.clone()]);
@@ -2216,9 +2343,11 @@ pub(crate) mod tests {
             drop(report);
             // Retained certificate provenance authorizes no overwrite of a
             // different uncertain identity, even under a genuine runtime.
-            let unrelated = temporary.with_file_name(format!("{}.tmp", UInt256::from([7; 32]).to_hex_string()));
+            let unrelated =
+                temporary.with_file_name(format!("{}.tmp", UInt256::from([7; 32]).to_hex_string()));
             std::fs::rename(&temporary, &unrelated).unwrap();
-            let blocked = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            let blocked =
+                SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
             assert!(blocked.poll(draft.clone()).is_err());
             assert!(sink.0.lock().unwrap().is_empty());
             assert_eq!(std::fs::read(&unrelated).unwrap(), prefix);
@@ -2227,7 +2356,8 @@ pub(crate) mod tests {
             std::fs::rename(&unrelated, &temporary).unwrap();
             // The authenticated runtime's ordinary candidate replay performs the
             // existing retain operation. Scanning supplied no body or receipt.
-            let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+            let source =
+                SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
             source.prepare_intents(true).unwrap();
             assert_eq!(source.pending_intents().unwrap().len(), 1);
             assert!(source.poll(draft).unwrap().is_none());
@@ -2244,10 +2374,12 @@ pub(crate) mod tests {
     fn source_finality_incomplete_retention_without_certificate_still_refuses_bootstrap() {
         let temp = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, draft) = fixture();
-        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let namespace =
+            PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
         let store = PendingFinalityStore::open(&namespace).unwrap();
         let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
-        let temporary = store.directory.join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
+        let temporary =
+            store.directory.join(format!("{}.tmp", record.id().unwrap().to_hex_string()));
         std::fs::write(&temporary, b"{\"schema\":").unwrap();
         drop(store);
         assert!(scan_pending_finality_for_bootstrap(temp.path()).is_err());
@@ -2259,15 +2391,25 @@ pub(crate) mod tests {
         for kind in ["empty", "torn", "wrong_identity"] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
             let (runtime, draft) = fixture();
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let store = PendingFinalityStore::open(&namespace).unwrap();
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
-            let name = if kind == "wrong_identity" { UInt256::from([7; 32]) } else { record.id().unwrap() };
+            let name = if kind == "wrong_identity" {
+                UInt256::from([7; 32])
+            } else {
+                record.id().unwrap()
+            };
             let temporary = store.directory.join(format!("{}.tmp", name.to_hex_string()));
-            let bytes = match kind { "empty" => Vec::new(), "torn" => b"{torn".to_vec(), _ => record.encode().unwrap() };
+            let bytes = match kind {
+                "empty" => Vec::new(),
+                "torn" => b"{torn".to_vec(),
+                _ => record.encode().unwrap(),
+            };
             std::fs::write(&temporary, &bytes).unwrap();
             drop(store);
-            let error = scan_pending_finality(temp.path()).err().expect("invalid temporary admitted");
+            let error =
+                scan_pending_finality(temp.path()).err().expect("invalid temporary admitted");
             if kind == "wrong_identity" {
                 assert!(error.to_string().contains("filename/domain mismatch"));
             }
@@ -2281,7 +2423,8 @@ pub(crate) mod tests {
     fn source_finality_unknown_temporary_still_blocks_new_mutation() {
         let temp = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, draft) = fixture();
-        let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+        let namespace =
+            PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
         let store = PendingFinalityStore::open(&namespace).unwrap();
         let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
         store.retain(&record).unwrap();
@@ -2375,35 +2518,66 @@ pub(crate) mod tests {
     fn source_finality_progress_notifies_after_wal_and_node_acceptance() {
         for is_final in [false, true] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
-            let (runtime, draft) = fixture_role(is_final,
-                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let (runtime, draft) = fixture_role(
+                is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap(),
+            );
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let sink = Arc::new(HeldSink::default());
             *sink.1.lock().unwrap() = Some(Vec::new());
             let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let observed = wakes.clone();
-            let source = SourceFinalityDelivery::open_with_ready(runtime.clone(), &namespace, sink.clone(), None,
-                Some(Arc::new(move || { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }))).unwrap();
+            let source = SourceFinalityDelivery::open_with_ready(
+                runtime.clone(),
+                &namespace,
+                sink.clone(),
+                None,
+                Some(Arc::new(move || {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+            )
+            .unwrap();
             assert!(source.poll(draft.clone()).unwrap().is_none());
-            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0, "uncommitted work cannot wake a completed continuation");
+            assert_eq!(
+                wakes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "uncommitted work cannot wake a completed continuation"
+            );
             let (_, staged) = sink.0.lock().unwrap().pop().unwrap();
             let receipt = UInt256::from([4; 32]);
             staged(Ok(receipt.clone()));
-            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1, "successful durable stage must wake its awaiter");
+            assert_eq!(
+                wakes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "successful durable stage must wake its awaiter"
+            );
             assert!(!source.consumed(&draft).unwrap());
             assert!(source.poll(draft.clone()).unwrap().is_none());
             let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
             accepted(Err(error!("transient node acceptance failure")));
-            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1, "failed acceptance retains the existing timed retry");
+            assert_eq!(
+                wakes.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "failed acceptance retains the existing timed retry"
+            );
             assert!(!source.consumed(&draft).unwrap());
             let id = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap().id().unwrap();
-            if let Some(SourceStage::AcceptanceRetry(at, _, _)) = source.stages.lock().unwrap().get_mut(&id) {
+            if let Some(SourceStage::AcceptanceRetry(at, _, _)) =
+                source.stages.lock().unwrap().get_mut(&id)
+            {
                 *at = std::time::Instant::now();
-            } else { panic!("acceptance retry missing"); }
+            } else {
+                panic!("acceptance retry missing");
+            }
             assert!(source.poll(draft.clone()).unwrap().is_none());
             let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
             accepted(Ok(()));
-            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2, "successful node acceptance must wake its awaiter");
+            assert_eq!(
+                wakes.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "successful node acceptance must wake its awaiter"
+            );
             assert_eq!(source.poll(draft.clone()).unwrap().unwrap().0, receipt);
             assert!(source.consumed(&draft).unwrap());
             assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2415,30 +2589,46 @@ pub(crate) mod tests {
         for is_final in [false, true] {
             for immediate in [false, true] {
                 let temp = crate::authenticated_fixture::TestDirectory::new();
-                let (runtime, draft) = fixture_role(is_final,
-                    ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
-                let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+                let (runtime, draft) = fixture_role(
+                    is_final,
+                    ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap(),
+                );
+                let namespace = PathBuf::from(
+                    runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap(),
+                );
                 let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
                 let receipt = UInt256::from([4; 32]);
                 let sink = Arc::new(HeldSink::default());
                 if !immediate {
                     *sink.1.lock().unwrap() = Some(Vec::new());
                 }
-                let source = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
+                let source =
+                    SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone())
+                        .unwrap();
                 assert!(!source.consumed(&draft).unwrap());
                 assert!(source.poll(draft.clone()).unwrap().is_none());
                 let (_, staged) = sink.0.lock().unwrap().pop().unwrap();
                 staged(Ok(receipt.clone()));
                 if !immediate {
                     assert!(source.poll(draft.clone()).unwrap().is_none());
-                    assert!(!source.consumed(&draft).unwrap(), "in-flight acceptance cannot complete a source");
+                    assert!(
+                        !source.consumed(&draft).unwrap(),
+                        "in-flight acceptance cannot complete a source"
+                    );
                     let (_, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop().unwrap();
                     accepted(Err(error!("transient node acceptance failure")));
-                    assert!(!source.consumed(&draft).unwrap(), "failure cannot populate completed acceptance");
+                    assert!(
+                        !source.consumed(&draft).unwrap(),
+                        "failure cannot populate completed acceptance"
+                    );
                     assert!(source.poll(draft.clone()).unwrap().is_none());
-                    assert!(sink.1.lock().unwrap().as_ref().unwrap().is_empty(), "retain the retry backoff");
+                    assert!(
+                        sink.1.lock().unwrap().as_ref().unwrap().is_empty(),
+                        "retain the retry backoff"
+                    );
                     if let Some(SourceStage::AcceptanceRetry(at, _, _)) =
-                        source.stages.lock().unwrap().get_mut(&record.id().unwrap()) {
+                        source.stages.lock().unwrap().get_mut(&record.id().unwrap())
+                    {
                         *at = std::time::Instant::now();
                     } else {
                         panic!("failed acceptance must retain its original receipt for retry");
@@ -2449,16 +2639,29 @@ pub(crate) mod tests {
                 }
                 assert_eq!(source.poll(draft.clone()).unwrap().unwrap().0, receipt);
                 for _ in 0..8 {
-                    assert!(source.consumed(&draft).unwrap(), "successful acceptance must remain reusable");
-                    assert!(source.poll(draft.clone()).unwrap().is_none(), "notify the session listener only once");
+                    assert!(
+                        source.consumed(&draft).unwrap(),
+                        "successful acceptance must remain reusable"
+                    );
+                    assert!(
+                        source.poll(draft.clone()).unwrap().is_none(),
+                        "notify the session listener only once"
+                    );
                 }
                 assert!(sink.0.lock().unwrap().is_empty());
                 assert!(sink.1.lock().unwrap().as_ref().is_none_or(Vec::is_empty));
-                assert!(!source.store.delivered_path(&record.id().unwrap()).exists(), "WC acceptance is not MC custody");
+                assert!(
+                    !source.store.delivered_path(&record.id().unwrap()).exists(),
+                    "WC acceptance is not MC custody"
+                );
                 drop(source);
                 *sink.1.lock().unwrap() = Some(Vec::new());
-                let cold = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
-                assert!(!cold.consumed(&draft).unwrap(), "a cold process must reauthenticate node acceptance");
+                let cold = SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone())
+                    .unwrap();
+                assert!(
+                    !cold.consumed(&draft).unwrap(),
+                    "a cold process must reauthenticate node acceptance"
+                );
                 assert!(cold.poll(draft.clone()).unwrap().is_none());
                 let (_, staged) = sink.0.lock().unwrap().pop().expect("cold WAL handoff");
                 staged(Ok(receipt.clone()));
@@ -2477,9 +2680,12 @@ pub(crate) mod tests {
     fn source_finality_cold_workchain_ack_waits_for_acceptance_with_closing_enabled() {
         for is_final in [false, true] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
-            let (runtime, draft) = fixture_role(is_final,
-                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let (runtime, draft) = fixture_role(
+                is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap(),
+            );
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
             let receipt = UInt256::from([4; 32]);
             {
@@ -2489,13 +2695,27 @@ pub(crate) mod tests {
             }
             let sink = Arc::new(HeldSink::default());
             *sink.1.lock().unwrap() = Some(Vec::new());
-            let source = SourceFinalityDelivery::open_with_delivered(runtime, &namespace,
-                sink.clone(), Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody")))).unwrap();
-            assert!(source.poll(draft.clone()).expect("cold WC must use normal acceptance").is_none());
+            let source = SourceFinalityDelivery::open_with_delivered(
+                runtime,
+                &namespace,
+                sink.clone(),
+                Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody"))),
+            )
+            .unwrap();
+            assert!(source
+                .poll(draft.clone())
+                .expect("cold WC must use normal acceptance")
+                .is_none());
             let (_, staged) = sink.0.lock().unwrap().pop().expect("normal WAL staging");
             staged(Ok(receipt.clone()));
             assert!(source.poll(draft.clone()).unwrap().is_none(), "WAL handoff is not acceptance");
-            let (request, accepted) = sink.1.lock().unwrap().as_mut().unwrap().pop()
+            let (request, accepted) = sink
+                .1
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .pop()
                 .expect("actual node acceptance must be requested");
             assert_eq!(request.node_receipt, receipt);
             assert_eq!(request.block_id, draft.block_id);
@@ -2628,8 +2848,11 @@ pub(crate) mod tests {
         >,
     }
     impl consensus_common::finality_delivery::DurableFinalitySink for CanonicalSink {
-        fn await_accepted(&self, request: CanonicalFinalityRequest,
-            done: Box<dyn FnOnce(Result<()>) + Send>) -> Result<()> {
+        fn await_accepted(
+            &self,
+            request: CanonicalFinalityRequest,
+            done: Box<dyn FnOnce(Result<()>) + Send>,
+        ) -> Result<()> {
             self.acceptances.lock().unwrap().push((request, done));
             Ok(())
         }
@@ -2667,9 +2890,12 @@ pub(crate) mod tests {
     fn source_finality_cold_workchain_reference_waits_for_acceptance_with_closing_enabled() {
         for is_final in [false, true] {
             let temp = crate::authenticated_fixture::TestDirectory::new();
-            let (runtime, draft) = fixture_role(is_final,
-                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
-            let namespace = PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
+            let (runtime, draft) = fixture_role(
+                is_final,
+                ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap(),
+            );
+            let namespace =
+                PathBuf::from(runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap());
             let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
             let receipt = UInt256::from([4; 32]);
             {
@@ -2679,12 +2905,20 @@ pub(crate) mod tests {
                 store.compact(&record, receipt.clone()).unwrap();
             }
             let sink = Arc::new(CanonicalSink::default());
-            let source = SourceFinalityDelivery::open_with_delivered(runtime, &namespace,
-                sink.clone(), Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody")))).unwrap();
+            let source = SourceFinalityDelivery::open_with_delivered(
+                runtime,
+                &namespace,
+                sink.clone(),
+                Some(Arc::new(|_, _| panic!("Workchain cannot mint MC custody"))),
+            )
+            .unwrap();
             assert!(source.poll(draft.clone()).unwrap().is_none());
             let (request, canonical) = sink.lookups.lock().unwrap().pop().unwrap();
             canonical(Ok(canonical_response(request, &draft)));
-            assert!(source.poll(draft.clone()).unwrap().is_none(), "canonical custody is not acceptance");
+            assert!(
+                source.poll(draft.clone()).unwrap().is_none(),
+                "canonical custody is not acceptance"
+            );
             let (request, accepted) = sink.acceptances.lock().unwrap().pop().unwrap();
             assert_eq!(request.node_receipt, receipt);
             assert_eq!(request.block_id, draft.block_id);

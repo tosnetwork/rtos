@@ -118,7 +118,7 @@ async fn open(
         ArchiveSlice::with_data(
             provider.repair_protection().clone(),
             provider.test_archive_provider().unwrap(),
-        &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             pack_root,
             0,
             mode,
@@ -132,7 +132,7 @@ async fn open(
     } else {
         ArchiveSlice::new_empty(
             provider.test_archive_provider().unwrap(),
-        &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            &provider.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             pack_root,
             0,
             mode,

@@ -1,0 +1,516 @@
+{
+  "schema": 1,
+  "qualification": "Selected scenarios only. Unintegrated adapters are refused before execution; no all-scenarios or release qualification.",
+  "fixture_sources": [
+    "expired_member_restart_fixture.py",
+    "first_intent_cut_fixture.py",
+    "network_fault_fixture.py",
+    "observer_budget_fixture.py",
+    "partition_restart_fixture.py",
+    "propagation_receiver_fixture.py",
+    "publication_io_fixture.py",
+    "recovery_quorum_fixture.py",
+    "rotation_fixture.py",
+    "signer_expiry_fixture.py",
+    "source_ack_fault_fixture.py",
+    "source_ack_partition_fixture.py",
+    "source_retention_cut_fixture.py",
+    "successor_ledger_fixture.py",
+    "threshold_fault_fixture.py",
+    "weighted_quorum_fixture.py",
+    "workchain_history_fixture.py"
+  ],
+  "scenarios": [
+    {
+      "id": "matrix4-cpp0",
+      "driver": "mixed_matrix.py",
+      "scope": "Four active members: 0 C++ and 4 Rust; every MC/WC creator and full states",
+      "depends_on": [
+        "matrix4-cpp4"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix4-cpp1",
+      "driver": "mixed_matrix.py",
+      "scope": "Four active members: 1 C++ and 3 Rust; every MC/WC creator and full states",
+      "depends_on": [
+        "matrix4-cpp4"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix4-cpp2",
+      "driver": "mixed_matrix.py",
+      "scope": "Four active members: 2 C++ and 2 Rust; every MC/WC creator and full states",
+      "depends_on": [
+        "matrix4-cpp4"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix4-cpp3",
+      "driver": "mixed_matrix.py",
+      "scope": "Four active members: 3 C++ and 1 Rust; every MC/WC creator and full states",
+      "depends_on": [
+        "matrix4-cpp4"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix4-cpp4",
+      "driver": "mixed_matrix.py",
+      "scope": "Four active members: 4 C++ and 0 Rust; every MC/WC creator and full states",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix3-healthy-control",
+      "driver": "mixed_matrix.py",
+      "scope": "3 active C++ members; all MC/WC creators and full states",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix3-healthy-mixed",
+      "driver": "mixed_matrix.py",
+      "scope": "1 C++ / 2 Rust; same assertions as control",
+      "depends_on": [
+        "matrix3-healthy-control"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix3-threshold-control",
+      "driver": "mixed_matrix.py",
+      "scope": "3 active C++ members; exact quorum, below quorum stall, same-PID recovery",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix3-threshold-mixed",
+      "driver": "mixed_matrix.py",
+      "scope": "1 C++ / 2 Rust; same assertions as control",
+      "depends_on": [
+        "matrix3-threshold-control"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-healthy-control",
+      "driver": "mixed_matrix.py",
+      "scope": "6 active C++ members; all MC/WC creators and full states",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-healthy-mixed",
+      "driver": "mixed_matrix.py",
+      "scope": "3 C++ / 3 Rust; same assertions as control",
+      "depends_on": [
+        "matrix6-healthy-control"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-threshold-control",
+      "driver": "mixed_matrix.py",
+      "scope": "6 active C++ members; exact quorum, below quorum stall, same-PID recovery",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-threshold-mixed",
+      "driver": "mixed_matrix.py",
+      "scope": "3 C++ / 3 Rust; same assertions as control",
+      "depends_on": [
+        "matrix6-threshold-control"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-low-weight-majority-control",
+      "driver": "mixed_matrix.py",
+      "scope": "Five low-weight members cannot finalize without weight30 member5",
+      "depends_on": [],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "matrix6-low-weight-majority-mixed",
+      "driver": "mixed_matrix.py",
+      "scope": "3 C++ / 3 Rust; member5 Rust, bounded stall and recovery",
+      "depends_on": [
+        "matrix6-low-weight-majority-control"
+      ],
+      "execution": "matrix_v1"
+    },
+    {
+      "id": "rotation-control",
+      "driver": "rotation_fixture.py",
+      "scope": "Both predeclared committees: all MC/WC creators",
+      "depends_on": [],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "rotation-mixed",
+      "driver": "rotation_fixture.py",
+      "scope": "Both predeclared committees: all MC/WC creators; two C++ and two Rust per active committee",
+      "depends_on": [
+        "rotation-control"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "exact-weight-control",
+      "driver": "rotation_fixture.py",
+      "scope": "Successor weight40 of60 finality and same-PID recovery",
+      "depends_on": [],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "exact-weight-mixed",
+      "driver": "rotation_fixture.py",
+      "scope": "Successor weight40 of60 finality and same-PID recovery; two C++ and two Rust per active committee",
+      "depends_on": [
+        "exact-weight-control"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "necessary-low-weight-control",
+      "driver": "rotation_fixture.py",
+      "scope": "Initial three necessary signers plus successor exact weight40",
+      "depends_on": [],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "necessary-low-weight-mixed",
+      "driver": "rotation_fixture.py",
+      "scope": "Initial three necessary signers plus successor exact weight40; two C++ and two Rust per active committee",
+      "depends_on": [
+        "necessary-low-weight-control"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "observer-budget-control",
+      "driver": "rotation_fixture.py",
+      "scope": "Retired observers cannot replace paused active quorum",
+      "depends_on": [],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "observer-budget-mixed",
+      "driver": "rotation_fixture.py",
+      "scope": "Retired observers cannot replace paused active quorum; two C++ and two Rust per active committee",
+      "depends_on": [
+        "observer-budget-control"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "restart-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "SIGKILL and original-database recovery with fresh own signature and MC/WC creators",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-partition-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-loss-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-reorder-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-duplicate-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "partition-restart-member2",
+      "driver": "rotation_fixture.py",
+      "scope": "Partition across original-database restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "restart-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "SIGKILL and original-database recovery with fresh own signature and MC/WC creators",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-partition-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-loss-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-reorder-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "packet-duplicate-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "Owned namespace packet impairment and authenticated recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "partition-restart-member5",
+      "driver": "rotation_fixture.py",
+      "scope": "Partition across original-database restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "below-quorum-restart",
+      "driver": "rotation_fixture.py",
+      "scope": "Partitioned restart while interrupted member is necessary for quorum",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "signer-expiry",
+      "driver": "rotation_fixture.py",
+      "scope": "Custody expiry with continued peer finality",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "expired-member-restart",
+      "driver": "rotation_fixture.py",
+      "scope": "Expired member returns as nonsigning synchronized observer",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "followup-intent-frontier",
+      "driver": "rotation_fixture.py",
+      "scope": "New intents after original ACK recovery must complete",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "propagation-receiver",
+      "driver": "rotation_fixture.py",
+      "scope": "Native nonvoting receiver validates propagated bodies",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "publication-io",
+      "driver": "rotation_fixture.py",
+      "scope": "Native retained-body fsync EIO and partitioned restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "cold-bootstrap-body",
+      "driver": "rotation_fixture.py",
+      "scope": "Retained exact candidate body delivered after cold restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "first-intent-before-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Initial MC intent interruption at before-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "first-intent-after-partial-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Initial MC intent interruption at after-partial-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "source-retention-after-fsync",
+      "driver": "rotation_fixture.py",
+      "scope": "Source retention interruption at after-fsync",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-intent-after-fsync",
+      "driver": "rotation_fixture.py",
+      "scope": "Source ACK interruption then intent cut at after-fsync",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-retention-before-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Source retention interruption at before-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-intent-before-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Source ACK interruption then intent cut at before-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-retention-after-partial-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Source retention interruption at after-partial-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-intent-after-partial-write",
+      "driver": "rotation_fixture.py",
+      "scope": "Source ACK interruption then intent cut at after-partial-write",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-sync-eio",
+      "driver": "rotation_fixture.py",
+      "scope": "Native ACK storage refusal and original-database recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-partition-sync-eio",
+      "driver": "rotation_fixture.py",
+      "scope": "ACK storage refusal combined with partitioned restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-write-enospc",
+      "driver": "rotation_fixture.py",
+      "scope": "Native ACK storage refusal and original-database recovery",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "source-ack-partition-write-enospc",
+      "driver": "rotation_fixture.py",
+      "scope": "ACK storage refusal combined with partitioned restart",
+      "depends_on": [
+        "rotation-mixed"
+      ],
+      "execution": "rotation_v1"
+    },
+    {
+      "id": "cpp-bootstrap",
+      "driver": "cpp_control.py",
+      "scope": "Pinned native control",
+      "depends_on": [],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "unsigned-bootstrap",
+      "driver": "mixed_bootstrap.py",
+      "scope": "Unsigned Rust follows native peers with matching full state",
+      "depends_on": [
+        "cpp-bootstrap"
+      ],
+      "execution": "unintegrated"
+    },
+    {
+      "id": "required-rust-vote",
+      "driver": "mixed_bootstrap.py",
+      "scope": "C++ alone lacks quorum; Rust participation needed",
+      "depends_on": [
+        "cpp-bootstrap"
+      ],
+      "execution": "unintegrated"
+    }
+  ]
+}

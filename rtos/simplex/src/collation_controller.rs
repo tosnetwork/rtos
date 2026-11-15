@@ -2363,8 +2363,9 @@ impl CollationController {
     }
 
     fn owns_collation_request(&self, slot: SlotIndex, request_id: u32) -> bool {
-        self.precollated(slot).is_some_and(|entry|
-            entry.request.get_request_id() == request_id && !entry.request.is_cancelled())
+        self.precollated(slot).is_some_and(|entry| {
+            entry.request.get_request_id() == request_id && !entry.request.is_cancelled()
+        })
     }
 
     /// Handle a successful collation result. Moved from `SessionProcessor`
@@ -2385,8 +2386,12 @@ impl CollationController {
         // Cancellation/reset or a retry may have replaced this request while
         // its callback was queued. It no longer owns publication or the pipeline.
         if !self.owns_collation_request(slot, request_id) {
-            log::debug!("Session {} ignoring obsolete collation completion: slot {}, request_id={}",
-                self.session_id().to_hex_string(), slot, request_id);
+            log::debug!(
+                "Session {} ignoring obsolete collation completion: slot {}, request_id={}",
+                self.session_id().to_hex_string(),
+                slot,
+                request_id
+            );
             return;
         }
 
@@ -2626,8 +2631,12 @@ impl CollationController {
         instrument!();
 
         if !self.owns_collation_request(slot, request_id) {
-            log::debug!("Session {} ignoring obsolete collation failure: slot {}, request_id={}",
-                self.session_id().to_hex_string(), slot, request_id);
+            log::debug!(
+                "Session {} ignoring obsolete collation failure: slot {}, request_id={}",
+                self.session_id().to_hex_string(),
+                slot,
+                request_id
+            );
             return;
         }
 
@@ -3778,11 +3787,12 @@ impl CollationController {
         //
         // Falls back to raw bytes if canonicalization fails (e.g., in unit tests with
         // mock data that's not valid BOC). In production, all data is valid BOC.
-        let canonical_data = consensus_common::compression::canonicalize_boc(data.data(), BocFlags::all())
-            .unwrap_or_else(|_| data.data().to_vec());
-        let canonical_collated_data = consensus_common::compression::canonicalize_boc(
-            collated_data.data(), BocFlags::Crc32,
-        ).unwrap_or_else(|_| collated_data.data().to_vec());
+        let canonical_data =
+            consensus_common::compression::canonicalize_boc(data.data(), BocFlags::all())
+                .unwrap_or_else(|_| data.data().to_vec());
+        let canonical_collated_data =
+            consensus_common::compression::canonicalize_boc(collated_data.data(), BocFlags::Crc32)
+                .unwrap_or_else(|_| collated_data.data().to_vec());
         let file_hash = UInt256::from_slice(&sha256_digest(&canonical_data));
         let collated_file_hash = UInt256::from_slice(&sha256_digest(&canonical_collated_data));
         log::trace!(

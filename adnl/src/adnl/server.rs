@@ -824,7 +824,9 @@ impl AdnlServer {
         listener.set_reuse_address(true)?;
         listener.bind(&config.address.clone().into())?;
         listener.listen(SOCKET_TCP_BACKLOG)?;
-        let local_addr = listener.local_addr()?.as_socket()
+        let local_addr = listener
+            .local_addr()?
+            .as_socket()
             .ok_or_else(|| error!("ADNL server listener has no IP endpoint"))?;
         tokio::spawn(async move {
             loop {

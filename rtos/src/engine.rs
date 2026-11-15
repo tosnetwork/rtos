@@ -163,7 +163,6 @@ pub struct Engine {
         Option<Arc<crate::validator::retired_session_service::RetiredSessionService>>,
     >,
 
-    shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
     download_block_awaiters: AwaitersPool<BlockDownloadKey, (BlockStuff, BlockProofStuff)>,
@@ -972,12 +971,6 @@ impl Engine {
                     pq_custody,
                     db,
                     candidate_db,
-                    shard_states_awaiters: AwaitersPool::new(
-                        "shard_states_awaiters",
-                        #[cfg(feature = "telemetry")]
-                        engine_telemetry.clone(),
-                        engine_allocated.clone(),
-                    ),
                     block_applying_awaiters: AwaitersPool::new(
                         "block_applying_awaiters",
                         #[cfg(feature = "telemetry")]
@@ -1563,7 +1556,7 @@ impl Engine {
     }
 
     pub fn shard_states_awaiters(&self) -> &AwaitersPool<BlockIdExt, Arc<ShardStateStuff>> {
-        &self.shard_states_awaiters
+        self.shard_states_keeper.state_awaiters()
     }
 
     pub fn block_applying_awaiters(&self) -> &AwaitersPool<BlockIdExt, ()> {
@@ -1893,10 +1886,7 @@ impl Engine {
             let block_n_proof = if let Some(block_data) = cached {
                 let block = BlockStuff::deserialize_block(id.clone(), block_data.clone())?;
                 let proof = create_new_proof_link(&block)?;
-                log::trace!(
-                    "download_and_apply_block_worker {} loaded from candidates cache",
-                    id
-                );
+                log::trace!("download_and_apply_block_worker {} loaded from candidates cache", id);
                 Some((block, proof))
             } else {
                 // for pre-apply only 10 attempts, for apply - infinity

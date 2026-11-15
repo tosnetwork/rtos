@@ -15,7 +15,10 @@ use rtos_block::{error, fail, Result};
 use std::{
     io::SeekFrom,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Debug)]
@@ -44,7 +47,9 @@ pub(super) struct PackageState {
     append_probe: std::sync::Mutex<Option<AppendProbe>>,
 }
 impl PackageState {
-    pub(super) fn view(&self) -> &ArchiveView { &self.view }
+    pub(super) fn view(&self) -> &ArchiveView {
+        &self.view
+    }
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -61,10 +66,14 @@ struct PackageWriter {
 }
 impl std::ops::Deref for PackageWriter {
     type Target = Option<std::fs::File>;
-    fn deref(&self) -> &Self::Target { &self.guard }
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
 }
 impl std::ops::DerefMut for PackageWriter {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.guard }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
 }
 
 pub(crate) const PKG_HEADER_SIZE: usize = 4;
@@ -78,11 +87,14 @@ struct AppendLayout {
 
 impl AppendLayout {
     fn checked(raw_size: u64, entry_size: u64) -> Result<Self> {
-        let entry_offset = raw_size.checked_sub(PKG_HEADER_SIZE as u64)
+        let entry_offset = raw_size
+            .checked_sub(PKG_HEADER_SIZE as u64)
             .ok_or_else(|| error!("Package length is smaller than its header"))?;
-        let total_size = raw_size.checked_add(entry_size)
+        let total_size = raw_size
+            .checked_add(entry_size)
             .ok_or_else(|| error!("Package append size overflow"))?;
-        let logical_size = total_size.checked_sub(PKG_HEADER_SIZE as u64)
+        let logical_size = total_size
+            .checked_sub(PKG_HEADER_SIZE as u64)
             .ok_or_else(|| error!("Package logical size underflow"))?;
         Ok(Self { entry_offset, total_size, logical_size })
     }
@@ -111,14 +123,18 @@ async fn read_header<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Resu
 fn read_header_sync(reader: &mut impl std::io::Read) -> Result<()> {
     let mut bytes = [0; PKG_HEADER_SIZE];
     reader.read_exact(&mut bytes)?;
-    if u32::from_le_bytes(bytes) != PKG_HEADER_MAGIC { fail!("Package file header mismatch"); }
+    if u32::from_le_bytes(bytes) != PKG_HEADER_MAGIC {
+        fail!("Package file header mismatch");
+    }
     Ok(())
 }
 
 impl Package {
     fn ensure_active(&self) -> Result<()> {
         if self.state.retired.load(Ordering::Acquire) {
-            return Err(super::context::ArchiveContextError::Retired(self.state.view.epoch()).into());
+            return Err(
+                super::context::ArchiveContextError::Retired(self.state.view.epoch()).into()
+            );
         }
         Ok(())
     }
@@ -137,9 +153,21 @@ impl Package {
         PackageWriter { guard, _state: state }
     }
 
-    fn from_opened(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, file: Option<std::fs::File>, size: u64) -> Result<Self> {
+    fn from_opened(
+        view: ArchiveView,
+        parent: &ArchiveOperation,
+        path: PathBuf,
+        read_only: bool,
+        file: Option<std::fs::File>,
+        size: u64,
+    ) -> Result<Self> {
         let state = Arc::new(PackageState {
-            view, path, read_only, size: AtomicU64::new(size), write_healthy: AtomicBool::new(true), retired: AtomicBool::new(false),
+            view,
+            path,
+            read_only,
+            size: AtomicU64::new(size),
+            write_healthy: AtomicBool::new(true),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             fail_retirement_close: AtomicBool::new(false),
             #[cfg(test)]
@@ -152,7 +180,13 @@ impl Package {
         Ok(Self { state })
     }
 
-    pub async fn open(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, create: bool) -> Result<Self> {
+    pub async fn open(
+        view: ArchiveView,
+        parent: &ArchiveOperation,
+        path: PathBuf,
+        read_only: bool,
+        create: bool,
+    ) -> Result<Self> {
         if read_only || !create {
             return Self::open_native_existing(view, parent, path, read_only, None).await;
         }
@@ -163,7 +197,12 @@ impl Package {
             // O_CREAT may create the file, so cancellation must be ordered before
             // the open itself, not merely before a later header write.
             job.start()?;
-            let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&native_path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&native_path)?;
             let mut size = file.metadata()?.len();
             std::io::Seek::seek(&mut file, SeekFrom::Start(0))?;
             if size < PKG_HEADER_SIZE as u64 {
@@ -175,11 +214,14 @@ impl Package {
                 std::io::Seek::seek(&mut file, SeekFrom::End(0))?;
             }
             Ok::<_, anyhow::Error>(job.handoff((Some(file), size)))
-        }).await.map_err(|e| error!("Native package create task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package create task failed: {e}"))??;
         phase.check_completion()?;
         let mut package = None;
         handoff.consume(|opened| {
-            package = Some(Self::from_opened(view, &operation, path, false, opened.0.take(), opened.1)?);
+            package =
+                Some(Self::from_opened(view, &operation, path, false, opened.0.take(), opened.1)?);
             Ok(())
         })?;
         phase.complete();
@@ -188,15 +230,25 @@ impl Package {
 
     /// Validate a leased existing package without any repair or creation. Use
     /// the same native descriptor for validation and subsequent append access.
-    pub(crate) async fn open_existing_exact(view: ArchiveView, parent: &ArchiveOperation, path: PathBuf, read_only: bool, logical_size: u64) -> Result<Self> {
-        let expected = logical_size.checked_add(PKG_HEADER_SIZE as u64)
+    pub(crate) async fn open_existing_exact(
+        view: ArchiveView,
+        parent: &ArchiveOperation,
+        path: PathBuf,
+        read_only: bool,
+        logical_size: u64,
+    ) -> Result<Self> {
+        let expected = logical_size
+            .checked_add(PKG_HEADER_SIZE as u64)
             .ok_or_else(|| error!("Protected package size overflow"))?;
         Self::open_native_existing(view, parent, path, read_only, Some(expected)).await
     }
 
     async fn open_native_existing(
-        view: ArchiveView, parent: &ArchiveOperation, path: PathBuf,
-        read_only: bool, expected: Option<u64>,
+        view: ArchiveView,
+        parent: &ArchiveOperation,
+        path: PathBuf,
+        read_only: bool,
+        expected: Option<u64>,
     ) -> Result<Self> {
         let operation = view.inherit(parent)?;
         let native_path = path.clone();
@@ -206,26 +258,47 @@ impl Package {
             // inspects length; protected exact opens also validate the header.
             if read_only && expected.is_none() {
                 let size = std::fs::metadata(&native_path)?.len();
-                if size < PKG_HEADER_SIZE as u64 { fail!("Package file is too short"); }
+                if size < PKG_HEADER_SIZE as u64 {
+                    fail!("Package file is too short");
+                }
                 return Ok::<_, anyhow::Error>(custody.acquisition((None, size)));
             }
-            let mut file = std::fs::OpenOptions::new().read(true).write(!read_only).open(&native_path)
-                .map_err(|error| error!("Existing package open failed for {}: {error}", native_path.display()))?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(!read_only)
+                .open(&native_path)
+                .map_err(|error| {
+                    error!("Existing package open failed for {}: {error}", native_path.display())
+                })?;
             let size = file.metadata()?.len();
             if expected.is_some_and(|expected| expected != size) || size < PKG_HEADER_SIZE as u64 {
                 fail!("Package physical length differs from durable metadata or header minimum");
             }
             read_header_sync(&mut file)?;
             std::io::Seek::seek(&mut file, SeekFrom::End(0))?;
-            let file = if read_only { drop(file); None } else { Some(file) };
+            let file = if read_only {
+                drop(file);
+                None
+            } else {
+                Some(file)
+            };
             Ok(custody.acquisition((file, size)))
-        }).await.map_err(|e| error!("Native package existing-open task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package existing-open task failed: {e}"))??;
         // Recheck the epoch and failure state after native acquisition, before
         // publishing a writer. The acquisition still owns its resource here.
         let _registration = view.inherit(parent)?;
         let mut package = None;
         acquisition.consume(|opened| {
-            package = Some(Self::from_opened(view, &_registration, path, read_only, opened.0.take(), opened.1)?);
+            package = Some(Self::from_opened(
+                view,
+                &_registration,
+                path,
+                read_only,
+                opened.0.take(),
+                opened.1,
+            )?);
             Ok(())
         })?;
         Ok(package.expect("registered existing native package"))
@@ -236,10 +309,14 @@ impl Package {
     }
 
     pub async fn remove(&self) -> Result<()> {
-        if self.state.read_only { fail!("Cannot remove a read-only package"); }
+        if self.state.read_only {
+            fail!("Cannot remove a read-only package");
+        }
         let operation = self.enter_operation()?;
         let mut guard = self.lock_writer().await;
-        if guard.is_none() { return Ok(()); }
+        if guard.is_none() {
+            return Ok(());
+        }
         let (phase, mut job) = operation.mutation_phase();
         let handoff = tokio::task::spawn_blocking(move || {
             // Keep the live writer intact when cancellation wins before start.
@@ -247,7 +324,9 @@ impl Package {
             drop(guard.take());
             remove_file_native(&guard._state.path)?;
             Ok::<_, anyhow::Error>(job.handoff(guard))
-        }).await.map_err(|e| error!("Native package remove task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package remove task failed: {e}"))??;
         phase.check_completion()?;
         handoff.consume(|_| Ok(()))?;
         phase.complete();
@@ -255,7 +334,9 @@ impl Package {
     }
 
     pub(crate) async fn remove_by_path(
-        view: &ArchiveView, parent: &ArchiveOperation, path: &Path,
+        view: &ArchiveView,
+        parent: &ArchiveOperation,
+        path: &Path,
     ) -> Result<()> {
         let operation = view.inherit(parent)?;
         let (phase, mut job) = operation.mutation_phase();
@@ -264,7 +345,9 @@ impl Package {
             job.start()?;
             remove_file_native(&path)?;
             Ok::<_, anyhow::Error>(job.handoff(()))
-        }).await.map_err(|e| error!("Native package path remove task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package path remove task failed: {e}"))??;
         phase.check_completion()?;
         handoff.consume(|_| Ok(()))?;
         phase.complete();
@@ -272,10 +355,7 @@ impl Package {
     }
 
     /// File and directory entries are separate durability obligations.
-    pub async fn sync_durable(
-        &self,
-        observer: crate::durability::SyncObservation,
-    ) -> Result<()> {
+    pub async fn sync_durable(&self, observer: crate::durability::SyncObservation) -> Result<()> {
         let operation = self.enter_operation()?;
         let guard = self.lock_writer().await;
         let (phase, mut job) = operation.mutation_phase();
@@ -283,7 +363,9 @@ impl Package {
             job.start()?;
             sync_file_and_parents_native(&guard._state.path, observer.as_deref())?;
             Ok::<_, anyhow::Error>(job.handoff(guard))
-        }).await.map_err(|e| error!("Native package sync task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package sync task failed: {e}"))??;
         phase.check_completion()?;
         handoff.consume(|_| Ok(()))?;
         phase.complete();
@@ -341,7 +423,8 @@ impl Package {
 
     pub(super) async fn truncate_in(&self, parent: &ArchiveOperation, size: u64) -> Result<()> {
         let operation = self.state.view.inherit(parent)?;
-        let new_size = (PKG_HEADER_SIZE as u64).checked_add(size)
+        let new_size = (PKG_HEADER_SIZE as u64)
+            .checked_add(size)
             .ok_or_else(|| error!("Package truncate size overflow"))?;
         let guard = self.lock_writer().await;
         if !self.state.write_healthy.load(Ordering::SeqCst) {
@@ -359,9 +442,14 @@ impl Package {
             std::io::Seek::seek(file, SeekFrom::Start(new_size))?;
             state.size.store(new_size, Ordering::SeqCst);
             Ok::<_, anyhow::Error>(job.handoff(guard))
-        }).await.map_err(|e| error!("Native package truncate task failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| error!("Native package truncate task failed: {e}"))??;
         phase.check_completion()?;
-        handoff.consume(|_| { self.state.write_healthy.store(true, Ordering::SeqCst); Ok(()) })?;
+        handoff.consume(|_| {
+            self.state.write_healthy.store(true, Ordering::SeqCst);
+            Ok(())
+        })?;
         phase.complete();
         Ok(())
     }
@@ -372,7 +460,12 @@ impl Package {
 
     pub(super) async fn open_reader(&self) -> Result<super::native_read::NativePackageReader> {
         let operation = self.enter_operation()?;
-        super::native_read::NativePackageReader::open(operation, self.state.path.clone(), wire_read_limits()).await
+        super::native_read::NativePackageReader::open(
+            operation,
+            self.state.path.clone(),
+            wire_read_limits(),
+        )
+        .await
     }
 
     pub async fn read_entry_bounded(
@@ -385,7 +478,9 @@ impl Package {
     }
 
     pub(super) async fn read_entry_bounded_in(
-        &self, parent: &ArchiveOperation, offset: u64,
+        &self,
+        parent: &ArchiveOperation,
+        offset: u64,
         limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<PackageEntry> {
         let operation = self.inherit_operation(parent)?;
@@ -393,7 +488,10 @@ impl Package {
     }
 
     pub(super) async fn read_range_in(
-        &self, parent: &ArchiveOperation, offset: u64, limit: u32,
+        &self,
+        parent: &ArchiveOperation,
+        offset: u64,
+        limit: u32,
     ) -> Result<Vec<u8>> {
         let operation = self.inherit_operation(parent)?;
         super::native_read::read_range(operation, self.state.path.clone(), offset, limit).await
@@ -416,7 +514,8 @@ impl Package {
     }
 
     async fn append_entry_checked<O: Send + 'static>(
-        &self, entry: PackageEntry,
+        &self,
+        entry: PackageEntry,
         checked_offset: impl FnOnce(u64) -> Result<O> + Send + 'static,
         after_append: impl FnOnce(O, u64) -> Result<()>,
     ) -> Result<PackageEntry> {
@@ -433,16 +532,25 @@ impl Package {
             let file = guard.as_mut().ok_or_else(|| error!("Package writer is closed"))?;
             state.write_healthy.store(false, Ordering::SeqCst);
             let raw_size = state.size.load(Ordering::SeqCst);
-            if raw_size < PKG_HEADER_SIZE as u64 { fail!("Package length is smaller than its header"); }
+            if raw_size < PKG_HEADER_SIZE as u64 {
+                fail!("Package length is smaller than its header");
+            }
             let actual_before = file.metadata()?.len();
-            if raw_size != actual_before { fail!("Package physical/logical length mismatch before append"); }
+            if raw_size != actual_before {
+                fail!("Package physical/logical length mismatch before append");
+            }
             let cursor = std::io::Seek::stream_position(file)?;
-            if cursor != raw_size { fail!("Package writer cursor mismatch before append"); }
+            if cursor != raw_size {
+                fail!("Package writer cursor mismatch before append");
+            }
             let prepared = AppendLayout::checked(raw_size, entry_size)
                 .and_then(|layout| Ok((checked_offset(layout.entry_offset)?, layout)));
             let (offset, layout) = match prepared {
                 Ok(value) => value,
-                Err(error) => { state.write_healthy.store(true, Ordering::SeqCst); return Err(error); }
+                Err(error) => {
+                    state.write_healthy.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
             };
             if let Err(error) = job.start() {
                 // Pure preflight succeeded and no canonical byte was touched.
@@ -455,12 +563,23 @@ impl Package {
                 probe.release.recv_timeout(std::time::Duration::from_secs(10))?;
             }
             let written = entry.write_to_sync(file)?;
-            if written != entry_size { fail!("Package entry encoded size changed during append"); }
+            if written != entry_size {
+                fail!("Package entry encoded size changed during append");
+            }
             file.sync_data()?;
-            if file.metadata()?.len() != layout.total_size { fail!("Package physical/logical length mismatch after append"); }
+            if file.metadata()?.len() != layout.total_size {
+                fail!("Package physical/logical length mismatch after append");
+            }
             state.size.store(layout.total_size, Ordering::SeqCst);
-            Ok::<_, anyhow::Error>(job.handoff((Some(entry), Some(offset), layout.logical_size, guard)))
-        }).await.map_err(|e| error!("Native package append task failed: {e}"))??;
+            Ok::<_, anyhow::Error>(job.handoff((
+                Some(entry),
+                Some(offset),
+                layout.logical_size,
+                guard,
+            )))
+        })
+        .await
+        .map_err(|e| error!("Native package append task failed: {e}"))??;
         let mut entry = None;
         phase.check_completion()?;
         handoff.consume(|payload| {
@@ -472,13 +591,15 @@ impl Package {
         phase.complete();
         Ok(entry.expect("consumed package entry"))
     }
-
 }
 
 // Preserve the legacy API's full wire-format range. Callers requiring a
 // resource budget must continue using read_entry_bounded with explicit limits.
 fn wire_read_limits() -> super::bounded_read::ArchiveReadLimits {
-    super::bounded_read::ArchiveReadLimits { data_bytes: u32::MAX as usize, filename_bytes: u16::MAX as usize }
+    super::bounded_read::ArchiveReadLimits {
+        data_bytes: u32::MAX as usize,
+        filename_bytes: u16::MAX as usize,
+    }
 }
 
 pub struct PackageReader<R: tokio::io::AsyncReadExt + Unpin> {
@@ -509,9 +630,15 @@ pub async fn read_package_from<R: tokio::io::AsyncReadExt + Unpin>(
 }
 
 #[cfg(test)]
-pub(super) fn package_fixture_context() -> Result<(tempfile::TempDir, ArchiveView, ArchiveOperation)> {
+pub(super) fn package_fixture_context() -> Result<(tempfile::TempDir, ArchiveView, ArchiveOperation)>
+{
     let dir = tempfile::tempdir()?;
-    let db = crate::db::rocksdb::RocksDb::new(dir.path(), "provider", None, crate::db::rocksdb::AccessType::ReadWrite)?;
+    let db = crate::db::rocksdb::RocksDb::new(
+        dir.path(),
+        "provider",
+        None,
+        crate::db::rocksdb::AccessType::ReadWrite,
+    )?;
     let view = db.bind_archive_domain(super::context::ArchiveDomain::new())?.view()?;
     let operation = view.enter()?;
     Ok((dir, view, operation))
@@ -542,7 +669,8 @@ pub(crate) async fn sync_file_and_parents_observed(
 ) -> Result<()> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || sync_file_and_parents_native(&path, observer.as_deref()))
-        .await.map_err(|e| error!("Native file sync task failed: {e}"))?
+        .await
+        .map_err(|e| error!("Native file sync task failed: {e}"))?
 }
 
 /// One publication's loose body and proof share their namespace barrier.
@@ -556,7 +684,11 @@ pub(crate) async fn sync_files_and_parents_observed(
         let mut directories = std::collections::HashSet::new();
         for path in &paths {
             let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-            crate::durability::before(observer.as_deref(), crate::durability::SyncPoint::File, path)?;
+            crate::durability::before(
+                observer.as_deref(),
+                crate::durability::SyncPoint::File,
+                path,
+            )?;
             file.sync_all()?;
             for parent in path.ancestors().skip(1) {
                 if !parent.as_os_str().is_empty() {
@@ -566,14 +698,21 @@ pub(crate) async fn sync_files_and_parents_observed(
         }
         let mut directories: Vec<_> = directories.into_iter().collect();
         // Persist children before their ancestors, including newly created chains.
-        directories.sort_by(|a, b| b.components().count().cmp(&a.components().count()).then(a.cmp(b)));
+        directories
+            .sort_by(|a, b| b.components().count().cmp(&a.components().count()).then(a.cmp(b)));
         for directory in directories {
             let file = std::fs::File::open(&directory)?;
-            crate::durability::before(observer.as_deref(), crate::durability::SyncPoint::Directory, &directory)?;
+            crate::durability::before(
+                observer.as_deref(),
+                crate::durability::SyncPoint::Directory,
+                &directory,
+            )?;
             file.sync_all()?;
         }
         Ok(())
-    }).await.map_err(|e| error!("Native artifact group sync task failed: {e}"))?
+    })
+    .await
+    .map_err(|e| error!("Native artifact group sync task failed: {e}"))?
 }
 
 pub(crate) fn sync_file_and_parents_native(
@@ -615,14 +754,20 @@ mod bounded_tests {
         let package = Package::open(view.clone(), &operation, path.clone(), true, false).await?;
         let limits = ArchiveReadLimits { data_bytes: 4, filename_bytes: 1 };
         let entry = package.read_entry_bounded(0, limits).await?;
-        assert_eq!(entry.filename(), "x"); assert_eq!(entry.data(), b"abcd");
-        let error = package.read_entry_bounded(0, ArchiveReadLimits { data_bytes: 3, ..limits }).await.err().unwrap();
+        assert_eq!(entry.filename(), "x");
+        assert_eq!(entry.data(), b"abcd");
+        let error = package
+            .read_entry_bounded(0, ArchiveReadLimits { data_bytes: 3, ..limits })
+            .await
+            .err()
+            .unwrap();
         assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
         assert!(package.read_entry_bounded(u64::MAX, limits).await.is_err());
-        std::fs::write(&path, &data[..data.len()-1])?;
+        std::fs::write(&path, &data[..data.len() - 1])?;
         assert!(package.read_entry_bounded(0, limits).await.is_err());
         // Malicious advertised size rejected even though the file has no body.
-        data.truncate(12); data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        data.truncate(12);
+        data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&path, data)?;
         let error = package.read_entry_bounded(0, limits).await.err().unwrap();
         assert!(error.downcast_ref::<ArchiveReadLimitExceeded>().is_some());
@@ -634,7 +779,8 @@ mod bounded_tests {
 mod protected_open_tests {
     use super::*;
     #[tokio::test]
-    async fn protected_package_exact_open_checks_readonly_magic_and_allows_valid_append() -> Result<()> {
+    async fn protected_package_exact_open_checks_readonly_magic_and_allows_valid_append(
+    ) -> Result<()> {
         let (_context_dir, view, operation) = package_fixture_context()?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("protected.pack");
@@ -647,15 +793,27 @@ mod protected_open_tests {
         let mut damaged = original.clone();
         damaged[0] ^= 0xff;
         std::fs::write(&path, &damaged)?;
-        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), true, size).await.is_err());
+        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), true, size)
+            .await
+            .is_err());
         assert_eq!(std::fs::read(&path)?, damaged);
         std::fs::write(&path, &original)?;
-        let package = Package::open_existing_exact(view.clone(), &operation, path.clone(), false, size).await?;
+        let package =
+            Package::open_existing_exact(view.clone(), &operation, path.clone(), false, size)
+                .await?;
         package.append_entry(entry, |_, _| Ok(())).await?;
         let appended = package.size();
         assert!(appended > size);
         drop(package);
-        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), true, appended).await.is_ok());
+        assert!(Package::open_existing_exact(
+            view.clone(),
+            &operation,
+            path.clone(),
+            true,
+            appended
+        )
+        .await
+        .is_ok());
         Ok(())
     }
 }
@@ -678,7 +836,8 @@ mod write_health_tests {
         let error = package
             .append_entry(target(), |_, _| Err(error!("metadata commit refused")))
             .await
-            .err().expect("metadata callback failure must propagate");
+            .err()
+            .expect("metadata callback failure must propagate");
         assert!(error.to_string().contains("metadata commit refused"));
         let uncertain = std::fs::read(&path)?;
         assert!(uncertain.starts_with(&original));
@@ -692,7 +851,8 @@ mod write_health_tests {
                 Ok(())
             })
             .await
-            .err().expect("unhealthy append must be refused");
+            .err()
+            .expect("unhealthy append must be refused");
         assert!(error.is::<crate::archives::context::ArchiveContextError>());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let error =
@@ -700,20 +860,42 @@ mod write_health_tests {
         assert!(error.is::<crate::archives::context::ArchiveContextError>());
         assert_eq!(std::fs::read(&path)?, uncertain, "refusal must not repair or mutate bytes");
         drop(package);
-        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), false, committed_end).await.is_err());
+        assert!(Package::open_existing_exact(
+            view.clone(),
+            &operation,
+            path.clone(),
+            false,
+            committed_end
+        )
+        .await
+        .is_err());
         assert_eq!(
             std::fs::read(&path)?,
             uncertain,
             "protected reopen must preserve uncertain history"
         );
         assert!(view.binding().domain().recovery_required());
-        drop(operation); drop(view);
+        drop(operation);
+        drop(view);
         // Reopen the actual provider with a fresh domain; the failed in-process
         // domain cannot be bypassed by merely constructing another Package.
-        let db = crate::db::rocksdb::RocksDb::new(_context_dir.path(), "provider", None, crate::db::rocksdb::AccessType::ReadWrite)?;
+        let db = crate::db::rocksdb::RocksDb::new(
+            _context_dir.path(),
+            "provider",
+            None,
+            crate::db::rocksdb::AccessType::ReadWrite,
+        )?;
         let view = db.bind_archive_domain(super::super::context::ArchiveDomain::new())?.view()?;
         let operation = view.enter()?;
-        assert!(Package::open_existing_exact(view.clone(), &operation, path.clone(), false, committed_end).await.is_err());
+        assert!(Package::open_existing_exact(
+            view.clone(),
+            &operation,
+            path.clone(),
+            false,
+            committed_end
+        )
+        .await
+        .is_err());
         // This models only the explicitly unprotected durable-end recovery policy.
         let recovered = Package::open(view.clone(), &operation, path.clone(), false, false).await?;
         recovered.truncate(committed_end).await?;
@@ -742,7 +924,8 @@ mod write_health_tests {
         let error = package
             .append_entry(seed, |_, _| panic!("mismatch must precede metadata"))
             .await
-            .err().expect("length mismatch must fail closed");
+            .err()
+            .expect("length mismatch must fail closed");
         assert!(error.to_string().contains("length mismatch before append"));
         assert_eq!(std::fs::read(&path)?, before);
         assert!(package
@@ -763,23 +946,28 @@ mod consuming_tests {
     async fn check_owned_append(indexed: bool) -> Result<()> {
         let (_context_dir, view, operation) = package_fixture_context()?;
         let directory = tempfile::tempdir()?;
-        let package = Package::open(
-            view, &operation, directory.path().join("owned.pack"), false, true,
-        ).await?;
+        let package =
+            Package::open(view, &operation, directory.path().join("owned.pack"), false, true)
+                .await?;
         let entry = PackageEntry::with_data("owned".into(), b"owned payload".to_vec());
         let data_pointer = entry.data().as_ptr();
         let name_pointer = entry.filename().as_ptr();
         let encoded_size = entry.serialized_size()?;
         let calls = AtomicU64::new(0);
         let callback = |offset: u64, size: u64| {
-            assert!(package.state.write_mutex.try_lock().is_err(), "metadata callback lost writer guard");
+            assert!(
+                package.state.write_mutex.try_lock().is_err(),
+                "metadata callback lost writer guard"
+            );
             assert_eq!(offset, 0);
             assert_eq!(size, encoded_size);
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         };
         let entry = if indexed {
-            package.append_indexed_entry(entry, |offset, size| callback(u64::from(offset), size)).await?
+            package
+                .append_indexed_entry(entry, |offset, size| callback(u64::from(offset), size))
+                .await?
         } else {
             package.append_entry(entry, callback).await?
         };
@@ -788,22 +976,30 @@ mod consuming_tests {
         assert_eq!(entry.filename().as_ptr(), name_pointer);
         assert_eq!(entry.data(), b"owned payload");
         assert_eq!(entry.filename(), "owned");
-        assert!(package.state.write_mutex.try_lock().is_ok(), "append returned while writer guard remained locked");
+        assert!(
+            package.state.write_mutex.try_lock().is_ok(),
+            "append returned while writer guard remained locked"
+        );
         tokio::time::timeout(Duration::from_secs(5), package.sync_durable(None)).await??;
         let next = package.size();
         let entry = tokio::time::timeout(Duration::from_secs(5), async {
             if indexed {
-                package.append_indexed_entry(entry, |offset, _| {
-                    assert_eq!(u64::from(offset), next);
-                    Ok(())
-                }).await
+                package
+                    .append_indexed_entry(entry, |offset, _| {
+                        assert_eq!(u64::from(offset), next);
+                        Ok(())
+                    })
+                    .await
             } else {
-                package.append_entry(entry, |offset, _| {
-                    assert_eq!(offset, next);
-                    Ok(())
-                }).await
+                package
+                    .append_entry(entry, |offset, _| {
+                        assert_eq!(offset, next);
+                        Ok(())
+                    })
+                    .await
             }
-        }).await??;
+        })
+        .await??;
         assert_eq!(entry.data().as_ptr(), data_pointer, "append replaced owned payload allocation");
         tokio::time::timeout(Duration::from_secs(5), package.sync_durable(None)).await??;
         for offset in [0, next] {
@@ -834,7 +1030,9 @@ mod state_ownership_tests {
     async fn shared_state_and_owned_writer_outlive_dropped_package_handle() -> Result<()> {
         let (_context_dir, view, operation) = package_fixture_context()?;
         let dir = tempfile::tempdir()?;
-        let package = Package::open(view.clone(), &operation, dir.path().join("owned.pack"), false, true).await?;
+        let package =
+            Package::open(view.clone(), &operation, dir.path().join("owned.pack"), false, true)
+                .await?;
         let state = package.state.clone();
         let weak_state = Arc::downgrade(&state);
         let weak_provider = Arc::downgrade(view.binding().db());
@@ -858,11 +1056,16 @@ mod state_ownership_tests {
             let _ = done_tx.send(());
         });
         started_rx.await?;
-        drop(package); drop(operation); drop(view); drop(observer);
-        assert!(weak_state.upgrade().is_some()); assert!(weak_provider.upgrade().is_some());
+        drop(package);
+        drop(operation);
+        drop(view);
+        drop(observer);
+        assert!(weak_state.upgrade().is_some());
+        assert!(weak_provider.upgrade().is_some());
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), done_rx).await??;
-        assert!(weak_state.upgrade().is_none()); assert!(weak_provider.upgrade().is_none());
+        assert!(weak_state.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
         Ok(())
     }
 }
@@ -873,4 +1076,6 @@ mod native_writer_tests;
 
 #[path = "package_retirement.rs"]
 pub(super) mod retirement;
-pub(super) fn retirement_restart_required() -> bool { retirement::restart_required() }
+pub(super) fn retirement_restart_required() -> bool {
+    retirement::restart_required()
+}

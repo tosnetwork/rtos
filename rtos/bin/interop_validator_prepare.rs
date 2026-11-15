@@ -54,7 +54,9 @@ fn signer_expiry(explicit: Option<u32>, now: u64) -> anyhow::Result<u32> {
         {
             Ok(value)
         }
-        _ => fail!("Explicit fixture signer expiry must be finite, in the future and at most 2147483647"),
+        _ => fail!(
+            "Explicit fixture signer expiry must be finite, in the future and at most 2147483647"
+        ),
     }
 }
 
@@ -73,7 +75,6 @@ mod expiry_tests {
     }
 }
 
-
 fn public_seed(label: &str, member: u8) -> UInt256 {
     UInt256::calc_file_hash(format!("n6-validator-{label}-{member}").as_bytes())
 }
@@ -91,8 +92,10 @@ fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let expire_at = signer_expiry(args.signer_expire_at,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let expire_at = signer_expiry(
+        args.signer_expire_at,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+    )?;
     let root = args.configs.canonicalize()?;
     // Do not provision a running, previously used, or partially prepared node.
     for name in ["config.json", "node_db", "consensus-keys", "validator-prepared.json"] {
@@ -221,8 +224,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let loaded = rtos::pq_consensus_config::load_pq_consensus_config(
         pq_consensus.clone(),
-        u32::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
-            .unwrap_or(u32::MAX),
+        u32::try_from(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        )
+        .unwrap_or(u32::MAX),
     )?;
     let key_id = loaded
         .key_ids_by_file

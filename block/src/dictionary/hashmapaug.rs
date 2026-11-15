@@ -1034,12 +1034,25 @@ pub trait HashmapAugType<
     }
     /// Meter the label before its temporary allocation and each traversed path.
     /// The callback must separately admit dynamic decoding of its value/augmentation.
-    fn traverse_slices_bounded<F, R>(&self, budget: &dyn crate::config_read_budget::ConfigReadBudget,
-        mut callback: F) -> Result<Option<R>>
-    where F: FnMut(&[u8], usize, SliceData) -> Result<TraverseNextStep<R>> {
+    fn traverse_slices_bounded<F, R>(
+        &self,
+        budget: &dyn crate::config_read_budget::ConfigReadBudget,
+        mut callback: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnMut(&[u8], usize, SliceData) -> Result<TraverseNextStep<R>>,
+    {
         if let Some(root) = self.data() {
-            Self::traverse_internal_bounded(root, BuilderData::default(), self.bit_len(), &mut callback, budget)
-        } else { Ok(None) }
+            Self::traverse_internal_bounded(
+                root,
+                BuilderData::default(),
+                self.bit_len(),
+                &mut callback,
+                budget,
+            )
+        } else {
+            Ok(None)
+        }
     }
     fn traverse_internal_bounded<F, R>(
         cell: &Cell,
@@ -1052,7 +1065,10 @@ pub trait HashmapAugType<
         F: FnMut(&[u8], usize, SliceData) -> Result<crate::TraverseNextStep<R>>,
     {
         budget.step()?;
-        let max = (bit_len + 1).checked_next_power_of_two().ok_or_else(|| crate::error!("Dictionary key overflow"))? - 1;
+        let max = (bit_len + 1)
+            .checked_next_power_of_two()
+            .ok_or_else(|| crate::error!("Dictionary key overflow"))?
+            - 1;
         budget.workspace(max / 8 + 1)?;
         let mut cursor = LabelReader::with_cell(cell)?;
         let label = cursor.get_label(bit_len)?;
@@ -1077,9 +1093,13 @@ pub trait HashmapAugType<
                 for i in to_visit.iter().flatten() {
                     let mut key = key.clone();
                     key.append_bit_bool(*i != 0)?;
-                    if let Some(r) =
-                        Self::traverse_internal_bounded(&slice.reference(*i)?, key, bit_len, callback, budget)?
-                    {
+                    if let Some(r) = Self::traverse_internal_bounded(
+                        &slice.reference(*i)?,
+                        key,
+                        bit_len,
+                        callback,
+                        budget,
+                    )? {
                         return Ok(Some(r));
                     }
                 }

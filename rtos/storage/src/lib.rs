@@ -26,12 +26,11 @@ mod tests;
 pub mod traits;
 pub mod types;
 
+#[cfg(feature = "telemetry")]
+use adnl::telemetry::{Metric, MetricBuilder};
 /// Native types for Engine-backed storage fault fixtures only.
 #[cfg(any(test, feature = "integration-test-support"))]
 pub use rocksdb as sst_native_test;
-
-#[cfg(feature = "telemetry")]
-use adnl::telemetry::{Metric, MetricBuilder};
 use std::sync::{atomic::AtomicU64, Arc};
 
 #[cfg(feature = "telemetry")]

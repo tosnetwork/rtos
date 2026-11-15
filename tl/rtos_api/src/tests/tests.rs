@@ -101,7 +101,6 @@ fn test_check_all_structs_with_vecs() {
         ("crate::ton::dns::entry::Entry", std::mem::size_of::<crate::ton::dns::entry::Entry>()),
         ("crate::ton::blocks::outmsgqueuesize::OutMsgQueueSize", std::mem::size_of::<crate::ton::blocks::outmsgqueuesize::OutMsgQueueSize>()),
         ("crate::ton::lite_server::outmsgqueuesize::OutMsgQueueSize", std::mem::size_of::<crate::ton::lite_server::outmsgqueuesize::OutMsgQueueSize>()),
-        ("crate::ton::overlay::node::Node", std::mem::size_of::<crate::ton::overlay::node::Node>()),
         ("crate::ton::validator_session::round::Message", std::mem::size_of::<crate::ton::validator_session::round::Message>()),
         ("crate::ton::dht::node::Node", std::mem::size_of::<crate::ton::dht::node::Node>()),
         ("crate::ton::blocks::shardblocklink::ShardBlockLink", std::mem::size_of::<crate::ton::blocks::shardblocklink::ShardBlockLink>()),
@@ -112,6 +111,7 @@ fn test_check_all_structs_with_vecs() {
         ("crate::ton::catchain::block::Block", std::mem::size_of::<crate::ton::catchain::block::Block>()),
         ("crate::ton::lite_server::transactionid::TransactionId", std::mem::size_of::<crate::ton::lite_server::transactionid::TransactionId>()),
         ("crate::ton::storage::daemon::contractinfo::ContractInfo", std::mem::size_of::<crate::ton::storage::daemon::contractinfo::ContractInfo>()),
+        ("crate::ton::overlay::node::Node", std::mem::size_of::<crate::ton::overlay::node::Node>()),
         ("crate::ton::overlay::nodev2::NodeV2", std::mem::size_of::<crate::ton::overlay::nodev2::NodeV2>()),
         ("crate::ton::lite_server::nonfinal::candidateinfo::CandidateInfo", std::mem::size_of::<crate::ton::lite_server::nonfinal::candidateinfo::CandidateInfo>()),
         ("crate::ton::raw::message::Message", std::mem::size_of::<crate::ton::raw::message::Message>()),
@@ -125,10 +125,8 @@ fn test_check_all_structs_with_vecs() {
         ("crate::ton::fullaccountstate::FullAccountState", std::mem::size_of::<crate::ton::fullaccountstate::FullAccountState>()),
         ("crate::ton::validator_session::statsproducer::StatsProducer", std::mem::size_of::<crate::ton::validator_session::statsproducer::StatsProducer>()),
     ];
-    // for (name, size) in sizes {
-    //     println!("{}: {} bytes", name, size);
-    // }
-    assert!(sizes.is_sorted_by(|a, b| a.1 <= b.1));
+    let inversions: Vec<_> = sizes.windows(2).filter(|pair| pair[0].1 > pair[1].1).collect();
+    assert!(inversions.is_empty(), "TL layout order changed: {inversions:?}");
 }
 
 #[test]

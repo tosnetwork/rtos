@@ -1,7 +1,6 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Exact private package IO and owned-close EIO; no hardware/power-loss claim.
-use super::metadata_eio_tests as base;
-use super::*;
+use super::{metadata_eio_tests as base, *};
 use crate::{archives::package::PKG_HEADER_SIZE, tests::late_index_eio_support as late};
 use std::time::Duration;
 

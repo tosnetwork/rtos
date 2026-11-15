@@ -3,7 +3,7 @@ use crate::{
         intermediate_tuple, partition, EncodingPacket, ObjectTransmissionInformation, PayloadId,
     },
     constraint_matrix::{enc_indices, generate_constraint_matrix},
-    encoder::SPARSE_MATRIX_THRESHOLD,
+    encoder::{SourceBlockEncoder, SPARSE_MATRIX_THRESHOLD},
     matrix::{BinaryMatrix, DenseBinaryMatrix},
     octet_matrix::DenseOctetMatrix,
     pi_solver::fused_inverse_mul_symbols,
@@ -199,6 +199,7 @@ impl SourceBlockDecoder {
         constraint_matrix: impl BinaryMatrix,
         hdpc_rows: DenseOctetMatrix,
         symbols: Vec<Symbol>,
+        recovered: Option<&mut Option<Vec<Symbol>>>,
     ) -> Option<Vec<u8>> {
         let intermediate_symbols = match fused_inverse_mul_symbols(
             constraint_matrix,
@@ -232,12 +233,43 @@ impl SourceBlockDecoder {
         }
 
         self.decoded = true;
+        if let Some(recovered) = recovered {
+            *recovered = Some(intermediate_symbols);
+        }
         return Some(result);
     }
 
     pub fn decode<T: IntoIterator<Item = EncodingPacket>>(
         &mut self,
         packets: T,
+    ) -> Option<Vec<u8>> {
+        self.decode_internal(packets, None)
+    }
+
+    /// Decode and retain the solved intermediate symbols for repair regeneration.
+    /// Ordinary decode callers do not retain this extra state.
+    pub fn decode_with_encoder<T: IntoIterator<Item = EncodingPacket>>(
+        &mut self,
+        packets: T,
+    ) -> Option<(Vec<u8>, SourceBlockEncoder)> {
+        let mut recovered = None;
+        let data = self.decode_internal(packets, Some(&mut recovered))?;
+        let config = ObjectTransmissionInformation::new(
+            data.len() as u64,
+            self.symbol_size,
+            1,
+            self.num_sub_blocks,
+            self.symbol_alignment,
+        );
+        let encoder =
+            SourceBlockEncoder::from_decoded(self.source_block_id, &config, &data, recovered);
+        Some((data, encoder))
+    }
+
+    fn decode_internal<T: IntoIterator<Item = EncodingPacket>>(
+        &mut self,
+        packets: T,
+        recovered: Option<&mut Option<Vec<Symbol>>>,
     ) -> Option<Vec<u8>> {
         let num_extended_symbols = extended_source_block_symbols(self.source_block_symbols);
         for packet in packets {
@@ -252,8 +284,7 @@ impl SourceBlockDecoder {
             if self.received_esi.insert(symbol_id) {
                 if symbol_id >= num_extended_symbols {
                     // Repair symbol
-                    self.repair_packets
-                        .push(EncodingPacket::new(PayloadId::new(0, symbol_id), payload));
+                    self.repair_packets.push(EncodingPacket::new(payload_id, payload));
                 } else {
                     // Check that this is not an extended symbol (which aren't explicitly sent)
                     assert!(symbol_id < self.source_block_symbols);
@@ -296,7 +327,11 @@ impl SourceBlockDecoder {
             }
 
             for repair_packet in self.repair_packets.iter() {
-                encoded_indices.push(repair_packet.payload_id.encoding_symbol_id());
+                // Keep wire ESI in PayloadId; the padded internal ISI can exceed 24 bits.
+                encoded_indices.push(
+                    repair_packet.payload_id.encoding_symbol_id() + num_extended_symbols
+                        - self.source_block_symbols,
+                );
                 d.push(Symbol::new(repair_packet.data.clone()));
             }
 
@@ -305,13 +340,13 @@ impl SourceBlockDecoder {
                     self.source_block_symbols,
                     &encoded_indices,
                 );
-                return self.try_pi_decode(constraint_matrix, hdpc, d);
+                return self.try_pi_decode(constraint_matrix, hdpc, d, recovered);
             } else {
                 let (constraint_matrix, hdpc) = generate_constraint_matrix::<DenseBinaryMatrix>(
                     self.source_block_symbols,
                     &encoded_indices,
                 );
-                return self.try_pi_decode(constraint_matrix, hdpc, d);
+                return self.try_pi_decode(constraint_matrix, hdpc, d, recovered);
             }
         }
         None

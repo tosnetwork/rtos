@@ -463,7 +463,8 @@ pub(super) fn decode_close(bytes: &[u8], domain_digest: &UInt256) -> Result<Clos
 /// and private custody only while constructing the durable test baseline.
 #[cfg(test)]
 pub(crate) fn seed_released_pair_for_recovery(
-    store: &PropagationOutbox, ids: [BlockIdExt; 3],
+    store: &PropagationOutbox,
+    ids: [BlockIdExt; 3],
 ) -> Result<(ClosingRecord, ClosingRecord)> {
     let (d, e, c) = tests::setup_with_ids(store, ids[1].clone(), ids[0].clone())?;
     store.begin_close_offer_inner(c.clone(), &d, &e)?;
@@ -513,7 +514,9 @@ mod tests {
         setup_with_ids(store, id(seq), id(seq - 1))
     }
     pub(super) fn setup_with_ids(
-        store: &PropagationOutbox, block_id: BlockIdExt, previous: BlockIdExt,
+        store: &PropagationOutbox,
+        block_id: BlockIdExt,
+        previous: BlockIdExt,
     ) -> Result<(Delivery, UnverifiedRecord, ClosingRecord)> {
         let record = PublicationRecord {
             domain: store.domain().clone(),
@@ -612,17 +615,23 @@ mod tests {
         Ok((first, second))
     }
     #[test]
-    fn close_history_hashes_live_ids_once_and_refuses_revival_under_a_new_record_id() -> Result<()> {
-        let store = PropagationOutbox::load(Arc::new(Disk::default()), domain(), Limits::default(), None)?;
+    fn close_history_hashes_live_ids_once_and_refuses_revival_under_a_new_record_id() -> Result<()>
+    {
+        let store =
+            PropagationOutbox::load(Arc::new(Disk::default()), domain(), Limits::default(), None)?;
         let mut revival = None;
         for seq in 1..=8 {
             let (delivery, entry, close) = setup(&store, seq)?;
-            if revival.is_none() { revival = Some(entry); }
+            if revival.is_none() {
+                revival = Some(entry);
+            }
             let entry = store.delivery(&delivery.delivery_id)?.unwrap().1;
             store.begin_close_offer_inner(close.clone(), &delivery, &entry)?;
             store.confirm_close_inner(close)?;
         }
-        for seq in 9..=12 { setup(&store, seq)?; }
+        for seq in 9..=12 {
+            setup(&store, seq)?;
+        }
         let mut snapshot = store.state.lock().unwrap().snapshot.clone();
         assert_eq!(snapshot.entries.len(), 4);
         assert_eq!(snapshot.closing.iter().filter(|c| c.released).count(), 8);
@@ -631,12 +640,18 @@ mod tests {
             hashes += 1;
             delivery_id(record)
         })?;
-        assert!(hashes <= snapshot.entries.len(), "rehashed live delivery IDs for each released record: {hashes}");
+        assert!(
+            hashes <= snapshot.entries.len(),
+            "rehashed live delivery IDs for each released record: {hashes}"
+        );
         let mut revived = revival.unwrap();
         revived.id = RecordId(snapshot.next_id);
         snapshot.next_id += 1;
         snapshot.entries.push(revived);
-        assert!(validate_history(&snapshot, &domain()).is_err(), "a new record ID cannot revive a released delivery");
+        assert!(
+            validate_history(&snapshot, &domain()).is_err(),
+            "a new record ID cannot revive a released delivery"
+        );
         snapshot.entries.pop();
         snapshot.closing.clear();
         let mut hashes = 0usize;
@@ -814,7 +829,12 @@ mod tests {
         store.begin_close_offer_inner(c.clone(), &d, &e)?;
         assert!(store.delivery(&d.delivery_id)?.is_some());
         assert!(store
-            .stage_draft(e.record.as_ref().clone(), d.last_mc, d.candidate_already_sent, d.origin.clone())
+            .stage_draft(
+                e.record.as_ref().clone(),
+                d.last_mc,
+                d.candidate_already_sent,
+                d.origin.clone()
+            )
             .is_err());
         drop(store);
         let store = open(disk.clone());
@@ -904,7 +924,12 @@ mod tests {
         assert!(store.lookup_close(&d.delivery_id)?.unwrap().released);
         assert!(store.delivery(&d.delivery_id)?.is_none());
         assert!(store
-            .stage_draft(Arc::unwrap_or_clone(e.record), d.last_mc, d.candidate_already_sent, d.origin)
+            .stage_draft(
+                Arc::unwrap_or_clone(e.record),
+                d.last_mc,
+                d.candidate_already_sent,
+                d.origin
+            )
             .is_err());
         assert_eq!(store.confirm_close_inner(c)?.offer().generation, 1);
         Ok(())

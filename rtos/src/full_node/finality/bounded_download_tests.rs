@@ -2,8 +2,10 @@
 //! Real peer/overlay/RLDP responses. Injection replaces only a scoped peer reply,
 //! never the downloader, budget checker, decoder, or transport.
 use super::*;
-use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits};
-use crate::network::full_node_overlay_client::{BoundedBocDecodeRejected, NetworkDownloadLimits};
+use crate::{
+    history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits},
+    network::full_node_overlay_client::{BoundedBocDecodeRejected, NetworkDownloadLimits},
+};
 use rtos_api::{
     ton::ton_node::datafull::{DataFull, DataFullCompressed},
     WireProfile,

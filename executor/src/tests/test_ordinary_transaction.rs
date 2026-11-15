@@ -3649,7 +3649,17 @@ fn do_test_acc_size_limits(workchain_id: i8, acc_id: &AccountId, mut config: Con
         trans.read_description().unwrap().compute_phase_ref().unwrap().is_skipped().unwrap(),
         &ComputeSkipReason::BadState
     );
-    assert_eq!(trans.end_status, AccountStatus::AccStateUninit);
+    // A self-hash frozen state is physically uninit, but before v13 the
+    // transaction still reports the logical frozen status.
+    assert_eq!(acc.status(), AccountStatus::AccStateUninit);
+    assert_eq!(
+        trans.end_status,
+        if config.block_version() < 13 {
+            AccountStatus::AccStateFrozen
+        } else {
+            AccountStatus::AccStateUninit
+        }
+    );
     assert_eq!(trans.out_msgs.count(2).unwrap(), 1);
 
     let mut acc = Account::frozen(

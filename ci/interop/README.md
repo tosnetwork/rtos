@@ -1,6 +1,121 @@
 # Local C++ / Rust interop runners
 
-The active C++ reference is `881240331ee48a291b96d73f8b8b93bae005ace0`. The default version-16 profile pins its AUTH network tag and regenerated masterchain/workchain Genesis identities. Historical `8f083dc` profiles remain available only for explicit matching-snapshot replay; their results do not qualify the new reference. Updating this pin does not establish Rust compatibility with the new C++ baseline.
+## Fixed scenario inventory and serial execution
+
+`scenario_catalog.json` records named scenarios, assertion scope and native
+control dependencies. Inspect with `python3 ci/interop/scenarios.py list`, or
+expand a selection with `python3 ci/interop/scenarios.py plan necessary-low-weight-mixed`.
+The planner orders controls before mixed cases and refuses unknown selections,
+cycles, missing drivers and additions/removals in the fixture-source inventory.
+This inventory does not prove every parameter combination is represented.
+
+The `rotation_v1` adapter runs rotation, exact-weight, necessary-low-weight
+control/mixed pairs and member2/member5 original-database restart. The `matrix_v1` adapter adds all five four-member compositions, three/six-member
+healthy and threshold control/mixed cases, and six-member low-weight-majority
+cases. The observer-budget control/mixed pair pauses two active successor
+members while both retired observers remain responsive; it requires a bounded
+stall, same-PID recovery, and native/Rust successor role evidence. It shares the
+original240-second rotation deadline and requires all four authenticated signers
+in both epochs. This does not inject invalid old-group votes. Eight packet cases cover partition,
+loss, reorder and duplicate for retained2/joining5; each uses12 seconds of declared
+impairment and the existing180-second recovery budget after rotation. Supply
+`--socket-mark-library` and `--socket-mark-build-record` for packet selections.
+The build JSON names `source`, `library`, and `source_meta`/`library_meta` objects
+with `bytes` and `sha256`; both paths and content must match the current fixture
+source and supplied library before any suite directory is created. The suite
+hashes that C source, library and record along with its other inputs.
+
+Three partitioned restart cases use the same native library provenance:
+`partition-restart-member2`, `partition-restart-member5`, and
+`below-quorum-restart`. They keep isolation through SIGKILL and original-database
+restart, with12-second holds before survivor sampling and after restart within
+the existing180-second recovery budget. The new process must remain isolated,
+increase native drop counters, and recover its own vote and MC/WC creators with
+matching full states after restoration. Below-quorum restart gives member2
+weight30 and each other active member10: survivors have30 of60, below quorum40.
+It requires4 seconds settling and12 seconds of responsive stalled finality,
+then recovery without changing the original committee. A historical certificate
+is not counted as new finality during the stall. Generic rotation dependencies
+remain controls for rotation, not native controls for each injected restart.
+
+Source ACK cases `source-ack-sync-eio` and `source-ack-write-enospc` target one
+owned authenticated current-masterchain source store. Supply
+`--source-ack-fault-library` and `--source-ack-fault-build-record`; the build record
+uses the same source/library path, size and SHA256 checks described above.
+The native syscall refusal must leave the original source pending across SIGKILL,
+then recover its ACK after reopening the original database without injection.
+Acceptance binds the retained source bytes, recovered ACK/reference, native error
+marker, process identities and fresh vote/MC/WC participation, within the original
+180-second recovery budget. These are syscall interposition tests, not physical
+media failures. Combined cases `source-ack-partition-sync-eio` and
+`source-ack-partition-write-enospc` additionally require both packet-library
+arguments. They bind the ACK refusal and partition to the same original
+180-second budget, process and checkpoints, and retain both native counter
+samples. The source IO fault is removed before restart while packet isolation
+continues through the restarted-process hold.
+
+The `source-ack-intent-before-write`, `source-ack-intent-after-partial-write`
+and `source-ack-intent-after-fsync` selections add an explicit intent cut to the
+ACK sync-EIO and partition recovery scenario. They retain the empty file, exact
+half-written prefix or complete synced record respectively, and require normal
+replay to complete the original certificate after restart. The original record,
+completed proof, stopped-process marker and disarmed injection are checked
+against the same session, slot and candidate. Supply both ACK and packet library
+arguments. All stages share the original180-second recovery budget.
+
+Source retention cases `source-retention-before-write`,
+`source-retention-after-partial-write` and `source-retention-after-fsync` stop
+one owned source write before its commit rename. Supply
+`--source-retention-cut-library` and `--source-retention-cut-build-record` with
+verified native source/library provenance. The adapter checks the interrupted
+prefix, original source identity, recovered ACK/reference and fresh participation
+after reopening the original database. Only the existing three replay hints may
+be reconstructed for writes that had not completed; the source body and certificate
+remain exact. Recovery retains the original180-second budget.
+
+Packet completion additionally requires native netem counters demonstrating
+traffic effects (drops for partition/loss, traffic with zero drops for reorder),
+a fresh surviving quorum, restored own vote and both chain creators, unchanged
+process identity, and retained queue removal in a fresh namespace. The saved
+statistics must match the semantic receipt. Native driver checks still verify
+actual block/state/certificate content. The generic rotation control dependency
+is not a native run of every individual packet impairment. Other entries
+remain `unintegrated`; selecting any of them refuses the entire suite before
+creating runtime directories. An omitted selection means the entire catalog,
+so `run` currently requires an explicit supported selection.
+
+```sh
+"$CPP_PYTHON" ci/interop/scenarios.py run necessary-low-weight-mixed \
+  --cpp-python "$CPP_PYTHON" --snapshot "$CPP_SNAPSHOT" \
+  --profile-template "$EXPLICIT_BASELINE_PROFILE" \
+  --rust-node "$RUST_NODE" --rust-revision "$RUST_REVISION" \
+  --validator-preparer "$VALIDATOR_PREPARER" --block-checker "$BLOCK_CHECKER" \
+  --output "$FRESH_SUITE_OUTPUT"
+```
+
+The template supplies schema, C++ revision, global version, consensus options
+and AUTH network tag. The adapter rebuilds scenario weights and membership,
+uses a fresh timestamp, freezes complete MC/WC Genesis identities before startup,
+and gives each invocation a fresh user/network namespace. Scenarios run serially;
+control failure prevents the dependent mixed run. The original rotation240s,
+activation120s and recovery180s budgets are fixed for rotation. Matrices retain
+their original180-second total deadline, including threshold pause/observation/
+recovery. Four-member matrices with a C++ source enable WC creator history;
+three/six-member and all-Rust matrices retain their supported direct sampling.
+No arbitrary extra flags,
+existing runtime-directory reuse or automatic retries are accepted.
+
+`suite.json` retains source/binary/profile hashes and completed scenario result
+hashes; each invocation retains its command, exit and log. Existing native driver
+checks still authenticate certificates, bodies and states. The adapter additionally
+requires successful exit and scenario-specific semantic receipts. It does not
+accept externally supplied result files. `selected_scenarios_passed` applies only
+to that selection; missing adapters and the separate replay, seven-day follower,
+fuzz, review and release gates remain open. `plan` is always `not_executed`.
+
+## Baseline and bootstrap
+
+The active C++ reference and default version-16 profile are pinned to `5af405dcb1f523be0ff3b812e9f6945275c4945b`. The frozen profile contains the native-generated masterchain/workchain Genesis identities for this commit. Previous `8812403` and `8f083dc` snapshots require explicit matching historical profiles; their results do not qualify the current reference. The baseline selection establishes test inputs; full runtime and release qualification remain separate.
 
 The snapshot pins the executable's reported commit, copies the C++ programs,
 checks their SHA-256 values, and exports the matching test sources. Supply a
@@ -29,13 +144,16 @@ Genesis states and public deterministic PQ test identities through the existing
 C++ harness. They do not load an existing validator identity or reset an
 existing node. The bootstrap stage runs three C++ validators, reserves the
 fourth identity without starting its C++ process, and starts Rust with signing
-disabled. It records whether Rust logs processing MC4 from that network. Its result does
-not prove Rust signed, validated a candidate, produced a block, or has the same
-state root. Those are subsequent acceptance requirements; a bootstrap result
-must not close the mixed-validator gate.
+disabled. It requires Rust to serve a native masterchain state at or beyond the
+minimum height whose block identity and state root match all C++ observers,
+with every observer pinned to the generated Genesis. A bounded history of C++
+checkpoints permits a lagging Rust observer. This does not prove Rust signed,
+validated every candidate, or produced a block; bootstrap does not close the
+mixed-validator gate.
 
 To exercise active signing, build both programs with the explicit isolated
-signing feature and use the frozen `8f083dc` C++ snapshot:
+signing feature and use the default TOS5af405d C++ snapshot. The same
+reference can also be selected explicitly with `--cpp-revision 5af405dcb1f523be0ff3b812e9f6945275c4945b`:
 
 ```sh
 cargo +1.100.0 build -p rtos --bin rtos --bin interop_validator_prepare \
@@ -56,8 +174,9 @@ provisioning is not an operator custody or committee-rotation implementation.
 The native Param29 carrier version 5 is admitted with T0 wire format; it remains
 distinct from the Param30 Simplex protocol version 2.
 
-An active result requires both C++ nodes to agree at MC4 and Rust to log
-processing at least MC4. This log is not an independent applied-state check. This measures required Rust participation in chain progress. It does
+An active result requires both C++ nodes and the Rust native served state to
+match the same block identity and state root at or beyond the minimum height.
+This measures required Rust participation in chain progress. It does
 not close the full mixed-validator gate or prove every transaction/state profile
 and every Rust leadership case.
 
@@ -210,6 +329,16 @@ masterchain inclusion in the initial frozen epoch, with the containing
 masterchain FinalCert checked. It does not independently export a workchain
 FinalCert, prove a workchain database applied cursor, or qualify set rotation.
 
+For four-member matrices with at least one C++ process, add
+`--workchain-creator-history --verify-workchain --verify-certificates` to recover
+creators missed between sampled shard tops. The existing rotation collector
+fetches full parent bodies and full states from all four endpoints; the checker
+validates the ancestry back to the certified masterchain anchor. Rust creators
+still require their local successful collation record. Historical evidence keeps
+its original sample path and anchor, and uses the original run deadline and
+64-link ancestry bound. This does not infer acceptance from candidate logs or
+extend the timeout. All-Rust matrices currently require direct tip coverage.
+
 ## Predeclared successor rotation
 
 `rotation_fixture.py` deploys six public fixture identities with initial members
@@ -225,6 +354,13 @@ the Simplex options, the pinned C++ revision and nullable complete MC/WC Genesis
 IDs. First run `--prepare-genesis-only` and then pass its `frozen-profile.json`
 to the live invocation while the declared activation remains in the future.
 Each output directory must be new. The original `testnet-v16.json` stays fixed.
+
+On the current baseline, the fixture prepares signing ledgers for C++
+successors declared in the frozen Genesis before any validator starts. It uses
+the pinned key tool and only accepts never-started directories containing the
+fixture keyring and seed. Existing state or ledgers are refused; the ceremony
+receipt is retained. This is fresh fixture provisioning, not recovery of unknown
+signing history.
 
 Without Rust arguments all six processes use C++. Adding `--rust-node` and
 `--validator-preparer` uses Rust members 2, 3 and 5: each active committee then
@@ -374,3 +510,12 @@ certificate session; retired3 must be observer with no validator index, while
 retained2/new5 are validators. CPP retired members require corresponding MC
 observer startup logs. This legitimate availability/role observation does not
 replace acceptance for invalid old-group votes submitted to a new group.
+
+The `expired-member-restart` scenario naturally expires member5 before an ACK
+sync-EIO and partitioned restart of its original database. It requires recovery
+as a full node with no vote or creator role, unchanged original signing authority,
+and at least three progressing native-checked samples spanning12 seconds.
+Provide both ACK and packet library provenance arguments. Authority copies,
+pre-expiry-process refusal logs and post-expiry survivor certificates are checked
+alongside original ACK bytes and kernel partition counters. The distinct
+`signer-expiry` below-quorum combination remains unintegrated.

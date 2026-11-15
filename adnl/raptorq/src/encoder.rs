@@ -182,6 +182,22 @@ pub struct SourceBlockEncoder {
 }
 
 impl SourceBlockEncoder {
+    pub(crate) fn from_decoded(
+        source_block_id: u8,
+        config: &ObjectTransmissionInformation,
+        data: &[u8],
+        intermediate_symbols: Option<Vec<Symbol>>,
+    ) -> Self {
+        match intermediate_symbols {
+            Some(intermediate_symbols) => Self {
+                source_block_id,
+                source_symbols: Self::create_symbols(config, data),
+                intermediate_symbols,
+            },
+            None => Self::new2(source_block_id, config, data),
+        }
+    }
+
     #[deprecated(
         since = "1.3.0",
         note = "Use the new2() function instead. In version 2.0, that function will replace this one"
@@ -289,11 +305,17 @@ impl SourceBlockEncoder {
             .collect()
     }
 
-    // See section 5.3.4
+    /// Number of source symbols, also the first repair packet's external ESI.
+    pub fn source_symbol_count(&self) -> u32 {
+        self.source_symbols.len() as u32
+    }
+
+    /// Generate repair packets starting at a relative repair index (zero is the first).
+    /// Their wire ESI starts at the source-symbol count; see RFC 6330 section 5.3.4.
     pub fn repair_packets(&self, start_repair_symbol_id: u32, packets: u32) -> Vec<EncodingPacket> {
         let source_symbols = self.source_symbols.len() as u32;
         let start_encoding_symbol_id =
-            start_repair_symbol_id - source_symbols + extended_source_block_symbols(source_symbols);
+            start_repair_symbol_id + extended_source_block_symbols(source_symbols);
         let mut result = vec![];
         let lt_symbols = num_lt_symbols(source_symbols);
         let pi_symbols = num_pi_symbols(source_symbols);
@@ -302,7 +324,7 @@ impl SourceBlockEncoder {
         for i in 0..packets {
             let tuple = intermediate_tuple(start_encoding_symbol_id + i, lt_symbols, sys_index, p1);
             result.push(EncodingPacket::new(
-                PayloadId::new(self.source_block_id, start_repair_symbol_id + i),
+                PayloadId::new(self.source_block_id, source_symbols + start_repair_symbol_id + i),
                 enc(self.source_symbols.len() as u32, &self.intermediate_symbols, tuple)
                     .into_bytes(),
             ));

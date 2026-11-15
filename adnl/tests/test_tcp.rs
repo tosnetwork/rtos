@@ -121,14 +121,17 @@ fn tcp_session() {
 fn tcp_ephemeral_listener_reports_actual_endpoint_for_client() {
     let rt = init_test();
     rt.block_on(async {
-        let mut server_config: serde_json::Value = serde_json::from_str(ADNL_SERVER_CONFIG).unwrap();
+        let mut server_config: serde_json::Value =
+            serde_json::from_str(ADNL_SERVER_CONFIG).unwrap();
         server_config["address"] = "127.0.0.1:0".into();
         let server = AdnlServer::listen(
             AdnlServerConfig::from_json(&server_config.to_string()).unwrap(),
             vec![],
             #[cfg(feature = "telemetry")]
             "ephemeral test server",
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let endpoint = server.local_addr();
         let result: Result<()> = async {
             assert_ne!(endpoint.port(), 0);
@@ -140,7 +143,8 @@ fn tcp_ephemeral_listener_reports_actual_endpoint_for_client() {
             let ping = request_server(&mut client).await;
             client.shutdown().await?;
             ping
-        }.await;
+        }
+        .await;
         server.shutdown().await;
         result.unwrap();
     });

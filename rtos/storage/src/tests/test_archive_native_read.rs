@@ -264,9 +264,12 @@ async fn native_stream_keeps_admitted_owner_through_entries_and_rejects_partial_
         let (dir, _db, domain, view) = fixture();
         let path = dir.path().join("stream.pack");
         let mut bytes = package_bytes();
-        if partial { bytes.push(0x8b); }
+        if partial {
+            bytes.push(0x8b);
+        }
         std::fs::write(&path, bytes).unwrap();
-        let mut reader = NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
+        let mut reader =
+            NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
         let closed = domain.close(view.epoch()).unwrap();
         assert_eq!(domain.outstanding(), 1);
         let entry = reader.next().await.unwrap().unwrap();
@@ -288,14 +291,18 @@ async fn native_stream_keeps_admitted_owner_through_entries_and_rejects_partial_
 
 #[test]
 fn cancelled_native_stream_next_retains_provider_until_job_retires() {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all()
-        .max_blocking_threads(1).build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
     runtime.block_on(async {
         let (dir, db, domain, view) = fixture();
         let path = dir.path().join("cancel-stream.pack");
         std::fs::write(&path, package_bytes()).unwrap();
         let weak = Arc::downgrade(&db);
-        let mut reader = NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
+        let mut reader =
+            NativePackageReader::open(view.enter().unwrap(), path, LIMITS).await.unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let blocker = tokio::task::spawn_blocking(move || {
@@ -307,7 +314,9 @@ fn cancelled_native_stream_next_retains_provider_until_job_retires() {
         assert!(futures::poll!(&mut next).is_pending());
         drop(next);
         assert!(reader.next().await.is_err());
-        drop(reader); drop(view); drop(db);
+        drop(reader);
+        drop(view);
+        drop(db);
         let closed = domain.close(0).unwrap();
         assert_eq!(domain.outstanding(), 1);
         assert!(weak.upgrade().is_some());

@@ -138,7 +138,7 @@ impl IntegerData {
     /// Returns true if signed value fits into a given bits size; otherwise false.
     #[inline]
     pub fn fits_in(&self, bits: usize) -> Result<bool> {
-        Ok(self.bitsize()? <= bits)
+        Ok(self.is_zero() || self.bitsize()? <= bits)
     }
 
     /// Returns true if unsigned value fits into a given bits size; otherwise false.

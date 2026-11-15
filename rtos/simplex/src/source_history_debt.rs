@@ -208,19 +208,25 @@ pub fn authenticate_source_history_debt(
         budget.workspace(
             1024 * std::mem::size_of::<rtos_api::ton::consensus::simplex::VoteSignature>(),
         )?;
-        let (actual, _certificate, wire) = match decode_intent_typed(&path, &record.namespace, &bytes) {
-            Ok(value) => value,
-            Err(error) if interrupted_pending_id(&path, &error).is_some() => {
-                // Physical debt is retained and bound into the receipt, but
-                // contributes no certificate authority. At least one intact,
-                // matching quorum proof below remains mandatory.
-                digests.extend_from_slice(UInt256::calc_file_hash(b"uncommitted-source-intent").as_slice());
-                digests.extend_from_slice(UInt256::calc_file_hash(path.file_name().unwrap().as_encoded_bytes()).as_slice());
-                digests.extend_from_slice(UInt256::calc_file_hash(&bytes).as_slice());
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let (actual, _certificate, wire) =
+            match decode_intent_typed(&path, &record.namespace, &bytes) {
+                Ok(value) => value,
+                Err(error) if interrupted_pending_id(&path, &error).is_some() => {
+                    // Physical debt is retained and bound into the receipt, but
+                    // contributes no certificate authority. At least one intact,
+                    // matching quorum proof below remains mandatory.
+                    digests.extend_from_slice(
+                        UInt256::calc_file_hash(b"uncommitted-source-intent").as_slice(),
+                    );
+                    digests.extend_from_slice(
+                        UInt256::calc_file_hash(path.file_name().unwrap().as_encoded_bytes())
+                            .as_slice(),
+                    );
+                    digests.extend_from_slice(UInt256::calc_file_hash(&bytes).as_slice());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         if !same_record(record, &actual) {
             fail!("Source history certificate locator mismatch");
         }
@@ -252,6 +258,18 @@ pub fn authenticate_source_history_debt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn authenticate_released(
+        record: &SessionRecoveryRecord,
+        runtime: &AuthenticatedSessionRuntime,
+        budget: &dyn SourceHistoryDebtBudget,
+    ) -> Result<SourceHistoryDebt> {
+        crate::authenticated_fixture::wait_for_source_release(|| {
+            match authenticate_source_history_debt(record, runtime, budget) {
+                Err(error) if error.is::<SourceHistoryDebtBusy>() => Ok(None),
+                result => Ok(Some(result)),
+            }
+        })?
+    }
     struct Budget;
     impl SourceHistoryDebtBudget for Budget {
         fn step(&self) -> Result<()> {
@@ -310,7 +328,10 @@ mod tests {
         source.bind_start(runtime.pin().zerostate.clone()).unwrap();
         source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
         drop(source);
-        let record = scan_finality_recovery_namespace(&namespace).unwrap().unwrap();
+        let record = crate::authenticated_fixture::wait_for_source_release(|| {
+            scan_finality_recovery_namespace(&namespace)
+        })
+        .unwrap();
         let path = FinalityIntentStore::new(&namespace).paths().unwrap().remove(0);
         (runtime, record, path)
     }
@@ -321,7 +342,7 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
         let temporary = path.with_extension("tmp");
         std::fs::rename(&path, &temporary).unwrap();
-        let receipt = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        let receipt = authenticate_released(&record, &runtime, &Budget).unwrap();
         assert!(same_record(receipt.record(), &record));
         assert_eq!(std::fs::read(&temporary).unwrap(), original);
         assert!(!path.exists(), "authentication must not publish an uncommitted intent");
@@ -339,7 +360,7 @@ mod tests {
         disk.certificate = hex::encode(WireProfile::T0.serialize(&wire).unwrap());
         let invalid = serde_json::to_vec(&disk).unwrap();
         std::fs::write(&temporary, &invalid).unwrap();
-        let error = authenticate_source_history_debt(&record, &runtime, &Budget).err().unwrap();
+        let error = authenticate_released(&record, &runtime, &Budget).err().unwrap();
         assert!(error.to_string().contains("Not enough signatures"), "{error:#}");
         assert_eq!(std::fs::read(&temporary).unwrap(), invalid);
         assert!(!path.exists());
@@ -359,17 +380,26 @@ mod tests {
         let (runtime, record, canonical) = retained(root.path());
         let (_, target) = super::super::tests::signed_fixture_event(1);
         let store = FinalityIntentStore::new(&record.namespace);
-        store.retain(&runtime, record.prev_blocks.clone(), record.start_masterchain.clone(), &target).unwrap();
-        let path = record.namespace.join(DIRECTORY).join(format!("{}-{}.json", target.slot.value(), target.block_hash.to_hex_string()));
+        store
+            .retain(&runtime, record.prev_blocks.clone(), record.start_masterchain.clone(), &target)
+            .unwrap();
+        let path = record.namespace.join(DIRECTORY).join(format!(
+            "{}-{}.json",
+            target.slot.value(),
+            target.block_hash.to_hex_string()
+        ));
         let temporary = path.with_extension("tmp");
         std::fs::rename(&path, &temporary).unwrap();
         std::fs::write(&temporary, b"").unwrap();
-        let receipt = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        let receipt = authenticate_released(&record, &runtime, &Budget).unwrap();
         assert_eq!(std::fs::read(&temporary).unwrap(), b"");
         assert!(!path.exists());
         drop(receipt);
         std::fs::remove_file(canonical).unwrap();
-        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_err(), "torn data alone grants no authority");
+        assert!(
+            authenticate_released(&record, &runtime, &Budget).is_err(),
+            "torn data alone grants no authority"
+        );
         assert_eq!(std::fs::read(&temporary).unwrap(), b"");
     }
 
@@ -378,7 +408,7 @@ mod tests {
         let root = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, record, path) = retained(root.path());
         let original = std::fs::read(&path).unwrap();
-        let receipt = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        let receipt = authenticate_released(&record, &runtime, &Budget).unwrap();
         assert!(same_record(receipt.record(), &record));
         assert!(crate::finality_delivery::PendingFinalityStore::lock(
             record.namespace.join("finality-pending")
@@ -392,7 +422,7 @@ mod tests {
             .contains("owner busy"));
         let digest = receipt.digest().clone();
         drop(receipt);
-        let again = authenticate_source_history_debt(&record, &runtime, &Budget).unwrap();
+        let again = authenticate_released(&record, &runtime, &Budget).unwrap();
         assert_eq!(&digest, again.digest());
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
@@ -414,12 +444,13 @@ mod tests {
         disk.certificate = hex::encode(WireProfile::T0.serialize(&wire).unwrap());
         let invalid = serde_json::to_vec(&disk).unwrap();
         std::fs::write(&path, &invalid).unwrap();
-        let error = authenticate_source_history_debt(&record, &runtime, &Budget).err().unwrap();
+        let error = authenticate_released(&record, &runtime, &Budget).err().unwrap();
         assert!(error.to_string().contains("Not enough signatures"), "{error:#}");
         assert_eq!(std::fs::read(&path).unwrap(), invalid);
         // Error released the actual lock, and restoring real bytes reauthenticates.
         std::fs::write(&path, original).unwrap();
-        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+        let result = authenticate_released(&record, &runtime, &Budget);
+        assert!(result.is_ok(), "history debt {}: {:?}", path.display(), result.as_ref().err());
     }
     #[test]
     fn source_history_debt_budget_and_locator_failures_release_owner() {
@@ -438,14 +469,14 @@ mod tests {
         let root = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, record, path) = retained(root.path());
         let original = std::fs::read(&path).unwrap();
-        let failure = authenticate_source_history_debt(&record, &runtime, &DenyRead).err().unwrap();
+        let failure = authenticate_released(&record, &runtime, &DenyRead).err().unwrap();
         assert!(failure.to_string().contains("read budget exhausted"));
         let mut changed = record.clone();
         changed.prev_blocks[0].seq_no += 1;
-        let failure = authenticate_source_history_debt(&changed, &runtime, &Budget).err().unwrap();
+        let failure = authenticate_released(&changed, &runtime, &Budget).err().unwrap();
         assert!(failure.to_string().contains("locator mismatch"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
-        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+        assert!(authenticate_released(&record, &runtime, &Budget).is_ok());
     }
     #[test]
     fn source_history_debt_initial_tl_vector_is_charged_before_decode() {
@@ -470,10 +501,10 @@ mod tests {
         let root = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, record, path) = retained(root.path());
         let bytes = std::fs::read(&path).unwrap();
-        let error = authenticate_source_history_debt(&record, &runtime, &DenyVector).err().unwrap();
+        let error = authenticate_released(&record, &runtime, &DenyVector).err().unwrap();
         assert!(error.to_string().contains("TL vector allocation limit"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+        assert!(authenticate_released(&record, &runtime, &Budget).is_ok());
     }
     #[test]
     fn source_history_debt_declared_signature_bytes_rejected_before_allocation() {
@@ -497,17 +528,16 @@ mod tests {
         std::fs::write(&path, &invalid).unwrap();
         // Both the ordinary scanner and gate share the same allocation guard.
         let scanner_error = read_intent(&path, &record.namespace).err().unwrap();
-        let gate_error =
-            authenticate_source_history_debt(&record, &runtime, &Budget).err().unwrap();
+        let gate_error = authenticate_released(&record, &runtime, &Budget).err().unwrap();
         for error in [scanner_error, gate_error] {
-            let limit = error
-                .downcast_ref::<rtos_api::DecodeLimitExceeded>()
-                .expect("typed preallocation refusal");
-            assert_eq!(limit.actual, 0x7fffff);
-            assert!(limit.limit < 1024);
+            // Native slice-backed TL parsing checks available input before
+            // allocation budgets. This declaration has no signature payload.
+            let input = error.downcast_ref::<std::io::Error>().expect("typed input refusal");
+            assert_eq!(input.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert_eq!(input.to_string(), "truncated TL field");
         }
         assert_eq!(std::fs::read(&path).unwrap(), invalid);
         std::fs::write(&path, original).unwrap();
-        assert!(authenticate_source_history_debt(&record, &runtime, &Budget).is_ok());
+        assert!(authenticate_released(&record, &runtime, &Budget).is_ok());
     }
 }

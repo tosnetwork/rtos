@@ -31,8 +31,8 @@ async fn publication_canonical_retention_preserves_evidence_and_rejects_foreign_
         draft.candidate_already_sent = true;
         draft.created_at_unix_secs -= 11;
         let original = spool_pending_record(&runtime, &draft);
-        let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
         let result = std::panic::AssertUnwindSafe(async {
+            let sink = engine.clone().durable_finality_sink(runtime.clone()).await.unwrap();
             let id = stage_spool(&sink, draft.clone()).await.unwrap();
             let request = CanonicalFinalityRequest {
                 node_receipt: id,
@@ -77,10 +77,10 @@ async fn publication_canonical_retention_preserves_evidence_and_rejects_foreign_
             let canonical = retain(&sink, request.clone()).await.unwrap();
             assert_eq!(canonical.request, request);
             assert_canonical(&runtime, &original, &draft, canonical);
-            request
+            (request, sink)
         }).catch_unwind().await;
         engine.clone().wait_stop().await.unwrap();
-        let request = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let (request, sink) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         // Rejected admission must not run the supplied completion.
         let (tx, rx) = tokio::sync::oneshot::channel();
         assert!(sink

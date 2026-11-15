@@ -240,7 +240,8 @@ impl AuthenticatedSessionRuntime {
         Ok(Self {
             pin,
             coordinates: SessionRecoveryCoordinates {
-                shard: coordinates.shard.clone(), catchain_seqno: coordinates.catchain_seqno,
+                shard: coordinates.shard.clone(),
+                catchain_seqno: coordinates.catchain_seqno,
                 vertical_seqno: coordinates.vertical_seqno,
                 last_key_block_seqno: coordinates.last_key_block_seqno,
                 new_catchain_ids: coordinates.new_catchain_ids,
@@ -268,17 +269,25 @@ impl AuthenticatedSessionRuntime {
     /// anchor and its state against `pin`, not obtained it from a peer claim.
     /// A runtime retains its first anchor; binding it twice is forbidden.
     pub fn bind_recovery_anchor(mut self, anchor: BlockIdExt) -> Result<Self> {
-        if self.recovery_binding.is_some() { fail!("Session recovery anchor already bound"); }
-        if !anchor.shard().is_masterchain() || anchor.root_hash().is_zero() || anchor.file_hash().is_zero()
-            || (anchor.seq_no() == 0 && anchor != self.pin.zerostate) {
+        if self.recovery_binding.is_some() {
+            fail!("Session recovery anchor already bound");
+        }
+        if !anchor.shard().is_masterchain()
+            || anchor.root_hash().is_zero()
+            || anchor.file_hash().is_zero()
+            || (anchor.seq_no() == 0 && anchor != self.pin.zerostate)
+        {
             fail!("Invalid governing masterchain recovery anchor");
         }
         self.recovery_binding = Some(SessionRecoveryBinding {
-            governing_masterchain: anchor, coordinates: self.coordinates.clone(),
+            governing_masterchain: anchor,
+            coordinates: self.coordinates.clone(),
         });
         Ok(self)
     }
-    pub fn recovery_binding(&self) -> Option<&SessionRecoveryBinding> { self.recovery_binding.as_ref() }
+    pub fn recovery_binding(&self) -> Option<&SessionRecoveryBinding> {
+        self.recovery_binding.as_ref()
+    }
 
     /// Whether a live group may retain its immutable admission snapshot.
     /// The session hash alone does not encode a change to transport members.
@@ -294,9 +303,24 @@ impl AuthenticatedSessionRuntime {
                 $(if self.$field != other.$field { return Some(stringify!($field)); })+
             };
         }
-        compare!(pin, coordinates, profile, session, shard, catchain_seqno,
-            protocol, carrier_version, slots_per_leader_window, max_candidate_size,
-            wire_profile, committee, members, current_total_set, local_role, local_adnl);
+        compare!(
+            pin,
+            coordinates,
+            profile,
+            session,
+            shard,
+            catchain_seqno,
+            protocol,
+            carrier_version,
+            slots_per_leader_window,
+            max_candidate_size,
+            wire_profile,
+            committee,
+            members,
+            current_total_set,
+            local_role,
+            local_adnl
+        );
         None
     }
 
@@ -580,11 +604,22 @@ mod tests {
     fn authenticated_recovery_anchor_retains_coordinates_without_spurious_rotation() {
         let (pin, config, nodes) = fixture();
         let shard = ShardIdent::masterchain();
-        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(pin.clone(), &config,
-            coords(&shard), nodes, KeyId::from_data([99; 32])).unwrap();
+        let runtime = AuthenticatedSessionRuntime::from_authenticated_config(
+            pin.clone(),
+            &config,
+            coords(&shard),
+            nodes,
+            KeyId::from_data([99; 32]),
+        )
+        .unwrap();
         assert!(runtime.recovery_binding().is_none());
         let first = runtime.clone().bind_recovery_anchor(pin.zerostate.clone()).unwrap();
-        let later_anchor = BlockIdExt::with_params(shard.clone(), 1, UInt256::from([5; 32]), UInt256::from([6; 32]));
+        let later_anchor = BlockIdExt::with_params(
+            shard.clone(),
+            1,
+            UInt256::from([5; 32]),
+            UInt256::from([6; 32]),
+        );
         let later = runtime.clone().bind_recovery_anchor(later_anchor).unwrap();
         assert!(first.same_admission(&later));
         assert!(first.clone().bind_recovery_anchor(pin.zerostate.clone()).is_err());

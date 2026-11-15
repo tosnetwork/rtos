@@ -7,6 +7,7 @@
 
 use std::{error::Error, fmt, os::raw::c_int};
 
+pub mod elector;
 pub mod falcon512;
 pub mod lms_fee;
 pub mod slhdsa128s;
@@ -16,6 +17,34 @@ pub const SIGNATURE_BYTES: usize = 2420;
 pub const MAX_MESSAGE_BYTES: usize = 8192;
 pub const MAX_CONTEXT_BYTES: usize = 255;
 pub const SIMPLEX_CONTEXT: &[u8] = b"TOS-CONSENSUS-SIMPLEX-v1";
+
+/// Frozen authority domains. Selecting a domain does not authorize a key.
+#[derive(Clone, Copy, Debug)]
+pub enum ConsensusSurface {
+    Simplex,
+    ValidatorElection,
+    ValidatorConfigVote,
+    ConfigAdmin,
+}
+impl ConsensusSurface {
+    pub fn context(self) -> &'static [u8] {
+        match self {
+            Self::Simplex => SIMPLEX_CONTEXT,
+            Self::ValidatorElection => b"TOS-VALIDATOR-ELECTION-v1",
+            Self::ValidatorConfigVote => b"TOS-VALIDATOR-CONFIG-VOTE-v1",
+            Self::ConfigAdmin => b"TOS-CONFIG-ADMIN-v1",
+        }
+    }
+}
+
+pub fn verify_consensus(
+    surface: ConsensusSurface,
+    message: &[u8],
+    signature: &[u8],
+    public_key: &[u8],
+) -> Result<bool, VerifyError> {
+    verify(message, surface.context(), signature, public_key)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerifyError {

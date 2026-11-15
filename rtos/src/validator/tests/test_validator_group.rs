@@ -1300,8 +1300,12 @@ struct RelayGateEngine {
 }
 #[async_trait::async_trait]
 impl EngineOperations for RelayGateEngine {
-    fn zerostate_id(&self) -> Result<&BlockIdExt> { Ok(&self.zero) }
-    fn destroy_block_candidates(&self, _: &SessionId) -> Result<bool> { Ok(true) }
+    fn zerostate_id(&self) -> Result<&BlockIdExt> {
+        Ok(&self.zero)
+    }
+    fn destroy_block_candidates(&self, _: &SessionId) -> Result<bool> {
+        Ok(true)
+    }
     async fn relay_validated_candidate(
         &self,
         _: &crate::validator::propagation::ValidatedCandidateRelay,
@@ -1309,7 +1313,9 @@ impl EngineOperations for RelayGateEngine {
     ) -> crate::validator::propagation::PropagationOutcome {
         struct Released(Arc<AtomicBool>);
         impl Drop for Released {
-            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
         let _released = Released(self.dropped.clone());
         self.entered.add_permits(1);
@@ -1322,37 +1328,76 @@ async fn test_group_stop_cancels_pending_authenticated_relay() {
     let (runtime, evidence) = crate::validator::candidate_authentication::tests::fixture();
     let runtime = Arc::new(runtime);
     let engine = Arc::new(RelayGateEngine {
-        zero: runtime.pin().zerostate.clone(), entered: tokio::sync::Semaphore::new(0),
+        zero: runtime.pin().zerostate.clone(),
+        entered: tokio::sync::Semaphore::new(0),
         dropped: Arc::new(AtomicBool::new(false)),
     });
     let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x61; 32]).unwrap();
     assert_eq!(transport.id().data(), runtime.local_adnl().data());
     let info = Arc::new(GeneralSessionInfo {
-        shard: runtime.shard().clone(), opts_hash: UInt256::default(),
-        catchain_seqno: runtime.catchain_seqno(), key_seqno: 0, max_vertical_seqno: 0,
+        shard: runtime.shard().clone(),
+        opts_hash: UInt256::default(),
+        catchain_seqno: runtime.catchain_seqno(),
+        key_seqno: 0,
+        max_vertical_seqno: 0,
     });
-    let set = ValidatorSet::with_cc_seqno(0, 100000, runtime.committee().len() as u16,
-        runtime.catchain_seqno(), runtime.committee().to_vec()).unwrap();
+    let set = ValidatorSet::with_cc_seqno(
+        0,
+        100000,
+        runtime.committee().len() as u16,
+        runtime.catchain_seqno(),
+        runtime.committee().to_vec(),
+    )
+    .unwrap();
     let options = simplex::SessionOptions {
-        protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
-        slots_per_leader_window: runtime.slots_per_leader_window(), wire_profile: runtime.wire_profile(),
+        protocol: runtime.protocol(),
+        proto_version: runtime.carrier_version(),
+        slots_per_leader_window: runtime.slots_per_leader_window(),
+        wire_profile: runtime.wire_profile(),
         ..Default::default()
     };
-    let group = Arc::new(ValidatorGroup::new(info, transport, runtime.session_id().clone(),
-        UInt256::default(), set, 0, ConsensusOptions::Simplex(options), engine.clone(), false, None)
-        .with_authenticated_runtime(runtime).unwrap());
+    let group = Arc::new(
+        ValidatorGroup::new(
+            info,
+            transport,
+            runtime.session_id().clone(),
+            UInt256::default(),
+            set,
+            0,
+            ConsensusOptions::Simplex(options),
+            engine.clone(),
+            false,
+            None,
+        )
+        .with_authenticated_runtime(runtime)
+        .unwrap(),
+    );
     let block = evidence.block_id.clone();
     let receiver = group.receiver.lock().unwrap().take().unwrap();
     let queue_group = group.clone();
     let rt = tokio::runtime::Handle::current();
-    group.spawn_task(&rt.clone(), async move { process_validation_queue(receiver, queue_group, rt).await });
+    group.spawn_task(&rt.clone(), async move {
+        process_validation_queue(receiver, queue_group, rt).await
+    });
     group.action_queue.send(ValidationAction::OnAuthenticatedCandidate(evidence)).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), engine.entered.acquire()).await.unwrap().unwrap().forget();
-    tokio::time::timeout(Duration::from_secs(5), group.clone().stop(tokio::runtime::Handle::current(), false))
-        .await.expect("retirement must cancel relay without cancelling an apply").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), engine.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        group.clone().stop(tokio::runtime::Handle::current(), false),
+    )
+    .await
+    .expect("retirement must cancel relay without cancelling an apply")
+    .unwrap();
     assert!(engine.dropped.load(Ordering::Acquire));
     assert!(group.tasks.is_empty());
-    assert!(!group.candidate_relays.lock().unwrap().contains(&block), "cancelled relay cannot be marked sent");
+    assert!(
+        !group.candidate_relays.lock().unwrap().contains(&block),
+        "cancelled relay cannot be marked sent"
+    );
 }
 
 #[async_trait::async_trait]
@@ -1639,50 +1684,97 @@ async fn test_candidate_validation_uses_exact_historical_reference_not_latest_he
     }
     #[async_trait::async_trait]
     impl EngineOperations for ReferenceEngine {
-        async fn load_state(&self, id: &BlockIdExt) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
+        async fn load_state(
+            &self,
+            id: &BlockIdExt,
+        ) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
             self.requested.lock().unwrap().push(id.clone());
             Ok(self.state.clone())
         }
-        async fn load_last_applied_mc_state(&self) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
+        async fn load_last_applied_mc_state(
+            &self,
+        ) -> Result<Arc<crate::shard_state::ShardStateStuff>> {
             panic!("historical validation must not substitute the newer applied head");
         }
     }
-    let reference = BlockIdExt::with_params(ShardIdent::masterchain(), 2,
-        UInt256::from([2; 32]), UInt256::from([3; 32]));
+    let reference = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        2,
+        UInt256::from([2; 32]),
+        UInt256::from([3; 32]),
+    );
     let mut state = rtos_block::ShardStateUnsplit::with_ident(ShardIdent::masterchain());
     state.set_seq_no(2);
     state.write_custom(Some(&rtos_block::McStateExtra::default())).unwrap();
-    let state = crate::shard_state::ShardStateStuff::from_state(reference.clone(), state,
+    let state = crate::shard_state::ShardStateStuff::from_state(
+        reference.clone(),
+        state,
         #[cfg(feature = "telemetry")]
         &crate::collator_test_bundle::create_engine_telemetry(),
-        &crate::collator_test_bundle::create_engine_allocated()).unwrap();
+        &crate::collator_test_bundle::create_engine_allocated(),
+    )
+    .unwrap();
     let engine = ReferenceEngine { state, requested: Mutex::new(Vec::new()) };
     let mut info = rtos_block::BlockInfo::default();
     info.set_shard(ShardIdent::masterchain());
     info.set_seq_no(3).unwrap();
-    info.set_prev_stuff(false, &rtos_block::BlkPrevInfo::Block { prev: rtos_block::ExtBlkRef {
-        end_lt: 0, seq_no: 2, root_hash: reference.root_hash().clone(),
-        file_hash: reference.file_hash().clone(),
-    }}).unwrap();
-    let candidate = BlockIdExt::with_params(ShardIdent::masterchain(), 3,
-        UInt256::from([4; 32]), UInt256::from([5; 32]));
-    assert_eq!(candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap(),
-        Some(reference.clone()));
+    info.set_prev_stuff(
+        false,
+        &rtos_block::BlkPrevInfo::Block {
+            prev: rtos_block::ExtBlkRef {
+                end_lt: 0,
+                seq_no: 2,
+                root_hash: reference.root_hash().clone(),
+                file_hash: reference.file_hash().clone(),
+            },
+        },
+    )
+    .unwrap();
+    let candidate = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        3,
+        UInt256::from([4; 32]),
+        UInt256::from([5; 32]),
+    );
+    assert_eq!(
+        candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap(),
+        Some(reference.clone())
+    );
     assert_eq!(*engine.requested.lock().unwrap(), vec![reference]);
     // Matching seqno is insufficient: a different hash cannot borrow the state.
-    info.set_prev_stuff(false, &rtos_block::BlkPrevInfo::Block { prev: rtos_block::ExtBlkRef {
-        end_lt: 0, seq_no: 2, root_hash: UInt256::from([6; 32]), file_hash: UInt256::from([7; 32]),
-    }}).unwrap();
-    assert!(candidate_validation_reference_top(&engine, &info, &candidate).await.unwrap_err()
-        .to_string().contains("reference state identity differs"));
+    info.set_prev_stuff(
+        false,
+        &rtos_block::BlkPrevInfo::Block {
+            prev: rtos_block::ExtBlkRef {
+                end_lt: 0,
+                seq_no: 2,
+                root_hash: UInt256::from([6; 32]),
+                file_hash: UInt256::from([7; 32]),
+            },
+        },
+    )
+    .unwrap();
+    assert!(candidate_validation_reference_top(&engine, &info, &candidate)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("reference state identity differs"));
 }
 
 #[tokio::test]
 async fn test_mc_validation_parent_group_stop_cancels_live_and_ready_waits() {
-    let parent = BlockIdExt::with_params(ShardIdent::masterchain(), 7,
-        UInt256::from([0x51; 32]), UInt256::from([0x52; 32]));
-    let candidate = BlockIdExt::with_params(ShardIdent::masterchain(), 8,
-        UInt256::from([0x41; 32]), UInt256::from([0x42; 32]));
+    let parent = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        7,
+        UInt256::from([0x51; 32]),
+        UInt256::from([0x52; 32]),
+    );
+    let candidate = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        8,
+        UInt256::from([0x41; 32]),
+        UInt256::from([0x42; 32]),
+    );
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let stop = tokio_util::sync::CancellationToken::new();
     let tracker = tokio_util::task::TaskTracker::new();
@@ -1691,18 +1783,24 @@ async fn test_mc_validation_parent_group_stop_cancels_live_and_ready_waits() {
     let (task_candidate, task_parent) = (candidate.clone(), parent.clone());
     let task = tracker.spawn(async move {
         task_entered.notify_one();
-        wait_for_mc_validation_parent_until_stop(rx, &task_candidate, &task_parent, &task_stop).await
+        wait_for_mc_validation_parent_until_stop(rx, &task_candidate, &task_parent, &task_stop)
+            .await
     });
     entered.notified().await;
     tracker.close();
-    assert!(tokio::time::timeout(Duration::from_millis(20), tracker.wait()).await.is_err(),
-        "live accepted-parent observer must remain owned before group stop");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), tracker.wait()).await.is_err(),
+        "live accepted-parent observer must remain owned before group stop"
+    );
     stop.cancel();
-    tokio::time::timeout(Duration::from_secs(1), tracker.wait()).await
+    tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+        .await
         .expect("group stop must drain the accepted-parent observer wait");
     let error = task.await.unwrap().unwrap_err();
     assert!(error.to_string().contains("cancelled by group stop"));
     // A stopped C++ actor cannot approve even if its parent is already ready.
     let (_tx, rx) = tokio::sync::watch::channel(Some(parent.clone()));
-    assert!(wait_for_mc_validation_parent_until_stop(rx, &candidate, &parent, &stop).await.is_err());
+    assert!(wait_for_mc_validation_parent_until_stop(rx, &candidate, &parent, &stop)
+        .await
+        .is_err());
 }

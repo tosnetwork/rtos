@@ -51,7 +51,15 @@ impl Deserializable for StorageStatCellInfo {
 }
 
 define_HashmapE!(StorageStatDict, 256, StorageStatCellInfo);
-pub type StorageRoots = SmallVec<[Cell; 3]>;
+pub type StorageRoots = SmallVec<[Cell; 4]>;
+
+#[derive(Clone, Debug, PartialEq)]
+struct SeededStorageUsage {
+    roots: StorageRoots,
+    extra_currency_root: Option<Cell>,
+    used: StorageUsed,
+    root_bits: u64,
+}
 
 /// Per-account storage statistics over the `code`/`data`/`library` subtrees of `StateInit`.
 /// Counts total cells/bits (excluding the `AccountStorage` root itself) and tracks per-cell
@@ -65,6 +73,10 @@ pub type StorageRoots = SmallVec<[Cell; 3]>;
 /// `cache` into `dict` via hashmap_multiset. After a flush `cache` is NOT cleared — the entries
 /// are kept (with `ref_count_diff = 0`) as a hot L1 over `dict` for subsequent operations.
 ///
+/// Input transaction snapshots carry supplied usage independently of subtree totals.
+/// They survive previews/view switches and are replaced after finalization. Decoder-only
+/// malformed-usage seeds retain the same carry behavior outside transaction execution.
+///
 /// Three meaningful initial states from constructors:
 /// - empty: `Default` / `empty()` / `new(_, used)` with `used.cells == 0` — everything zero.
 /// - seeded: `new(storage, used)` with non-empty used — totals trusted from `used`, but `dict`
@@ -74,18 +86,23 @@ pub type StorageRoots = SmallVec<[Cell; 3]>;
 ///   is empty. This is the cheap path; used by `Account::import_storage_stat_dict` when the
 ///   engine-level LRU (`Engine::storage_dicts_cache`) has the dict for this `dict_hash`.
 ///
-/// Invariants: `roots` mirrors `get_roots(storage.state_init())`; root changes go through
+/// Invariants: `roots` mirrors the selected accounting view (code/data/library,
+/// plus the currency root only for pre10 serialization); root changes go through
 /// `replace_roots`, which produces an incremental diff via `add_cell`/`remove_cell`. The
 /// `(dict empty && cache empty)` combination is treated as "seeded or freshly empty" and lets
 /// `replace_roots` reset roots/totals before rebuilding incrementally.
 #[derive(Default, Clone, PartialEq)]
 pub struct AccountStorageStat {
+    // Legacy (<10) serialization includes the currency root. Size-limit
+    // checks use the code/data/library view even for those versions.
+    include_extra_currencies: bool,
     dict: StorageStatDict,
     roots: StorageRoots,
     total_cells: u64,
     total_bits: u64,
     cache: ahash::AHashMap<UInt256, StorageStatCellInfo>,
     dict_updated: bool,
+    seeded_usage: Option<SeededStorageUsage>,
     // Hashes of cells that existed in the previous state — lets the incremental recalc survive a
     // pruned (collated-data) proof of that state.
     //
@@ -130,24 +147,56 @@ impl AccountStorageStat {
             return Self::empty();
         };
         Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::new(),
             roots: Self::get_roots(storage.state_init()),
             total_cells,
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            seeded_usage: None,
             hint: Default::default(),
+        }
+    }
+
+    /// Only a decoded original account may carry supplied usage. Fresh
+    /// constructors must count their new storage, even when initialized to zero.
+    pub(crate) fn from_account_usage(storage: &AccountStorage, used: &StorageUsed) -> Self {
+        let mut stat = Self::new(storage, used);
+        if let Ok(cell) = storage.write_to_new_cell() {
+            let root_bits = cell.length_in_bits() as u64;
+            if used.cells() == 0 || used.bits() < root_bits {
+                stat.seeded_usage = Some(SeededStorageUsage {
+                    roots: Self::get_roots(storage.state_init()),
+                    extra_currency_root: storage.balance().other.root().cloned(),
+                    used: used.clone(),
+                    root_bits,
+                });
+            }
+        }
+        stat
+    }
+
+    pub(crate) fn clear_usage_seed(&mut self) {
+        self.seeded_usage = None;
+    }
+
+    pub(crate) fn finish_usage_update(&mut self) {
+        if self.seeded_usage.as_ref().is_some_and(|seed| self.seed_roots(seed) != self.roots) {
+            self.seeded_usage = None;
         }
     }
 
     fn empty() -> Self {
         Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::new(),
             roots: StorageRoots::new(),
             total_cells: 0,
             total_bits: 0,
             cache: Default::default(),
             dict_updated: true,
+            seeded_usage: None,
             hint: Default::default(),
         }
     }
@@ -166,12 +215,14 @@ impl AccountStorageStat {
             )
         };
         Ok(Self {
+            include_extra_currencies: false,
             dict: StorageStatDict::with_hashmap(Some(dict)),
             roots: Self::get_roots(storage.state_init()),
             total_cells,
             total_bits,
             cache: Default::default(),
             dict_updated: false,
+            seeded_usage: None,
             hint: Default::default(),
         })
     }
@@ -184,25 +235,44 @@ impl AccountStorageStat {
             return;
         }
         fn dfs(
+            stat: &mut AccountStorageStat,
             cell: &Cell,
             loaded: &std::collections::HashSet<UInt256>,
             hint: &mut ahash::AHashSet<UInt256>,
+            is_root: bool,
         ) {
             let hash = cell.repr_hash().clone();
             if !hint.insert(hash.clone()) {
                 return;
             }
+            // Native add_hint seeds known existence before a later dictionary
+            // lookup can encounter an intentionally pruned, unchanged entry.
+            if is_root {
+                if !stat.cache.contains_key(&hash) {
+                    if let Ok(Some(data)) = stat.dict.get(&hash) {
+                        stat.cache.insert(hash.clone(), data);
+                    }
+                }
+                if stat.cache.get(&hash).is_some_and(|data| data.max_merkle_depth != 0) {
+                    return;
+                }
+            }
+            stat.cache.entry(hash.clone()).or_insert(StorageStatCellInfo {
+                ref_count: None,
+                max_merkle_depth: 0,
+                ref_count_diff: 0,
+            });
             if loaded.contains(&hash) {
                 for i in 0..cell.references_count() {
                     if let Ok(child) = cell.reference_without_usage(i) {
-                        dfs(&child, loaded, hint);
+                        dfs(stat, &child, loaded, hint, false);
                     }
                 }
             }
         }
         let mut hint = std::mem::take(&mut self.hint);
         for root in self.roots.clone() {
-            dfs(&root, loaded, &mut hint);
+            dfs(self, &root, loaded, &mut hint, true);
         }
         self.hint = hint;
     }
@@ -228,26 +298,26 @@ impl AccountStorageStat {
 
             fn map_entry<'a>(
                 (hash, data): (&'a UInt256, &mut StorageStatCellInfo),
-            ) -> (FixedBitsKey<'a>, Option<SliceData>) {
-                data.ref_count_diff = 0;
+            ) -> Result<(FixedBitsKey<'a>, Option<SliceData>)> {
                 let key = FixedBitsKey::new(hash.as_slice());
-                if data.ref_count == Some(0) {
-                    (key, None)
-                } else {
-                    (key, data.write_to_bitstring().ok())
-                }
+                let value =
+                    if data.ref_count == Some(0) { None } else { Some(data.write_to_bitstring()?) };
+                data.ref_count_diff = 0;
+                Ok((key, value))
             }
 
             if self.dict.is_empty() {
                 // no filter when dict is filled from scratch - `collect` will use size hint for allocation
-                self.dict.0.hashmap_multiset(self.cache.iter_mut().map(map_entry))?;
+                let entries = self.cache.iter_mut().map(map_entry).collect::<Result<Vec<_>>>()?;
+                self.dict.0.hashmap_multiset(entries)?;
             } else {
-                self.dict.0.hashmap_multiset(
-                    self.cache
-                        .iter_mut()
-                        .filter(|(_, data)| data.ref_count_diff != 0)
-                        .map(map_entry),
-                )?;
+                let entries = self
+                    .cache
+                    .iter_mut()
+                    .filter(|(_, data)| data.ref_count_diff != 0)
+                    .map(map_entry)
+                    .collect::<Result<Vec<_>>>()?;
+                self.dict.0.hashmap_multiset(entries)?;
             }
 
             self.dict_updated = true;
@@ -257,13 +327,90 @@ impl AccountStorageStat {
     }
 
     pub fn calc_stat(&mut self, storage: &AccountStorage) -> Result<StorageUsed> {
-        self.replace_roots(Self::get_roots(storage.state_init()))?;
+        let roots = self.roots_for_storage(storage);
+        self.replace_roots(roots.clone())?;
 
         let cell = storage.serialize()?;
+        if let Some(seed) = &self.seeded_usage {
+            if roots == self.seed_roots(seed) {
+                let root_bits = cell.bit_length() as u64;
+                let bits = if root_bits >= seed.root_bits {
+                    seed.used.bits().checked_add(root_bits - seed.root_bits)
+                } else {
+                    seed.used.bits().checked_sub(seed.root_bits - root_bits)
+                }
+                .ok_or_else(|| error!("storage usage bit count out of range"))?;
+                return StorageUsed::with_values_checked(seed.used.cells(), bits);
+            }
+        }
         StorageUsed::with_values_checked(
             self.total_cells + 1,
             self.total_bits + cell.bit_length() as u64,
         )
+    }
+
+    pub(crate) fn configure_version(&mut self, version: u32) {
+        let legacy = version < 10;
+        if self.include_extra_currencies != legacy {
+            let seed = self.seeded_usage.take();
+            *self = Self::empty();
+            self.include_extra_currencies = legacy;
+            self.seeded_usage = seed;
+        }
+    }
+
+    pub(crate) fn prepare_transaction(
+        &mut self,
+        storage: &AccountStorage,
+        used: &StorageUsed,
+    ) -> Result<()> {
+        self.seeded_usage = Some(SeededStorageUsage {
+            roots: Self::get_roots(storage.state_init()),
+            extra_currency_root: storage.balance().other.root().cloned(),
+            used: used.clone(),
+            root_bits: storage.serialize()?.bit_length() as u64,
+        });
+        Ok(())
+    }
+
+    fn seed_roots(&self, seed: &SeededStorageUsage) -> StorageRoots {
+        let mut roots = StorageRoots::new();
+        if self.include_extra_currencies {
+            roots.extend(seed.extra_currency_root.iter().cloned());
+        }
+        roots.extend(seed.roots.iter().cloned());
+        roots
+    }
+
+    pub(crate) fn input_usage(&self) -> Option<&StorageUsed> {
+        self.seeded_usage.as_ref().map(|seed| &seed.used)
+    }
+
+    pub(crate) fn roots_changed(&self, storage: &AccountStorage) -> bool {
+        self.seeded_usage
+            .as_ref()
+            .is_none_or(|seed| self.seed_roots(seed) != self.roots_for_storage(storage))
+    }
+
+    pub(crate) fn recount(&mut self) {
+        let legacy = self.include_extra_currencies;
+        *self = Self::empty();
+        self.include_extra_currencies = legacy;
+    }
+
+    pub(crate) fn dict_root(&self) -> Option<&Cell> {
+        self.dict.root()
+    }
+
+    pub(crate) fn roots_for_storage(&self, storage: &AccountStorage) -> StorageRoots {
+        let mut roots = StorageRoots::new();
+        if self.include_extra_currencies {
+            if let Some(root) = storage.balance().other.root() {
+                roots.push(root.clone());
+            }
+        }
+        roots.extend(Self::get_roots(storage.state_init()));
+        roots
     }
 
     pub fn get_roots(storage: Option<&StateInit>) -> StorageRoots {
@@ -321,7 +468,31 @@ impl AccountStorageStat {
         for root in &to_remove {
             self.remove_cell(root)?;
         }
+        // Like native finalize_entry, only a zero net change may retain an
+        // unknown hinted count. Changed entries require the actual dictionary.
+        for (hash, data) in &mut self.cache {
+            Self::resolve_hint_count(&self.dict, hash, data)?;
+        }
         self.roots = roots;
+        Ok(())
+    }
+
+    fn resolve_hint_count(
+        dict: &StorageStatDict,
+        hash: &UInt256,
+        data: &mut StorageStatCellInfo,
+    ) -> Result<()> {
+        if data.ref_count.is_none() && data.ref_count_diff != 0 {
+            let previous = dict.get(hash)?.ok_or_else(|| {
+                error!("Hinted cell with hash {} not found in storage stat dictionary", hash)
+            })?;
+            let count = previous.ref_count.ok_or_else(|| error!("Unknown stored ref_count"))?;
+            data.ref_count = Some(
+                u32::try_from(i64::from(count) + i64::from(data.ref_count_diff))
+                    .map_err(|_| error!("Storage stat reference count out of range"))?,
+            );
+            data.max_merkle_depth = previous.max_merkle_depth;
+        }
         Ok(())
     }
 
@@ -381,6 +552,9 @@ impl AccountStorageStat {
             // known count decreased; unknown (hint) stays unknown, never "removed" → no double-count
             data.ref_count = data.ref_count.map(|c| c - 1);
             data.ref_count_diff -= 1;
+            if data.ref_count.is_none() && data.ref_count_diff < 0 {
+                Self::resolve_hint_count(&self.dict, &hash, data)?;
+            }
             data.ref_count == Some(0)
         } else {
             let data = self.dict.get(&hash)?.ok_or_else(|| {

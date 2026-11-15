@@ -933,6 +933,18 @@ impl WireKind {
     fn as_read_method(&self) -> TokenStream {
         match *self {
             WireKind::Bare(..) | WireKind::Flags => quote!(read_bare),
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: object"
+                    || ty.tokens_canon == "crate :: ton :: Object" =>
+            {
+                quote!(read_object)
+            }
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: function"
+                    || ty.tokens_canon == "crate :: ton :: Function" =>
+            {
+                quote!(read_function)
+            }
             WireKind::Boxed(..) | WireKind::TypeParameter(..) => quote!(read_boxed),
             WireKind::ExtraDefault(..) => quote!(just_default),
             WireKind::FlaggedTrue => fail_hard(),
@@ -942,6 +954,18 @@ impl WireKind {
     fn as_write_method(&self) -> Option<TokenStream> {
         match *self {
             WireKind::Bare(..) | WireKind::Flags => Some(quote!(write_bare)),
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: object"
+                    || ty.tokens_canon == "crate :: ton :: Object" =>
+            {
+                Some(quote!(write_object))
+            }
+            WireKind::Boxed(ref ty)
+                if ty.tokens_canon == "crate :: ton :: function"
+                    || ty.tokens_canon == "crate :: ton :: Function" =>
+            {
+                Some(quote!(write_function))
+            }
             WireKind::Boxed(..) | WireKind::TypeParameter(..) => Some(quote!(write_boxed)),
             WireKind::ExtraDefault(..) => None,
             WireKind::FlaggedTrue => Some(fail_hard()),
@@ -2046,6 +2070,16 @@ impl Constructors<TypeIR, FieldIR> {
         deserialize: TokenStream,
     ) -> TokenStream {
         let tl_ids = self.as_tl_ids();
+        let constructor_reader =
+            if self.0.first().is_some_and(|Matched(c, _)| c.original_output == "Bool") {
+                quote! {
+                    fn read_constructor(_de: &mut crate::Deserializer) -> crate::Result<u32> {
+                        _de.read_raw_constructor()
+                    }
+                }
+            } else {
+                quote!()
+            };
 
         quote! {
 
@@ -2056,6 +2090,7 @@ impl Constructors<TypeIR, FieldIR> {
             }
 
             impl crate::BoxedDeserialize for #name {
+                #constructor_reader
                 fn possible_constructors() -> Vec<u32> { vec![#tl_ids] }
                 fn deserialize_boxed(_id: u32, _de: &mut crate::Deserializer) -> crate::Result<Self> {
                     #deserialize

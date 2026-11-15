@@ -310,9 +310,9 @@ impl FinalityIntentStore {
         if let Some(count) = *cached {
             return Ok(count);
         }
-        let count = self.paths()?
-            .iter()
-            .try_fold(0usize, |n, path| Ok::<_, anyhow::Error>(n + usize::from(self.needs_output_rebuild(path)?)))?;
+        let count = self.paths()?.iter().try_fold(0usize, |n, path| {
+            Ok::<_, anyhow::Error>(n + usize::from(self.needs_output_rebuild(path)?))
+        })?;
         *cached = Some(count);
         Ok(count)
     }
@@ -568,52 +568,95 @@ mod tests {
         // /proc/self/io is process-wide; isolate this measurement even when
         // the normal test runner executes unrelated tests in parallel.
         if std::env::var("RTOS_OUTPUT_COUNT_IO_CHILD").ok().as_deref() != Some("1") {
-            let test = format!("{}::source_output_count_reuses_owned_snapshot_and_invalidates_on_mutation",
-                module_path!().split_once("::").unwrap().1);
+            let test = format!(
+                "{}::source_output_count_reuses_owned_snapshot_and_invalidates_on_mutation",
+                module_path!().split_once("::").unwrap().1
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--test-threads=1", "--nocapture"])
-                .env("RTOS_OUTPUT_COUNT_IO_CHILD", "1").output().unwrap();
-            assert!(output.status.success(), "isolated progress IO check: {}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"), "isolated check did not run");
+                .env("RTOS_OUTPUT_COUNT_IO_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated progress IO check: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated check did not run"
+            );
             return;
         }
         fn reads() -> u64 {
-            std::fs::read_to_string("/proc/self/io").unwrap().lines()
-                .find_map(|line| line.strip_prefix("syscr: ").map(|v| v.trim().parse().unwrap())).unwrap()
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("syscr: ").map(|v| v.trim().parse().unwrap()))
+                .unwrap()
         }
         let directory = crate::authenticated_fixture::TestDirectory::new();
         let (runtime, _) = crate::finality_delivery::tests::fixture();
-        let namespace = PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
+        let namespace =
+            PathBuf::from(runtime.runtime_directory(directory.path().to_str().unwrap()).unwrap());
         let _owner = crate::finality_delivery::PendingFinalityStore::open(&namespace).unwrap();
         let store = FinalityIntentStore::new(&namespace);
         let event = crate::simplex_state::BlockFinalizedEvent {
-            slot: crate::block::SlotIndex::new(100), block_hash: UInt256::from([7; 32]), block_id: None,
+            slot: crate::block::SlotIndex::new(100),
+            block_hash: UInt256::from([7; 32]),
+            block_id: None,
             certificate: std::sync::Arc::new(crate::certificate::Certificate {
                 vote: crate::simplex_state::FinalizeVote {
-                    slot: crate::block::SlotIndex::new(100), block_hash: UInt256::from([7; 32]),
-                }, signatures: Vec::new(),
+                    slot: crate::block::SlotIndex::new(100),
+                    block_hash: UInt256::from([7; 32]),
+                },
+                signatures: Vec::new(),
             }),
         };
-        let trigger = crate::block::RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
+        let trigger =
+            crate::block::RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
         assert_eq!(store.legacy_output_count().unwrap(), 0);
-        store.retain(&runtime, vec![runtime.pin().zerostate.clone()], runtime.pin().zerostate.clone(), &event).unwrap();
+        store
+            .retain(
+                &runtime,
+                vec![runtime.pin().zerostate.clone()],
+                runtime.pin().zerostate.clone(),
+                &event,
+            )
+            .unwrap();
         store.resolve(&trigger).unwrap();
-        assert_eq!(store.legacy_output_count().unwrap(), 1, "new completed legacy debt invalidates zero");
+        assert_eq!(
+            store.legacy_output_count().unwrap(),
+            1,
+            "new completed legacy debt invalidates zero"
+        );
         let mut block = runtime.pin().zerostate.clone();
         block.seq_no = 1;
-        store.seal_outputs(&trigger, vec![ExpectedFinalityOutput::new(&block, true, &UInt256::from([3; 32]))]).unwrap();
+        store
+            .seal_outputs(
+                &trigger,
+                vec![ExpectedFinalityOutput::new(&block, true, &UInt256::from([3; 32]))],
+            )
+            .unwrap();
         assert_eq!(store.legacy_output_count().unwrap(), 0, "sealing clears rebuild debt");
         let baseline = reads();
         let read_overhead = reads() - baseline;
         let before = reads();
-        for _ in 0..8 { assert_eq!(store.legacy_output_count().unwrap(), 0); }
+        for _ in 0..8 {
+            assert_eq!(store.legacy_output_count().unwrap(), 0);
+        }
         let repeated_reads = reads() - before;
-        assert!(repeated_reads <= read_overhead + 2, "unchanged progress queries reread output files: {repeated_reads} read syscalls");
+        assert!(
+            repeated_reads <= read_overhead + 2,
+            "unchanged progress queries reread output files: {repeated_reads} read syscalls"
+        );
         let before = reads();
         let cold = FinalityIntentStore::new(&namespace);
         assert_eq!(cold.legacy_output_count().unwrap(), 0);
         assert!(reads() - before > read_overhead, "a new owner must read its own snapshot");
-        assert!(store.collect_delivered(&runtime, |_| Err(error!("retained delivery read failure"))).is_err());
+        assert!(store
+            .collect_delivered(&runtime, |_| Err(error!("retained delivery read failure")))
+            .is_err());
         let before = reads();
         assert_eq!(store.legacy_output_count().unwrap(), 0);
         assert!(reads() - before > read_overhead, "failed mutation must leave no reusable count");
@@ -621,7 +664,10 @@ mod tests {
         let intact = std::fs::read(&path).unwrap();
         std::fs::write(&path, b"invalid output").unwrap();
         let cold = FinalityIntentStore::new(&namespace);
-        assert!(cold.legacy_output_count().is_err(), "cold reads cannot trust a previous owner's zero");
+        assert!(
+            cold.legacy_output_count().is_err(),
+            "cold reads cannot trust a previous owner's zero"
+        );
         std::fs::write(&path, intact).unwrap();
         assert_eq!(cold.legacy_output_count().unwrap(), 0, "failed scans cannot cache a count");
         store.collect_delivered(&runtime, |_| Ok(true)).unwrap();

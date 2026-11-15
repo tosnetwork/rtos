@@ -2273,7 +2273,8 @@ impl ValidatorManagerImpl {
     ) {
         consensus_common::check_execution_time!(5000); // 5ms max
 
-        let observers = self.observer_groups.iter().map(|((session_id, _), group)| (session_id, group));
+        let observers =
+            self.observer_groups.iter().map(|((session_id, _), group)| (session_id, group));
         for (session_id, group) in self.current_sessions.iter().chain(observers) {
             if !group.is_simplex() {
                 continue;

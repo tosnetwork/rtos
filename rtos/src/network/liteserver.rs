@@ -199,7 +199,7 @@ fn transaction_query_error(code: i32, message: impl Into<String>) -> anyhow::Err
 }
 
 fn make_liteserver_error(code: i32, message: String) -> TLObject {
-    ErrorEnum::LiteServer_Error(LSError { code, message }).into_tl_object()
+    ErrorEnum::LiteServer_Error(LSError { code, message: message.into() }).into_tl_object()
 }
 
 fn format_block_for_error(id: &BlockId) -> String {

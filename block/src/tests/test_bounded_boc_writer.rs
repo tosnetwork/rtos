@@ -201,7 +201,12 @@ fn bounded_boc_large_state_repeated_parse_and_reencode_default_work_budget() {
     let expected = run(&measure).unwrap();
     let work = measure.work.load(Ordering::Relaxed);
     let workspace = measure.bytes.load(Ordering::Relaxed);
-    eprintln!("large bounded BOC: bytes={}, work={}, workspace={}", original.len(), work, workspace);
+    eprintln!(
+        "large bounded BOC: bytes={}, work={}, workspace={}",
+        original.len(),
+        work,
+        workspace
+    );
     assert!(work < 4_000_000);
     let exact = Budget::new(work, workspace);
     assert_eq!(run(&exact).unwrap(), expected);

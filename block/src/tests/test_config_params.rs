@@ -17,6 +17,39 @@ use crate::{
 };
 use rand::Rng;
 
+#[test]
+fn fee_arithmetic_signed_gas_amount_cannot_be_coins() {
+    let prices = GasLimitsPrices { gas_price: 1 << 16, ..Default::default() };
+    assert!(prices.calc_gas_fee(1 << 63).is_err());
+}
+
+#[test]
+fn fee_arithmetic_zero_price_preserves_invalid_quotient_sentinel() {
+    let prices = GasLimitsPrices { flat_gas_price: 1 << 63, ..Default::default() };
+    assert_eq!(prices.gas_bought_for(99, 0, 1 << 63).unwrap(), 1 << 63);
+}
+
+#[test]
+fn fee_arithmetic_node_forward_fee_wraps_at_u64() {
+    let prices = MsgForwardPrices { lump_price: 1, bit_price: u64::MAX, ..Default::default() };
+    assert_eq!(prices.calc_fwd_fee(1 << 16, 0), 0);
+}
+
+#[test]
+fn fee_arithmetic_parts_of_maximum_coins_do_not_overflow() {
+    let prices = MsgForwardPrices {
+        first_frac: u16::MAX,
+        next_frac: u16::MAX,
+        ihr_price_factor: u32::MAX,
+        ..Default::default()
+    };
+    let fee = Coins::try_from((1u128 << 120) - 1).unwrap();
+    let expected = fee.as_u128() - (1u128 << 104);
+    assert_eq!(prices.mine_fee_checked(&fee).unwrap().as_u128(), expected);
+    assert_eq!(prices.next_fee_checked(&fee).unwrap().as_u128(), expected);
+    assert!(prices.ihr_fee_checked(&fee).is_err());
+}
+
 fn get_config_param0() -> ConfigParam0 {
     ConfigParam0 { config_addr: AccountId::from([1; 32]) }
 }
@@ -1507,7 +1540,7 @@ fn test_consensus_v4_transport_flags_and_reused_legacy_reader() {
 }
 
 // Build the wire record independently of SizeLimitsConfig::write_to.
-fn size_limits_wire(tag: u8, loads: Option<u32>, bits: u32, cells: u32) -> Cell {
+fn size_limits_wire_prefix(tag: u8, loads: Option<u32>, bits: u32, cells: u32) -> Cell {
     let mut b = BuilderData::new();
     b.append_u8(tag).unwrap();
     for n in [1000u32, 100, 1000] {
@@ -1531,6 +1564,17 @@ fn size_limits_wire(tag: u8, loads: Option<u32>, bits: u32, cells: u32) -> Cell 
         b.append_u32(bits).unwrap();
         b.append_u32(cells).unwrap();
     }
+    b.into_cell().unwrap()
+}
+
+fn size_limits_wire(tag: u8, loads: Option<u32>, bits: u32, cells: u32) -> Cell {
+    let prefix = size_limits_wire_prefix(tag, loads, bits, cells);
+    if tag != 3 {
+        return prefix;
+    }
+    let mut b = BuilderData::from_cell(&prefix).unwrap();
+    b.append_u32(18000).unwrap();
+    b.append_u32(12000).unwrap();
     b.into_cell().unwrap()
 }
 
@@ -1599,8 +1643,16 @@ fn size_limits_cpp_cell_hashes() {
         let f: Vec<_> = line.split('\t').collect();
         let tag = f[0].parse().unwrap();
         let loads = if f[1] == "-1" { None } else { Some(f[1].parse().unwrap()) };
-        let wire = size_limits_wire(tag, loads, f[2].parse().unwrap(), f[3].parse().unwrap());
+        let wire =
+            size_limits_wire_prefix(tag, loads, f[2].parse().unwrap(), f[3].parse().unwrap());
         assert_eq!(wire.repr_hash().to_hex_string().to_uppercase(), f[4]);
+        // Legacy C++ hashes cover a v3 prefix that omits the queue fields.
+        // Retain these bytes as malformed-input evidence, not valid schema vectors.
+        if tag == 3 {
+            assert!(SizeLimitsConfig::construct_from_cell(wire).is_err());
+            count += 1;
+            continue;
+        }
         let parsed = SizeLimitsConfig::construct_from_cell(wire.clone()).unwrap();
         if tag >= 2 {
             assert_eq!(parsed.serialize().unwrap().repr_hash(), wire.repr_hash());
@@ -1782,3 +1834,34 @@ fn decode_config_param_39_cells() {
 
 #[path = "test_config_param_schema.rs"]
 mod schema_corpus;
+
+#[test]
+fn size_limits_v3_rejects_missing_queue_limits() {
+    for loads in [None, Some(0), Some(u32::MAX)] {
+        let wire = size_limits_wire(3, loads, 2000, 200);
+        let slice = SliceData::load_cell(wire).unwrap();
+        for missing in [1, 32, 64] {
+            let mut truncated = slice.clone();
+            truncated.shrink_data(0..slice.remaining_bits() - missing);
+            assert!(
+                SizeLimitsConfig::construct_from(&mut truncated).is_err(),
+                "accepted missing {missing} queue-limit bits"
+            );
+        }
+    }
+}
+
+#[test]
+fn size_limits_queue_only_changes_select_v3() {
+    for (hard, soft) in [(123, 12000), (18000, 456), (0, 0), (u32::MAX, u32::MAX)] {
+        let prefix = size_limits_wire_prefix(3, None, MAX_MSG_BITS * 5 / 2, MAX_MSG_CELLS * 5 / 2);
+        let mut b = BuilderData::from_cell(&prefix).unwrap();
+        b.append_u32(hard).unwrap();
+        b.append_u32(soft).unwrap();
+        let wire = b.into_cell().unwrap();
+        let limits = SizeLimitsConfig::construct_from_full_cell(wire.clone()).unwrap();
+        assert_eq!(limits.out_msg_queue_size_hard_limit, hard);
+        assert_eq!(limits.out_msg_queue_size_soft_limit, soft);
+        assert_eq!(limits.serialize().unwrap(), wire);
+    }
+}

@@ -25,7 +25,16 @@ async fn overlay_owned_real_post_insert_failure_rolls_back_only_owned_generation
     let adnl = node(91).await;
     let remote = node(92).await;
     let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
-    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    let rldp = RldpNode::with_params(
+        adnl.clone(),
+        vec![overlay.clone()],
+        None,
+        #[cfg(feature = "debug")]
+        None,
+        #[cfg(feature = "debug")]
+        None,
+    )
+    .unwrap();
     overlay.set_rldp(rldp).unwrap();
     let id = KeyId::from_data([93; 32]);
     let foreign = remote.key_by_tag(0).unwrap();
@@ -78,7 +87,16 @@ async fn overlay_owned_checked_delete_waits_real_inbound_and_survives_waiter_can
     let adnl = node(96).await;
     let remote = node(97).await;
     let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
-    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
+    let rldp = RldpNode::with_params(
+        adnl.clone(),
+        vec![overlay.clone()],
+        None,
+        #[cfg(feature = "debug")]
+        None,
+        #[cfg(feature = "debug")]
+        None,
+    )
+    .unwrap();
     overlay.set_rldp(rldp.clone()).unwrap();
     let key = adnl.key_by_tag(0).unwrap();
     let other = remote.key_by_tag(0).unwrap();

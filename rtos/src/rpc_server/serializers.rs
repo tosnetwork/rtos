@@ -309,13 +309,14 @@ fn normalize_number_decimal(number: &str) -> String {
     parsed.to_str_radix(10)
 }
 
-impl From<&Number> for NumberJson {
-    fn from(value: &Number) -> Self {
-        match value {
+impl TryFrom<&Number> for NumberJson {
+    type Error = ConversionError;
+    fn try_from(value: &Number) -> ConvResult<Self> {
+        Ok(match value {
             Number::Tvm_NumberDecimal(inner) => {
-                NumberJson::Decimal { number: normalize_number_decimal(&inner.number) }
+                NumberJson::Decimal { number: normalize_number_decimal(inner.number.as_str()?) }
             }
-        }
+        })
     }
 }
 
@@ -325,7 +326,7 @@ impl TryFrom<NumberJson> for Number {
     fn try_from(value: NumberJson) -> ConvResult<Self> {
         match value {
             NumberJson::Decimal { number } => {
-                Ok(Number::Tvm_NumberDecimal(NumberDecimal { number }))
+                Ok(Number::Tvm_NumberDecimal(NumberDecimal { number: number.into() }))
             }
         }
     }
@@ -389,14 +390,19 @@ enum ListJson {
     List { elements: Vec<StackEntryJson> },
 }
 
-impl From<&List> for ListJson {
-    fn from(value: &List) -> Self {
-        match value {
+impl TryFrom<&List> for ListJson {
+    type Error = ConversionError;
+    fn try_from(value: &List) -> ConvResult<Self> {
+        Ok(match value {
             List::Tvm_List(inner) => {
-                let elements = inner.elements.iter().map(StackEntryJson::from).collect();
+                let elements = inner
+                    .elements
+                    .iter()
+                    .map(StackEntryJson::try_from)
+                    .collect::<ConvResult<Vec<_>>>()?;
                 ListJson::List { elements }
             }
-        }
+        })
     }
 }
 
@@ -420,14 +426,19 @@ enum TupleJson {
     Tuple { elements: Vec<StackEntryJson> },
 }
 
-impl From<&Tuple> for TupleJson {
-    fn from(value: &Tuple) -> Self {
-        match value {
+impl TryFrom<&Tuple> for TupleJson {
+    type Error = ConversionError;
+    fn try_from(value: &Tuple) -> ConvResult<Self> {
+        Ok(match value {
             Tuple::Tvm_Tuple(inner) => {
-                let elements = inner.elements.iter().map(StackEntryJson::from).collect();
+                let elements = inner
+                    .elements
+                    .iter()
+                    .map(StackEntryJson::try_from)
+                    .collect::<ConvResult<Vec<_>>>()?;
                 TupleJson::Tuple { elements }
             }
-        }
+        })
     }
 }
 
@@ -461,26 +472,27 @@ enum StackEntryJson {
     Unsupported,
 }
 
-impl From<&StackEntry> for StackEntryJson {
-    fn from(value: &StackEntry) -> Self {
-        match value {
+impl TryFrom<&StackEntry> for StackEntryJson {
+    type Error = ConversionError;
+    fn try_from(value: &StackEntry) -> ConvResult<Self> {
+        Ok(match value {
             StackEntry::Tvm_StackEntryNumber(inner) => {
-                StackEntryJson::Number { number: NumberJson::from(&inner.number) }
+                StackEntryJson::Number { number: NumberJson::try_from(&inner.number)? }
             }
             StackEntry::Tvm_StackEntryCell(inner) => {
                 StackEntryJson::Cell { cell: CellJson::from(&inner.cell) }
             }
             StackEntry::Tvm_StackEntryList(inner) => {
-                StackEntryJson::List { list: ListJson::from(&inner.list) }
+                StackEntryJson::List { list: ListJson::try_from(&inner.list)? }
             }
             StackEntry::Tvm_StackEntrySlice(inner) => {
                 StackEntryJson::Slice { slice: SliceJson::from(&inner.slice) }
             }
             StackEntry::Tvm_StackEntryTuple(inner) => {
-                StackEntryJson::Tuple { tuple: TupleJson::from(&inner.tuple) }
+                StackEntryJson::Tuple { tuple: TupleJson::try_from(&inner.tuple)? }
             }
             StackEntry::Tvm_StackEntryUnsupported => StackEntryJson::Unsupported,
-        }
+        })
     }
 }
 
@@ -630,18 +642,18 @@ where
 {
     let values = stack
         .into_iter()
-        .map(|entry| {
+        .map(|entry| -> ConvResult<_> {
             let entry = entry.into();
-            serde_json::json!(StackEntryJson::from(&entry))
+            Ok(serde_json::to_value(StackEntryJson::try_from(&entry)?)?)
         })
-        .collect();
+        .collect::<ConvResult<Vec<_>>>()?;
     Ok(serde_json::Value::Array(values))
 }
 
 fn serialize_stack_entry(entry: &StackEntry) -> JsonResult {
     let result = match entry {
         StackEntry::Tvm_StackEntryNumber(value) => {
-            serde_json::json!(["num", value.number.number()])
+            serde_json::json!(["num", value.number.number().as_str()?])
         }
         StackEntry::Tvm_StackEntryCell(cell) => {
             let root_cell = read_single_root_boc(&cell.cell.bytes)?;
@@ -651,13 +663,13 @@ fn serialize_stack_entry(entry: &StackEntry) -> JsonResult {
             serde_json::json!(["cell", CellEntrySerializable { bytes, object }])
         }
         StackEntry::Tvm_StackEntryList(list) => {
-            serde_json::json!(["list", ListJson::from(&list.list)])
+            serde_json::json!(["list", ListJson::try_from(&list.list)?])
         }
         StackEntry::Tvm_StackEntrySlice(slice_entry) => {
             serde_json::json!(["slice", base64_encode(&slice_entry.slice.bytes)])
         }
         StackEntry::Tvm_StackEntryTuple(tuple_entry) => {
-            serde_json::json!(["tuple", TupleJson::from(&tuple_entry.tuple)])
+            serde_json::json!(["tuple", TupleJson::try_from(&tuple_entry.tuple)?])
         }
         StackEntry::Tvm_StackEntryUnsupported => {
             serde_json::json!(["unsupported"])
@@ -737,7 +749,7 @@ impl<'de> serde::Deserialize<'de> for RPCStackEntry {
                         })?;
                         let inner = stackentry::StackEntryNumber {
                             number: Number::Tvm_NumberDecimal(NumberDecimal {
-                                number: value.into_string(),
+                                number: value.into_string().into(),
                             }),
                         };
                         Ok(RPCStackEntry::Tvm_StackEntryNumber(inner))

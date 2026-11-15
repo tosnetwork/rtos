@@ -5,8 +5,7 @@
 //! Each failure is followed by a cold reopen before any retry, so the
 //! reopen sees exactly what the failure left. With `RTOS_ENOSPC_CONTROL=1`
 //! the case runs its positive control: the same write with ample space.
-use super::tests::fixture_seqno;
-use super::*;
+use super::{tests::fixture_seqno, *};
 use rtos_block::ShardIdent;
 
 fn enospc_root() -> PathBuf {

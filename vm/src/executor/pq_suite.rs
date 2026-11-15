@@ -29,11 +29,11 @@ pub(super) fn execute_pq_suite(engine: &mut Engine) -> Status {
             use rtos_pq_crypto::{
                 MAX_CONTEXT_BYTES, MAX_MESSAGE_BYTES, PUBLIC_KEY_BYTES, SIGNATURE_BYTES,
             };
-            engine.try_use_gas(50_000)?;
-            let key = read_bytes_priced(engine, key, PUBLIC_KEY_BYTES, 1)?;
-            let signature = read_bytes_priced(engine, signature, SIGNATURE_BYTES, 1)?;
-            let context = read_bytes_priced(engine, context, MAX_CONTEXT_BYTES, 1)?;
-            let message = read_bytes_priced(engine, message, MAX_MESSAGE_BYTES, 1)?;
+            let key = read_bytes_priced(engine, key, PUBLIC_KEY_BYTES, 0)?;
+            let signature = read_bytes_priced(engine, signature, SIGNATURE_BYTES, 0)?;
+            let context = read_bytes_priced(engine, context, MAX_CONTEXT_BYTES, 0)?;
+            let message = read_bytes_priced(engine, message, MAX_MESSAGE_BYTES, 0)?;
+            engine.register_signature_call()?;
             match rtos_pq_crypto::verify(&message, &context, &signature, &key) {
                 Ok(valid) => valid,
                 Err(rtos_pq_crypto::VerifyError::Backend(_)) => {
@@ -61,11 +61,12 @@ pub(super) fn execute_pq_suite(engine: &mut Engine) -> Status {
             }
         }
         3 => {
-            engine.try_use_gas(750_000)?;
-            let key = read_bytes_priced(engine, key, slhdsa128s::PUBLIC_KEY_BYTES, 1)?;
-            let signature = read_bytes_priced(engine, signature, slhdsa128s::SIGNATURE_BYTES, 1)?;
-            let context = read_bytes_priced(engine, context, slhdsa128s::MAX_CONTEXT_BYTES, 1)?;
-            let message = read_bytes_priced(engine, message, slhdsa128s::MAX_MESSAGE_BYTES, 1)?;
+            engine.register_slh_attempt()?;
+            engine.try_use_gas(4_500)?;
+            let key = read_bytes_priced(engine, key, slhdsa128s::PUBLIC_KEY_BYTES, 0)?;
+            let signature = read_bytes_priced(engine, signature, slhdsa128s::SIGNATURE_BYTES, 0)?;
+            let context = read_bytes_priced(engine, context, slhdsa128s::MAX_CONTEXT_BYTES, 0)?;
+            let message = read_bytes_priced(engine, message, slhdsa128s::MAX_MESSAGE_BYTES, 0)?;
             match slhdsa128s::verify(&message, &context, &signature, &key) {
                 Ok(valid) => valid,
                 Err(slhdsa128s::VerifyError::Backend(_)) => {

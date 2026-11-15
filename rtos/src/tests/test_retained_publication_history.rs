@@ -108,8 +108,10 @@ impl EngineOperations for CapsuleEngine {
     ) -> Result<BlockProofStuff> {
         fail!("ordinary historical proof unavailable")
     }
-    async fn load_last_applied_mc_state_bounded(&self,
-        _budget: Arc<crate::history_read_budget::HistoryReadBudget>) -> Result<Arc<ShardStateStuff>> {
+    async fn load_last_applied_mc_state_bounded(
+        &self,
+        _budget: Arc<crate::history_read_budget::HistoryReadBudget>,
+    ) -> Result<Arc<ShardStateStuff>> {
         fail!("ordinary historical index unavailable")
     }
     async fn load_last_applied_mc_state(&self) -> Result<Arc<ShardStateStuff>> {
@@ -185,18 +187,33 @@ async fn retained_publication_nonzero_epoch_cold_cache_and_revocation() {
         )
         .unwrap();
     {
-        use crate::history_read_budget::{HistoryReadBudget, HistoryReadLimits, HistoryBudgetExceeded};
+        use crate::history_read_budget::{
+            HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits,
+        };
         crate::block_proof::MasterchainProofVerifier::default()
-            .pq_broadcast_context_bounded(&engine, target.id(), &block,
-                HistoryReadBudget::new(HistoryReadLimits::default())).await.unwrap();
+            .pq_broadcast_context_bounded(
+                &engine,
+                target.id(),
+                &block,
+                HistoryReadBudget::new(HistoryReadLimits::default()),
+            )
+            .await
+            .unwrap();
         for limits in [
             HistoryReadLimits { metadata_bytes: 1, ..Default::default() },
             HistoryReadLimits { state_boc_bytes: 1, ..Default::default() },
             HistoryReadLimits { cells: 0, ..Default::default() },
         ] {
             let error = crate::block_proof::MasterchainProofVerifier::default()
-                .pq_broadcast_context_bounded(&engine, target.id(), &block, HistoryReadBudget::new(limits))
-                .await.err().expect("bounded capsule must reject before unbounded fallback");
+                .pq_broadcast_context_bounded(
+                    &engine,
+                    target.id(),
+                    &block,
+                    HistoryReadBudget::new(limits),
+                )
+                .await
+                .err()
+                .expect("bounded capsule must reject before unbounded fallback");
             assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some(), "{error:#}");
         }
     }

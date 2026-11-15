@@ -20,18 +20,33 @@ pub struct PqNetworkSignatureSet {
 }
 
 impl PqNetworkSignatureSet {
+    fn checked_pair(
+        validator_id: UInt256,
+        algorithm_id: i32,
+        signature: Vec<u8>,
+    ) -> Result<PqBlockSignaturePair> {
+        let algorithm_id =
+            u16::try_from(algorithm_id).map_err(|_| error!("PQ network algorithm out of range"))?;
+        if algorithm_id != MLDSA44_ALGORITHM_ID {
+            fail!("PQ network unsupported algorithm");
+        }
+        if signature.len() != PQ_SIGNATURE_BYTES {
+            fail!("PQ network signature length");
+        }
+        Ok(PqBlockSignaturePair { validator_id, algorithm_id, signature })
+    }
+
     pub fn from_node(value: ton::ton_node::signature_set::signatureset::SimplexPq) -> Result<Self> {
         if value.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
             fail!("PQ network signer count exceeds maximum");
         }
         let mut signatures = Vec::with_capacity(value.signatures.len());
         for pair in value.signatures {
-            signatures.push(PqBlockSignaturePair {
-                validator_id: pair.validator_id,
-                algorithm_id: u16::try_from(pair.algorithm_id)
-                    .map_err(|_| error!("PQ network algorithm out of range"))?,
-                signature: pair.signature,
-            });
+            signatures.push(Self::checked_pair(
+                pair.validator_id,
+                pair.algorithm_id,
+                pair.signature,
+            )?);
         }
         let result = Self {
             is_final: matches!(value.final_, ton::Bool::BoolTrue),
@@ -58,12 +73,11 @@ impl PqNetworkSignatureSet {
         let mut signatures = cb::vector(budget, value.signatures.len())?;
         for pair in value.signatures {
             budget.step()?;
-            signatures.push(PqBlockSignaturePair {
-                validator_id: pair.validator_id,
-                algorithm_id: u16::try_from(pair.algorithm_id)
-                    .map_err(|_| error!("PQ network algorithm out of range"))?,
-                signature: pair.signature,
-            });
+            signatures.push(Self::checked_pair(
+                pair.validator_id,
+                pair.algorithm_id,
+                pair.signature,
+            )?);
         }
         let result = Self {
             is_final: matches!(value.final_, ton::Bool::BoolTrue),
@@ -111,27 +125,29 @@ impl PqNetworkSignatureSet {
         if value.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
             fail!("PQ network signer count exceeds maximum");
         }
+        let signatures = value
+            .signatures
+            .into_iter()
+            .map(|pair| Self::checked_pair(pair.validator_id, pair.algorithm_id, pair.signature))
+            .collect::<Result<Vec<_>>>()?;
+        Self::validate_signatures(&signatures)?;
         if value.candidate.len() > 1024 {
             fail!("PQ network candidate exceeds maximum");
         }
         let candidate = WireProfile::T0.deserialize_typed(&value.candidate)?;
-        Self::from_node(ton::ton_node::signature_set::signatureset::SimplexPq {
-            final_: ton::Bool::BoolTrue,
-            cc_seqno: value.cc_seqno,
-            validator_set_hash: value.validator_set_hash,
-            signatures: value
-                .signatures
-                .into_iter()
-                .map(|pair| ton::ton_node::pqblocksignature::PqBlockSignature {
-                    validator_id: pair.validator_id,
-                    algorithm_id: pair.algorithm_id,
-                    signature: pair.signature,
-                })
-                .collect(),
+        let result = Self {
+            is_final: true,
+            validator_info: ValidatorBaseInfo::with_params(
+                value.validator_set_hash as u32,
+                value.cc_seqno as u32,
+            ),
+            signatures,
             session_id: value.session_id,
-            slot: value.slot,
+            slot: value.slot as u32,
             candidate,
-        })
+        };
+        result.validate_structure()?;
+        Ok(result)
     }
 
     /// Prepare outgoing final fields; this is structural validation, not authentication.
@@ -156,11 +172,19 @@ impl PqNetworkSignatureSet {
     }
 
     fn validate_structure(&self) -> Result<()> {
-        if self.signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
+        Self::validate_signatures(&self.signatures)?;
+        if WireProfile::T0.serialize(&self.candidate)?.len() > 1024 {
+            fail!("PQ network candidate exceeds maximum");
+        }
+        Ok(())
+    }
+
+    fn validate_signatures(signatures: &[PqBlockSignaturePair]) -> Result<()> {
+        if signatures.len() > PQ_SIGNATURE_MAX_SIGNERS as usize {
             fail!("PQ network signer count exceeds maximum");
         }
         let mut ids = HashSet::new();
-        for pair in &self.signatures {
+        for pair in signatures {
             if pair.algorithm_id != MLDSA44_ALGORITHM_ID {
                 fail!("PQ network unsupported algorithm");
             }
@@ -170,9 +194,6 @@ impl PqNetworkSignatureSet {
             if !ids.insert(&pair.validator_id) {
                 fail!("PQ network duplicate validator identity");
             }
-        }
-        if WireProfile::T0.serialize(&self.candidate)?.len() > 1024 {
-            fail!("PQ network candidate exceeds maximum");
         }
         Ok(())
     }

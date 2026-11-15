@@ -153,6 +153,8 @@ mod block;
 mod candidate_book;
 mod candidate_controller;
 mod certificate;
+#[cfg(any(test, feature = "isolated-consensus-signing"))]
+mod cold_bootstrap_test_control;
 mod collation_controller;
 mod consensus_controller;
 mod controller_queue;
@@ -170,8 +172,6 @@ mod session_runtime;
 mod session_telemetry;
 mod simplex_state;
 mod startup_recovery;
-#[cfg(any(test, feature = "isolated-consensus-signing"))]
-mod cold_bootstrap_test_control;
 mod task_queue;
 pub mod trace_collector;
 pub mod utils;

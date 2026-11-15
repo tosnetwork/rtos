@@ -25,7 +25,7 @@ use std::{
     fmt::Display,
     hash::Hash,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -39,9 +39,13 @@ mod tests;
 #[path = "../tests/test_awaiters_pool_typed_errors.rs"]
 mod typed_error_tests;
 
+const OP_IDLE: u8 = 0;
+const OP_STARTED: u8 = 1;
+const OP_RETIRED: u8 = 2;
+
 declare_counted!(
     struct OperationAwaiters<R> {
-        is_started: AtomicBool,
+        state: AtomicU8,
         tx: tokio::sync::watch::Sender<Option<Result<R>>>,
         rx: tokio::sync::watch::Receiver<Option<Result<R>>>,
     }
@@ -55,7 +59,7 @@ impl<R: Clone> OperationAwaiters<R> {
     ) -> Arc<Self> {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let ret = Self {
-            is_started: AtomicBool::new(is_started),
+            state: AtomicU8::new(if is_started { OP_STARTED } else { OP_IDLE }),
             tx,
             rx,
             counter: allocated.awaiters.clone().into(),
@@ -131,9 +135,18 @@ where
     ) -> Result<Option<R>> {
         loop {
             if let Some(op_awaiters) = self.ops_awaiters.get(id) {
-                if !op_awaiters.1.is_started.swap(true, Ordering::SeqCst) {
+                let state = op_awaiters.1.state.compare_exchange(
+                    OP_IDLE,
+                    OP_STARTED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                if state.is_ok() {
                     return Some(self.do_operation(id, operation, &op_awaiters.1).await)
                         .transpose();
+                } else if state == Err(OP_RETIRED) {
+                    self.remove_matching(id, &op_awaiters.1);
+                    continue;
                 } else {
                     return self
                         .wait_operation(id, wait_timeout_ms, &op_awaiters.1, || Ok(false))
@@ -259,6 +272,12 @@ where
     ) -> Result<Option<R>> {
         let mut rx = op_awaiters.rx.clone();
         let result = loop {
+            // An externally completed idle registration has no result producer.
+            // All attached readers must recheck their external state, including
+            // those that subscribed before the registration left the map.
+            if op_awaiters.state.load(Ordering::SeqCst) == OP_RETIRED {
+                break Ok(None);
+            }
             log::trace!("{}: wait_operation: waiting... {}", self.description, id);
 
             let result = if let Ok(result) =
@@ -289,10 +308,19 @@ where
             log::trace!("{}: wait_operation: done {}", self.description, id);
             break r;
         };
-        // External finalization paths (Ok(None)) own the cleanup, since the
-        // value sender (`do_operation`/`shunt`) won't fire for them.
-        if matches!(result, Ok(None)) {
+        // Only retire a registration that has no operation owner. Removing an
+        // active owner would allow a second writer for the same key. The CAS
+        // also prevents a new owner from claiming an entry while it retires.
+        if matches!(result, Ok(None))
+            && op_awaiters
+                .state
+                .compare_exchange(OP_IDLE, OP_RETIRED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             self.remove_matching(id, op_awaiters);
+            // Wake every old subscriber without inventing a result or
+            // cancelling an operation. Retired entries cannot have an owner.
+            op_awaiters.tx.send_modify(|_| {});
         }
         result
     }

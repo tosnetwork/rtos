@@ -76,11 +76,19 @@ fn orphan_controls(root: &Path) -> Result<()> {
     // Ordinary provider aliases remain compatible when no root work exists.
     // Resolve the provider root, then reject aliases in the control area itself.
     let archive = fs::canonicalize(root)?.join("archive");
-    if !checked_exists(&archive)? { return Ok(()); }
-    if !fs::symlink_metadata(&archive)?.is_dir() { fail!("Archive path is not a directory"); }
+    if !checked_exists(&archive)? {
+        return Ok(());
+    }
+    if !fs::symlink_metadata(&archive)?.is_dir() {
+        fail!("Archive path is not a directory");
+    }
     let controls = archive.join("recovery");
-    if !checked_exists(&controls)? { return Ok(()); }
-    if !fs::symlink_metadata(&controls)?.is_dir() { fail!("Recovery control path is not a directory"); }
+    if !checked_exists(&controls)? {
+        return Ok(());
+    }
+    if !fs::symlink_metadata(&controls)?.is_dir() {
+        fail!("Recovery control path is not a directory");
+    }
     if let Some(entry) = fs::read_dir(&controls)?.next() {
         let entry = entry?;
         fail!("Orphan archive recovery artifact: {}", entry.path().display());

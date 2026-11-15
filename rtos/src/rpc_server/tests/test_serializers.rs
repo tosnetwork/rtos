@@ -421,3 +421,19 @@ fn test_api_error_display() {
     let display = format!("{}", err);
     assert_eq!(display, "Some internal error");
 }
+
+#[test]
+fn invalid_utf8_stack_numbers_return_errors() {
+    let number = stackentry::StackEntryNumber {
+        number: Number::Tvm_NumberDecimal(NumberDecimal { number: vec![0xff].into() }),
+    }
+    .into_boxed();
+    let list = stackentry::StackEntryList {
+        list: List::Tvm_List(list::List { elements: vec![number.clone()] }),
+    }
+    .into_boxed();
+    for entry in [number, list] {
+        assert!(serialize_stack([entry.clone()]).is_err());
+        assert!(serialize_stack_std([entry]).is_err());
+    }
+}

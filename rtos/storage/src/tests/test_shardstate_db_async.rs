@@ -185,10 +185,16 @@ async fn publication_durability_state_failure_cannot_ack_a_barrier() -> Result<(
 async fn state_owner_immediate_stop_joins_unpolled_worker_and_reopens_db() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
-    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+    let states = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
-        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
     // No yield since spawn: current-thread worker has not set MASK_WORKER yet.
     states.stop().await?;
     states.clone().start_gc(Arc::new(MockedResolver), Arc::new(AtomicU32::new(0)));
@@ -204,19 +210,30 @@ async fn state_owner_immediate_stop_joins_unpolled_worker_and_reopens_db() -> Re
 async fn state_owner_cancelled_stop_retains_join_until_callback_finishes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
-    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+    let states = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
-        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
-    let pause = Arc::new(StateDurabilityPause { entered: Default::default(), release: Default::default() });
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    let pause =
+        Arc::new(StateDurabilityPause { entered: Default::default(), release: Default::default() });
     states.put(&BlockIdExt::default(), Cell::default(), Some(pause.clone())).await?;
     pause.entered.notified().await;
     let owner = states.clone();
     let mut stop = tokio::spawn(async move { owner.stop().await });
-    let (waiting, cancelled) = match tokio::time::timeout(Duration::from_millis(20), &mut stop).await {
-        Ok(result) => (false, result),
-        Err(_) => { stop.abort(); (true, stop.await) },
-    };
+    let (waiting, cancelled) =
+        match tokio::time::timeout(Duration::from_millis(20), &mut stop).await {
+            Ok(result) => (false, result),
+            Err(_) => {
+                stop.abort();
+                (true, stop.await)
+            }
+        };
     pause.release.notify_one();
     let drained = states.stop().await;
     let weak = Arc::downgrade(&db);
@@ -240,11 +257,19 @@ impl crate::shardstate_db_async::Callback for PanickingStateCallback {
 async fn state_owner_worker_panic_is_retained_by_every_stop_waiter() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
-    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+    let states = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
-        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
-    states.put(&BlockIdExt::default(), Cell::default(), Some(Arc::new(PanickingStateCallback))).await?;
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
+    states
+        .put(&BlockIdExt::default(), Cell::default(), Some(Arc::new(PanickingStateCallback)))
+        .await?;
     // Observe actual task termination before setting the stop flag; otherwise
     // normal stop could reject queued work before this callback runs.
     let worker = states.test_worker_completion().await;
@@ -264,10 +289,16 @@ async fn state_owner_worker_panic_is_retained_by_every_stop_waiter() -> Result<(
 async fn state_owner_gc_admission_racing_stop_has_no_unjoined_db_owner() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite)?;
-    let states = ShardStateDb::new(db.clone(), "states", "cells", "counters",
+    let states = ShardStateDb::new(
+        db.clone(),
+        "states",
+        "cells",
+        "counters",
         CellsDbConfig::default(),
         #[cfg(feature = "telemetry")]
-        Arc::new(StorageTelemetry::default()), Arc::new(StorageAlloc::default()))?;
+        Arc::new(StorageTelemetry::default()),
+        Arc::new(StorageAlloc::default()),
+    )?;
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let admission_owner = states.clone();
     let start = barrier.clone();

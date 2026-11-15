@@ -2,7 +2,10 @@
 //! Owned, versioned archive truncation inputs shared by both archive maps.
 use crate::traits::Serializable;
 use rtos_block::{error, fail, BlockIdExt, Result};
-use std::{io::{Read, Write}, sync::Arc};
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
 
 const PREDICATE_VERSION: u16 = 1;
 const _: () = assert!(BlockIdExt::SIZE == 80);
@@ -36,9 +39,9 @@ impl TruncationSelection {
         if id.shard().is_masterchain() {
             id.seq_no() >= self.cutoff.seq_no()
         } else {
-            self.top_blocks.iter().any(|top| {
-                id.shard().intersect_with(top.shard()) && id.seq_no() > top.seq_no()
-            })
+            self.top_blocks
+                .iter()
+                .any(|top| id.shard().intersect_with(top.shard()) && id.seq_no() > top.seq_no())
         }
     }
 
@@ -61,7 +64,8 @@ impl TruncationSelection {
 }
 
 fn predicate_len(count: u64) -> Result<u64> {
-    count.checked_mul(BlockIdExt::SIZE as u64)
+    count
+        .checked_mul(BlockIdExt::SIZE as u64)
         .and_then(|bytes| PREFIX_BYTES.checked_add(bytes))
         .ok_or_else(|| error!("Archive truncation predicate length overflow"))
 }

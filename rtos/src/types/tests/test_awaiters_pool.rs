@@ -16,7 +16,7 @@ use crate::collator_test_bundle::create_engine_telemetry;
 use rtos_block::fail;
 use std::{
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -123,6 +123,82 @@ async fn test_awaiters_pool_fail() {
         .find(|r| r.is_err())
         .unwrap_or(Ok(()))
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_completion_does_not_orphan_an_existing_waiter() {
+    let pool = Arc::new(AwaitersPool::<u32, u32>::new(
+        "external completion",
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    ));
+    let complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let waiter_pool = pool.clone();
+    let waiter_complete = complete.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_pool
+            .wait(&1, None, || {
+                let done = waiter_complete.load(std::sync::atomic::Ordering::SeqCst);
+                registered_tx.send(()).unwrap();
+                Ok(done)
+            })
+            .await
+    });
+    let watchdog = Duration::from_secs(2);
+    tokio::time::timeout(watchdog, registered_rx.recv()).await.unwrap().unwrap();
+    // A second reader sees the newly stored state before the storing task
+    // publishes its result. It must not detach the already registered reader.
+    complete.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(pool.wait(&1, None, || Ok(true)).await.unwrap(), None);
+    assert_eq!(pool.do_or_wait(&1, None, async { Ok(7) }).await.unwrap(), Some(7));
+    let observed = tokio::time::timeout(watchdog, &mut waiter).await;
+    if observed.is_err() {
+        waiter.abort();
+        let _ = waiter.await;
+    }
+    assert!(observed.is_ok(), "external completion orphaned a registered state waiter");
+    assert!(matches!(observed.unwrap().unwrap().unwrap(), None | Some(7)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_completion_preserves_the_active_operation_owner() {
+    let pool = Arc::new(AwaitersPool::<u32, u32>::new(
+        "external completion with owner",
+        #[cfg(feature = "telemetry")]
+        create_engine_telemetry(),
+        create_engine_allocated(),
+    ));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let owner_pool = pool.clone();
+    let owner = tokio::spawn(async move {
+        owner_pool
+            .do_or_wait(&1, None, async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(7)
+            })
+            .await
+    });
+    let watchdog = Duration::from_secs(2);
+    tokio::time::timeout(watchdog, started_rx).await.unwrap().unwrap();
+    assert_eq!(pool.wait(&1, None, || Ok(true)).await.unwrap(), None);
+    // The external predicate may become true before the owner finishes its
+    // remaining writes. A new caller must still subscribe to that owner.
+    let follower_pool = pool.clone();
+    let follower = async move {
+        follower_pool.do_or_wait(&1, None, async { panic!("duplicate operation owner") }).await
+    };
+    tokio::pin!(follower);
+    tokio::select! {
+        result = &mut follower => panic!("follower finished before owner: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+    }
+    release_tx.send(()).unwrap();
+    assert_eq!(tokio::time::timeout(watchdog, owner).await.unwrap().unwrap().unwrap(), Some(7));
+    assert_eq!(tokio::time::timeout(watchdog, follower).await.unwrap().unwrap(), Some(7));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -51,7 +51,10 @@ use std::{
 const DEFAULT_PKG_VERSION: u32 = 1;
 
 #[derive(Clone, Copy)]
-enum PackageOpenMode { RecoverOrCreate, PreserveExisting }
+enum PackageOpenMode {
+    RecoverOrCreate,
+    PreserveExisting,
+}
 
 enum ChosenPackage {
     Info(Arc<PackageInfo>),
@@ -71,7 +74,12 @@ enum ChosenPackage {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetadataCut { EntryMeta, NonSlicedStatus, Offset, BlockIndex }
+enum MetadataCut {
+    EntryMeta,
+    NonSlicedStatus,
+    Offset,
+    BlockIndex,
+}
 #[cfg(test)]
 type MetadataGate = Arc<dyn Fn(u64, u64) -> Result<()> + Send + Sync>;
 
@@ -128,7 +136,10 @@ impl ArchiveSlice {
         let operation = parent.inherit(&binding)?;
         let db = binding.db().clone();
         super::recovery_guard::ensure_slice_clear(
-            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+            db.db(),
+            &db_root_path,
+            archive_id,
+            matches!(package_type, PackageType::KeyBlocks),
         )?;
         let mut ret = Self::create(
             operation.view(),
@@ -180,7 +191,15 @@ impl ArchiveSlice {
             )
         }
         let entry = ret.get_base_entry_info();
-        ret.open_package(&operation, entry, None, 0, DEFAULT_PKG_VERSION, PackageOpenMode::RecoverOrCreate).await?;
+        ret.open_package(
+            &operation,
+            entry,
+            None,
+            0,
+            DEFAULT_PKG_VERSION,
+            PackageOpenMode::RecoverOrCreate,
+        )
+        .await?;
         Ok(ret)
     }
 
@@ -200,7 +219,10 @@ impl ArchiveSlice {
         let operation = parent.inherit(&binding)?;
         let db = binding.db().clone();
         super::recovery_guard::ensure_slice_clear(
-            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+            db.db(),
+            &db_root_path,
+            archive_id,
+            matches!(package_type, PackageType::KeyBlocks),
         )?;
         let mut ret = Self::create(
             operation.view(),
@@ -253,10 +275,14 @@ impl ArchiveSlice {
         }
 
         if !self.sliced_mode {
-            let pi = self.get_package_by_entry(&self.get_base_entry_info()).await
+            let pi = self
+                .get_package_by_entry(&self.get_base_entry_info())
+                .await
                 .ok_or_else(|| error!("Imported non-sliced package is missing"))?;
-            self.entry_db.put_value(&u32::MAX.into(),
-                &PackageEntryMeta::with_data(file_size, pi.version(), None))?;
+            self.entry_db.put_value(
+                &u32::MAX.into(),
+                &PackageEntryMeta::with_data(file_size, pi.version(), None),
+            )?;
             self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &file_size)?;
         }
 
@@ -303,7 +329,10 @@ impl ArchiveSlice {
         let db = binding.db().clone();
         let _startup = protection.deletion().await;
         super::recovery_guard::ensure_slice_clear(
-            db.db(), &db_root_path, archive_id, matches!(package_type, PackageType::KeyBlocks),
+            db.db(),
+            &db_root_path,
+            archive_id,
+            matches!(package_type, PackageType::KeyBlocks),
         )?;
         let mode = if protection.archive_range(archive_id, None) {
             PackageOpenMode::PreserveExisting
@@ -362,10 +391,15 @@ impl ArchiveSlice {
                 } else {
                     fail!("No entry info for slice #{i}")
                 };
-                match ret.open_package(&operation, entry, None, meta.entry_size(), meta.version(), mode).await {
+                match ret
+                    .open_package(&operation, entry, None, meta.entry_size(), meta.version(), mode)
+                    .await
+                {
                     Ok(_) => (),
                     Err(e) => {
-                        if e.is::<ArchiveContextError>() { return Err(e); }
+                        if e.is::<ArchiveContextError>() {
+                            return Err(e);
+                        }
                         if cleanup_if_broken && matches!(mode, PackageOpenMode::RecoverOrCreate) {
                             match ret.destroy_broken().await {
                                 Ok(_) => (),
@@ -396,7 +430,7 @@ impl ArchiveSlice {
                             fail!("Protected non-sliced package has ambiguous durable length metadata")
                         }
                         (meta.entry_size(), meta.version())
-                    },
+                    }
                     None => (size, 0),
                 }
             } else {
@@ -434,8 +468,11 @@ impl ArchiveSlice {
                     let shard = ShardIdent::with_prefix_len(
                         self.shard_split_depth,
                         BASE_WORKCHAIN_ID,
-                        if self.shard_split_depth == 0 { 0 }
-                        else { (shard as u64) << (64 - self.shard_split_depth) },
+                        if self.shard_split_depth == 0 {
+                            0
+                        } else {
+                            (shard as u64) << (64 - self.shard_split_depth)
+                        },
                     )?;
                     shards.push(shard)
                 }
@@ -461,7 +498,9 @@ impl ArchiveSlice {
                             // Preserve remaining packages and tables once a
                             // deletion fails; retrying indefinitely cannot heal
                             // the now-failed archive domain.
-                            return Err(e.context(format!("Cannot remove package {seq_no} {shard}")));
+                            return Err(
+                                e.context(format!("Cannot remove package {seq_no} {shard}"))
+                            );
                         }
                     }
                 }
@@ -570,9 +609,13 @@ impl ArchiveSlice {
             let mut gate = self.metadata_gate.lock().unwrap();
             if gate.as_ref().is_some_and(|(selected, _)| *selected == stage) {
                 gate.take().map(|(_, gate)| gate)
-            } else { None }
+            } else {
+                None
+            }
         };
-        if let Some(gate) = gate { gate(offset, size)?; }
+        if let Some(gate) = gate {
+            gate(offset, size)?;
+        }
         Ok(())
     }
 
@@ -637,13 +680,17 @@ impl ArchiveSlice {
             Ok(())
         };
         let entry = if matches!(entry_id, PackageEntryId::Block(_)) {
-            package_info.package().append_indexed_entry(entry, |offset, size| {
-                after_append(u64::from(offset), size, Some(offset))
-            }).await?
+            package_info
+                .package()
+                .append_indexed_entry(entry, |offset, size| {
+                    after_append(u64::from(offset), size, Some(offset))
+                })
+                .await?
         } else {
-            package_info.package().append_entry(entry, |offset, size| {
-                after_append(offset, size, None)
-            }).await?
+            package_info
+                .package()
+                .append_entry(entry, |offset, size| after_append(offset, size, None))
+                .await?
         };
         // Relocation may delete the loose copy immediately after this returns.
         // Commit package directory entries and the provider's index WAL first.
@@ -720,9 +767,14 @@ impl ArchiveSlice {
     }
 
     #[cfg(any(test, feature = "integration-test-support"))]
-    pub(super) fn test_remove_entry_offset<B: Borrow<BlockIdExt> + Hash>(&self, entry: &PackageEntryId<B>) -> Result<()> {
+    pub(super) fn test_remove_entry_offset<B: Borrow<BlockIdExt> + Hash>(
+        &self,
+        entry: &PackageEntryId<B>,
+    ) -> Result<()> {
         let key = entry.into();
-        if !self.offsets_db.contains(&key)? { fail!("Fault fixture archive entry was absent"); }
+        if !self.offsets_db.contains(&key)? {
+            fail!("Fault fixture archive entry was absent");
+        }
         self.offsets_db.delete(&key)
     }
 
@@ -737,11 +789,21 @@ impl ArchiveSlice {
     }
 
     pub(super) async fn get_file_bounded_in<B: Borrow<BlockIdExt> + Hash>(
-        &self, parent: &ArchiveOperation, handle: &BlockHandle,
-        entry_id: &PackageEntryId<B>, limits: super::bounded_read::ArchiveReadLimits,
+        &self,
+        parent: &ArchiveOperation,
+        handle: &BlockHandle,
+        entry_id: &PackageEntryId<B>,
+        limits: super::bounded_read::ArchiveReadLimits,
     ) -> Result<Option<PackageEntry>> {
         let operation = self.view.inherit(parent)?;
-        self.get_file_raw_bounded(&operation, get_mc_seq_no(handle), handle.id().shard(), entry_id, limits).await
+        self.get_file_raw_bounded(
+            &operation,
+            get_mc_seq_no(handle),
+            handle.id().shard(),
+            entry_id,
+            limits,
+        )
+        .await
     }
 
     async fn get_file_raw_bounded<B: Borrow<BlockIdExt> + Hash>(
@@ -780,7 +842,9 @@ impl ArchiveSlice {
             package_info.package().get_path()
         );
         let entry = package_info.package().read_entry_bounded_in(operation, offset, limits).await?;
-        if entry.filename() != entry_id.filename() { fail!("Archive entry filename mismatch"); }
+        if entry.filename() != entry_id.filename() {
+            fail!("Archive entry filename mismatch");
+        }
         if entry.data().is_empty() {
             fail!("Read entry ({}) is corrupted! It can't have zero length!", entry_id);
         }
@@ -792,9 +856,19 @@ impl ArchiveSlice {
         self.get_slice_in(&operation, archive_id, offset, limit).await
     }
 
-    pub(super) async fn get_slice_in(&self, parent: &ArchiveOperation, archive_id: u64, offset: u64, limit: u32) -> Result<Vec<u8>> {
+    pub(super) async fn get_slice_in(
+        &self,
+        parent: &ArchiveOperation,
+        archive_id: u64,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<u8>> {
         let operation = self.view.inherit(parent)?;
-        super::bounded_read::check_length("range", u64::from(limit), super::bounded_read::ARCHIVE_RANGE_MAX_BYTES)?;
+        super::bounded_read::check_length(
+            "range",
+            u64::from(limit),
+            super::bounded_read::ARCHIVE_RANGE_MAX_BYTES,
+        )?;
         if archive_id as u32 != self.archive_id {
             fail!(
                 "Bad archive ID (archive_id = {}, expected {})!",
@@ -803,7 +877,8 @@ impl ArchiveSlice {
             )
         }
         let index = if self.shard_separated {
-            ((archive_id >> 32) as u32).checked_sub(self.archive_id)
+            ((archive_id >> 32) as u32)
+                .checked_sub(self.archive_id)
                 .and_then(|relative| relative.checked_div(self.slice_size))
                 .ok_or_else(|| error!("Invalid archive slice index"))?
         } else {
@@ -860,7 +935,9 @@ impl ArchiveSlice {
         Ok(Some((block_id.clone(), entry.take_data())))
     }
 
-    pub(super) fn rebuild_block_ranges(&self) -> Result<lockfree::map::Map<ShardIdent, super::file_maps::BlockRanges>> {
+    pub(super) fn rebuild_block_ranges(
+        &self,
+    ) -> Result<lockfree::map::Map<ShardIdent, super::file_maps::BlockRanges>> {
         self.block_index_db.rebuild_ranges()
     }
 
@@ -935,9 +1012,10 @@ impl ArchiveSlice {
     /// truncs slice starting from master block_id
     pub async fn trunc(&mut self, selection: Arc<TruncationSelection>) -> Result<()> {
         if self.package_status_db.contains(&PackageStatusKey::RepackPending)? {
-            return Err(super::recovery_guard::ArchiveRecoveryRequired(
-                error!("Pending package publication requires archive recovery"),
-            ).into());
+            return Err(super::recovery_guard::ArchiveRecoveryRequired(error!(
+                "Pending package publication requires archive recovery"
+            ))
+            .into());
         }
         let block_id = selection.cutoff();
         log::info!(
@@ -1020,8 +1098,10 @@ impl ArchiveSlice {
                 .withdraw_package(0)
                 .map_err(|e| error!("Slice is corrupted: {e}, cannot truncate, non-sliced mode"))?;
             package_info.package().truncate(offset).await?;
-            self.entry_db.put_value(&u32::MAX.into(),
-                &PackageEntryMeta::with_data(offset, package_info.version(), None))?;
+            self.entry_db.put_value(
+                &u32::MAX.into(),
+                &PackageEntryMeta::with_data(offset, package_info.version(), None),
+            )?;
             self.package_status_db.put_value(&PackageStatusKey::NonSlicedSize, &offset)?;
             let entry = package_info.entry().clone();
             self.package_store.insert(entry.clone(), OnceLock::from(Arc::new(package_info)));
@@ -1047,7 +1127,9 @@ impl ArchiveSlice {
             let new_name = old_package.get_path() + ".new";
             log::trace!(target: TARGET, "repack package {}", old_package.get_path());
             let _ = tokio::fs::remove_file(&new_name).await;
-            let new_package = Package::open(self.view.clone(), &self.view.enter()?, new_name.into(), false, true).await?;
+            let new_package =
+                Package::open(self.view.clone(), &self.view.enter()?, new_name.into(), false, true)
+                    .await?;
             let mut old_reader = old_package.open_reader().await?;
 
             let mut metadata_batch = rocksdb::WriteBatch::default();
@@ -1061,7 +1143,8 @@ impl ArchiveSlice {
                 } else {
                     None
                 };
-                source_offset = source_offset.checked_add(entry.serialized_size()?)
+                source_offset = source_offset
+                    .checked_add(entry.serialized_size()?)
                     .ok_or_else(|| error!("Archive source offset overflow"))?;
                 let id = match &entry_id {
                     PackageEntryId::Block(id) => id,
@@ -1074,12 +1157,15 @@ impl ArchiveSlice {
                     if let Some(offset) = block_offset {
                         index_offsets.insert((id.shard().clone(), offset), None);
                     }
-                    self.offsets_db.add_delete_to_batch(&mut metadata_batch, &(&entry_id).into())?;
+                    self.offsets_db
+                        .add_delete_to_batch(&mut metadata_batch, &(&entry_id).into())?;
                 } else {
                     log::trace!(target: TARGET, "repack package: repack {entry_id}");
                     let mut after_append = |offset: u64, _size: u64| {
                         self.offsets_db.add_put_to_batch(
-                            &mut metadata_batch, &(&entry_id).into(), &serde_cbor::to_vec(&offset)?,
+                            &mut metadata_batch,
+                            &(&entry_id).into(),
+                            &serde_cbor::to_vec(&offset)?,
                         )?;
                         if let Some(old) = block_offset {
                             index_offsets.insert((id.shard().clone(), old), Some(offset));
@@ -1087,9 +1173,11 @@ impl ArchiveSlice {
                         Ok(())
                     };
                     if block_offset.is_some() {
-                        new_package.append_indexed_entry(entry, |offset, size| {
-                            after_append(u64::from(offset), size)
-                        }).await?;
+                        new_package
+                            .append_indexed_entry(entry, |offset, size| {
+                                after_append(u64::from(offset), size)
+                            })
+                            .await?;
                     } else {
                         new_package.append_entry(entry, after_append).await?;
                     }
@@ -1099,9 +1187,12 @@ impl ArchiveSlice {
             if any_kept {
                 effective_total = i + 1;
                 let info = self.shard_separated.then(|| package_info.entry());
-                let meta = PackageEntryMeta::with_data(new_package.size(), package_info.version(), info);
+                let meta =
+                    PackageEntryMeta::with_data(new_package.size(), package_info.version(), info);
                 self.entry_db.add_put_to_batch(
-                    &mut metadata_batch, &i.into(), &serde_cbor::to_vec(&meta)?,
+                    &mut metadata_batch,
+                    &i.into(),
+                    &serde_cbor::to_vec(&meta)?,
                 )?;
             } else {
                 log::debug!(
@@ -1113,24 +1204,27 @@ impl ArchiveSlice {
                 self.entry_db.add_delete_to_batch(&mut metadata_batch, &i.into())?;
             }
 
-            let mut index_batch = self.block_index_db.prepare_repack_changes(
-                &index_offsets,
-                metadata_batch,
-                |shard, mc_ref| {
-                    Ok(self.package_entry_info(mc_ref, shard)? == *package_info.entry())
-                },
-            )?;
+            let mut index_batch =
+                self.block_index_db.prepare_repack_changes(
+                    &index_offsets,
+                    metadata_batch,
+                    |shard, mc_ref| {
+                        Ok(self.package_entry_info(mc_ref, shard)? == *package_info.entry())
+                    },
+                )?;
             // Persist a refusal marker before the file/DB publication window.
             // It grants no replay authority. Clear it atomically with all child
             // metadata; ordinary startup must never truncate using stale sizes.
             self.package_status_db.put_value(&PackageStatusKey::RepackPending, &i)?;
             self.package_status_db.sync_wal()?;
-            self.package_status_db.add_delete_to_batch(&mut index_batch, &PackageStatusKey::RepackPending)?;
+            self.package_status_db
+                .add_delete_to_batch(&mut index_batch, &PackageStatusKey::RepackPending)?;
             tokio::fs::rename(new_package.get_path(), old_package.get_path()).await?;
             crate::archives::package::sync_file_and_parents(old_package.path()).await?;
             self.block_index_db.commit_repack_offsets(index_batch)?;
             let name = old_package.get_path().into();
-            *package_info.package_mut() = Package::open(self.view.clone(), &self.view.enter()?, name, false, true).await?;
+            *package_info.package_mut() =
+                Package::open(self.view.clone(), &self.view.enter()?, name, false, true).await?;
             log::trace!(
                 target: TARGET,
                 "package repacked {}",
@@ -1292,12 +1386,18 @@ impl ArchiveSlice {
         version: u32,
     ) -> Result<bool> {
         let operation = self.view.enter()?;
-        self.open_package(&operation, entry, index, size, version, PackageOpenMode::RecoverOrCreate).await
+        self.open_package(&operation, entry, index, size, version, PackageOpenMode::RecoverOrCreate)
+            .await
     }
 
     async fn open_package(
-        &self, parent: &ArchiveOperation, entry: PackageEntryInfo, index: Option<u32>, size: u64,
-        version: u32, mode: PackageOpenMode,
+        &self,
+        parent: &ArchiveOperation,
+        entry: PackageEntryInfo,
+        index: Option<u32>,
+        size: u64,
+        version: u32,
+        mode: PackageOpenMode,
     ) -> Result<bool> {
         let operation = self.view.inherit(parent)?;
         let package_str = format!("{} {}", entry.seqno, entry.shard);
@@ -1319,12 +1419,29 @@ impl ArchiveSlice {
                 #[cfg(test)]
                 {
                     let gate = self.before_package_open.lock().unwrap().take();
-                    if let Some(gate) = gate { gate(); }
+                    if let Some(gate) = gate {
+                        gate();
+                    }
                 }
                 if matches!(mode, PackageOpenMode::PreserveExisting) {
-                    return Package::open_existing_exact(self.view.clone(), &operation, path.clone(), self.finalized, size).await;
+                    return Package::open_existing_exact(
+                        self.view.clone(),
+                        &operation,
+                        path.clone(),
+                        self.finalized,
+                        size,
+                    )
+                    .await;
                 }
-                let package = match Package::open(self.view.clone(), &operation, path.clone(), self.finalized, true).await {
+                let package = match Package::open(
+                    self.view.clone(),
+                    &operation,
+                    path.clone(),
+                    self.finalized,
+                    true,
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e) if e.is::<ArchiveContextError>() => return Err(e),
                     Err(e) => match tokio::fs::remove_file(path.as_path()).await {

@@ -3,6 +3,8 @@
     "ton_global_config_name": "ton-global.config.json",
     "internal_db_path": "node_db_nodenumber",
     "ip_address": "0.0.0.0:main_port",
+    "ip_address_quic": "0.0.0.0:quic_port",
+    "boot_from_zerostate": true,
     "control_server_port": control_port,
     workchain_id
     "shard_keeper": {

@@ -189,6 +189,24 @@ fn test_chksig_identity_pubkey_rejected() {
 }
 
 #[test]
+fn test_chksign_partial_byte_signature_underflow() {
+    for version in [13, 14, 16] {
+        for (opcode, data) in [("CHKSIGNU", "ZERO"), ("CHKSIGNS", "PUSHSLICE x00")] {
+            for bits in 504..=511 {
+                test_case(format!("{data} NEWC PUSHINT {bits} STZEROES ENDC CTOS ZERO {opcode}"))
+                    .with_block_version(version)
+                    .expect_failure(ExceptionCode::CellUnderflow);
+            }
+            for bits in [512, 513] {
+                test_case(format!("{data} NEWC PUSHINT {bits} STZEROES ENDC CTOS ZERO {opcode}"))
+                    .with_block_version(version)
+                    .expect_int_stack(&[0]);
+            }
+        }
+    }
+}
+
+#[test]
 fn test_chksigns_underflow() {
     test_case(
         "

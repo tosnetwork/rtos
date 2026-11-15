@@ -1,0 +1,8 @@
+{
+  "reference_commit": "1181c08ed4c2d88425e6ee66efff6d696714495d",
+  "rule": "CPP v16 getter c7 has19 fields; last is null",
+  "sources": {
+    "rust-get-context": "6cbf5cf6eeca8b0d448e8201da76dad99a6e5acba8a13205c3c21ff175ac3d81",
+    "rust-get-history-context": "4875c717dd7729d3cdd726535293472ef6c3aa1373a079b755b17bf7813915f0"
+  }
+}

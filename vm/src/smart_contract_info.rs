@@ -86,6 +86,8 @@ pub struct SmcMethodResult {
     pub gas_used: i64,
     pub stack: Vec<StackItem>,
     pub smc_info: SmartContractInfo,
+    /// Preserve absence for initial-c7 responses after a null-code VM run.
+    pub code_present: bool,
 }
 
 impl SmcMethodResult {
@@ -100,7 +102,9 @@ impl SmcMethodResult {
         full: bool,
         rng: &mut R,
     ) -> Result<StackItem> {
-        let mut context = self.smc_info.as_get_method_data_item()?;
+        let mut context = self.smc_info.as_get_method_data_item_with_code(
+            self.code_present.then_some(&self.smc_info.mycode),
+        )?;
         if full {
             return Ok(context);
         }
@@ -359,7 +363,9 @@ impl SmartContractInfo {
         StackItem::tuple(tuple)
     }
 
-    fn get_method_prev_blocks_info(
+    /// Checked history tuple shared by getter and block replay contexts.
+    /// An unavailable history returns null; dictionary traversal errors propagate.
+    pub fn get_method_prev_blocks_info(
         state: &ShardStateUnsplit,
         current: &BlockIdExt,
     ) -> Result<StackItem> {
@@ -420,7 +426,7 @@ impl SmartContractInfo {
         Ok(StackItem::tuple(fields))
     }
 
-    fn get_method_precompiled(&self) -> Result<Option<rtos_block::PrecompiledSmc>> {
+    fn get_method_precompiled(&self, code: &Cell) -> Result<Option<rtos_block::PrecompiledSmc>> {
         let Some(param) = self.config_params.config_params.get(45u32.write_to_bitstring()?)? else {
             return Ok(None);
         };
@@ -438,7 +444,7 @@ impl SmartContractInfo {
         {
             return Ok(None);
         }
-        let Some(mut entry) = list.get(self.mycode.repr_hash().write_to_bitstring()?)? else {
+        let Some(mut entry) = list.get(code.repr_hash().write_to_bitstring()?)? else {
             return Ok(None);
         };
         Ok(rtos_block::PrecompiledSmc::construct_from(&mut entry)
@@ -447,9 +453,15 @@ impl SmartContractInfo {
     }
 
     /// Node getter context follows the lite-server profile. It has no
-    /// authenticated message import and does not include the incoming storage
-    /// slot used by the transaction context. Historical tuple lengths remain observable.
-    fn as_get_method_data_item(&self) -> Result<StackItem> {
+    /// authenticated message import; from version16 the incoming storage slot
+    /// is present and null. Historical tuple lengths remain observable.
+    pub fn as_get_method_data_item(&self) -> Result<StackItem> {
+        self.as_get_method_data_item_with_code(Some(&self.mycode))
+    }
+
+    /// Getter profile with the account's actual optional code root. No-code
+    /// accounts must not look up a precompiled entry for an empty-cell hash.
+    pub fn as_get_method_data_item_with_code(&self, code: Option<&Cell>) -> Result<StackItem> {
         let version = self.config_params.global_version();
         let mut outer = self.as_temp_data_item().as_tuple_mut()?;
         let mut fields = outer.remove(0).as_tuple_mut()?;
@@ -459,13 +471,24 @@ impl SmartContractInfo {
             14
         } else if version < 11 {
             17
-        } else {
+        } else if version < 16 {
             18
+        } else {
+            19
         };
         fields.truncate(length);
+        if version >= 4 {
+            fields[10] = code.map_or(StackItem::None, |cell| StackItem::cell(cell.clone()));
+        }
+        if version >= 16 {
+            // A getter never has authenticated message import statistics,
+            // including when this helper is used with a transaction profile.
+            fields[18] = StackItem::None;
+        }
         if version >= 6 {
             // A configured zero cost is an integer, distinct from no entry.
-            let precompiled = self.get_method_precompiled()?;
+            let precompiled =
+                code.map(|cell| self.get_method_precompiled(cell)).transpose()?.flatten();
             fields[16] = precompiled
                 .map(|contract| StackItem::int(contract.gas_usage))
                 .unwrap_or(StackItem::None);
@@ -561,7 +584,8 @@ pub fn convert_stack(items: &[StackItem]) -> Result<Vec<StackEntry>> {
             StackItem::Integer(value) => {
                 let number = value.to_str_hex();
                 let number =
-                    rtos_api::ton::tvm::numberdecimal::NumberDecimal { number }.into_boxed();
+                    rtos_api::ton::tvm::numberdecimal::NumberDecimal { number: number.into() }
+                        .into_boxed();
                 StackEntryNumber { number }.into_boxed()
             }
             StackItem::Slice(slice) => {
@@ -641,7 +665,7 @@ pub fn convert_ton_stack(items: &[StackEntry]) -> Result<Vec<StackItem>> {
             }
             StackEntry::Tvm_StackEntryNumber(number) => {
                 let number = &number.number;
-                let value = parse_stack_number(number.number())?;
+                let value = parse_stack_number(number.number().as_str()?)?;
                 StackItem::int(value)
             }
             StackEntry::Tvm_StackEntrySlice(slice) => {
@@ -740,7 +764,10 @@ fn run_smc_method_with_seed(
     seed: [u8; 32],
     mc_block_id: Option<&BlockIdExt>,
 ) -> Result<SmcMethodResult> {
-    let code = account.get_code().ok_or_else(|| error!("Account has no code"))?;
+    if !account.is_active() {
+        fail!("Getter account is not active");
+    }
+    let code = account.get_code();
     let data = account.get_data().unwrap_or_default();
     let mc_state = ShardStateUnsplit::construct_from_cell(mc_state_cell.clone())?;
     let current = mc_block_id.cloned().unwrap_or_else(|| {
@@ -793,7 +820,7 @@ fn run_smc_method_with_seed(
     let stack = Stack::with_storage(storage);
 
     let mut ctrls = SaveList::new();
-    ctrls.put(7, smc_info.as_get_method_data_item()?)?;
+    ctrls.put(7, smc_info.as_get_method_data_item_with_code(code.as_ref())?)?;
     ctrls.put(4, StackItem::Cell(data))?;
 
     let gas = Gas::new(1000000, 0, 1000000, 1000000);
@@ -806,8 +833,9 @@ fn run_smc_method_with_seed(
     }
 
     let caps = smc_info.config_params.capabilities();
-    let mut vm =
-        Engine::with_capabilities(caps).setup_checked(code, ctrls, stack, gas, libraries)?;
+    let code_present = code.is_some();
+    let mut vm = Engine::with_capabilities(caps)
+        .setup_with_optional_code(code, ctrls, stack, gas, libraries)?;
 
     let block_version = smc_info.config_params.get_global_version()?.version;
     vm.set_block_version(block_version);
@@ -827,7 +855,7 @@ fn run_smc_method_with_seed(
     log::debug!("run_smc_method: result_stack_depth={}\n", stack.len());
     log::debug!("run_smc_method: result_stack dump: [ {} ]\n", render_stack(&stack));
 
-    Ok(SmcMethodResult { exit_code, gas_used: vm.gas_used(), stack, smc_info })
+    Ok(SmcMethodResult { exit_code, gas_used: vm.gas_used(), stack, smc_info, code_present })
 }
 
 #[cfg(test)]

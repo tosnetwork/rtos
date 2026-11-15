@@ -79,8 +79,11 @@ struct Pair {
 
 async fn stop_fixture_engines(engines: Vec<Arc<Engine>>) {
     // Join every owner even if one shutdown reports an error.
-    let results = futures::future::join_all(engines.into_iter().map(|engine| engine.wait_stop())).await;
-    for result in results { result.unwrap(); }
+    let results =
+        futures::future::join_all(engines.into_iter().map(|engine| engine.wait_stop())).await;
+    for result in results {
+        result.unwrap();
+    }
 }
 
 // These isolated fixtures have no external DHT to refresh authenticated public
@@ -98,13 +101,20 @@ async fn refresh_fixture_public_advertisements(
             for &shard in shards {
                 let client = local.overlay_client(shard).await.unwrap();
                 let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
-                let advertised = remote.network().context().stack.overlay
-                    .get_signed_node(&id, false).unwrap();
-                local.network().context().stack.overlay.add_public_peer(
-                    remote.network().context().stack.adnl.ip_address_adnl(),
-                    &advertised,
-                    &id,
-                ).unwrap().unwrap();
+                let advertised =
+                    remote.network().context().stack.overlay.get_signed_node(&id, false).unwrap();
+                local
+                    .network()
+                    .context()
+                    .stack
+                    .overlay
+                    .add_public_peer(
+                        remote.network().context().stack.adnl.ip_address_adnl(),
+                        &advertised,
+                        &id,
+                    )
+                    .unwrap()
+                    .unwrap();
             }
         }
     }
@@ -121,21 +131,40 @@ async fn initialize_cold_history_network(cold: &Arc<Engine>, peers: &[&Arc<Engin
             let remote_adnl = &remote.network().context().stack.adnl;
             let local_key = local_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
             let remote_key = remote_adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
-            local_adnl.add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key).unwrap();
-            local.network().context().stack.quic.as_ref().unwrap().add_peer_key(
-                remote_key.id().clone(), remote.network().context().quic_address.unwrap(),
-            ).unwrap();
+            local_adnl
+                .add_peer(local_key.id(), remote_adnl.ip_address_adnl(), None, &remote_key)
+                .unwrap();
+            local
+                .network()
+                .context()
+                .stack
+                .quic
+                .as_ref()
+                .unwrap()
+                .add_peer_key(
+                    remote_key.id().clone(),
+                    remote.network().context().quic_address.unwrap(),
+                )
+                .unwrap();
         }
     }
     cold.initialize_test_full_node_overlays().await.unwrap();
-    assert!(cold.overlays_router().is_ok(), "cold overlay initialization must finish before recovery");
+    assert!(
+        cold.overlays_router().is_ok(),
+        "cold overlay initialization must finish before recovery"
+    );
     // Public history transport needs no current/historical validator runtime.
     // In particular, do not refresh private overlays by loading the GC'd head.
     let shards = [rtos_block::ShardIdent::MASTERCHAIN, rtos_block::ShardIdent::BASE_WORKCHAIN];
     for &peer in peers {
         for (local, remote) in [(cold, peer), (peer, cold)] {
-            let remote_key = remote.network().context().stack.adnl
-                .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap();
+            let remote_key = remote
+                .network()
+                .context()
+                .stack
+                .adnl
+                .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+                .unwrap();
             for shard in &shards {
                 let client = local.overlay_client(shard).await.unwrap();
                 client.overlay_client().neighbours().add(remote_key.id().clone()).unwrap();
@@ -153,8 +182,10 @@ impl Pair {
         let mut engines = vec![&self.provider, &self.receiver];
         engines.extend(self.observer.iter());
         refresh_fixture_public_advertisements(
-            &engines, &[self.shard.id().shard(), self.anchor.shard()],
-        ).await;
+            &engines,
+            &[self.shard.id().shard(), self.anchor.shard()],
+        )
+        .await;
     }
     async fn stop_all(&self) {
         let mut engines = vec![self.provider.clone(), self.receiver.clone()];
@@ -169,7 +200,12 @@ impl Pair {
         Self::with_gc_options(variant, corrupt_signature, v2, false).await
     }
 
-    async fn with_gc_options(variant: &str, corrupt_signature: bool, v2: bool, history_gc: bool) -> Self {
+    async fn with_gc_options(
+        variant: &str,
+        corrupt_signature: bool,
+        v2: bool,
+        history_gc: bool,
+    ) -> Self {
         Self::with_source_options(variant, corrupt_signature, v2, history_gc, false).await
     }
 
@@ -178,7 +214,10 @@ impl Pair {
     }
 
     async fn with_source_options(
-        variant: &str, corrupt_signature: bool, v2: bool, history_gc: bool,
+        variant: &str,
+        corrupt_signature: bool,
+        v2: bool,
+        history_gc: bool,
         source_transport: bool,
     ) -> Self {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -216,7 +255,11 @@ impl Pair {
         let (master, proof, master_state_root) = if source_transport {
             persistent_closure_engine_tests::source_bootstrap(&anchor, &mc_root)
         } else {
-            (master, proof, read_single_root_boc(&decode(&row["state_boc"])).unwrap().repr_hash().clone())
+            (
+                master,
+                proof,
+                read_single_root_boc(&decode(&row["state_boc"])).unwrap().repr_hash().clone(),
+            )
         };
         let dir = tempfile::tempdir().unwrap();
         let receiver_dir = dir.path().join("receiver");
@@ -224,7 +267,9 @@ impl Pair {
         write_recovery_config(&receiver_dir, &anchor, true);
         write_recovery_config(&provider_dir, &anchor, true);
         let observer_dir = source_transport.then(|| dir.path().join("observer"));
-        if let Some(path) = &observer_dir { write_recovery_config(path, &anchor, true); }
+        if let Some(path) = &observer_dir {
+            write_recovery_config(path, &anchor, true);
+        }
         if v2 {
             // The provider is a governing validator transport. The receiver is
             // a public observer outside that committee, so normal T0 policy
@@ -234,7 +279,9 @@ impl Pair {
                 (&provider_dir, 0x60),
                 (&receiver_dir, if source_transport { 0x61 } else { 0x70 }),
             ];
-            if let Some(path) = &observer_dir { configurations.push((path, 0x70)); }
+            if let Some(path) = &observer_dir {
+                configurations.push((path, 0x70));
+            }
             for (dir, seed) in configurations {
                 let file = dir.join("config.json");
                 let mut config: serde_json::Value =
@@ -252,11 +299,20 @@ impl Pair {
                     // validator -> transport binding. Derive it from the actual
                     // governing state and persist it for the cold-open phase.
                     let governing = ShardStateUnsplit::construct_from_cell(mc_root.clone())
-                        .unwrap().read_custom().unwrap().unwrap().config;
-                    let validator = governing.validator_set().unwrap().list().iter()
+                        .unwrap()
+                        .read_custom()
+                        .unwrap()
+                        .unwrap()
+                        .config;
+                    let validator = governing
+                        .validator_set()
+                        .unwrap()
+                        .list()
+                        .iter()
                         .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
                         .expect("source circulation key must belong to the governing committee")
-                        .validator_id().unwrap();
+                        .validator_id()
+                        .unwrap();
                     config["validator_key_ring"][base64_encode(transport.id().data())] =
                         serde_json::to_value(&key).unwrap();
                     config["consensus_transport_bindings"] = serde_json::json!([{
@@ -273,7 +329,8 @@ impl Pair {
         if history_gc {
             for dir in [&receiver_dir, &provider_dir] {
                 let file = dir.join("config.json");
-                let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
                 config["gc"] = serde_json::json!({"enable_for_archives": false,
                     "enable_for_shard_state_persistent": false,
                     "cells_gc_config": {"gc_interval_sec": 1, "cells_lifetime_sec": 0}});
@@ -290,8 +347,12 @@ impl Pair {
         let mut routes = vec![(&receiver, &provider), (&provider, &receiver)];
         if let Some(observer) = &observer {
             engines.push(observer);
-            routes.extend([(&provider, observer), (observer, &provider),
-                (&receiver, observer), (observer, &receiver)]);
+            routes.extend([
+                (&provider, observer),
+                (observer, &provider),
+                (&receiver, observer),
+                (observer, &receiver),
+            ]);
         }
         let setup = std::panic::AssertUnwindSafe(async {
             if v2 {
@@ -401,7 +462,8 @@ impl Pair {
                     client.overlay_client().neighbours().add(peer.clone()).unwrap();
                 }
             }
-            refresh_fixture_public_advertisements(&engines, &[shard.id().shard(), anchor.shard()]).await;
+            refresh_fixture_public_advertisements(&engines, &[shard.id().shard(), anchor.shard()])
+                .await;
         })
         .catch_unwind()
         .await;
@@ -522,6 +584,7 @@ impl Pair {
             .unwrap();
         let client = self.receiver.overlay_client(self.shard.id().shard()).await.unwrap();
         let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+        let previous_advertisement_version = adnl::common::Version::get();
         for (index, engine, remote_key) in
             [(0, &self.receiver, &provider_key), (1, &self.provider, &receiver_key)]
         {
@@ -553,6 +616,17 @@ impl Pair {
                 )
                 .unwrap();
         }
+        // The creation-time advertisements said Plumtree was disabled. Admit
+        // fresh signed capabilities after activation, as public discovery does.
+        // A same-second advertisement cannot supersede the cached version.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adnl::common::Version::get() <= previous_advertisement_version {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("public advertisement version must advance after Plumtree activation");
+        self.refresh_public_advertisements().await;
         let prefix = rtos_api::serialize_boxed(
             &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*id.data()) }
                 .into_boxed(),
@@ -1096,7 +1170,9 @@ struct SpoolFixture {
 
 impl SpoolFixture {
     async fn new(row_index: usize) -> Self {
-        Self::new_for_transport(row_index, 0x61).await
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+        Self::from_transport_fixture_with_custody(fixture, row_index, 0x61, true).await
     }
 
     async fn new_for_transport(row_index: usize, transport_seed: u8) -> Self {
@@ -1109,6 +1185,15 @@ impl SpoolFixture {
         fixture: serde_json::Value,
         row_index: usize,
         transport_seed: u8,
+    ) -> Self {
+        Self::from_transport_fixture_with_custody(fixture, row_index, transport_seed, false).await
+    }
+
+    async fn from_transport_fixture_with_custody(
+        fixture: serde_json::Value,
+        row_index: usize,
+        transport_seed: u8,
+        with_custody: bool,
     ) -> Self {
         use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
         let row = fixture["rows"][row_index].clone();
@@ -1133,15 +1218,15 @@ impl SpoolFixture {
             read_single_root_boc(&decode(&fixture["config_boc"])).unwrap(),
         )
         .unwrap();
-        let validator = governing
+        let member = governing
             .validator_set()
             .unwrap()
             .list()
             .iter()
             .find(|member| member.adnl_addr().is_ok_and(|id| id == *key.id()))
             .expect("fixture transport must bind to its real governing identity")
-            .validator_id()
-            .unwrap();
+            .clone();
+        let validator = member.validator_id().unwrap();
         config["ip_address_quic"] = "127.0.0.1:0".into();
         config["validator_key_ring"][base64_encode(key.id().data())] =
             serde_json::to_value(key_json).unwrap();
@@ -1149,6 +1234,48 @@ impl SpoolFixture {
             "validator_id":base64_encode(validator.as_slice()),
             "adnl_key_id":base64_encode(key.id().data()),
         }]);
+        if with_custody {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            // Public synthetic seeds only. Loading an unrelated key under the
+            // same stable identity would not exercise real committee custody.
+            let entry = fixture["public_custody"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["validator_id"] == hex::encode(validator.as_slice()))
+                .expect("native fixture must provide its member's public test seed");
+            let seed = decode(&entry["seed"]);
+            let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&seed, 0).unwrap();
+            assert_eq!(Some(store.consensus_key()), member.pq_key());
+            drop(store);
+            let path = dir.path().join("public-test-consensus-seed");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            let mut seed_file = options.open(&path).unwrap();
+            seed_file.write_all(&seed).unwrap();
+            seed_file.sync_all().unwrap();
+            config[crate::pq_consensus_config::CONFIG_FIELD] =
+                crate::pq_consensus_config::PqConsensusConfig {
+                    validator_id: validator.clone(),
+                    keys: vec![rtos_pq_consensus::ConfiguredKey {
+                        key_file: path,
+                        valid_from: 0,
+                        expire_at: 0,
+                    }],
+                }
+                .to_json();
+        }
         std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
         let engine = open_engine(dir.path()).await;
         let setup = std::panic::AssertUnwindSafe(async {
@@ -1213,7 +1340,29 @@ impl SpoolFixture {
                 consensus_common::session_runtime::LocalRole::Validator(expected_index)
             );
             assert_eq!(runtime.session_id(), &UInt256::from_slice(&decode(&row["session"])));
-            Arc::new(runtime)
+            let runtime = Arc::new(runtime);
+            if with_custody {
+                let custody = engine.pq_consensus_custody().expect("real configured custody");
+                assert_eq!(custody.validator_id(), &validator);
+                assert!(custody
+                    .usable_key_ids(crate::pq_consensus_config::pq_custody_now())
+                    .contains(member.pq_key().unwrap().key_id.as_array()));
+            } else {
+                assert!(engine.pq_consensus_custody().is_none());
+                let error = engine
+                    .clone()
+                    .durable_finality_sink(runtime.clone())
+                    .await
+                    .err()
+                    .expect("validator sink must require actual local custody");
+                assert!(
+                    error.to_string().contains(
+                        "Finality sink validator is not the one this node custodies keys for"
+                    ),
+                    "unexpected sink refusal: {error:#}"
+                );
+            }
+            runtime
         })
         .catch_unwind()
         .await;

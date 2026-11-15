@@ -454,7 +454,7 @@ where
 {
     unary::<T>(engine, "BITSIZE", |x| {
         if x.is_nan() {
-            on_nan_parameter!(T)?;
+            T::on_range_check_error(file!(), line!())?;
             Ok(IntegerData::nan())
         } else if x.is_zero() {
             Ok(IntegerData::zero())
@@ -534,6 +534,12 @@ where
     }
 
     fetch_stack(engine, n)?;
+    if (mode.mul_by_shift() || mode.div_by_shift())
+        && !engine.cmd.has_length()
+        && (!T::quiet() || engine.block_version() < 13)
+    {
+        engine.cmd.var(0).as_integer_value(0..=256usize)?;
+    }
     for i in 0..n {
         engine.cmd.var(i).as_integer()?;
     }
@@ -560,7 +566,7 @@ where
                         tvm_exception_code(&err).unwrap(),
                         ExceptionCode::RangeCheckError
                     );
-                    if !T::quiet() || engine.block_version() < 14 {
+                    if !T::quiet() || engine.block_version() < 13 {
                         return Err(err);
                     } else {
                         if mode.need_quotient() {
@@ -671,6 +677,9 @@ where
     T: OperationBehavior,
 {
     engine.load_instruction(Instruction::new("FITSX").set_name_prefix(T::name_prefix()))?;
+    if engine.cc.stack.depth() < 2 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     fetch_stack(engine, 1)?;
     let length = engine.cmd.var(0).as_integer_value(0..=1023)?;
     fits_in::<T>(engine, length, IntegerData::fits_in)
@@ -838,16 +847,16 @@ pub(super) fn execute_pow2<T>(engine: &mut Engine) -> Status
 where
     T: OperationBehavior,
 {
-    unary::<T>(engine, "POW2", |x| match x.as_integer_value(0..=1023) {
-        Ok(shift) => IntegerData::one().shl::<T>(shift),
-        Err(exception) => match tvm_exception_code(&exception) {
-            Some(ExceptionCode::IntegerOverflow) => {
-                on_integer_overflow!(T)?;
-                Ok(IntegerData::nan())
-            }
-            _ => Err(exception),
-        },
-    })
+    engine.load_instruction(Instruction::new("POW2").set_name_prefix(T::name_prefix()))?;
+    fetch_stack(engine, 1)?;
+    let x = engine.cmd.var(0).as_integer()?;
+    let result = match x.as_integer_value(0..=1023) {
+        Ok(shift) => IntegerData::one().shl::<T>(shift)?,
+        Err(_) if T::quiet() && engine.block_version() >= 13 => IntegerData::nan(),
+        Err(err) => return Err(err),
+    };
+    engine.cc.stack.push(StackItem::integer(result));
+    Ok(())
 }
 
 // (x - sign(x))
@@ -895,8 +904,12 @@ where
     let block_version = engine.block_version();
     let v0 = engine.cc.stack.get_mut(0).withdraw();
     let v0 = v0.as_integer()?;
+    let shift = v0.as_integer_value(0..=1023);
+    if shift.is_err() && (!T::quiet() || block_version < 13) {
+        fail!(ExceptionCode::RangeCheckError);
+    }
     let v1 = engine.cc.stack.get_mut(1).as_integer_mut()?;
-    *v1 = match v0.as_integer_value(0..=1023) {
+    *v1 = match shift {
         Ok(shift) => {
             if RIGHT {
                 v1.shr::<T>(shift)?
@@ -904,14 +917,7 @@ where
                 v1.shl::<T>(shift)?
             }
         }
-        Err(err) => {
-            debug_assert_eq!(tvm_exception_code(&err).unwrap(), ExceptionCode::RangeCheckError);
-            if !T::quiet() || block_version < 14 {
-                return Err(err);
-            } else {
-                IntegerData::nan()
-            }
-        }
+        Err(_) => IntegerData::nan(),
     };
     engine.cc.stack.drop(0)?;
     Ok(())
@@ -968,6 +974,9 @@ where
     T: OperationBehavior,
 {
     engine.load_instruction(Instruction::new("UFITSX").set_name_prefix(T::name_prefix()))?;
+    if engine.cc.stack.depth() < 2 {
+        fail!(ExceptionCode::StackUnderflow)
+    }
     fetch_stack(engine, 1)?;
     let length = engine.cmd.var(0).as_integer_value(0..=1023)?;
     fits_in::<T>(engine, length, IntegerData::ufits_in)

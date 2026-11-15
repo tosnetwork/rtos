@@ -147,8 +147,14 @@ async fn immutable_views_refuse_stale_epochs_and_preserve_typed_errors() {
     let current = db.bind_archive_domain(domain.clone()).unwrap().view().unwrap();
     assert_eq!(current.epoch(), 1);
     let current_operation = current.enter().unwrap();
-    let error = old.inherit(&current_operation).err().expect("stale target view inherited current authority");
-    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::Stale { expected: 0, current: 1 }));
+    let error = old
+        .inherit(&current_operation)
+        .err()
+        .expect("stale target view inherited current authority");
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::Stale { expected: 0, current: 1 })
+    );
     drop(current_operation);
     assert!(current.enter().is_ok());
     assert!(domain.close(0).is_err());
@@ -267,11 +273,11 @@ async fn cancelled_observer_does_not_release_held_native_owner() {
     assert_eq!(domain.outstanding(), 0);
 }
 
-
 #[tokio::test]
 async fn checked_inheritance_pins_destination_after_closing() {
     let (dir, db, domain, view) = fixture();
-    let epoch_db = RocksDb::new(dir.path(), "inherited-epoch", None, AccessType::ReadWrite).unwrap();
+    let epoch_db =
+        RocksDb::new(dir.path(), "inherited-epoch", None, AccessType::ReadWrite).unwrap();
     let destination = epoch_db.bind_archive_domain(domain.clone()).unwrap();
     let weak = Arc::downgrade(&epoch_db);
     let parent = view.enter().unwrap();
@@ -303,22 +309,30 @@ fn checked_inheritance_rejects_other_domain_and_failure_before_read_start() {
     let destination = db.bind_archive_domain(domain.clone()).unwrap();
     let other = other_db.bind_archive_domain(other_domain.clone()).unwrap();
     let error = parent.inherit(&other).err().expect("cross-domain inheritance admitted");
-    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::BindingConflict));
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::BindingConflict)
+    );
     assert_eq!(other_domain.outstanding(), 0);
     let queued = parent.inherit(&destination).unwrap();
     let started = parent.inherit(&destination).unwrap().start_read().unwrap();
     domain.latch_failure();
     let error = queued.start_read().err().expect("read started after recovery latch");
-    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RecoveryRequired(0)));
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::RecoveryRequired(0))
+    );
     let error = parent.inherit(&destination).err().expect("inheritance ignored recovery latch");
-    assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&ArchiveContextError::RecoveryRequired(0)));
+    assert_eq!(
+        error.downcast_ref::<ArchiveContextError>(),
+        Some(&ArchiveContextError::RecoveryRequired(0))
+    );
     assert_eq!(domain.outstanding(), 2, "started read custody was revoked by failure");
     drop(parent);
     assert_eq!(domain.outstanding(), 1);
     drop(started);
     assert_eq!(domain.outstanding(), 0);
 }
-
 
 #[tokio::test]
 async fn cached_package_and_slice_views_refuse_stale_read_authority() {
@@ -357,7 +371,10 @@ async fn cached_package_and_slice_views_refuse_stale_read_authority() {
         .err()
         .unwrap();
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
-    let error = package.read_range_in(&current, 0, 4).await.err()
+    let error = package
+        .read_range_in(&current, 0, 4)
+        .await
+        .err()
         .expect("stale cached package read admitted");
     assert_eq!(error.downcast_ref::<ArchiveContextError>(), Some(&expected));
     let error = slice.get_slice(0, 0, 4).await.unwrap_err();

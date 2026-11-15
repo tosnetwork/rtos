@@ -103,7 +103,9 @@ fn execute_throwanyif_throwanyifnot(engine: &mut Engine, reverse_condition: bool
         "THROWANYIF"
     }))?;
     fetch_stack(engine, 2)?;
-    if reverse_condition ^ engine.cmd.var(0).as_bool()? {
+    let flag = engine.cmd.var(0).as_bool()?;
+    engine.cmd.var(1).as_integer_value(0..=0xFFFFi32)?;
+    if reverse_condition ^ flag {
         do_throw(engine, Some(1), None)
     } else {
         Ok(())
@@ -151,7 +153,9 @@ fn execute_throwarganyif_throwarganyifnot(engine: &mut Engine, reverse_condition
         "THROWARGANYIF"
     }))?;
     fetch_stack(engine, 3)?;
-    if reverse_condition ^ engine.cmd.var(0).as_bool()? {
+    let flag = engine.cmd.var(0).as_bool()?;
+    engine.cmd.var(1).as_integer_value(0..=0xFFFFi32)?;
+    if reverse_condition ^ flag {
         do_throw(engine, Some(1), Some(2))
     } else {
         Ok(())

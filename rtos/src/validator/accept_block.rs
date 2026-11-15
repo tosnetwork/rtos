@@ -1026,14 +1026,21 @@ impl AcceptedSessionBlock {
         let Some(handle) = engine.load_block_handle(self.block.id())? else {
             return Ok(None);
         };
-        let has_proof = if self.proof.is_link() { handle.has_proof_link() } else { handle.has_proof() };
-        if !handle.has_data() || !handle.has_state() || !has_proof
+        let has_proof =
+            if self.proof.is_link() { handle.has_proof_link() } else { handle.has_proof() };
+        if !handle.has_data()
+            || !handle.has_state()
+            || !has_proof
             || (self.phase == AcceptancePhase::Applied && !handle.is_applied())
         {
             return Ok(None);
         }
         let mut receipt = self.clone();
-        receipt.phase = if handle.is_applied() { AcceptancePhase::Applied } else { AcceptancePhase::Preapplied };
+        receipt.phase = if handle.is_applied() {
+            AcceptancePhase::Applied
+        } else {
+            AcceptancePhase::Preapplied
+        };
         receipt.already_present = handle.is_applied();
         Ok(Some(receipt))
     }
@@ -1111,7 +1118,9 @@ impl AcceptedSessionBlock {
         engine: Arc<dyn EngineOperations>,
         locally_generated: bool,
     ) -> Result<()> {
-        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+        if let Some((tbd, cc_seqno)) =
+            self.shard_description(engine.clone(), locally_generated).await?
+        {
             engine.send_top_shard_block_description(tbd, cc_seqno, false).await?;
         }
         Ok(())
@@ -1124,7 +1133,9 @@ impl AcceptedSessionBlock {
         engine: Arc<dyn EngineOperations>,
         locally_generated: bool,
     ) -> Result<()> {
-        if let Some((tbd, cc_seqno)) = self.shard_description(engine.clone(), locally_generated).await? {
+        if let Some((tbd, cc_seqno)) =
+            self.shard_description(engine.clone(), locally_generated).await?
+        {
             engine.register_top_shard_block_description(tbd, cc_seqno).await?;
         }
         Ok(())
@@ -1391,10 +1402,18 @@ async fn persist_authenticated_pq_block(
         fail!("`prev` has invalid length");
     }
     let already_applied = existing.as_ref().is_some_and(|handle| handle.is_applied());
+    let trace_started = std::time::Instant::now();
+    let trace_phase = |phase: &str| {
+        log::debug!(target: "simplex_resolver",
+            "PQ_ACCEPT_PHASE: block={} phase={} elapsed_ms={}",
+            id, phase, trace_started.elapsed().as_millis());
+    };
+    trace_phase("proof_begin");
     precheck_header(&block, &prev, false, false)?;
     // Verify before constructing even a signature-free proof link. The live
     // approval has no serialized signature representation.
     let proof = create_pq_session_proof(&block, &finality, verifier)?;
+    trace_phase("proof_done");
     if already_applied {
         // Rebuild a verified publication result on retry without repeating apply
         // or replacing an already-final persisted proof with an approval link.
@@ -1407,6 +1426,7 @@ async fn persist_authenticated_pq_block(
             already_present: true,
         });
     }
+    trace_phase("store_block_begin");
     let mut handle = match existing {
         Some(handle) if handle.has_data() => handle,
         _ => engine
@@ -1415,24 +1435,31 @@ async fn persist_authenticated_pq_block(
             .to_non_created()
             .ok_or_else(|| error!("PQ accept block handle mismatch"))?,
     };
+    trace_phase("store_block_done");
     engine.store_block_prev1(&handle, &prev[0])?;
     if prev.len() == 2 {
         engine.store_block_prev2(&handle, &prev[1])?;
     }
     if !handle.has_state() {
+        trace_phase("state_begin");
         calc_and_store_state(&handle, &block, &(prev[0].clone(), prev.get(1).cloned()), &engine)
             .await?;
+        trace_phase("state_done");
     }
     // A previously notarized shard may already have state. Final signatures
     // still need processing; has_state is not a finality or authentication gate.
+    trace_phase("store_proof_begin");
     handle = engine
         .store_block_proof(&id, Some(handle), &proof)
         .await?
         .to_non_created()
         .ok_or_else(|| error!("PQ accept proof handle mismatch"))?;
+    trace_phase("store_proof_done");
     let is_final = matches!(&authenticated, AcceptedFinality::Final { .. });
     if is_final && id.shard().is_masterchain() {
+        trace_phase("apply_begin");
         engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
+        trace_phase("apply_done");
     }
     // Shard finality is still preapplied until authenticated MC inclusion.
     let phase =

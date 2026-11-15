@@ -25,7 +25,7 @@ use crate::{
     HashmapIterator, HashmapType, IBitstring, MsgAddressInt, Result, Serializable, SliceData,
     UInt256, BASE_WORKCHAIN_ID, MAX_SPLIT_DEPTH,
 };
-use num::BigInt;
+use num::{BigInt, ToPrimitive};
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -43,6 +43,19 @@ pub struct ConfigParams {
     pub config_params: HashmapE, // <u32, SliceData>
 }
 
+#[derive(Debug)]
+pub struct ConfigParamReferenceError(pub u32);
+impl std::fmt::Display for ConfigParamReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "config parameter {}: dictionary value must contain exactly one reference",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ConfigParamReferenceError {}
+
 impl Default for ConfigParams {
     fn default() -> ConfigParams {
         Self { config_addr: AccountId::ZERO_ID, config_params: HashmapE::with_bit_len(32) }
@@ -52,10 +65,8 @@ impl Default for ConfigParams {
 impl ConfigParams {
     pub fn with_root(data: Cell) -> Result<Self> {
         let config_params = HashmapE::with_hashmap(32, Some(data));
-        let cell = config_params
-            .get(0u32.write_to_bitstring()?)?
-            .ok_or_else(|| error!("config param 0 is missing"))?
-            .reference(0)?;
+        let cell = Self::reference_from_dictionary(&config_params, 0)?
+            .ok_or_else(|| error!("config param 0 is missing"))?;
         let result = ConfigParamEnum::construct_from_cell_and_number(cell, 0)?;
         let ConfigParamEnum::ConfigParam0(ConfigParam0 { config_addr }) = result else {
             fail!("config param 0 has invalid format");
@@ -95,13 +106,21 @@ impl ConfigParams {
 
     /// get config by index
     pub fn config(&self, index: u32) -> Result<Option<ConfigParamEnum>> {
-        let key = index.write_to_bitstring()?;
-        if let Some(slice) = self.config_params.get(key)? {
-            if let Some(cell) = slice.reference_opt(0) {
-                return Ok(Some(ConfigParamEnum::construct_from_cell_and_number(cell, index)?));
-            }
+        if let Some(cell) = self.config_param_reference(index)? {
+            return Ok(Some(ConfigParamEnum::construct_from_cell_and_number(cell, index)?));
         }
         Ok(None)
+    }
+
+    pub(crate) fn config_param_reference(&self, index: u32) -> Result<Option<Cell>> {
+        Self::reference_from_dictionary(&self.config_params, index)
+    }
+    fn reference_from_dictionary(dictionary: &HashmapE, index: u32) -> Result<Option<Cell>> {
+        let Some(value) = dictionary.get(index.write_to_bitstring()?)? else { return Ok(None) };
+        if value.remaining_bits() != 0 || value.remaining_references() != 1 {
+            fail!(ConfigParamReferenceError(index));
+        }
+        Ok(Some(value.reference(0)?))
     }
 
     /// get config by index
@@ -324,36 +343,30 @@ impl ConfigParams {
         }
     }
     pub fn prev_validator_set(&self) -> Result<ValidatorSet> {
-        #[cfg(feature = "mirrornet")]
-        if let Some(ConfigParamEnum::ConfigParam33(param)) = self.config(33)? {
-            return Ok(param.prev_temp_validators);
-        }
-        Ok(match self.config(32)? {
-            Some(ConfigParamEnum::ConfigParam32(param)) => param.prev_validators,
-            _ => ValidatorSet::default(),
-        })
+        self.cached_validator_parameters(cfg!(feature = "mirrornet").then_some(33), 32)
     }
     pub fn prev_validator_set_present(&self) -> Result<bool> {
         Ok(self.config_present(33)? || self.config_present(32)?)
     }
     pub fn validator_set(&self) -> Result<ValidatorSet> {
-        if let Some(ConfigParamEnum::ConfigParam35(param)) = self.config(35)? {
-            return Ok(param.cur_temp_validators);
-        }
-        Ok(match self.config(34)? {
-            Some(ConfigParamEnum::ConfigParam34(param)) => param.cur_validators,
-            _ => ValidatorSet::default(),
-        })
+        self.cached_validator_parameters(Some(35), 34)
     }
     pub fn next_validator_set(&self) -> Result<ValidatorSet> {
-        #[cfg(feature = "mirrornet")]
-        if let Some(ConfigParamEnum::ConfigParam37(param)) = self.config(37)? {
-            return Ok(param.next_temp_validators);
+        self.cached_validator_parameters(cfg!(feature = "mirrornet").then_some(37), 36)
+    }
+    fn cached_validator_parameters(
+        &self,
+        preferred: Option<u32>,
+        fallback: u32,
+    ) -> Result<ValidatorSet> {
+        for index in preferred.into_iter().chain(std::iter::once(fallback)) {
+            if let Some(root) = self.config_param_reference(index)? {
+                return Ok(std::sync::Arc::unwrap_or_clone(ValidatorSet::unpack_with_cache(
+                    root, true,
+                )?));
+            }
         }
-        Ok(match self.config(36)? {
-            Some(ConfigParamEnum::ConfigParam36(param)) => param.next_validators,
-            _ => ValidatorSet::default(),
-        })
+        Ok(ValidatorSet::default())
     }
     pub fn next_validator_set_present(&self) -> Result<bool> {
         Ok(self.config_present(37)? || self.config_present(36)?)
@@ -402,6 +415,64 @@ impl ConfigParams {
         let (mc, shard) = read_consensus_config_cells(&mut wrapper)?;
         let selected = if masterchain { mc } else { shard };
         selected.map(SelectedSimplexConfig::from_cell).transpose().map(Option::flatten)
+    }
+
+    /// C++ proof-selection profile: first locate the selected reference, then
+    /// read legacy options, then decode the selected config. Only enumerated
+    /// noncritical keys are visited; unknown dictionary subtrees remain opaque.
+    pub fn selected_simplex_proof_config(
+        &self,
+        masterchain: bool,
+    ) -> Result<Option<SelectedSimplexConfig>> {
+        let Some(cell) = self.proof_config_param_cell(30)? else { return Ok(None) };
+        let mut wrapper = SliceData::load_cell(cell)?;
+        let (mc, shard) = read_consensus_config_cells(&mut wrapper)?;
+        let Some(cell) = (if masterchain { mc } else { shard }) else { return Ok(None) };
+        self.legacy_proof_session_config()?;
+        crate::proof::require_proof_cell(&cell)?;
+        let mut slice = SliceData::load_cell_ref(&cell)?;
+        let tag = slice.get_next_byte()?;
+        let flags = slice.get_next_byte()?;
+        let mut config = SimplexConfig::default();
+        match tag {
+            SIMPLEX_CONFIG_TAG => {
+                if flags & !1 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
+                config.use_quic = flags & 1 != 0;
+                config.noncritical_params.target_rate_ms = slice.get_next_u32()?;
+                config.slots_per_leader_window = slice.get_next_u32()?;
+                config.noncritical_params.first_block_timeout_ms = slice.get_next_u32()?;
+                config.noncritical_params.max_leader_window_desync = slice.get_next_u32()?;
+            }
+            SIMPLEX_CONFIG_V2_TAG => {
+                if flags & !7 != 0 {
+                    fail!("nonzero Simplex reserved flags");
+                }
+                config.use_quic = flags & 1 != 0;
+                config.protocol_version = (flags >> 1) & 3;
+                config.slots_per_leader_window = slice.get_next_u32()?;
+                let params = if slice.get_next_bit()? {
+                    Some(slice.checked_drain_reference()?)
+                } else {
+                    None
+                };
+                let params = HashmapE::with_hashmap(8, params);
+                for index in 0u8..=16 {
+                    if let Some(mut value) = params.get(index.write_to_bitstring()?)? {
+                        // C++ prefetches the uint32 prefix and ignores trailing
+                        // data here; complete schema validation is independent.
+                        config.noncritical_params.set(index, value.get_next_u32()?);
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+        if config.slots_per_leader_window == 0 {
+            fail!("zero Simplex leader window");
+        }
+        ensure_config_slice_empty(&slice)?;
+        Ok(Some(SelectedSimplexConfig { config, original_cell: cell }))
     }
 
     pub fn get_mc_simplex_config(&self) -> Result<Option<SimplexConfig>> {
@@ -783,7 +854,7 @@ impl ConfigParamEnum {
             37 => read_config!(ConfigParam37, ConfigParam37,                cell),
             39 => read_config!(ConfigParam39, ConfigParam39,                cell),
             40 => read_config!(ConfigParam40, MisbehaviourPunishmentConfig, cell),
-            43 => read_config!(ConfigParam43, SizeLimitsConfig,             cell),
+            43 => Ok(ConfigParamEnum::ConfigParam43(SizeLimitsConfig::construct_from_full_cell(cell)?)),
             44 => read_config!(ConfigParam44, SuspendedAddressList,         cell),
             45 => read_config!(ConfigParam45, PrecompiledContractsList,     cell),
             47 => read_config!(ConfigParam47, ValidatorControllerPolicy,    cell),
@@ -1487,9 +1558,9 @@ impl StoragePrices {
     ) -> BigInt {
         let bit_price = if is_masterchain { self.mc_bit_price_ps } else { self.bit_price_ps };
         let cell_price = if is_masterchain { self.mc_cell_price_ps } else { self.cell_price_ps };
-        let total = BigInt::from(bits) * BigInt::from(bit_price)
-            + BigInt::from(cells) * BigInt::from(cell_price);
-        BigInt::from(delta) * total
+        let total = BigInt::from(bits) * BigInt::from(bit_price as i64)
+            + BigInt::from(cells) * BigInt::from(cell_price as i64);
+        BigInt::from(delta as i64) * total
     }
 }
 
@@ -1526,12 +1597,29 @@ pub fn accrued_storage_fee(
             }
         }
     }
+    compute_storage_fees(prices, cells, bits, last_paid, now, is_special, is_masterchain)
+        .ok_or_else(|| error!("invalid partial storage payment"))
+}
+
+/// Compute directly from an explicit price vector, as StoragePrices does.
+/// Loading a chain configuration must still validate its ordered history via
+/// accrued_storage_fee. The reference's partial products use signed64 scalars.
+/// A failed partial-payment invariant is the reference's null fee, not zero.
+pub fn compute_storage_fees(
+    prices: &[StoragePrices],
+    cells: u64,
+    bits: u64,
+    last_paid: u32,
+    now: u32,
+    is_special: bool,
+    is_masterchain: bool,
+) -> Option<BigInt> {
     let first = match prices.first() {
         Some(first) => first,
-        None => return Ok(BigInt::default()),
+        None => return Some(BigInt::default()),
     };
     if now <= last_paid || last_paid == 0 || is_special || now <= first.utime_since {
-        return Ok(BigInt::default());
+        return Some(BigInt::default());
     }
     // The period in force at last_paid; the first one if last_paid precedes them all.
     let start = prices.iter().rposition(|period| period.utime_since <= last_paid).unwrap_or(0);
@@ -1548,27 +1636,25 @@ pub fn accrued_storage_fee(
         };
         if upto < valid_until {
             if upto < period.utime_since {
-                fail!(BlockError::InvalidData(format!(
-                    "storage fee interval starting at {upto} precedes its period at {}",
-                    period.utime_since
-                )))
+                return None;
             }
-            let seconds = valid_until.checked_sub(upto).ok_or_else(|| {
-                error!(BlockError::InvalidData("storage fee interval is negative".to_string()))
-            })?;
+            let seconds = valid_until.checked_sub(upto)?;
             let (bit_price, cell_price) = if is_masterchain {
                 (period.mc_bit_price_ps, period.mc_cell_price_ps)
             } else {
                 (period.bit_price_ps, period.cell_price_ps)
             };
-            let per_second = BigInt::from(cells) * BigInt::from(cell_price)
-                + BigInt::from(bits) * BigInt::from(bit_price);
+            let per_second = BigInt::from(cells as i64) * BigInt::from(cell_price as i64)
+                + BigInt::from(bits as i64) * BigInt::from(bit_price as i64);
+            if per_second < BigInt::default() {
+                return None;
+            }
             total += per_second * BigInt::from(seconds);
         }
         upto = valid_until;
     }
     // Divide by 2^16, rounding up, once.
-    Ok((total + BigInt::from(0xffffu32)) >> 16u8)
+    Some((total + BigInt::from(0xffffu32)) >> 16u8)
 }
 
 const STORAGE_PRICES_TAG: u8 = 0xCC;
@@ -1710,24 +1796,35 @@ impl GasLimitsPrices {
         Self::default()
     }
 
-    /// Calculate gas fee by gas used value
-    pub fn calc_gas_fee(&self, gas_used: u64) -> u128 {
-        // There is a flat_gas_limit value which is the minimum gas value possible and has fixed price.
-        // If actual gas value is less then flat_gas_limit then flat_gas_price paid.
-        // If actual gas value is bigger then flat_gas_limit then flat_gas_price paid for first
-        // flat_gas_limit gas and remaining value costs gas_price
-        if gas_used <= self.flat_gas_limit {
-            self.flat_gas_price as u128
-        } else {
-            // gas_price is pseudo value (shifted by 16 as forward and storage price)
-            // after calculation divide by 0xffff with ceil rounding
-            self.flat_gas_price as u128
-                + (((gas_used - self.flat_gas_limit) as u128 * self.gas_price as u128 + 0xffff)
-                    >> 16)
-        }
+    /// Calculate a transaction gas fee. The reference keeps a flat-only fee
+    /// unsigned, but converts the amount above the flat limit and the added
+    /// flat price to signed64. A negative result cannot be serialized as Coins.
+    pub fn calc_gas_fee(&self, gas_used: u64) -> Result<u128> {
+        let fee = self.compute_gas_price(gas_used);
+        u128::try_from(fee).map_err(|_| error!("negative transaction gas fee {fee}"))
     }
 
-    /// Calculate gas fee by gas used value without flat gas price
+    /// Mathematical ComputePhaseConfig fee, before the Coins boundary.
+    /// Its scalar multiplication and flat-price addition use signed64 values;
+    /// a flat-only result retains the unsigned configuration price.
+    /// This does not emulate the pinned RefInt backend's shared add_tiny
+    /// signed-limb overflow at extreme flat prices; see the conformance scope.
+    pub fn compute_gas_price(&self, gas_used: u64) -> i128 {
+        if gas_used <= self.flat_gas_limit {
+            return i128::from(self.flat_gas_price);
+        }
+        let amount = i128::from((gas_used - self.flat_gas_limit) as i64);
+        ((i128::from(self.gas_price) * amount + 0xffff) >> 16)
+            + i128::from(self.flat_gas_price as i64)
+    }
+
+    /// Exact simple fee used by the gas-purchase reference, with signed64 gas.
+    pub fn compute_simple_gas_price(&self, gas_used: u64) -> i128 {
+        (i128::from(self.gas_price) * i128::from(gas_used as i64) + 0xffff) >> 16
+    }
+
+    /// Legacy unsigned gas-unit helper. ComputePhaseConfig's signed scalar
+    /// profile is compute_simple_gas_price; the VM has its own price profile.
     pub fn calc_gas_fee_simple(&self, gas_used: u64) -> u128 {
         (gas_used as u128 * self.gas_price as u128 + 0xffff) >> 16
     }
@@ -1747,14 +1844,59 @@ impl GasLimitsPrices {
     /// the unsigned flat price. A threshold at or below zero is returned as
     /// zero, which every value reaches as well.
     pub fn calc_max_gas_threshold(&self, gas_limit: u64) -> u128 {
+        u128::try_from(self.compute_max_gas_threshold(gas_limit)).unwrap_or(0)
+    }
+
+    /// Preserve the signed threshold for diagnostics and exact arithmetic;
+    /// nonnegative balances reach any threshold at or below zero.
+    pub fn compute_max_gas_threshold(&self, gas_limit: u64) -> i128 {
         if gas_limit <= self.flat_gas_limit {
-            return u128::from(self.flat_gas_price);
+            return i128::from(self.flat_gas_price);
         }
         let above = i128::from((gas_limit - self.flat_gas_limit) as i64);
         let product = i128::from(self.gas_price) * above;
         let ceil = product.div_euclid(1 << 16) + i128::from(product.rem_euclid(1 << 16) != 0);
-        let threshold = ceil + i128::from(self.flat_gas_price as i64);
-        u128::try_from(threshold).unwrap_or(0)
+        ceil + i128::from(self.flat_gas_price as i64)
+    }
+
+    /// Shared gas-purchase calculation. The caller supplies the selected limit
+    /// and its nonnegative threshold view (including temporary gas overrides).
+    /// Defined arithmetic is retained at the known RefInt add_tiny overflow
+    /// boundary, rather than simulating compiler-dependent signed overflow.
+    pub fn gas_bought_for(
+        &self,
+        value: u128,
+        gas_limit: u64,
+        max_gas_threshold: u128,
+    ) -> Result<u64> {
+        if value >= max_gas_threshold {
+            return Ok(gas_limit);
+        }
+        let value = i128::try_from(value).map_err(|_| error!("gas value {value} out of range"))?;
+        let flat_price = i128::from(self.flat_gas_price as i64);
+        if value < flat_price {
+            return Ok(0);
+        }
+        let price = i128::from(self.gas_price);
+        if price == 0 {
+            // Below an unsigned flat-only threshold, a signed negative flat
+            // price can reach division by zero. RefInt256::to_long returns the
+            // signed minimum for the invalid quotient, then adds the flat limit.
+            return Ok((i64::MIN as u64).wrapping_add(self.flat_gas_limit));
+        }
+        // The reference subtracts by adding the 64-bit negation of the signed
+        // flat price, which leaves -2^63 unchanged. Below the threshold the value
+        // is under 2^111, so the shift fits.
+        let rest = value + i128::from((self.flat_gas_price as i64).wrapping_neg());
+        let shifted = rest
+            .checked_mul(1 << 16)
+            .ok_or_else(|| error!("gas bought for {value} does not fit"))?;
+        let mut quotient = shifted / price;
+        if shifted % price != 0 && (shifted < 0) != (price < 0) {
+            quotient -= 1;
+        }
+        let quotient = i64::try_from(quotient).unwrap_or(i64::MIN);
+        Ok((quotient as u64).wrapping_add(self.flat_gas_limit))
     }
 }
 
@@ -1855,28 +1997,103 @@ pub struct MsgForwardPrices {
     pub next_frac: u16,
 }
 
+/// Native message-price arithmetic, with the full u32 fractions accepted by
+/// the C++ MsgPrices constructor. The wire configuration keeps u16 fractions.
+#[derive(Clone, Debug, Default)]
+pub struct MsgPrices {
+    pub lump_price: u64,
+    pub bit_price: u64,
+    pub cell_price: u64,
+    pub ihr_factor: u32,
+    pub first_frac: u32,
+    pub next_frac: u32,
+}
+
+impl From<&MsgForwardPrices> for MsgPrices {
+    fn from(prices: &MsgForwardPrices) -> Self {
+        Self {
+            lump_price: prices.lump_price,
+            bit_price: prices.bit_price,
+            cell_price: prices.cell_price,
+            ihr_factor: prices.ihr_price_factor,
+            first_frac: u32::from(prices.first_frac),
+            next_frac: u32::from(prices.next_frac),
+        }
+    }
+}
+
+impl MsgPrices {
+    /// Scalar node fee: the intermediate sum wraps at128 bits, then the fee
+    /// and lump-price addition wrap at64 bits, exactly as td::uint128/.lo().
+    pub fn compute_fwd_fees(&self, cells: u64, bits: u64) -> u64 {
+        let total = (u128::from(self.bit_price) * u128::from(bits))
+            .wrapping_add(u128::from(self.cell_price) * u128::from(cells))
+            .wrapping_add(0xffff);
+        self.lump_price.wrapping_add((total >> 16) as u64)
+    }
+
+    /// RefInt256 multiplication takes its scalar counts as signed64 values.
+    pub fn compute_fwd_fees256(&self, cells: u64, bits: u64) -> BigInt {
+        BigInt::from(self.lump_price) + self.compute_fwd_fees_simple256(cells, bits)
+    }
+
+    pub fn compute_fwd_fees_simple256(&self, cells: u64, bits: u64) -> BigInt {
+        (BigInt::from(self.bit_price) * BigInt::from(bits as i64)
+            + BigInt::from(self.cell_price) * BigInt::from(cells as i64)
+            + 0xffffu32)
+            >> 16
+    }
+
+    pub fn compute_fwd_ihr_fees(&self, cells: u64, bits: u64, ihr_disabled: bool) -> (u64, u64) {
+        let fee = self.compute_fwd_fees(cells, bits);
+        let ihr = if ihr_disabled {
+            0
+        } else {
+            ((u128::from(fee) * u128::from(self.ihr_factor)) >> 16) as u64
+        };
+        (fee, ihr)
+    }
+
+    pub fn get_first_part(&self, total: u64) -> u64 {
+        ((u128::from(total) * u128::from(self.first_frac)) >> 16) as u64
+    }
+
+    pub fn get_first_part256(&self, total: &BigInt) -> BigInt {
+        (total * self.first_frac) >> 16
+    }
+
+    pub fn get_next_part256(&self, total: &BigInt) -> BigInt {
+        (total * self.next_frac) >> 16
+    }
+}
+
 impl MsgForwardPrices {
-    // All prices except `lump_price` are presented in `0xffff * price` form.
+    // All prices except `lump_price` are presented in `0x10000 * price` form.
     // It is needed because `ihr_factor`, `first_frac` and `next_frac` are not integer values
     // but calculations are performed in integers, so prices are multiplied to some big
     // number (0xffff) and fee calculation uses such values. At the end result is divided by
-    // 0xffff with ceil rounding to obtain nanocoins (add 0xffff and then `>> 16`)
+    // 0x10000 with ceil rounding to obtain nanocoins (add 0xffff and then `>> 16`)
     pub fn calc_fwd_fee(&self, bits: u64, cells: u64) -> u128 {
-        let res = (bits as u128 * self.bit_price as u128
-            + cells as u128 * self.cell_price as u128
-            + 0xffff)
-            >> 16;
-        self.lump_price as u128 + res
+        u128::from(MsgPrices::from(self).compute_fwd_fees(cells, bits))
     }
     pub fn calc_fwd_fee_simple(&self, bits: u64, cells: u64) -> u128 {
-        (bits as u128 * self.bit_price as u128 + cells as u128 * self.cell_price as u128 + 0xffff)
-            >> 16
+        // Retain this legacy unsigned accounting helper without overflowing
+        // its129-bit sum. VM/reference scalar conversions use MsgPrices.
+        let total = (BigInt::from(bits) * self.bit_price
+            + BigInt::from(cells) * self.cell_price
+            + 0xffffu32)
+            >> 16u8;
+        total.to_u128().expect("a sum of two u64 products shifted16 fits113 bits")
     }
 
     /// Calculate message IHR fee
     /// IHR fee is calculated as `(msg_forward_fee * ihr_factor) >> 16`
     pub fn ihr_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
-        Coins::try_from((fwd_fee.as_u128() * self.ihr_price_factor as u128) >> 16)
+        if let Some(product) = fwd_fee.as_u128().checked_mul(u128::from(self.ihr_price_factor)) {
+            return Coins::try_from(product >> 16);
+        }
+        let part = (BigInt::from(fwd_fee.as_u128()) * self.ihr_price_factor) >> 16u8;
+        Coins::try_from(part.to_u128().ok_or_else(|| error!("IHR fee out of range"))?)
     }
 
     /// Calculate mine part of forward fee
@@ -1886,11 +2103,19 @@ impl MsgForwardPrices {
     /// `int_msg_remain_fee` is placed in header of internal message and will go to validators
     /// of shard to which message destination address is belong.
     pub fn mine_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
-        Coins::try_from((fwd_fee.as_u128() * self.first_frac as u128) >> 16)
+        if let Some(product) = fwd_fee.as_u128().checked_mul(u128::from(self.first_frac)) {
+            return Coins::try_from(product >> 16);
+        }
+        let part = MsgPrices::from(self).get_first_part256(&BigInt::from(fwd_fee.as_u128()));
+        Coins::try_from(part.to_u128().ok_or_else(|| error!("forward fee part out of range"))?)
     }
 
     pub fn next_fee_checked(&self, fwd_fee: &Coins) -> Result<Coins> {
-        Coins::try_from((fwd_fee.as_u128() * self.next_frac as u128) >> 16)
+        if let Some(product) = fwd_fee.as_u128().checked_mul(u128::from(self.next_frac)) {
+            return Coins::try_from(product >> 16);
+        }
+        let part = MsgPrices::from(self).get_next_part256(&BigInt::from(fwd_fee.as_u128()));
+        Coins::try_from(part.to_u128().ok_or_else(|| error!("forward fee part out of range"))?)
     }
 }
 
@@ -3628,6 +3853,8 @@ pub struct SizeLimitsConfig {
     pub max_transaction_library_loads: Option<u32>,
     pub max_total_msg_bits: u32,
     pub max_total_msg_cells: u32,
+    pub out_msg_queue_size_hard_limit: u32,
+    pub out_msg_queue_size_soft_limit: u32,
 }
 
 impl Default for SizeLimitsConfig {
@@ -3649,6 +3876,8 @@ impl Default for SizeLimitsConfig {
             max_transaction_library_loads: None,
             max_total_msg_bits: MAX_MSG_BITS * 5 / 2,
             max_total_msg_cells: MAX_MSG_CELLS * 5 / 2,
+            out_msg_queue_size_hard_limit: 18000,
+            out_msg_queue_size_soft_limit: 12000,
         }
     }
 }
@@ -3663,6 +3892,8 @@ impl SizeLimitsConfig {
         self.max_transaction_library_loads != default.max_transaction_library_loads
             || self.max_total_msg_bits != default.max_total_msg_bits
             || self.max_total_msg_cells != default.max_total_msg_cells
+            || self.out_msg_queue_size_hard_limit != default.out_msg_queue_size_hard_limit
+            || self.out_msg_queue_size_soft_limit != default.out_msg_queue_size_soft_limit
     }
 }
 
@@ -3693,6 +3924,8 @@ impl Serializable for SizeLimitsConfig {
             }
             self.max_total_msg_bits.write_to(cell)?;
             self.max_total_msg_cells.write_to(cell)?;
+            self.out_msg_queue_size_hard_limit.write_to(cell)?;
+            self.out_msg_queue_size_soft_limit.write_to(cell)?;
         }
         Ok(())
     }
@@ -3731,6 +3964,8 @@ impl Deserializable for SizeLimitsConfig {
             };
             self.max_total_msg_bits.read_from(slice)?;
             self.max_total_msg_cells.read_from(slice)?;
+            self.out_msg_queue_size_hard_limit.read_from(slice)?;
+            self.out_msg_queue_size_soft_limit.read_from(slice)?;
         }
         Ok(())
     }

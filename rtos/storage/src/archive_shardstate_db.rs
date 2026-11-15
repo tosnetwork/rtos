@@ -17,8 +17,10 @@ use crate::{
     traits::Serializable,
     StorageAlloc, TARGET,
 };
-use rtos_block::merkle_apply_budget::{MerkleApplyBudget, MerkleApplyLimits};
-use rtos_block::{BlockIdExt, Cell, CellsFactory, CellsStorage, Result, UInt256, UnixTime};
+use rtos_block::{
+    merkle_apply_budget::{MerkleApplyBudget, MerkleApplyLimits},
+    BlockIdExt, Cell, CellsFactory, CellsStorage, Result, UInt256, UnixTime,
+};
 use std::sync::{Arc, Mutex};
 
 pub struct ArchiveShardStateDb {
@@ -49,7 +51,9 @@ impl ArchiveShardStateDb {
         )?);
         let index = Arc::new(RocksDbTable::with_db(db, index_cf, true)?);
         Ok(Self {
-            index, boc_db, write_gate: Arc::new(Mutex::new(None)),
+            index,
+            boc_db,
+            write_gate: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             late_index_gate: Mutex::new(None),
         })
@@ -162,7 +166,9 @@ impl ArchiveShardStateDb {
         #[cfg(test)]
         {
             let gate = self.late_index_gate.lock().unwrap().take();
-            if let Some(gate) = gate { gate()?; }
+            if let Some(gate) = gate {
+                gate()?;
+            }
         }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id, save_utime);
@@ -197,7 +203,9 @@ impl ArchiveShardStateDb {
         #[cfg(test)]
         {
             let gate = self.late_index_gate.lock().unwrap().take();
-            if let Some(gate) = gate { gate()?; }
+            if let Some(gate) = gate {
+                gate()?;
+            }
         }
         let save_utime = UnixTime::now();
         let db_entry = DbEntry::with_params(id.clone(), cell_id, save_utime);

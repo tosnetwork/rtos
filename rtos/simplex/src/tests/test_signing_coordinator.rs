@@ -15,23 +15,50 @@ fn native_carrier5_signing_and_recovery_preserve_exact_vote() {
     let store = Arc::new(rtos_pq_consensus::ConsensusKeyStore::from_seed(&[0x95; 32], 0).unwrap());
     let (mut nodes, keys) = f::members();
     nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store)).unwrap();
-    let options = SessionOptions { wire_profile: rtos_api::WireProfile::T0, proto_version: 5,
-        ..Default::default() };
+    let options = SessionOptions {
+        wire_profile: rtos_api::WireProfile::T0,
+        proto_version: 5,
+        ..Default::default()
+    };
     options.validate().unwrap();
-    for (wire_profile, proto_version) in [(rtos_api::WireProfile::Legacy, 5),
-        (rtos_api::WireProfile::T0, 6), (rtos_api::WireProfile::T0, u32::MAX)] {
-        assert!(SessionOptions { wire_profile, proto_version, ..Default::default() }.validate().is_err());
+    for (wire_profile, proto_version) in [
+        (rtos_api::WireProfile::Legacy, 5),
+        (rtos_api::WireProfile::T0, 6),
+        (rtos_api::WireProfile::T0, u32::MAX),
+    ] {
+        assert!(SessionOptions { wire_profile, proto_version, ..Default::default() }
+            .validate()
+            .is_err());
     }
-    let description = Arc::new(SessionDescription::new(&options, f::session(), 42, &nodes,
-        keys[1].clone(), &ShardIdent::masterchain(), SystemTime::now(), None)
-        .unwrap().bind_pq_session(7).unwrap());
+    let description = Arc::new(
+        SessionDescription::new(
+            &options,
+            f::session(),
+            42,
+            &nodes,
+            keys[1].clone(),
+            &ShardIdent::masterchain(),
+            SystemTime::now(),
+            None,
+        )
+        .unwrap()
+        .bind_pq_session(7)
+        .unwrap(),
+    );
     let mut binding = binding(&description);
     binding.protocol = options.proto_version;
     assert_eq!(binding.protocol, 5);
     let db = crate::database::SimplexDb::open(root.path().join("db"), "carrier5").unwrap();
-    let open = |initialize| SigningCoordinator::open(db.clone(), binding.clone(),
-        description.get_source_public_key(description.get_self_idx()).clone(), root.path(),
-        initialize, custody_backend(&description, store.clone()));
+    let open = |initialize| {
+        SigningCoordinator::open(
+            db.clone(),
+            binding.clone(),
+            description.get_source_public_key(description.get_self_idx()).clone(),
+            root.path(),
+            initialize,
+            custody_backend(&description, store.clone()),
+        )
+    };
     let signer = open(true).unwrap();
     let signed = signer.vote(&vote("notarize")).unwrap();
     assert_eq!(store.consensus_signatures_produced(), 1);
@@ -971,7 +998,8 @@ fn custody_binding_rejects_wrong_backend_before_journal_creation() {
 fn custody_randomized_signatures_require_exact_journal_replay() {
     let h = Harness::custody(rtos_api::WireProfile::T0);
     let b = binding(&h.description);
-    let preimage = SigningCoordinator::preimage(&b, &vote_decision(&vote("notarize")).unwrap()).unwrap();
+    let preimage =
+        SigningCoordinator::preimage(&b, &vote_decision(&vote("notarize")).unwrap()).unwrap();
     let store = h.store.as_ref().unwrap();
     let first = store.sign_consensus(&preimage).unwrap();
     let second = store.sign_consensus(&preimage).unwrap();
@@ -1097,13 +1125,32 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
     let (mut nodes, keys) = f::members();
     nodes[1] = crate::SimplexSessionNode::from_descriptor(&custody_descriptor(&store)).unwrap();
     let members = nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect();
-    let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(members, keys[1].clone());
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
-    let make_description = || Arc::new(SessionDescription::new_with_runtime(
-        &options, runtime.session_id().clone(), 42, &nodes, transport.clone(), runtime.shard(),
-        SystemTime::now(), None, Some(&runtime),
-    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let (runtime, transport, options) =
+        crate::authenticated_fixture::runtime_with_members(members, keys[1].clone());
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>()
+        .unwrap();
+    let make_description = || {
+        Arc::new(
+            SessionDescription::new_with_runtime(
+                &options,
+                runtime.session_id().clone(),
+                42,
+                &nodes,
+                transport.clone(),
+                runtime.shard(),
+                SystemTime::now(),
+                None,
+                Some(&runtime),
+            )
+            .unwrap()
+            .bind_pq_session(runtime.catchain_seqno())
+            .unwrap(),
+        )
+    };
     let description = make_description();
     let binding = SigningBinding::from_authenticated_runtime(&runtime, 1, 0).unwrap();
     assert_eq!((binding.simplex_protocol, binding.protocol), (Some(2), runtime.carrier_version()));
@@ -1111,8 +1158,17 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
     assert!(SigningBinding::from_authenticated_runtime(&observer, 1, 0).is_err());
     let db = crate::database::SimplexDb::open(root.path().join("db"), "v2-journal").unwrap();
     let identity = description.get_source_public_key(description.get_self_idx()).clone();
-    let coordinator = Arc::new(SigningCoordinator::open(db.clone(), binding.clone(), identity.clone(),
-        root.path(), true, custody_backend(&description, store.clone())).unwrap());
+    let coordinator = Arc::new(
+        SigningCoordinator::open(
+            db.clone(),
+            binding.clone(),
+            identity.clone(),
+            root.path(),
+            true,
+            custody_backend(&description, store.clone()),
+        )
+        .unwrap(),
+    );
     // Equal session/committee is insufficient: the attached authenticated runtime
     // also pins the full network anchor and selected Param30 profile.
     for mode in 0..5 {
@@ -1123,7 +1179,11 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
                 1 => state.header.binding.zerostate_root[0] ^= 1,
                 2 => state.header.binding.zerostate_file[0] ^= 1,
                 3 => state.header.binding.profile[0] ^= 1,
-                _ => { state.header.binding.schema = 2; state.header.binding.simplex_protocol = None; state.header.binding.local_adnl = None; }
+                _ => {
+                    state.header.binding.schema = 2;
+                    state.header.binding.simplex_protocol = None;
+                    state.header.binding.local_adnl = None;
+                }
             }
         }
         assert!(coordinator.check_session(&description).is_err(), "domain {mode}");
@@ -1137,18 +1197,48 @@ fn authenticated_schema3_native_signing_and_exact_recovery_bind_runtime() {
     drop(coordinator);
     let before = db.storage.get_by_prefix(Vec::new(), None).wait().unwrap();
     let description = make_description();
-    let recovered = Arc::new(SigningCoordinator::open(db.clone(), binding.clone(), identity.clone(),
-        root.path(), false, custody_backend(&description, store.clone())).unwrap());
+    let recovered = Arc::new(
+        SigningCoordinator::open(
+            db.clone(),
+            binding.clone(),
+            identity.clone(),
+            root.path(),
+            false,
+            custody_backend(&description, store.clone()),
+        )
+        .unwrap(),
+    );
     description.install_coordinator(recovered.clone()).unwrap();
-    assert_eq!(options.wire_profile.serialize(&description.sign_own_vote(&vote("skip")).unwrap().into_boxed()).unwrap(), wire);
-    assert_eq!(store.consensus_signatures_produced(), 1, "recovery must not invoke native signer again");
+    assert_eq!(
+        options
+            .wire_profile
+            .serialize(&description.sign_own_vote(&vote("skip")).unwrap().into_boxed())
+            .unwrap(),
+        wire
+    );
+    assert_eq!(
+        store.consensus_signatures_produced(),
+        1,
+        "recovery must not invoke native signer again"
+    );
     drop(description);
     drop(recovered);
     for mode in 0..3 {
         let mut mismatch = binding.clone();
-        match mode { 0 => mismatch.simplex_protocol = Some(1), 1 => mismatch.protocol ^= 1, _ => mismatch.local_adnl = Some([77; 32]) }
-        assert!(SigningCoordinator::open(db.clone(), mismatch, identity.clone(), root.path(), false,
-            custody_backend(&make_description(), store.clone())).is_err());
+        match mode {
+            0 => mismatch.simplex_protocol = Some(1),
+            1 => mismatch.protocol ^= 1,
+            _ => mismatch.local_adnl = Some([77; 32]),
+        }
+        assert!(SigningCoordinator::open(
+            db.clone(),
+            mismatch,
+            identity.clone(),
+            root.path(),
+            false,
+            custody_backend(&make_description(), store.clone())
+        )
+        .is_err());
         assert_eq!(db.storage.get_by_prefix(Vec::new(), None).wait().unwrap(), before);
     }
     db.close(None).unwrap();

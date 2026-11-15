@@ -25,3 +25,13 @@ pub enum ExecutorError {
     #[error("Compute phase skipped while processing external inbound message with reason {:?}", .0)]
     ExtMsgComputeSkipped(ComputeSkipReason),
 }
+
+impl ExecutorError {
+    pub fn external_rejection_code(&self) -> Option<i32> {
+        match self {
+            Self::NoAcceptError(code, _) => Some(*code),
+            Self::ExtMsgComputeSkipped(_) => Some(0),
+            _ => None,
+        }
+    }
+}

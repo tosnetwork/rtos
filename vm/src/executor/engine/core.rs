@@ -111,6 +111,7 @@ pub struct Engine {
     pub(in crate::executor) libraries: Vec<HashmapE>, // 256 bit dictionaries
     pub(in crate::executor) modifiers: BehaviorModifiers,
     pub(in crate::executor) checked_signatures_count: usize,
+    slh_attempts: usize,
     /// GETEXTRABALANCE calls so far; the first few calls have capped cell-load gas. Shared with
     /// non-isolated child VMs and reset on isolated entry, like the signature-check counter.
     pub(in crate::executor) get_extra_balance_counter: usize,
@@ -118,6 +119,8 @@ pub struct Engine {
     // visited cell with HashMap<UInt256, SliceData>
     visited_cells: HashSet<UInt256>,
     loaded_libraries: HashSet<UInt256>,
+    missing_library: Option<UInt256>,
+    code_missing: bool,
     max_library_loads: Option<u32>,
     cstate: Option<(Cell, Cell)>,
     time: u64,
@@ -177,7 +180,11 @@ impl EngineTraceInfo<'_> {
 
 impl GasConsumer for Engine {
     fn finalize_cell(&mut self, builder: BuilderData) -> Result<Cell> {
-        self.use_gas(Gas::finalize_price());
+        if self.block_version >= 4 {
+            self.try_use_gas(Gas::finalize_price())?;
+        } else {
+            self.use_gas(Gas::finalize_price());
+        }
         builder
             .finalize(1024)
             .map_err(|err| error!(ExceptionCode::CellOverflow, "finalize cell error: {:?}", err))
@@ -233,9 +240,12 @@ impl Engine {
             libraries: Vec::new(),
             modifiers: BehaviorModifiers::default(),
             checked_signatures_count: 0,
+            slh_attempts: 0,
             get_extra_balance_counter: 0,
             visited_cells: HashSet::new(),
             loaded_libraries: HashSet::new(),
+            missing_library: None,
+            code_missing: false,
             max_library_loads: None,
             cstate: None,
             time: 0,
@@ -257,6 +267,26 @@ impl Engine {
             dispatched: None,
             base_charged: false,
         }
+    }
+
+    pub(in crate::executor) fn register_signature_call(&mut self) -> Status {
+        if self.block_version >= 4 {
+            self.checked_signatures_count = self.checked_signatures_count.saturating_add(1);
+            if self.checked_signatures_count > Gas::check_signature_threshold() {
+                self.try_use_gas(Gas::check_signature_price())?;
+            } else {
+                self.use_free_gas(Gas::check_signature_price());
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::executor) fn register_slh_attempt(&mut self) -> Status {
+        if self.slh_attempts >= 1 {
+            fail!(ExceptionCode::RangeCheckError, "SLH-DSA verification limit reached");
+        }
+        self.slh_attempts += 1;
+        Ok(())
     }
 
     /// Limit distinct library lookup attempts, including missing libraries.
@@ -605,6 +635,11 @@ impl Engine {
         }
     }
     pub fn execute(&mut self) -> Result<i32> {
+        if self.code_missing {
+            // VmState::run returns fatal without executing an uninitialized VM;
+            // RTOS reports the already-complemented external exit code.
+            return Ok(!(ExceptionCode::FatalError as i32));
+        }
         self.trace_info(EngineTraceInfoType::Start, 0, None);
         let result = loop {
             if let Some(result) = self.seek_next_cmd()? {
@@ -789,7 +824,13 @@ impl Engine {
                 return Ok(lib);
             }
         }
+        self.missing_library = Some(UInt256::construct_from(&mut hash.clone())?);
         fail!(ExceptionCode::CellUnderflow, "Libraries do not contain code with hash {:x}", hash)
+    }
+
+    /// Most recent library lookup which exhausted the configured collections.
+    pub fn missing_library(&self) -> Option<&UInt256> {
+        self.missing_library.as_ref()
     }
 
     /// Loads cell to slice checking in precashed map
@@ -989,6 +1030,22 @@ impl Engine {
         )
     }
 
+    /// Set up a node getter, preserving an absent code root as distinct from
+    /// an ordinary empty code cell. All other setup semantics are shared.
+    pub fn setup_with_optional_code(
+        self,
+        code: Option<Cell>,
+        ctrls: SaveList,
+        stack: Stack,
+        gas: Gas,
+        libraries: Vec<HashmapE>,
+    ) -> Result<Self> {
+        let missing = code.is_none();
+        let mut vm = self.setup_checked(code.unwrap_or_default(), ctrls, stack, gas, libraries)?;
+        vm.code_missing = missing;
+        Ok(vm)
+    }
+
     pub fn setup_checked(
         mut self,
         code: Cell,
@@ -997,6 +1054,7 @@ impl Engine {
         gas: Gas,
         libraries: Vec<HashmapE>,
     ) -> Result<Self> {
+        self.code_missing = false;
         self.libraries = libraries;
         let slice = self.resolve_init_code_cell(code)?;
         *self.cc.code_mut() = slice.clone();
@@ -1056,9 +1114,12 @@ impl Engine {
             ctrls,
             libraries: std::mem::take(&mut self.libraries),
             loaded_libraries: std::mem::take(&mut self.loaded_libraries),
+            missing_library: None,
+            code_missing: false,
             max_library_loads: self.max_library_loads,
             modifiers: self.modifiers.clone(),
             checked_signatures_count: self.checked_signatures_count,
+            slh_attempts: self.slh_attempts,
             get_extra_balance_counter: self.get_extra_balance_counter,
             visited_cells,
             cstate: None,
@@ -1113,6 +1174,7 @@ impl Engine {
         self.loaded_libraries = std::mem::take(&mut child.loaded_libraries);
         self.free_gas_consumed = child.free_gas_consumed;
         self.checked_signatures_count = child.checked_signatures_count;
+        self.slh_attempts = child.slh_attempts;
         self.get_extra_balance_counter = child.get_extra_balance_counter;
         log::debug!(
             target: "tvm",
@@ -1750,16 +1812,15 @@ impl Engine {
             ),
         };
         let mut t1_items = t1.as_tuple_mut()?;
-        match t1_items.get_mut(6) {
-            Some(v) => *v = StackItem::int(rand),
-            None => fail!(
-                ExceptionCode::RangeCheckError,
-                "set tuple index is {} but length is {}",
-                6,
-                t1_items.len()
-            ),
+        if t1_items.len() < 7 {
+            t1_items.resize(7, StackItem::None);
         }
-        self.use_gas(Gas::tuple_gas_price(t1_items.len()));
+        t1_items[6] = StackItem::int(rand);
+        if self.block_version >= 4 {
+            self.try_use_gas(Gas::tuple_gas_price(t1_items.len()))?;
+        } else {
+            self.use_gas(Gas::tuple_gas_price(t1_items.len()));
+        }
         *t1 = StackItem::tuple(t1_items);
         self.use_gas(Gas::tuple_gas_price(tuple.len()));
         *self.ctrl_mut(7)? = StackItem::tuple(tuple);

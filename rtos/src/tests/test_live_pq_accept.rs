@@ -341,7 +341,11 @@ impl EngineOperations for PqAcceptEngine {
     ) -> Result<crate::internal_db::BlockResult> {
         assert_eq!(id, self.handle.id());
         *self.proof.lock().unwrap() = Some(proof.clone());
-        if proof.is_link() { self.handle.set_proof_link(); } else { self.handle.set_proof(); }
+        if proof.is_link() {
+            self.handle.set_proof_link();
+        } else {
+            self.handle.set_proof();
+        }
         self.proofs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(crate::internal_db::BlockResult::with_status(
             self.handle.clone(),
@@ -550,7 +554,10 @@ async fn pq_live_accept_result_separates_persistence_publication_and_inclusion()
     assert!(advanced.is_final());
     let approved_after_inclusion = approved.current_receipt(engine.as_ref()).unwrap().unwrap();
     assert_eq!(approved_after_inclusion.phase(), AcceptancePhase::Applied);
-    assert!(!approved_after_inclusion.is_final(), "inclusion must never upgrade the receipt's role");
+    assert!(
+        !approved_after_inclusion.is_final(),
+        "inclusion must never upgrade the receipt's role"
+    );
     assert_eq!(engine.proofs.load(Ordering::Relaxed), 2);
     let retried = accept_pq_session_block(
         block.id().clone(),

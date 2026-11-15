@@ -952,8 +952,9 @@ impl EngineOperations for BootstrapTestEngine {
     }
     #[cfg(feature = "telemetry")]
     fn collator_telemetry(&self) -> &crate::validator::telemetry::CollatorValidatorTelemetry {
-        static TELEMETRY: std::sync::OnceLock<crate::validator::telemetry::CollatorValidatorTelemetry> =
-            std::sync::OnceLock::new();
+        static TELEMETRY: std::sync::OnceLock<
+            crate::validator::telemetry::CollatorValidatorTelemetry,
+        > = std::sync::OnceLock::new();
         TELEMETRY.get_or_init(Default::default)
     }
     #[cfg(feature = "telemetry")]

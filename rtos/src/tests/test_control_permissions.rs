@@ -169,7 +169,7 @@ async fn ask_raw(client: &mut AdnlClient, data: Vec<u8>) -> TLObject {
 fn refusal(answer: TLObject) -> Option<(i32, String)> {
     answer.downcast::<ControlQueryErrorBoxed>().ok().map(|error| {
         let error = error.only();
-        (error.code, error.message)
+        (error.code, error.message.into_string().unwrap())
     })
 }
 

@@ -29,8 +29,15 @@ use rtos_block::{
 fn execute_config_param(engine: &mut Engine, name: &'static str, opt: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 1)?;
-    let index: i32 = engine.cmd.var(0).as_integer_value(i32::MIN..=i32::MAX)?;
-    if let Some(value) = engine.get_config_param(index)? {
+    let index = engine.cmd.var(0).as_integer()?.as_integer_value(i32::MIN..=i32::MAX).ok();
+    let value = if let Some(index) = index {
+        engine.get_config_param(index)?
+    } else {
+        // The configuration root is checked even when the integer is not a key.
+        engine.smci_param(9)?.as_dict()?;
+        None
+    };
+    if let Some(value) = value {
         engine.cc.stack.push(StackItem::Cell(value));
         if !opt {
             engine.cc.stack.push(boolean!(true));
@@ -292,8 +299,12 @@ fn calc_gas_fee(engine: &mut Engine, name: &'static str, simple: bool) -> Status
     let index = if is_masterchain { 2 } else { 3 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
     let prices = GasLimitsPrices::construct_from(&mut slice.clone())?;
-    let gas_fee = if simple { prices.calc_gas_fee_simple(gas) } else { prices.calc_gas_fee(gas) };
-    engine.cc.stack.push(StackItem::int(gas_fee));
+    // The reference VM converts the uint64 configuration prices to signed integers.
+    let variable_gas = if simple { gas } else { gas.saturating_sub(prices.flat_gas_limit) };
+    let product = i128::from(prices.gas_price as i64) * i128::from(variable_gas);
+    let variable_fee = (product + 0xffff) >> 16;
+    let flat_fee = if simple { 0 } else { i128::from(prices.flat_gas_price as i64) };
+    engine.cc.stack.push(StackItem::int(variable_fee + flat_fee));
     Ok(())
 }
 
@@ -361,10 +372,11 @@ fn calc_forward_prices(engine: &mut Engine, name: &'static str, simple: bool) ->
     let index = if is_masterchain { 4 } else { 5 };
     let slice = engine.smci_extra_param(14, index)?.as_slice()?;
     let prices = MsgForwardPrices::construct_from(&mut slice.clone())?;
+    let prices = rtos_block::MsgPrices::from(&prices);
     let fwd_fee = if simple {
-        prices.calc_fwd_fee_simple(bits, cells)
+        prices.compute_fwd_fees_simple256(cells, bits)
     } else {
-        prices.calc_fwd_fee(bits, cells)
+        prices.compute_fwd_fees256(cells, bits)
     };
     engine.cc.stack.push(StackItem::int(fwd_fee));
     Ok(())

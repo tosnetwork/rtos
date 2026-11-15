@@ -452,6 +452,10 @@ impl AccountStorage {
         }
     }
 
+    pub(crate) fn balance(&self) -> &CurrencyCollection {
+        &self.balance
+    }
+
     fn calc_storage_used(&self) -> Result<StorageUsed> {
         let root_cell = self.serialize()?;
         let mut calc = StorageUsageCalc::with_limits(0, 0);
@@ -579,6 +583,7 @@ impl AccountStuff {
     }
     fn calc_storage_stat_dict(&mut self, dict_hash_min_cells: u32) -> Result<Option<Cell>> {
         self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        self.storage_stat.finish_usage_update();
         if self.storage_info.used.cells.as_u64() >= dict_hash_min_cells as u64
             && !self.addr.is_masterchain()
         {
@@ -592,12 +597,49 @@ impl AccountStuff {
         }
     }
 
+    fn finalize_storage_stat(&mut self, version: u32, min_cells: u32) -> Result<Option<Cell>> {
+        self.storage_stat.configure_version(version);
+        let roots_changed = self.storage_stat.roots_changed(&self.storage);
+        let store_hash = version >= 11 && !self.addr.is_masterchain();
+        // CPP uses this fixed26-cell trigger independently of the configured
+        // threshold for storing the resulting dictionary hash.
+        let force_recount = store_hash
+            && self.storage_info.dict_hash().is_none()
+            && self.storage_stat.input_usage().is_some_and(|used| used.cells() > 25);
+        if force_recount {
+            self.storage_stat.recount();
+        }
+        self.storage_info.used = self.storage_stat.calc_stat(&self.storage)?;
+        if roots_changed || force_recount {
+            self.storage_info.storage_extra.dict_hash =
+                if store_hash && self.storage_info.used.cells() >= u64::from(min_cells) {
+                    Some(
+                        self.storage_stat
+                            .calc_dict()?
+                            .map_or_else(UInt256::default, |root| root.repr_hash().clone()),
+                    )
+                } else {
+                    None
+                };
+        } else if !store_hash {
+            self.storage_info.storage_extra.dict_hash = None;
+        }
+        let dict = if self.storage_info.dict_hash().is_some() {
+            self.storage_stat.dict_root().cloned()
+        } else {
+            None
+        };
+        self.storage_stat.prepare_transaction(&self.storage, &self.storage_info.used)?;
+        Ok(dict)
+    }
+
     fn calc_and_check_storage_stat_dict(
         &mut self,
         dict_hash_min_cells: u32,
     ) -> Result<Option<Cell>> {
         let dict_hash = self.storage_info.dict_hash().cloned();
         let used = self.storage_info.used.clone();
+        self.storage_stat.clear_usage_seed();
         let result = self.calc_storage_stat_dict(dict_hash_min_cells)?;
         if dict_hash.as_ref() != self.storage_info.dict_hash() {
             fail!(
@@ -922,6 +964,33 @@ impl Account {
         }
     }
 
+    /// Snapshot input usage and roots before execution mutates the account.
+    /// Execution limits use the currency-free view; finalization selects the
+    /// versioned billing view. This cache state is not serialized.
+    pub fn prepare_storage_stat_for_transaction(&mut self) -> Result<()> {
+        if let Some(stuff) = self.stuff_mut() {
+            stuff.storage_stat.configure_version(10);
+            stuff.storage_stat.prepare_transaction(&stuff.storage, &stuff.storage_info.used)?;
+        }
+        Ok(())
+    }
+
+    /// Select a storage-stat view (pre10 billing includes currency roots).
+    /// State-size checks always select the currency-free view.
+    pub fn configure_storage_stat_version(&mut self, version: u32) {
+        if let Some(stuff) = self.stuff_mut() {
+            stuff.storage_stat.configure_version(version);
+        }
+    }
+
+    /// Finalize usage and optional dictionary hash with the chain version's rules.
+    pub fn finalize_storage_stat(&mut self, version: u32, min_cells: u32) -> Result<Option<Cell>> {
+        self.stuff_mut()
+            .map(|stuff| stuff.finalize_storage_stat(version, min_cells))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn calc_and_check_storage_stat_dict(
         &mut self,
         dict_hash_min_cells: u32,
@@ -994,7 +1063,9 @@ impl Account {
 
     /// Storage roots (code/data/library) counted by the storage stat.
     pub fn storage_roots(&self) -> StorageRoots {
-        AccountStorageStat::get_roots(self.state_init())
+        self.stuff()
+            .map(|stuff| stuff.storage_stat.roots_for_storage(&stuff.storage))
+            .unwrap_or_default()
     }
 
     pub fn state_init_mut(&mut self) -> Option<&mut StateInit> {
@@ -1247,7 +1318,7 @@ impl Account {
         let balance = Deserializable::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let storage_stat = AccountStorageStat::from_account_usage(&storage, &storage_info.used);
         Ok(Account::with_stuff(AccountStuff { addr, storage_info, storage, storage_stat }))
     }
 
@@ -1258,7 +1329,7 @@ impl Account {
         let balance = CurrencyCollection::construct_from(slice)?; //balance:CurrencyCollection
         let state = Deserializable::construct_from(slice)?; //state:AccountState
         let storage = AccountStorage { last_trans_lt, balance, state };
-        let storage_stat = AccountStorageStat::new(&storage, &storage_info.used);
+        let storage_stat = AccountStorageStat::from_account_usage(&storage, &storage_info.used);
         let stuff = AccountStuff { addr, storage_info, storage, storage_stat };
         Ok(Account::with_stuff(stuff))
     }
@@ -1367,6 +1438,42 @@ pub struct ShardAccount {
 }
 
 impl ShardAccount {
+    /// Unpacks the node's account storage view for an expected address. The
+    /// returned slice is the original encoding, including its reference order.
+    /// A nonexisting account has no storage slice.
+    pub fn unpack_storage_slice(
+        root: Cell,
+        workchain: i8,
+        address: &AccountId,
+    ) -> Result<Option<SliceData>> {
+        use crate::config_param_schema::{tlb_type_is_valid, TlbProfile, TlbType};
+        // Account::unpack validates a ShardAccount slice with 1024 reference
+        // visits; the standalone-cell validator also charges its root.
+        if !tlb_type_is_valid(TlbType::ShardAccount, TlbProfile::Handwritten, root.clone(), 1025) {
+            fail!("invalid ShardAccount storage view");
+        }
+        let shard = Self::construct_from_full_cell(root)?;
+        let account = shard.read_account()?;
+        let Some(account_address) = account.get_addr() else { return Ok(None) };
+        if !matches!(account_address, MsgAddressInt::AddrStd(_)) {
+            fail!("account storage requires a standard address");
+        }
+        let (actual_workchain, actual_address) = account_address.extract_std_address(true)?;
+        if actual_workchain != i32::from(workchain) || actual_address != *address {
+            fail!("account storage address differs");
+        }
+        if account.last_tr_time().unwrap_or(0).max(1) <= shard.last_trans_lt() {
+            fail!("account storage logical time does not follow ShardAccount");
+        }
+        let mut slice = SliceData::load_cell(shard.account_cell())?;
+        if !slice.get_next_bit()? {
+            fail!("account storage is missing");
+        }
+        MsgAddressInt::construct_from(&mut slice)?;
+        StorageInfo::construct_from(&mut slice)?;
+        Ok(Some(slice))
+    }
+
     pub fn with_account_root(
         account_root: Cell,
         last_trans_hash: UInt256,

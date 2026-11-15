@@ -124,7 +124,8 @@ async fn test_sync() -> Result<()> {
             #[cfg(feature = "telemetry")]
             let telemetry = create_engine_telemetry();
             let db_root_path = Arc::new(PathBuf::from(DB_PATH));
-            let archive_binding = db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?;
+            let archive_binding =
+                db.bind_archive_domain(storage::archives::context::ArchiveDomain::new())?;
             let archive_startup = archive_binding.view()?.enter()?;
             let db_provider: Arc<dyn ArchiveDbProvider> =
                 Arc::new(SingleDbProvider::new(archive_binding.clone(), db_root_path.clone()));

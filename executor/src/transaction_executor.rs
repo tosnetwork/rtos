@@ -131,6 +131,18 @@ fn decode_action(slice: &mut SliceData, version: u32) -> Result<OutAction> {
     }
 }
 
+// Committed and frozen account states omit explicit zero-valued options.
+pub(crate) fn normalize_account_state_options(account: &mut Account) {
+    if let Some(state) = account.state_init_mut() {
+        if state.fixed_prefix_length().is_some_and(|n| n.as_u32() == 0) {
+            state.fixed_prefix_length = None;
+        }
+        if state.special.as_ref().is_some_and(|flags| !flags.tick && !flags.tock) {
+            state.special = None;
+        }
+    }
+}
+
 pub(crate) const MAX_ACTIONS: usize = 255;
 
 /// Cell visits of a reference validation of one currency value or action.
@@ -328,6 +340,7 @@ pub trait TransactionExecutor {
                 log::debug!(target: "executor", "due payment {} have to freeze", fee);
                 acc.set_due_payment(Some(fee));
                 if acc.status() == AccountStatus::AccStateActive {
+                    normalize_account_state_options(acc);
                     acc.try_freeze()?;
                     Ok(TrStoragePhase::with_params(
                         storage_fees_collected,
@@ -475,7 +488,9 @@ pub trait TransactionExecutor {
                 *acc = result_acc;
                 return Ok((TrComputePhase::skipped(reason), None, None));
             }
-        };
+        } else if !acc.is_active() {
+            return Ok((TrComputePhase::skipped(ComputeSkipReason::NoState), None, None));
+        }
 
         // Match the reference's address-normalization point, including tick/tock
         // transactions with no inbound message. A later precompiled-cost check
@@ -494,16 +509,23 @@ pub trait TransactionExecutor {
             }
         }
 
-        // The initial limit and credit are the compute phase fields; a value
-        // wider than its field leaves the transaction unserializable.
-        vm_phase.gas_credit = match u32::try_from(gas.get_gas_credit()) {
-            Ok(0) => None,
-            Ok(value) => Some(value.try_into()?),
-            Err(_) => fail!("gas credit {} does not fit VarUInteger 3", gas.get_gas_credit()),
+        let initial_credit = gas.get_gas_credit();
+        let initial_limit = gas.get_gas_limit();
+        // External rejection precedes serialization of the initial gas fields.
+        let serialize_limits = |phase: &mut TrComputePhaseVm| -> Result<()> {
+            phase.gas_credit = match u32::try_from(initial_credit) {
+                Ok(0) => None,
+                Ok(value) => Some(value.try_into()?),
+                Err(_) => fail!("gas credit {} does not fit VarUInteger 3", initial_credit),
+            };
+            phase.gas_limit = u64::try_from(initial_limit)
+                .map_err(|_| error!("gas limit {} does not fit VarUInteger 7", initial_limit))?
+                .try_into()?;
+            Ok(())
         };
-        vm_phase.gas_limit = u64::try_from(gas.get_gas_limit())
-            .map_err(|_| error!("gas limit {} does not fit VarUInteger 7", gas.get_gas_limit()))?
-            .try_into()?;
+        if !is_external {
+            serialize_limits(&mut vm_phase)?;
+        }
 
         let code = if let Some(code) = result_acc.get_code() {
             code
@@ -515,7 +537,7 @@ pub trait TransactionExecutor {
                 vm_phase.exit_arg = None;
                 vm_phase.success = false;
                 vm_phase.gas_fees =
-                    Coins::try_from(if is_special { 0 } else { gas_config.calc_gas_fee(0) })?;
+                    Coins::try_from(if is_special { 0 } else { gas_config.calc_gas_fee(0)? })?;
                 if !acc_balance.coins.sub(&vm_phase.gas_fees)? {
                     log::debug!(
                         target: "executor",
@@ -523,6 +545,20 @@ pub trait TransactionExecutor {
                         vm_phase.gas_fees, acc_balance.coins
                     );
                     fail!("can't sub funds: from acc_balance")
+                }
+                // A null code cell still used the inbound state to initialize
+                // the VM. Activation follows the same version gate as execution.
+                vm_phase.msg_state_used = use_msg_state;
+                vm_phase.account_activated = use_msg_state && self.config().block_version() < 14;
+                if use_msg_state && !vm_phase.account_activated {
+                    result_acc = acc.clone();
+                }
+                if vm_phase.account_activated {
+                    if let Some(state) = result_acc.state_init_mut() {
+                        if state.fixed_prefix_length().is_some_and(|n| n.as_u32() == 0) {
+                            state.fixed_prefix_length = None;
+                        }
+                    }
                 }
                 *acc = result_acc;
                 return Ok((TrComputePhase::Vm(vm_phase), None, None));
@@ -536,9 +572,19 @@ pub trait TransactionExecutor {
 
         let code_hash = code.repr_hash();
         let precompiled = self.config().raw_config().precompiled_contracts_list()?;
-        let precompiled = if let Some(list) = precompiled { list.get(&code_hash)? } else { None };
+        // The reference applies configured precompiled costs only to ordinary
+        // transactions; tick/tock executes the account's code at normal VM cost.
+        let precompiled = if let Some(list) = precompiled.filter(|_| is_ordinary) {
+            list.get(&code_hash)?
+        } else {
+            None
+        };
         if let Some(precompiled) = precompiled.as_ref() {
-            if gas.get_gas_limit() < precompiled.gas_usage as i64 {
+            // Upstream 495113c8: external credit has no limit until ACCEPT;
+            // admission depends on the gas the account can purchase.
+            let available =
+                if is_external { gas.get_gas_max() } else { gas.get_gas_limit() } as u64;
+            if precompiled.gas_usage > available {
                 log::debug!(target: "executor", "skip computing phase no gas for precompiled contract");
                 return Ok((TrComputePhase::skipped(ComputeSkipReason::NoGas), None, None));
             }
@@ -552,9 +598,10 @@ pub trait TransactionExecutor {
             );
             let gas_limit =
                 if is_special { gas_config.special_gas_limit } else { gas_config.gas_limit };
+            // The fallback starts unaccepted externals on credit alone.
             let gas_credit = if gas.get_gas_credit() != 0 { gas_limit } else { 0 };
             gas = Gas::new(
-                gas_limit as i64,
+                if gas_credit != 0 { 0 } else { gas_limit as i64 },
                 gas_credit as i64,
                 gas_limit as i64,
                 gas_config.get_real_gas_price() as i64,
@@ -618,10 +665,21 @@ pub trait TransactionExecutor {
         };
         log::debug!(target: "executor", "VM terminated with exit code {}", vm_phase.exit_code);
 
+        // Unknown-precompiled fallback exhaustion is an execution setup
+        // failure in the reference, before external acceptance classification.
+        if precompiled.is_some() && vm_phase.exit_code == !(ExceptionCode::OutOfGas as i32) {
+            fail!(ExecutorError::TrExecutorError(
+                "precompiled contract exhausted gas in TVM".to_string()
+            ));
+        }
+
         // calc gas fees
         let gas = vm.get_gas();
         let credit = gas.get_gas_credit();
         //for external messages gas will not be exacted if VM throws the exception and gas_credit != 0
+        if is_external && credit != 0 {
+            fail!(ExecutorError::NoAcceptError(vm_phase.exit_code, raw_exit_arg));
+        }
         if let Some(precompiled) = precompiled.as_ref() {
             vm_phase.gas_used = precompiled.gas_usage.try_into()?;
             vm_phase.vm_steps = 0;
@@ -631,16 +689,17 @@ pub trait TransactionExecutor {
             vm_phase.vm_steps = vm.steps();
         }
         if credit != 0 {
-            if is_external {
-                fail!(ExecutorError::NoAcceptError(vm_phase.exit_code, raw_exit_arg))
-            }
             vm_phase.gas_fees = Coins::zero();
         } else {
             // credit == 0 means contract accepted
             let gas_fees =
-                if is_special { 0 } else { gas_config.calc_gas_fee(vm_phase.gas_used.as_u64()) };
+                if is_special { 0 } else { gas_config.calc_gas_fee(vm_phase.gas_used.as_u64())? };
             vm_phase.gas_fees = gas_fees.try_into()?;
         };
+
+        if is_external {
+            serialize_limits(&mut vm_phase)?;
+        }
 
         log::debug!(
             target: "executor",
@@ -2281,31 +2340,7 @@ fn gas_bought_for(
     gas_limit: u64,
     max_gas_threshold: u128,
 ) -> Result<u64> {
-    if value >= max_gas_threshold {
-        return Ok(gas_limit);
-    }
-    let value = i128::try_from(value).map_err(|_| error!("gas value {value} out of range"))?;
-    let flat_price = i128::from(gas_info.flat_gas_price as i64);
-    if value < flat_price {
-        return Ok(0);
-    }
-    let price = i128::from(gas_info.gas_price);
-    if price == 0 {
-        // A zero price makes the threshold the flat price, decided above.
-        fail!("gas price is zero")
-    }
-    // The reference subtracts by adding the 64-bit negation of the signed
-    // flat price, which leaves -2^63 unchanged. Below the threshold the value
-    // is under 2^111, so the shift fits.
-    let rest = value + i128::from((gas_info.flat_gas_price as i64).wrapping_neg());
-    let shifted =
-        rest.checked_mul(1 << 16).ok_or_else(|| error!("gas bought for {value} does not fit"))?;
-    let mut quotient = shifted / price;
-    if shifted % price != 0 && (shifted < 0) != (price < 0) {
-        quotient -= 1;
-    }
-    let quotient = i64::try_from(quotient).unwrap_or(i64::MIN);
-    Ok((quotient as u64).wrapping_add(gas_info.flat_gas_limit))
+    gas_info.gas_bought_for(value, gas_limit, max_gas_threshold)
 }
 
 fn check_deploy_state_init(
@@ -2536,6 +2571,8 @@ pub(super) fn check_account_size_limits(
         };
     let acc_id = acc.get_id().cloned().unwrap_or_default();
     let _tc = time_checker!(|| format!("account {:x} precalc_storage_stat", acc_id), 100);
+    // State-size limits exclude currency dictionaries even before version10.
+    acc.configure_storage_stat_version(10);
     let Some(stat) = acc.precalc_storage_stat()? else {
         return Ok(true);
     };

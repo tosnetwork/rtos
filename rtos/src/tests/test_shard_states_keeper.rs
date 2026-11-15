@@ -364,15 +364,13 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     store_mc_state(&keeper, &floor, None).await?;
     store_mc_state(&keeper, &successor, Some(&floor)).await?;
     store_mc_state(&keeper, &fork, None).await?;
-    keeper.adopt_cleanup_floor(
-        &floor,
-        wait_pin(&keeper, &floor).await?,
-        keeper.cleanup_floor_epoch(),
-    )?;
+    // These states are deliberately used after the floor advances past them.
+    // Pin them before advancing; a later physical read can race legitimate GC.
+    let older_pin = wait_pin(&keeper, &older).await?;
+    let floor_pin = wait_pin(&keeper, &floor).await?;
+    keeper.adopt_cleanup_floor(&floor, floor_pin.clone(), keeper.cleanup_floor_epoch())?;
     // No regression, and no fork that does not record the current floor.
-    assert!(keeper
-        .adopt_cleanup_floor(&older, wait_pin(&keeper, &older).await?, keeper.cleanup_floor_epoch())
-        .is_err());
+    assert!(keeper.adopt_cleanup_floor(&older, older_pin, keeper.cleanup_floor_epoch()).is_err());
     assert!(keeper
         .adopt_cleanup_floor(&fork, wait_pin(&keeper, &fork).await?, keeper.cleanup_floor_epoch())
         .is_err());
@@ -408,9 +406,7 @@ async fn test_cleanup_floor_adoption_is_monotonic_and_uncertain_writes_fail_clos
     assert!(!keeper.cleanup_floor_unset());
     keeper.resolve_uncertain_cleanup_floor(keeper.cleanup_floor_epoch())?;
     assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(successor.clone()));
-    assert!(keeper
-        .adopt_cleanup_floor(&floor, wait_pin(&keeper, &floor).await?, keeper.cleanup_floor_epoch())
-        .is_err());
+    assert!(keeper.adopt_cleanup_floor(&floor, floor_pin, keeper.cleanup_floor_epoch()).is_err());
     stopper.set_stop();
     engine.db.stop_states_db().await.unwrap();
     Ok(())
@@ -945,8 +941,10 @@ async fn disk_full_floor_adoption_is_uncertain_then_resolves_previous_or_candida
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "disk-full harness only"]
 async fn disk_full_incarnation_is_refused_then_advances_past_any_applied_value() -> Result<()> {
-    use crate::publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler};
-    use crate::validator::validator_cleanup_gc::next_cleanup_incarnation;
+    use crate::{
+        publication_dependency_leases::disk_full_tests::{control, enospc_root, Filler},
+        validator::validator_cleanup_gc::next_cleanup_incarnation,
+    };
     let root = enospc_root().join("incarnation");
     std::fs::create_dir_all(&root)?;
     let engine = TestEngine::new_db_dir(root.to_str().unwrap(), None).await?;

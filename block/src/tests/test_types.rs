@@ -164,6 +164,39 @@ fn test_shared_secret() {
     assert_eq!(shared_secret.lock().unwrap().as_ref(), other.lock().unwrap().as_ref());
 }
 
+#[test]
+fn network_shared_secret_matches_wire_coordinate_reference() {
+    // Fixed public test seed and reference wire coordinate, not an admitted
+    // Edwards verification key. The network conversion reads Y directly.
+    let local = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[7; 32]).unwrap();
+    let mut peer = [0u8; 32];
+    peer[0] = 2;
+    for sign in [0, 128] {
+        peer[31] = sign;
+        let shared = local.shared_secret(&peer).unwrap();
+        assert_eq!(
+            hex::encode(shared.lock().unwrap().as_ref()),
+            "aa7105d25af8686c201a99e174e2800b816239862add65882b8c227cb49d0d08"
+        );
+    }
+}
+
+#[test]
+fn network_shared_secret_refuses_degenerate_wire_coordinates() {
+    let local = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[7; 32]).unwrap();
+    for low in [0u8, 1, 236, 237, 238] {
+        let mut peer = if low < 2 { [0; 32] } else { [255; 32] };
+        peer[0] = low;
+        if low >= 2 {
+            peer[31] = 127;
+        }
+        for sign in [0, 128] {
+            peer[31] = (peer[31] & 127) | sign;
+            assert!(local.shared_secret(&peer).err().unwrap().is::<crate::DegeneratePublicKey>());
+        }
+    }
+}
+
 #[rustfmt::skip]
 #[test]
 fn test_get_bytestring() {

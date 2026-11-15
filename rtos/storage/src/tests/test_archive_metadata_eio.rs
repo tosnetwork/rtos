@@ -47,7 +47,10 @@ pub(super) fn old_rows(db: &Arc<RocksDb>, key: bool, old: &[Rows; 2]) {
 pub(super) fn payload(handle: &BlockHandle) -> Vec<u8> {
     format!("actual metadata EIO block {}", handle.id().seq_no()).into_bytes()
 }
-pub(super) async fn native(path: &Path, key: bool) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<BlockHandle>>) {
+pub(super) async fn native(
+    path: &Path,
+    key: bool,
+) -> (Arc<RocksDb>, Arc<RocksDb>, Vec<Arc<BlockHandle>>) {
     let provider = RocksDb::new(path, "archive_provider", None, AccessType::ReadWrite).unwrap();
     provider.bind_archive_domain(crate::archives::context::ArchiveDomain::new()).unwrap();
     let handles_db = RocksDb::new(path, "handle_db", None, AccessType::ReadWrite).unwrap();
@@ -94,7 +97,7 @@ pub(super) async fn open(
     if db.db().cf_handle(&cf("status", key)).is_none() {
         ArchiveSlice::new_empty(
             db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root,
             0,
             mode,
@@ -108,7 +111,7 @@ pub(super) async fn open(
         ArchiveSlice::with_data(
             db.repair_protection().clone(),
             db.test_archive_provider().unwrap(),
-        &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
+            &db.test_archive_provider().unwrap().view().unwrap().enter().unwrap(),
             root,
             0,
             mode,
@@ -168,7 +171,13 @@ pub(super) async fn reads(slice: &ArchiveSlice, handles: &[Arc<BlockHandle>]) {
         assert_eq!(found, vec![(handle.id().clone(), payload(handle))]);
     }
 }
-pub(super) fn target_rows(db: &Arc<RocksDb>, key: bool, handle: &BlockHandle, offset: bool, index: bool) {
+pub(super) fn target_rows(
+    db: &Arc<RocksDb>,
+    key: bool,
+    handle: &BlockHandle,
+    offset: bool,
+    index: bool,
+) {
     let offsets = PackageOffsetsDb::with_db(db.clone(), &cf("offsets", key), false).unwrap();
     assert_eq!(offsets.contains(&(&PackageEntryId::Block(handle.id())).into()).unwrap(), offset);
     let lookup = rows(db, &cf("block_index", key));

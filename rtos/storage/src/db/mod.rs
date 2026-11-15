@@ -11,8 +11,8 @@
  */
 pub mod filedb;
 pub mod node;
-pub mod rocksdb;
 pub(crate) mod provider_reservation;
+pub mod rocksdb;
 
 #[cfg(test)]
 mod tests;

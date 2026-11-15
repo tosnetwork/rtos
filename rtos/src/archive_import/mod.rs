@@ -275,7 +275,6 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
     let router = Arc::new(EpochRouter::new(&epoch_config, &archive_startup).await?);
     let db_provider = Arc::new(EpochDbProvider::new(router));
 
-
     let handle_db = Arc::new(BlockHandleDb::with_db(node_db.clone(), BLOCK_HANDLE_DB_NAME, true)?);
     let full_node_state_db = Arc::new(NodeStateDb::with_db(
         node_db.clone(),

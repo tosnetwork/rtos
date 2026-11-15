@@ -170,11 +170,14 @@ fn find(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     fetch_stack(engine, 2)?;
     let nbits = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let mut dict = HashmapE::with_hashmap(nbits, engine.cmd.var(1).as_dict()?.cloned());
-    if let Some((key, value)) = finder(engine, &dict, how)? {
+    if let Some((key, mut value)) = finder(engine, &dict, how & !REF)? {
         if how.bit(DEL) {
             let key = SliceData::load_builder(key.clone())?;
             convert_dict_error(dict.remove_with_gas(key, engine))?;
             engine.cc.stack.push(StackItem::dict(dict.data()));
+        }
+        if how.bit(REF) {
+            value = try_unref_leaf(value.as_slice()?.clone())?;
         }
         engine.cc.stack.push(value);
         let key = write_key(engine, key, how)?;
@@ -269,7 +272,7 @@ fn pfxdictget(engine: &mut Engine, name: &'static str, how: u8) -> Status {
         } else {
             Ok(())
         }
-    } else if how.bit(RET) || get_cont {
+    } else if how.bit(RET) || how.bit(SWITCH) {
         engine.cc.stack.push(engine.cmd.pop_var()?);
         if how.bit(RET) {
             engine.cc.stack.push(boolean!(false));

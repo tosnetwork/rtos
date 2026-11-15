@@ -52,7 +52,8 @@ impl ToFromTL for GetValidatorConfigRqRs {
 
     fn deserialize(rs: TLObject) -> anyhow::Result<Self::Rs> {
         let config = downcast::<rtos_api::ton::engine::validator::JsonConfig>(rs)?;
-        let engine_validator_config = serde_json::from_str::<EngineValidatorConfig>(config.data())?;
+        let engine_validator_config =
+            serde_json::from_str::<EngineValidatorConfig>(config.data().as_str()?)?;
         Ok(engine_validator_config)
     }
 }

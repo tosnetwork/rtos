@@ -678,7 +678,13 @@ impl RocksDbAsyncKeyValueStorage {
                                     Err(_) => break,
                                 }
                             }
-                            Self::commit_mutations(&db, &metrics, &callback_tx, &storage_id, writes);
+                            Self::commit_mutations(
+                                &db,
+                                &metrics,
+                                &callback_tx,
+                                &storage_id,
+                                writes,
+                            );
                         }
                     }
                 }
@@ -1313,7 +1319,10 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
 
         let result = StorageAsyncResultImpl::<()>::new();
         self.post_work(StorageWork::Mutation(StorageMutation {
-            key, value: Some(value), result: result.clone(), callback: on_complete,
+            key,
+            value: Some(value),
+            result: result.clone(),
+            callback: on_complete,
         }));
         result
     }
@@ -1339,7 +1348,10 @@ impl AsyncKeyValueStorage for RocksDbAsyncKeyValueStorage {
 
         let result = StorageAsyncResultImpl::<()>::new();
         self.post_work(StorageWork::Mutation(StorageMutation {
-            key, value: None, result: result.clone(), callback: on_complete,
+            key,
+            value: None,
+            result: result.clone(),
+            callback: on_complete,
         }));
         result
     }

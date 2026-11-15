@@ -420,7 +420,7 @@ mod tl_json {
     ) -> Res<ton::engine::validator::customoverlay::CustomOverlay> {
         let mut overlay = ton::engine::validator::customoverlay::CustomOverlay::default();
         if let Some(value) = field(object, "name") {
-            overlay.name = string(value)?;
+            overlay.name = string(value)?.into();
         }
         if let Some(value) = field(object, "nodes") {
             overlay.nodes = objects(value, node)?;
@@ -863,7 +863,7 @@ fn prepare(name: &str, t: &mut Tokenizer<'_>) -> Res<Option<Action>> {
         "del-custom-overlay" => {
             let name = t.string()?;
             t.check_endl()?;
-            query(DelCustomOverlay { name }, success)
+            query(DelCustomOverlay { name: name.into() }, success)
         }
         "show-custom-overlays" => {
             t.check_endl()?;
@@ -1012,7 +1012,10 @@ impl Transport for ControlPort {
         if let Ok(object) = deserialize_boxed(&answer) {
             if let Ok(error) = object.downcast::<ControlQueryError>() {
                 let error = error.only();
-                return Err(Status::with_code(error.code, error.message));
+                return Err(Status::with_code(
+                    error.code,
+                    error.message.into_string().map_err(|e| Status::error(e.to_string()))?,
+                ));
             }
         }
         Ok(answer)

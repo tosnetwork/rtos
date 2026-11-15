@@ -1,0 +1,76 @@
+name: Conformance
+
+on:
+  pull_request:
+    branches: ["main", "release/**"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vectors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: rtos
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: rtos
+
+      - name: Read reference pin
+        id: reference
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          pin = pathlib.Path("ci/conformance/REFERENCE").read_text().strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", pin):
+              raise SystemExit("invalid conformance reference commit")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"commit={pin}\n")
+          PY
+
+      - uses: actions/checkout@v5
+        with:
+          repository: tosnetwork/tos
+          ref: ${{ steps.reference.outputs.commit }}
+          path: tos-reference
+          persist-credentials: false
+
+      - name: Install build dependencies and pinned Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang cmake libssl-dev libzstd-dev libgoogle-perftools-dev build-essential
+          toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rtos -> target
+          shared-key: conformance
+
+      - name: Run all pinned vectors and local regressions
+        run: |
+          python3 ci/conformance/run.py --tos ../tos-reference \
+            --out "$RUNNER_TEMP/conformance" --jobs 2
+
+      - name: Retain conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ github.sha }}
+          path: ${{ runner.temp }}/conformance
+          if-no-files-found: warn

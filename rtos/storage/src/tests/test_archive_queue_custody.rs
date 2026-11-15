@@ -290,10 +290,8 @@ async fn verify_writer_close_releases_provider(panic_after_release: bool) {
     let provider = Arc::downgrade(&db);
     let (storage, handle_db) = create_block_handle_storage(db);
     let completion = storage.writer_completion_for_test();
-    let handle = storage
-        .create_handle(BlockIdExt::default(), BlockMeta::default(), None)
-        .unwrap()
-        .unwrap();
+    let handle =
+        storage.create_handle(BlockIdExt::default(), BlockMeta::default(), None).unwrap().unwrap();
     storage.sync_pending().await.unwrap();
     let callback = Arc::new(HeldCallback {
         entered: Default::default(),

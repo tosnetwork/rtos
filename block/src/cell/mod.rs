@@ -1907,8 +1907,13 @@ impl Cell {
 
             let mut hasher = Sha256::new();
             let mut cur_depth: u16 = 0;
-            let cur_level_mask =
-                if is_pruned { level_mask } else { LevelMask::with_level(i as u8) };
+            let cur_level_mask = if is_pruned {
+                level_mask
+            } else {
+                // DataCell hashes the actual mask restricted to this level;
+                // sparse masks must not acquire nonexistent intermediate bits.
+                LevelMask::with_mask(level_mask.mask() & LevelMask::with_level(i as u8).mask())
+            };
             hasher.update([calc_d1(cur_level_mask, false, cell_type, refs_count), d2]);
 
             if i == 0 {
@@ -1925,8 +1930,10 @@ impl Cell {
                 cur_depth = max(cur_depth, child_depth + 1);
                 if cur_depth > max_depth {
                     return Err(CellDepthLimitExceeded {
-                        depth: cur_depth, limit: max_depth.min(MAX_DEPTH),
-                    }.into());
+                        depth: cur_depth,
+                        limit: max_depth.min(MAX_DEPTH),
+                    }
+                    .into());
                 }
                 hasher.update(child_depth.to_be_bytes());
                 child_hashes.push(child_hash);
@@ -2976,6 +2983,27 @@ impl Cell {
     /// cell has been resolved yet. Does NOT trigger the loader.
     pub fn is_lazy(&self) -> bool {
         !self.is_data_cell() && self.variant_tag() == CELL_VARIANT_LAZY_LOAD
+    }
+
+    /// Load this root, preserving lazy errors and usage visits, and report
+    /// whether a cache would bypass a live proof usage tree.
+    pub(crate) fn load_usage_tracking(&self) -> Result<bool> {
+        if self.is_data_cell() {
+            return Ok(false);
+        }
+        let p = self.content_ptr();
+        match self.variant_tag() {
+            CELL_VARIANT_USAGE => {
+                if !UsageCell::visit_on_load(p) {
+                    self.visit();
+                }
+                let inner = UsageCell::inner(p).load_usage_tracking()?;
+                Ok(UsageCell::visited(p).upgrade().is_some() || inner)
+            }
+            CELL_VARIANT_VIRTUAL => VirtualCell::inner(p).load_usage_tracking(),
+            CELL_VARIANT_LAZY_LOAD => LazyLoadCell::try_load(p)?.load_usage_tracking(),
+            _ => Ok(false),
+        }
     }
 
     pub fn to_hex_string(&self, lower: bool) -> String {

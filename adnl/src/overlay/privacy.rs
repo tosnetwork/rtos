@@ -24,7 +24,7 @@ use rtos_block::{error, fail, sha256_digest, KeyId, KeyOption, Result, UInt256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Largest payload sent as one simple broadcast; larger payloads use FEC.
@@ -119,6 +119,10 @@ impl OverlayPrivacyRules {
         self.flags
     }
 
+    pub fn max_broadcast_size(&self) -> u32 {
+        self.authorized_keys.values().copied().fold(self.max_unauthorized_size, u32::max)
+    }
+
     pub fn max_unauthorized_size(&self) -> u32 {
         self.max_unauthorized_size
     }
@@ -137,6 +141,11 @@ pub struct OverlayCertificate {
 }
 
 impl OverlayCertificate {
+    pub fn from_wire(bytes: &[u8]) -> Result<Option<Self>> {
+        let tl = crate::adnl::wire::decode(bytes, |s| crate::packet::Refusal(s).into())?;
+        Self::from_tl(&tl)
+    }
+
     /// The flags a version-1 certificate implies, and the flags for which the
     /// version-1 preimage and serialization are used.
     pub fn default_flags(max_size: u32) -> u32 {
@@ -330,18 +339,10 @@ impl OverlayCertificate {
         &self.signature
     }
 
-    pub(crate) fn issuer_key(&self) -> Result<Arc<dyn KeyOption>> {
-        (&self.issuer).try_into()
-    }
-
     fn verify_signature(&self, overlay: &[u8; 32], node: &[u8; 32]) -> Result<()> {
-        self.issuer_key()?.verify(&self.to_sign(overlay, node)?, &self.signature)
+        crate::wire_keys::NetworkPublicKey::from_wire(&serialize_boxed(&self.issuer)?)?
+            .verify(&self.to_sign(overlay, node)?, &self.signature)
     }
-}
-
-/// Unix time as the wire peer reads it: whole seconds of the system clock.
-pub(crate) fn unix_time_now() -> i32 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() as i32).unwrap_or(0)
 }
 
 /// A sliding window admitting at most `limit` events per `duration`.
@@ -435,34 +436,6 @@ pub(crate) struct BroadcastVerifier {
 
 impl BroadcastVerifier {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn check_source_eligible(
-        &self,
-        rules: &OverlayPrivacyRules,
-        fixed_member_list: bool,
-        overlay: &[u8; 32],
-        source: &[u8; 32],
-        cert: Option<&OverlayCertificate>,
-        size: u32,
-        is_fec: bool,
-        is_any_sender: bool,
-        message_from: Option<&Arc<KeyId>>,
-    ) -> BroadcastCheckResult {
-        self.check_source_eligible_at(
-            rules,
-            fixed_member_list,
-            overlay,
-            source,
-            cert,
-            size,
-            is_fec,
-            is_any_sender,
-            message_from,
-            unix_time_now(),
-            Instant::now(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_source_eligible_at(
         &self,
         rules: &OverlayPrivacyRules,
@@ -511,15 +484,8 @@ impl BroadcastVerifier {
                     );
                     r2 = BroadcastCheckResult::Forbidden;
                 } else {
-                    let verified = cert.issuer_key().and_then(|issuer| {
-                        let to_sign = cert.to_sign(overlay, source)?;
-                        self.check_signature_from_peer_at(
-                            &issuer,
-                            &to_sign,
-                            cert.signature(),
-                            message_from,
-                            now,
-                        )
+                    let verified = self.check_signature_with_peer_at(message_from, now, || {
+                        cert.verify_signature(overlay, source)
                     });
                     match verified {
                         Ok(()) => {
@@ -563,12 +529,21 @@ impl BroadcastVerifier {
         message_from: Option<&Arc<KeyId>>,
         now: Instant,
     ) -> Result<()> {
+        self.check_signature_with_peer_at(message_from, now, || key.verify(message, signature))
+    }
+
+    fn check_signature_with_peer_at(
+        &self,
+        message_from: Option<&Arc<KeyId>>,
+        now: Instant,
+        verify: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         if let Some(peer) = message_from {
             if self.is_peer_banned_at(peer, now) {
                 fail!("Peer {peer} is temporarily banned");
             }
         }
-        let result = key.verify(message, signature);
+        let result = verify();
         if result.is_err() {
             if let Some(peer) = message_from {
                 let mut rejected =

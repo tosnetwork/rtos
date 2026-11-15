@@ -162,12 +162,16 @@ async fn crash_window(phase: &str) {
         let cold = engine.db().repair_leases().lookup(record.generation, &budget).unwrap();
         assert_eq!(cold.state, record.state);
         assert_eq!(cold.binding, exact.encode().unwrap());
-        assert!(engine.db().test_contains_dynamic_state_record(&control).unwrap(),
-            "control must exist before this cold GC opportunity");
+        assert!(
+            engine.db().test_contains_dynamic_state_record(&control).unwrap(),
+            "control must exist before this cold GC opportunity"
+        );
         // First cold operation is a genuine GC opportunity, not capability
         // authentication or recreation of the killed child's temporary pins.
-        assert!(!engine.shard_states_keeper().allow_state_gc(&control).unwrap(),
-            "arm the batch observation before the control becomes GC eligible");
+        assert!(
+            !engine.shard_states_keeper().allow_state_gc(&control).unwrap(),
+            "arm the batch observation before the control becomes GC eligible"
+        );
         engine.db().test_watch_state_gc_batch(&control);
         engine.shard_states_keeper().test_retire_history_state(&target);
         assert!(!engine.shard_states_keeper().allow_state_gc(&parent).unwrap());
@@ -184,15 +188,22 @@ async fn crash_window(phase: &str) {
         .expect("same-cutoff control must be physically deleted and its exact GC batch completed");
         engine.db().archive_gc(&target).await.unwrap();
         for id in [&parent, &target] {
-            assert!(engine.db().test_contains_dynamic_state_record(id).unwrap(),
-                "leased physical state {id} disappeared after the control GC batch completed");
+            assert!(
+                engine.db().test_contains_dynamic_state_record(id).unwrap(),
+                "leased physical state {id} disappeared after the control GC batch completed"
+            );
             // Cold physical graph traversal: root/index presence alone is insufficient.
             let state = engine.load_state(id).await.unwrap();
             assert!(!write_boc(state.root_cell()).unwrap().is_empty());
-            let dependency = cold.dependencies.iter()
-                .find(|d| d.kind == "state" && d.id == id.to_string()).unwrap();
-            assert_eq!(dependency.root.as_deref(),
-                Some(format!("{:x}", state.root_cell().repr_hash()).as_str()));
+            let dependency = cold
+                .dependencies
+                .iter()
+                .find(|d| d.kind == "state" && d.id == id.to_string())
+                .unwrap();
+            assert_eq!(
+                dependency.root.as_deref(),
+                Some(format!("{:x}", state.root_cell().repr_hash()).as_str())
+            );
             let block =
                 engine.load_block(&engine.load_block_handle(id).unwrap().unwrap()).await.unwrap();
             assert_eq!(block.id(), id);

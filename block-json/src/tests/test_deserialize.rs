@@ -16,6 +16,66 @@ use rtos_block::{
     ConfigParam36, ConfigParam37, ConfigParam39, ConfigParam4, ConfigParam6, ConfigParamEnum,
     ConfigVotingSetup, IBitstring, NoncriticalParams, Number16, SigPubKey, VarUInteger32,
 };
+
+#[test]
+fn auth_policy_json_preserves_full_unsigned_wire_fields() {
+    for sequence in [0, i64::MAX as u64 + 1, u64::MAX] {
+        let input = serde_json::json!({"p48": {
+            "network": "12".repeat(32), "sequence": sequence,
+            "retired": 2, "deadline": u32::MAX
+        }});
+        let config = parse_config_with_mandatory_params(input.as_object().unwrap(), &[48]).unwrap();
+        let expected = rtos_block::AuthPolicy {
+            network: UInt256::from([0x12; 32]),
+            sequence,
+            retired: 2,
+            deadline: u32::MAX,
+        };
+        assert_eq!(config.config(48).unwrap(), Some(ConfigParamEnum::ConfigParam48(expected)));
+        for mode in
+            [SerializationMode::Standart, SerializationMode::QServer, SerializationMode::Debug]
+        {
+            let mut output = Map::new();
+            serialize_config(&mut output, &config, mode).unwrap();
+            assert!(!output.contains_key("unknown_config"));
+            let parsed =
+                parse_config_with_mandatory_params(output["config"].as_object().unwrap(), &[48])
+                    .unwrap();
+            assert_eq!(parsed.config(48).unwrap(), config.config(48).unwrap());
+        }
+    }
+}
+
+#[test]
+fn auth_policy_json_rejects_overflow_negative_and_unknown_retirement_bits() {
+    let input = serde_json::json!({"p48": {
+        "network": "12".repeat(32), "sequence": "0", "retired": 0, "deadline": 0
+    }});
+    for (field, invalid) in [
+        ("sequence", serde_json::json!(-1)),
+        ("sequence", serde_json::json!("18446744073709551616")),
+        ("sequence", serde_json::json!(1.5)),
+        ("sequence", serde_json::json!(true)),
+        ("retired", serde_json::json!(65536)),
+        ("retired", serde_json::json!(1)),
+        ("retired", serde_json::json!(4)),
+        ("deadline", serde_json::json!(4294967296_u64)),
+        ("deadline", serde_json::json!(-1)),
+        ("network", serde_json::json!("not-a-network-tag")),
+    ] {
+        let mut bad = input.clone();
+        bad["p48"][field] = invalid;
+        assert!(
+            parse_config_with_mandatory_params(bad.as_object().unwrap(), &[48]).is_err(),
+            "{bad}"
+        );
+    }
+    for field in ["network", "sequence", "retired", "deadline"] {
+        let mut bad = input.clone();
+        bad["p48"].as_object_mut().unwrap().remove(field);
+        assert!(parse_config_with_mandatory_params(bad.as_object().unwrap(), &[48]).is_err());
+    }
+}
 use std::fmt::Debug;
 
 include!("./test_common.rs");
@@ -973,6 +1033,8 @@ fn test_size_limits_v3_json() {
             max_transaction_library_loads: loads,
             max_total_msg_bits: 2000,
             max_total_msg_cells: 0,
+            out_msg_queue_size_hard_limit: 123,
+            out_msg_queue_size_soft_limit: u32::MAX,
             ..Default::default()
         };
         let mut cp = prepare_config_params();
@@ -980,8 +1042,13 @@ fn test_size_limits_v3_json() {
         let json: Value = serde_json::from_str(&serialize_config_param(&cp, 43).unwrap()).unwrap();
         let parse = |v: &Value| parse_config_with_mandatory_params(v.as_object().unwrap(), &[43]);
         assert_eq!(cp.config(43).unwrap(), parse(&json).unwrap().config(43).unwrap());
-        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
-        {
+        for field in [
+            "max_transaction_library_loads",
+            "max_total_msg_bits",
+            "max_total_msg_cells",
+            "out_msg_queue_size_hard_limit",
+            "out_msg_queue_size_soft_limit",
+        ] {
             for invalid in
                 [serde_json::json!(-1), serde_json::json!(4294967296u64), serde_json::json!(true)]
             {
@@ -991,11 +1058,18 @@ fn test_size_limits_v3_json() {
             }
         }
         let mut absent = json.clone();
-        for field in ["max_transaction_library_loads", "max_total_msg_bits", "max_total_msg_cells"]
-        {
+        for field in [
+            "max_transaction_library_loads",
+            "max_total_msg_bits",
+            "max_total_msg_cells",
+            "out_msg_queue_size_hard_limit",
+            "out_msg_queue_size_soft_limit",
+        ] {
             absent["p43"].as_object_mut().unwrap().remove(field);
         }
         let decoded = parse(&absent).unwrap().size_limits_config().unwrap();
+        assert_eq!(decoded.out_msg_queue_size_hard_limit, 18000);
+        assert_eq!(decoded.out_msg_queue_size_soft_limit, 12000);
         assert_eq!(decoded.max_transaction_library_loads, None);
         assert_eq!(decoded.max_total_msg_bits, rtos_block::MAX_MSG_BITS * 5 / 2);
         assert_eq!(decoded.max_total_msg_cells, rtos_block::MAX_MSG_CELLS * 5 / 2);

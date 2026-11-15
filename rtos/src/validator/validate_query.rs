@@ -31,6 +31,7 @@ use crate::{
     validator::{
         collator::PREV_STATE_WAIT_TIMEOUT_MS,
         consensus::ResolverPurpose,
+        dependency_deadline::DependencyDeadline,
         out_msg_queue::{MsgQueueManager, StatesManager},
         state_resolver_cache::{self, StateResolverCache},
         validator_utils::calc_subset_for_masterchain,
@@ -176,6 +177,7 @@ struct ValidateBase {
     mint_msg: Option<InMsg>,
     // from collated_data
     top_shard_descr_dict: TopBlockDescrSet,
+    governing_states: HashMap<BlockIdExt, Arc<ShardStateStuff>>,
     virt_states: HashMap<UInt256, ShardStateUnsplit>, // prev state and neighbour out msg queues proofs by block root hash
     storage_dict_proofs: HashMap<UInt256, Cell>,
     full_collated_data: bool,
@@ -294,6 +296,12 @@ fn config_from_contract(accounts: &ShardAccounts, address: &AccountId) -> Result
     data.reference(0)
 }
 
+/// Result of the native validation pipeline, without publishing or storing the candidate.
+pub struct ValidatedCandidate {
+    pub ok_from_utime_ms: u64,
+    pub next_state: Option<Arc<ShardStateStuff>>,
+}
+
 pub struct ValidateQuery {
     // current state of blockchain
     shard: ShardIdent,
@@ -321,6 +329,7 @@ pub struct ValidateQuery {
 
     /// Simplex speculative state cache for notarized-but-not-yet-applied parents.
     state_resolver_cache: Option<Arc<tokio::sync::Mutex<StateResolverCache>>>,
+    dependency_deadline: DependencyDeadline,
 
     next_block_descr: Arc<String>,
 }
@@ -334,6 +343,11 @@ enum MsgProcessedStatus {
 }
 
 impl ValidateQuery {
+    pub(super) fn with_dependency_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.dependency_deadline = DependencyDeadline::at(deadline);
+        self
+    }
+
     fn shard(&self) -> &ShardIdent {
         &self.shard
     }
@@ -342,6 +356,10 @@ impl ValidateQuery {
         &self,
         prev_id: &BlockIdExt,
     ) -> Result<Arc<ShardStateStuff>> {
+        let timeout_ms = self
+            .dependency_deadline
+            .timeout_ms(Some(PREV_STATE_WAIT_TIMEOUT_MS))?
+            .expect("previous-state waits always have a finite budget");
         match &self.state_resolver_cache {
             Some(cache) => {
                 state_resolver_cache::wait_prev_state(
@@ -349,16 +367,11 @@ impl ValidateQuery {
                     &self.engine,
                     prev_id,
                     ResolverPurpose::SimplexValidationParent,
-                    PREV_STATE_WAIT_TIMEOUT_MS,
+                    timeout_ms,
                 )
                 .await
             }
-            None => {
-                self.engine
-                    .clone()
-                    .wait_state(prev_id, Some(PREV_STATE_WAIT_TIMEOUT_MS), true)
-                    .await
-            }
+            None => self.engine.clone().wait_state(prev_id, Some(timeout_ms), true).await,
         }
     }
 
@@ -393,6 +406,7 @@ impl ValidateQuery {
             block_create_total: Default::default(),
             block_create_count: Default::default(),
             state_resolver_cache,
+            dependency_deadline: DependencyDeadline::default(),
             next_block_descr,
         }
     }
@@ -519,7 +533,9 @@ impl ValidateQuery {
         base.config_params.validate_local_workchain_execution(base.shard().workchain_id())?;
         base.block_limits = base.config_params.block_limits(base.shard().is_masterchain())?;
         base.limits = base.config_params.size_limits_config()?;
-        base.special_smartcontracts = base.config_params.fundamental_smc_addr()?;
+        if base.shard().is_masterchain() {
+            base.special_smartcontracts = base.config_params.fundamental_smc_addr()?;
+        }
 
         // 3. load state(s) corresponding to previous block(s)
         for i in 0..base.prev_blocks_ids.len() {
@@ -589,7 +605,8 @@ impl ValidateQuery {
         CHECK!(!block_candidate.data.is_empty());
         // 1. deserialize block itself
         let data = Arc::new(mem::take(&mut block_candidate.data));
-        base.block = BlockStuff::deserialize_block_checked(block_candidate.block_id.clone(), data)?;
+        base.block = BlockStuff::deserialize_block_checked(block_candidate.block_id.clone(), data)
+            .map_err(|e| error!("cannot decode block candidate: {e}"))?;
         // 3. initial block parse
         Self::init_parse(&mut base)?;
         // ...
@@ -642,6 +659,9 @@ impl ValidateQuery {
         }
         if base.info.start_lt() >= base.info.end_lt() {
             reject_query!("block has start_lt greater than or equal to end_lt")
+        }
+        if base.info.start_lt() % rtos_block::LT_ALIGN != 0 {
+            reject_query!("start_lt {} is not aligned", base.info.start_lt());
         }
         if base.info.shard().is_masterchain()
             && (base.info.after_merge() || base.info.before_split() || base.info.after_split())
@@ -842,7 +862,16 @@ impl ValidateQuery {
 
     async fn get_ref_mc_state(&mut self, base: &mut ValidateBase) -> Result<McData> {
         let (_, mc_id) = base.info.read_master_id()?.master_block_id();
-        let mc_state = self.engine.clone().wait_state(&mc_id, Some(1_000), true).await?;
+        let mc_state = self
+            .engine
+            .clone()
+            .wait_state(&mc_id, self.dependency_deadline.timeout_ms(Some(1_000))?, true)
+            .await?;
+        // CPP ConfigInfo::needAccountsRoot prepares the masterchain dictionary before
+        // auxiliary descriptor requests. Keep pruned-reference failures at this stage.
+        if base.shard().is_masterchain() {
+            base.prev_state_accounts = mc_state.state()?.read_accounts()?;
+        }
         log::debug!(
             target: "validate_query",
             "({}): in ValidateQuery::get_ref_mc_state() {}",
@@ -1032,6 +1061,16 @@ impl ValidateQuery {
             self.check_one_prev_state(base, &base.prev_states[0])?;
             base.prev_states[0].root_cell().clone()
         };
+        if prev_state_root.repr_hash() != &base.state_update.old_hash {
+            reject_query!("previous state hash mismatch for block {}", base.block_id());
+        }
+        for state in &base.prev_states {
+            if state.state()?.seq_no() != state.block_id().seq_no()
+                || state.state()?.shard() != state.block_id().shard()
+            {
+                reject_query!("previous state header differs from its block identity");
+            }
+        }
         log::debug!(target: "validate_query", "({}): computing next state", self.next_block_descr);
         let engine = self.engine.clone();
         let state_update = base.state_update.clone();
@@ -1061,7 +1100,7 @@ impl ValidateQuery {
             }
         }).await??;
         log::debug!(target: "validate_query", "({}): next state computed", self.next_block_descr);
-        let next_state = ShardStateStuff::from_root_cell(
+        let next_state = ShardStateStuff::from_root_cell_for_validation(
             base.block_id().clone(),
             next_state_root.clone(),
             #[cfg(feature = "telemetry")]
@@ -1232,7 +1271,7 @@ impl ValidateQuery {
             None,
             None,
             None,
-            states_manager,
+            states_manager.with_dependency_deadline(self.dependency_deadline),
         )
         .await
     }
@@ -1260,8 +1299,22 @@ impl ValidateQuery {
         // following checks are similar to those of Collator::import_new_shard_top_blocks()
         let do_flags = TopBlockDescrMode::FAIL_NEW | TopBlockDescrMode::FAIL_TOO_NEW;
         let mut res_flags = 0;
+        let governing_id = tsbd.governing_masterchain_block_id()?;
+        let governing = if governing_id == mc_data.state.block_id() {
+            &mc_data.state
+        } else {
+            base.governing_states.get(governing_id).ok_or_else(|| {
+                error!("governing masterchain state is unavailable: {}", governing_id)
+            })?
+        };
         let chain_len = tsbd
-            .prevalidate(mc_data.state.block_id(), &mc_data.state, do_flags, &mut res_flags)
+            .prevalidate_with_governing(
+                mc_data.state.block_id(),
+                &mc_data.state,
+                governing,
+                do_flags,
+                &mut res_flags,
+            )
             .map_err(|err| {
                 error!(
                     "ShardTopBlockDescr for {} is invalid: res_flags={}, err: {}",
@@ -1937,7 +1990,11 @@ impl ValidateQuery {
                                 let state = self
                                     .engine
                                     .clone()
-                                    .wait_state(&checked_id, Some(1_000), false)
+                                    .wait_state(
+                                        &checked_id,
+                                        self.dependency_deadline.timeout_ms(Some(1_000))?,
+                                        false,
+                                    )
                                     .await?;
 
                                 stack.push(RefBlockStatus::Checking(checked_id.clone()));
@@ -2448,7 +2505,6 @@ impl ValidateQuery {
                 cc.value_imported
             );
         }
-        let fees_import = CurrencyCollection::from_coins(cc.fees_collected);
         let cc = base.out_msg_descr.full_exported();
         if cc != &base.value_flow.exported {
             reject_query!(
@@ -2459,8 +2515,6 @@ impl ValidateQuery {
                 cc
             )
         }
-        let transaction_fees = base.account_blocks.full_transaction_fees();
-        let expected_fee_burned = Self::expected_fee_burned(&base, transaction_fees, &fees_import)?;
         if !base.shard().is_masterchain() && !base.value_flow.burned.is_zero()? {
             reject_query!(
                 "ValueFlow of block {} is invalid (non-zero burned value in a non-masterchain block)",
@@ -2468,6 +2522,14 @@ impl ValidateQuery {
             )
         }
 
+        Ok(())
+    }
+
+    fn check_value_flow_fees(base: &ValidateBase) -> Result<()> {
+        let fees_import =
+            CurrencyCollection::from_coins(base.in_msg_descr.full_import_fees().fees_collected);
+        let transaction_fees = base.account_blocks.full_transaction_fees();
+        let expected_fee_burned = Self::expected_fee_burned(base, transaction_fees, &fees_import)?;
         let mut expected_fees = transaction_fees.clone();
         expected_fees.add(&base.value_flow.fees_imported)?;
         expected_fees.add(&base.value_flow.created)?;
@@ -5500,7 +5562,6 @@ impl ValidateQuery {
                 old_hash
             )
         }
-        #[cfg(test)]
         let block_version = config.block_version();
         let dict_hash_min_cells = config.size_limits_config().acc_state_cells_for_storage_dict;
         let params = ExecuteParams {
@@ -5642,23 +5703,8 @@ impl ValidateQuery {
         let mut error = None;
         match executor.execute_with_params(in_msg_cell, account, params) {
             Ok(mut trans_execute) => {
-                // For an account whose storage roots are unchanged we can just update `used` info
-                // without dictionary reconstruction — UNLESS the account is large enough to need a
-                // dict but still has none.
-                let stat_changed =
-                    account.precalc_storage_stat()?.is_some_and(|stat| stat.is_changed());
-                let needs_initial_dict = !base.shard().is_masterchain()
-                    && account.dict_hash().is_none()
-                    && account
-                        .storage_info()
-                        .is_some_and(|info| info.used().cells() >= dict_hash_min_cells as u64);
-                if stat_changed || needs_initial_dict {
-                    *storage_dict = account.calc_storage_stat_dict(dict_hash_min_cells)?;
-                }
-                #[cfg(test)]
-                if block_version < 12 {
-                    account.del_storage_stat();
-                }
+                *storage_dict =
+                    account.finalize_storage_stat(block_version, dict_hash_min_cells)?;
                 *account_root = account.serialize()?;
                 let new_hash = account_root.repr_hash().clone();
                 if state_update.new_hash != new_hash {
@@ -5868,15 +5914,19 @@ impl ValidateQuery {
         // log::debug!(target: "validate_query", "({}): checking all transactions", base.next_block_descr);
         let (capabilities, block_version) =
             base.info.gen_software().map_or((0, 0), |v| (v.capabilities, v.version));
-        let config =
-            BlockchainConfig::with_params(capabilities, block_version, base.config_params.clone())?;
+        let config = BlockchainConfig::with_params_for_shard(
+            capabilities,
+            block_version,
+            base.config_params.clone(),
+            base.shard().is_masterchain(),
+        )?;
         base.account_blocks.iterate_with_keys_and_aug(|account_addr, acc_block, _fee| {
             let base = base.clone();
             let libraries = libraries.clone();
-            let (mut account_root, account) = Self::unpack_account(&base, &account_addr)?;
             let config = config.clone();
             let engine = engine.clone();
             Self::add_task(tasks, move || {
+                let (mut account_root, account) = Self::unpack_account(&base, &account_addr)?;
                 Self::check_account_transactions(
                     engine,
                     &base,
@@ -6970,6 +7020,27 @@ impl ValidateQuery {
     async fn common_preparation(&mut self) -> Result<(ValidateBase, McData)> {
         let mut base = self.init_base()?;
         let mc_data = self.init_mc_data(&mut base).await?;
+        let mut governing_ids = Vec::new();
+        base.top_shard_descr_dict.collection().iterate(|item| {
+            let block_id = item.0.proof_for().clone();
+            let descriptor = TopBlockDescrStuff::new(item.0, &block_id, base.is_fake, false)
+                .map_err(|e| {
+                    error!("cannot unpack ShardTopBlockDescr while loading governing state: {e}")
+                })?;
+            let id = descriptor.governing_masterchain_block_id()?.clone();
+            if id != *mc_data.state.block_id() && !governing_ids.contains(&id) {
+                governing_ids.push(id);
+            }
+            Ok(true)
+        })?;
+        for id in governing_ids {
+            let state = self
+                .engine
+                .clone()
+                .wait_state(&id, self.dependency_deadline.timeout_ms(Some(1000))?, true)
+                .await?;
+            base.governing_states.insert(id, state);
+        }
         // stage 0
         self.compute_next_state(&mut base, &mc_data).await?;
         self.unpack_prev_state(&mut base)?;
@@ -7009,7 +7080,6 @@ impl ValidateQuery {
     async fn validate(&mut self) -> Result<ValidateBase> {
         let (mut base, mc_data) = self.common_preparation().await?;
 
-        let manager = self.init_output_queue_manager(&mc_data, &mut base).await?;
         self.check_shard_layout(&base, &mc_data)?;
 
         #[cfg(feature = "xp25")]
@@ -7029,6 +7099,7 @@ impl ValidateQuery {
             base.is_fake,
         )?;
         self.check_utime_lt(&base, &mc_data)?;
+        let manager = self.init_output_queue_manager(&mc_data, &mut base).await?;
         // stage 1
         // log::debug!(target: "validate_query", "running letmated validity checks for block candidate {}", base.block_id());
         // if (!block::gen::t_Block.validate_ref(1000000, block_root_)) {
@@ -7073,6 +7144,7 @@ impl ValidateQuery {
         Self::check_all_ticktock_processed(&base)?;
         Self::check_message_processing_order(&mut base)?;
         Self::check_burned_value_flow(&base)?;
+        Self::check_value_flow_fees(&base)?;
         Self::check_new_state(&mut base, &mc_data, &manager)?;
         Self::check_mc_block_extra(&base, &mc_data)?;
         self.check_mc_state_extra(&base, &mc_data)?;
@@ -7093,6 +7165,16 @@ impl ValidateQuery {
             }
             Ok(_) => Ok(None),
         }
+    }
+
+    /// Executes the same validation core as `try_validate`, returning its validated timestamp.
+    /// Intended for offline callers with explicit state providers; this does not persist a block.
+    pub async fn validate_candidate(mut self) -> Result<ValidatedCandidate> {
+        let base = self.validate().await?;
+        Ok(ValidatedCandidate {
+            ok_from_utime_ms: base.now_ms.unwrap_or_else(|| u64::from(base.now()) * 1000),
+            next_state: if base.full_collated_data { None } else { base.next_state },
+        })
     }
 
     pub async fn try_validate(mut self) -> Result<Option<Arc<ShardStateStuff>>> {

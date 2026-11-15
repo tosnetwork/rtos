@@ -35,10 +35,14 @@ impl ConsensusOverlayManagerImpl {
 }
 
 impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
-    fn wire_profile(&self) -> rtos_api::WireProfile { self.network.wire_profile() }
+    fn wire_profile(&self) -> rtos_api::WireProfile {
+        self.network.wire_profile()
+    }
 
     fn stop_overlay_checked(
-        &self, id: &Arc<PrivateOverlayShortId>, overlay: &ConsensusOverlayPtr,
+        &self,
+        id: &Arc<PrivateOverlayShortId>,
+        overlay: &ConsensusOverlayPtr,
     ) -> Result<()> {
         self.network.stop_catchain_client_checked(id, overlay)
     }
@@ -72,12 +76,24 @@ impl ConsensusOverlayManager for ConsensusOverlayManagerImpl {
     }
 
     fn start_authenticated_overlay(
-        &self, key: &PrivateKey, id: &Arc<PrivateOverlayShortId>,
+        &self,
+        key: &PrivateKey,
+        id: &Arc<PrivateOverlayShortId>,
         runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
-        listener: ConsensusOverlayListenerPtr, replay: ConsensusOverlayLogReplayListenerPtr,
+        listener: ConsensusOverlayListenerPtr,
+        replay: ConsensusOverlayLogReplayListenerPtr,
         transport: OverlayTransportType,
     ) -> Result<ConsensusOverlayPtr> {
-        self.network.create_authenticated_consensus_client(self.validator_list_id.clone(), key, id, runtime, listener, replay, None, transport)
+        self.network.create_authenticated_consensus_client(
+            self.validator_list_id.clone(),
+            key,
+            id,
+            runtime,
+            listener,
+            replay,
+            None,
+            transport,
+        )
     }
 
     /// Stop existing overlay

@@ -807,7 +807,8 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
     async fn check_masterchain_proof(&self, proof: &BlockProofStuff) -> rtos_block::Result<()> {
         self.verifier.verify(self, proof).await.map(|_| ())
     }
-    async fn load_last_applied_mc_state_bounded(&self,
+    async fn load_last_applied_mc_state_bounded(
+        &self,
         budget: std::sync::Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> rtos_block::Result<std::sync::Arc<crate::shard_state::ShardStateStuff>> {
         // This adapter already owns the parsed fixture; production uses detached DB reads.
@@ -854,12 +855,18 @@ impl crate::engine_traits::EngineOperations for RecoveryProofEngine {
             .ok_or_else(|| rtos_block::error!("missing recovery proof"))
     }
     async fn load_block_proof_bounded(
-        &self, handle: &std::sync::Arc<storage::block_handle_db::BlockHandle>, _: bool,
+        &self,
+        handle: &std::sync::Arc<storage::block_handle_db::BlockHandle>,
+        _: bool,
         budget: std::sync::Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> rtos_block::Result<BlockProofStuff> {
         self.proof_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let proof = &self.entries.iter().find(|(h, _)| h.id() == handle.id())
-            .ok_or_else(|| rtos_block::error!("missing recovery proof"))?.1;
+        let proof = &self
+            .entries
+            .iter()
+            .find(|(h, _)| h.id() == handle.id())
+            .ok_or_else(|| rtos_block::error!("missing recovery proof"))?
+            .1;
         // Fixture objects are already parsed; account actual objects before clone.
         budget.proof(proof)?;
         Ok(proof.clone())
@@ -1060,17 +1067,36 @@ async fn test_live_proof_history_cache_never_caches_incoming_certificates() {
         verifier: Default::default(),
     };
     {
-        use crate::history_read_budget::{HistoryReadBudget, HistoryReadLimits, HistoryBudgetExceeded};
+        use crate::history_read_budget::{
+            HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits,
+        };
         let bytes = engine.entries.iter().map(|(_, p)| p.data().len()).sum();
         let exact = HistoryReadLimits { proof_count: 4, proof_bytes: bytes, ..Default::default() };
         let verifier = super::MasterchainProofVerifier::default();
-        verifier.verify_bounded(&engine, &target, HistoryReadBudget::new(exact.clone())).await.unwrap();
+        verifier
+            .verify_bounded(&engine, &target, HistoryReadBudget::new(exact.clone()))
+            .await
+            .unwrap();
         // A warm authority cache must still charge its actual retained proof.
-        let error = verifier.verify_bounded(&engine, &target, HistoryReadBudget::new(
-            HistoryReadLimits { proof_count: 0, ..exact.clone() })).await.err().expect("budget exceeded");
+        let error = verifier
+            .verify_bounded(
+                &engine,
+                &target,
+                HistoryReadBudget::new(HistoryReadLimits { proof_count: 0, ..exact.clone() }),
+            )
+            .await
+            .err()
+            .expect("budget exceeded");
         assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
-        let error = super::MasterchainProofVerifier::default().verify_bounded(&engine, &target,
-            HistoryReadBudget::new(HistoryReadLimits { proof_bytes: bytes - 1, ..exact })).await.err().expect("budget exceeded");
+        let error = super::MasterchainProofVerifier::default()
+            .verify_bounded(
+                &engine,
+                &target,
+                HistoryReadBudget::new(HistoryReadLimits { proof_bytes: bytes - 1, ..exact }),
+            )
+            .await
+            .err()
+            .expect("budget exceeded");
         assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some());
         engine.proof_reads.store(0, Ordering::SeqCst);
     }

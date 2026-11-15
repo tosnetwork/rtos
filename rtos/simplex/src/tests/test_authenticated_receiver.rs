@@ -139,11 +139,7 @@ async fn authenticated_observer_receiver_verifies_pq_candidate_and_authorizes_qu
         .into_boxed();
         let bytes = options.wire_profile.serialize(&candidate)?;
         let payload = ConsensusCommonFactory::create_block_payload(bytes.clone());
-        ingress.on_broadcast(
-            nodes[1].adnl_id.clone(),
-            &payload,
-            BroadcastSource::ConsensusOverlay,
-        );
+        ingress.on_broadcast(nodes[1].adnl_id.clone(), &payload, BroadcastSource::ConsensusOverlay);
         let query = rtos_api::ton::rpc::consensus::simplex::RequestCandidate {
             id: TlCandidateId { slot: slot as i32, hash: hash.clone() }.into_boxed(),
             want_candidate: true.into(),

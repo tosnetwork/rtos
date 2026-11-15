@@ -335,8 +335,8 @@ impl RetiredSessionService {
                 // A durable completion can be masked by newly discovered debt.
                 // Track completed intents as well as the pending low watermark;
                 // new arrivals, repeated reads and unknown counters do not renew it.
-                if let Some(pending) = owner.session.as_ref()
-                    .and_then(|session| session.finality_recovery_pending())
+                if let Some(pending) =
+                    owner.session.as_ref().and_then(|session| session.finality_recovery_pending())
                 {
                     if owner.pending_low_watermark.is_none_or(|low| pending < low) {
                         owner.pending_low_watermark = Some(pending);
@@ -510,8 +510,8 @@ mod tests {
                 completed: false,
                 listener: Arc::new(RecoveryListener),
                 last_progress_at: tokio::time::Instant::now(),
-            pending_low_watermark: None,
-            resolved_high_watermark: 0,
+                pending_low_watermark: None,
+                resolved_high_watermark: 0,
             };
             let (release, held) = std::sync::mpsc::channel();
             let mut slow = new_owner("slow");
@@ -566,36 +566,72 @@ mod tests {
         stopped: std::sync::atomic::AtomicBool,
     }
     impl std::fmt::Display for ProgressSession {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "progress-session") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "progress-session")
+        }
     }
     impl consensus_common::Session for ProgressSession {
         fn start(&self, _: Vec<rtos_block::BlockIdExt>, _: rtos_block::BlockIdExt) {}
-        fn stop(&self) { self.stopped.store(true, std::sync::atomic::Ordering::Release); }
-        fn stop_checked(&self) -> Result<()> { self.stop(); Ok(()) }
-        fn stop_async(&self) { self.stop(); }
-        fn destroy(&self) { self.stop(); }
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn stop(&self) {
+            self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        }
+        fn stop_checked(&self) -> Result<()> {
+            self.stop();
+            Ok(())
+        }
+        fn stop_async(&self) {
+            self.stop();
+        }
+        fn destroy(&self) {
+            self.stop();
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
     impl simplex::SimplexSession for ProgressSession {
         fn notify_mc_finalized(&self, _: rtos_block::BlockIdExt) {}
-        fn ensure_candidate_available(&self, _: rtos_block::BlockIdExt, _: simplex::EnsureCandidateAvailabilityOptions) {}
-        fn is_stopped(&self) -> bool { self.stopped.load(std::sync::atomic::Ordering::Acquire) }
-        fn is_panicked(&self) -> bool { false }
-        fn namespace_drained(&self) -> bool { self.is_stopped() }
+        fn ensure_candidate_available(
+            &self,
+            _: rtos_block::BlockIdExt,
+            _: simplex::EnsureCandidateAvailabilityOptions,
+        ) {
+        }
+        fn is_stopped(&self) -> bool {
+            self.stopped.load(std::sync::atomic::Ordering::Acquire)
+        }
+        fn is_panicked(&self) -> bool {
+            false
+        }
+        fn namespace_drained(&self) -> bool {
+            self.is_stopped()
+        }
         fn finality_recovery_pending(&self) -> Option<usize> {
             let n = self.pending.load(std::sync::atomic::Ordering::Acquire);
             (n != usize::MAX).then_some(n)
         }
-        fn finality_recovery_complete(&self) -> bool { self.finality_recovery_pending() == Some(0) }
-        fn finality_recovery_resolved(&self) -> u64 { self.resolved.load(std::sync::atomic::Ordering::Acquire) }
+        fn finality_recovery_complete(&self) -> bool {
+            self.finality_recovery_pending() == Some(0)
+        }
+        fn finality_recovery_resolved(&self) -> u64 {
+            self.resolved.load(std::sync::atomic::Ordering::Acquire)
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retired_recovery_preserves_progress_but_retires_stalled_or_completed_owners() {
-        for (pending, resolved, stopping, keep) in [(8,0,false,true),(9,0,false,false),
-            (10,0,false,false),(usize::MAX,0,false,false),(0,0,false,false),
-            (8,0,true,false),(10,1,false,true),(9,1,false,true),(10,1,true,false),
-            (0,1,false,false)] {
+        for (pending, resolved, stopping, keep) in [
+            (8, 0, false, true),
+            (9, 0, false, false),
+            (10, 0, false, false),
+            (usize::MAX, 0, false, false),
+            (0, 0, false, false),
+            (8, 0, true, false),
+            (10, 1, false, true),
+            (9, 1, false, true),
+            (10, 1, true, false),
+            (0, 1, false, false),
+        ] {
             let service = RetiredSessionService {
                 status: Mutex::new(Default::default()),
                 initialized: tokio::sync::watch::channel(false).0,
@@ -608,31 +644,43 @@ mod tests {
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
             let mut active = vec![ActiveRecovery {
-                namespace: PathBuf::from("progress"), lease: None, session: Some(session.clone()),
-                failure: None, constructing: None, retiring: None, completed: false,
-                listener: Arc::new(RecoveryListener), last_progress_at: tokio::time::Instant::now(),
-            pending_low_watermark: None,
-            resolved_high_watermark: 0,
+                namespace: PathBuf::from("progress"),
+                lease: None,
+                session: Some(session.clone()),
+                failure: None,
+                constructing: None,
+                retiring: None,
+                completed: false,
+                listener: Arc::new(RecoveryListener),
+                last_progress_at: tokio::time::Instant::now(),
+                pending_low_watermark: None,
+                resolved_high_watermark: 0,
             }];
             service.poll_owners(&stopper, &mut active, false).await.unwrap();
             // Age alone must not evict a source that has just reduced durable debt.
-            active[0].last_progress_at = tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
+            active[0].last_progress_at =
+                tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
             session.pending.store(pending, std::sync::atomic::Ordering::Release);
             session.resolved.store(resolved, std::sync::atomic::Ordering::Release);
             service.poll_owners(&stopper, &mut active, stopping).await.unwrap();
             let preserved = active[0].retiring.is_none();
             if preserved {
-                active[0].last_progress_at = tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
+                active[0].last_progress_at =
+                    tokio::time::Instant::now() - REPLAY_SLICE - Duration::from_secs(1);
                 service.poll_owners(&stopper, &mut active, false).await.unwrap();
-                assert!(active[0].retiring.is_some(),
-                    "observing the same completed count cannot indefinitely renew a stalled owner");
+                assert!(
+                    active[0].retiring.is_some(),
+                    "observing the same completed count cannot indefinitely renew a stalled owner"
+                );
             }
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !active.is_empty() {
                     service.poll_owners(&stopper, &mut active, true).await.unwrap();
                     tokio::task::yield_now().await;
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(preserved, keep,
                 "progressing historical source must survive its age slice; stalled/increasing/unknown/completed/stopping owners still retire (pending={pending}, resolved={resolved}, stopping={stopping})");
         }

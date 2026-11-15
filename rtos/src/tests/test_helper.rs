@@ -658,7 +658,9 @@ impl TestEngine {
             shard_blocks,
             last_applied_mc_block_id: RwLock::new(None),
             served_masterchain: Default::default(),
-            served_gc_resolver: Arc::new(crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(u64::MAX)),
+            served_gc_resolver: Arc::new(
+                crate::internal_db::state_gc_resolver::AllowStateGcSmartResolver::new(u64::MAX),
+            ),
             #[cfg(feature = "telemetry")]
             engine_telemetry: telemetry,
             engine_allocated: allocated,
@@ -1050,8 +1052,14 @@ impl EngineOperations for TestEngine {
     fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
         Some(&self.served_masterchain)
     }
-    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
-        crate::shard_states_keeper::PinnedShardStateGuard::new(self.load_state(id).await?, self.served_gc_resolver.clone())
+    async fn load_and_pin_state(
+        &self,
+        id: &BlockIdExt,
+    ) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
+        crate::shard_states_keeper::PinnedShardStateGuard::new(
+            self.load_state(id).await?,
+            self.served_gc_resolver.clone(),
+        )
     }
 
     fn now(&self) -> u32 {

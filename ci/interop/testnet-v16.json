@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "cpp_revision": "881240331ee48a291b96d73f8b8b93bae005ace0",
+  "cpp_revision": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
   "global_id": 3,
   "global_version": 16,
   "genesis_time": 1792180800,
@@ -20,8 +20,8 @@
     "workchain": -1,
     "shard": "-9223372036854775808",
     "seqno": 0,
-    "root_hash": "UP1l9eWaGB9TFUgsGQaRYnJ/K/a50cSoc+wVWMAxBYI=",
-    "file_hash": "jS25NEXly9tm72OIROAP+gmcuuJtuNQU6Y+Zw3s5XXA=",
+    "root_hash": "M4QpIZ6fiD/k8j8PQHkDLtSwsYPZZqBweq9WMP5VE8M=",
+    "file_hash": "5FInhj0H7Y613eFGHMNqUZY9EGv4K+6a+JtUS1oQaV8=",
     "@type": "tosNode.blockIdExt"
   },
   "expected_workchain_zerostate": {

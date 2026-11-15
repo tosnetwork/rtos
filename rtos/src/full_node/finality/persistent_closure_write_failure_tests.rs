@@ -2,8 +2,7 @@
 //! Real InternalDb before-write / after-successful-sync error injection. These
 //! are application-visible storage boundary errors, not failed OS syscalls.
 use super::*;
-use crate::internal_db::OutboxSyncBoundary;
-use crate::propagation_outbox::inspect_closure_batch;
+use crate::{internal_db::OutboxSyncBoundary, propagation_outbox::inspect_closure_batch};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,

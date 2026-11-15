@@ -2,11 +2,10 @@
 //! Validator consensus cleanup driven by the manager: the tick, the storage
 //! cleanup reservation, owned delete workers, the durable erase and its retry.
 use super::*;
-use crate::validator::validator_cleanup_gc::AttemptToken;
 use crate::{
     collator_test_bundle::{create_block_handle_storage, create_engine_allocated},
     shard_state::ShardStateStuff,
-    validator::validator_cleanup_gc::{delete_candidate_table, delete_v1_namespace},
+    validator::validator_cleanup_gc::{delete_candidate_table, delete_v1_namespace, AttemptToken},
 };
 use consensus_common::validator_cleanup::{
     make_record, record_key, NamespaceLayout, Page, PendingValidatorCleanup,

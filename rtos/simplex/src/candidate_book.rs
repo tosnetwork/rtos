@@ -55,7 +55,6 @@ std::thread_local! {
     static RECEIVED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-
 /// Soft warning threshold for deep parent-chain ancestry walks.
 ///
 /// We keep processing beyond this depth because long empty tails are
@@ -178,10 +177,7 @@ impl CandidateBook {
     /// serve as parent-resolution boundaries) — stubs must NOT suppress
     /// `requestCandidate` retries.
     pub(crate) fn has_real_body(&self, id: &RawCandidateId) -> bool {
-        self.received_candidates
-            .get(id)
-            .map(ReceivedCandidate::has_real_body)
-            .unwrap_or(false)
+        self.received_candidates.get(id).map(ReceivedCandidate::has_real_body).unwrap_or(false)
     }
 
     /// Reverse lookup: find the first received candidate whose `block_id`
@@ -465,6 +461,7 @@ impl ReceivedCandidate {
     /// Empty candidates are complete with metadata; ordinary candidates also
     /// require their body before suppressing retrieval or publishing finality.
     pub(crate) fn has_real_body(&self) -> bool {
-        !self.candidate_hash_data_bytes.is_empty() && (self.is_empty || !self.data.data().is_empty())
+        !self.candidate_hash_data_bytes.is_empty()
+            && (self.is_empty || !self.data.data().is_empty())
     }
 }

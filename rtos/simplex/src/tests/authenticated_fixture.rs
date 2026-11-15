@@ -19,20 +19,32 @@ pub fn runtime(
 }
 
 pub fn runtime_with_members(
-    members: Vec<ValidatorDescr>, transport: crate::PrivateKey,
+    members: Vec<ValidatorDescr>,
+    transport: crate::PrivateKey,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     runtime_with_members_on_shard(members, transport, ShardIdent::masterchain())
 }
 
 pub fn runtime_with_members_on_shard(
-    members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
+    members: Vec<ValidatorDescr>,
+    transport: crate::PrivateKey,
+    shard: ShardIdent,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
-    runtime_with_members_at_key(members, transport, shard, 0, ConsensusConfig::default().new_catchain_ids)
+    runtime_with_members_at_key(
+        members,
+        transport,
+        shard,
+        0,
+        ConsensusConfig::default().new_catchain_ids,
+    )
 }
 
 pub fn runtime_with_members_at_key(
-    members: Vec<ValidatorDescr>, transport: crate::PrivateKey, shard: ShardIdent,
-    key_seqno: u32, new_catchain_ids: bool,
+    members: Vec<ValidatorDescr>,
+    transport: crate::PrivateKey,
+    shard: ShardIdent,
+    key_seqno: u32,
+    new_catchain_ids: bool,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let total = members.clone();
     runtime_with_total_set(members, total, transport, shard, key_seqno, new_catchain_ids)
@@ -41,8 +53,12 @@ pub fn runtime_with_members_at_key(
 /// A protocol 2 runtime of `members` whose current total set is `total`:
 /// descriptors of `total` outside the committee are private overlay observers.
 pub fn runtime_with_total_set(
-    members: Vec<ValidatorDescr>, total: Vec<ValidatorDescr>, transport: crate::PrivateKey,
-    shard: ShardIdent, key_seqno: u32, new_catchain_ids: bool,
+    members: Vec<ValidatorDescr>,
+    total: Vec<ValidatorDescr>,
+    transport: crate::PrivateKey,
+    shard: ShardIdent,
+    key_seqno: u32,
+    new_catchain_ids: bool,
 ) -> (Arc<AuthenticatedSessionRuntime>, crate::PrivateKey, crate::SessionOptions) {
     let selected = SimplexConfig { protocol_version: 2, ..Default::default() };
     let selected_cell = selected.serialize().unwrap();
@@ -91,7 +107,14 @@ pub fn runtime_with_total_set(
             members,
             transport.id().clone(),
         )
-        .unwrap().bind_recovery_anchor(BlockIdExt::with_params(ShardIdent::masterchain(), key_seqno, UInt256::from([21; 32]), UInt256::from([22; 32]))).unwrap(),
+        .unwrap()
+        .bind_recovery_anchor(BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            key_seqno,
+            UInt256::from([21; 32]),
+            UInt256::from([22; 32]),
+        ))
+        .unwrap(),
     );
     let options = crate::SessionOptions {
         protocol: runtime.protocol(),
@@ -168,6 +191,23 @@ impl TestDirectory {
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Use only after the fixture's owner/continuation has been released. Parallel
+/// subprocess startup briefly inherits open flock descriptions until exec,
+/// even with CLOEXEC. Assertions about a still-held owner must call the real
+/// API directly; non-busy errors must not be retried.
+pub fn wait_for_source_release<T>(mut operation: impl FnMut() -> Result<Option<T>>) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if let Some(value) = operation()? {
+            return Ok(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            fail!("released source fixture remained busy");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

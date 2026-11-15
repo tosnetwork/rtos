@@ -16,6 +16,33 @@ use crate::{
 };
 
 #[test]
+fn validator_set_rejects_entries_beyond_declared_total() {
+    let value = ValidatorDescr::with_params(SigPubKey::from_bytes(&[17; 32]).unwrap(), 1, None);
+    let mut dictionary = ValidatorDescriptions::default();
+    dictionary.set(&0u16, &value).unwrap();
+    dictionary.set(&1u16, &value).unwrap();
+    let mut root = BuilderData::new();
+    root.append_u8(VALIDATOR_SET_EX_TAG).unwrap();
+    root.append_u32(0).unwrap().append_u32(100).unwrap();
+    root.append_u16(1).unwrap().append_u16(1).unwrap().append_u64(1).unwrap();
+    dictionary.write_to(&mut root).unwrap();
+    let cell = root.into_cell().unwrap();
+    let ordinary = ValidatorSet::construct_from_full_cell(cell.clone()).is_err();
+    struct Budget;
+    impl crate::config_read_budget::ConfigReadBudget for Budget {
+        fn step(&self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn workspace(&self, _: usize) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+    let bounded =
+        ValidatorSet::construct_bounded(&mut SliceData::load_cell(cell).unwrap(), &Budget).is_err();
+    assert!(ordinary && bounded, "extra entry refused: ordinary={ordinary}, bounded={bounded}");
+}
+
+#[test]
 fn test_validator_info_new_default() {
     let vi = ValidatorInfo::default();
     let vi2 = ValidatorInfo::default();

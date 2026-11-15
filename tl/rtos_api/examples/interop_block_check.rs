@@ -2,8 +2,8 @@
 //! Check native block/state checkpoints and optional authenticated final certificates.
 use anyhow::{ensure, Context, Result};
 use rtos_block::{
-    base64_decode, base64_encode, read_single_root_boc, BlkPrevInfo, Block, BlockIdExt, Deserializable,
-    ShardIdent, ShardStateUnsplit, UInt256,
+    base64_decode, base64_encode, read_single_root_boc, BlkPrevInfo, Block, BlockIdExt,
+    Deserializable, ShardIdent, ShardStateUnsplit, UInt256,
 };
 use serde_json::{json, Value};
 use std::{io::Write, path::PathBuf};
@@ -47,28 +47,37 @@ fn workchain_parent(block: &Block) -> Result<Value> {
 fn check_workchain_anchor(workchain: &Value, tops: &[Value], global_id: i32) -> Result<usize> {
     let target = identity(&workchain["block"]["id"])?;
     let chain = match workchain.get("anchor_chain") {
-        Some(value) => value.as_array().context("workchain anchor chain array required")?.as_slice(),
+        Some(value) => {
+            value.as_array().context("workchain anchor chain array required")?.as_slice()
+        }
         None => &[],
     };
     ensure!(chain.len() <= 64, "workchain anchor chain exceeds fixture bound");
     let top = chain.first().map(|link| &link["id"]).unwrap_or(&workchain["block"]["id"]);
     let mut expected = identity(top)?;
-    ensure!(tops.iter().any(|id| identity(id).ok().as_ref() == Some(&expected)),
-        "workchain block is not anchored by the checked masterchain block");
+    ensure!(
+        tops.iter().any(|id| identity(id).ok().as_ref() == Some(&expected)),
+        "workchain block is not anchored by the checked masterchain block"
+    );
     for link in chain {
         let id = identity(&link["id"])?;
-        ensure!(id == expected && id.0 == 0 && id.1 == i64::MIN && id.2 > target.2,
-            "workchain anchor link identity or order differs");
+        ensure!(
+            id == expected && id.0 == 0 && id.1 == i64::MIN && id.2 > target.2,
+            "workchain anchor link identity or order differs"
+        );
         let bytes = base64_decode(link["boc"].as_str().context("anchor link BOC required")?)?;
         ensure!(UInt256::calc_file_hash(&bytes) == id.4, "workchain anchor file hash differs");
         let cell = read_single_root_boc(&bytes)?;
         ensure!(cell.repr_hash() == &id.3, "workchain anchor cell hash differs");
         let block = Block::construct_from_cell(cell)?;
         let info = block.read_info()?;
-        ensure!(block.global_id() == global_id && u64::from(info.seq_no()) == id.2
-            && info.shard().workchain_id() == 0
-            && info.shard().shard_prefix_with_tag() == 1_u64 << 63,
-            "workchain anchor header differs");
+        ensure!(
+            block.global_id() == global_id
+                && u64::from(info.seq_no()) == id.2
+                && info.shard().workchain_id() == 0
+                && info.shard().shard_prefix_with_tag() == 1_u64 << 63,
+            "workchain anchor header differs"
+        );
         expected = identity(&workchain_parent(&block)?)?;
     }
     ensure!(expected == target, "workchain anchor does not reach the exact target");
@@ -93,19 +102,28 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
     // A historical governing witness needs authenticated block/state bodies,
     // not a claim that two RPC clients observed that past height as their head.
     // Root requests still require the actual native endpoint checkpoints.
-    let witness_only = depth > 0 && value.get("reference").is_none()
-        && value.get("comparison").is_none() && value.get("rust").is_none();
+    let witness_only = depth > 0
+        && value.get("reference").is_none()
+        && value.get("comparison").is_none()
+        && value.get("rust").is_none();
     let expanded = if witness_only {
-        let bytes = base64_decode(value["masterchain_state"]["boc"].as_str()
-            .context("governing state witness body required")?)?;
+        let bytes = base64_decode(
+            value["masterchain_state"]["boc"]
+                .as_str()
+                .context("governing state witness body required")?,
+        )?;
         let state_root = read_single_root_boc(&bytes)?.repr_hash().clone();
-        let mut zero = value["zerostate"].clone(); zero["@type"] = json!("tos.blockIdExt");
+        let mut zero = value["zerostate"].clone();
+        zero["@type"] = json!("tos.blockIdExt");
         let checkpoint = json!({"init":zero, "last":value["block"]["id"],
             "state_root_hash":base64_encode(state_root.as_slice())});
         let mut expanded = value.clone();
-        expanded["reference"] = checkpoint.clone(); expanded["comparison"] = checkpoint;
+        expanded["reference"] = checkpoint.clone();
+        expanded["comparison"] = checkpoint;
         Some(expanded)
-    } else { None };
+    } else {
+        None
+    };
     let value = expanded.as_ref().unwrap_or(value);
     let reference = &value["reference"];
     let comparison = value.get("comparison").unwrap_or(&value["rust"]);
@@ -152,14 +170,21 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
     let mut configuration = Value::Null;
     if let Some(source) = value.get("masterchain_state") {
         ensure!(identity(&source["id"])? == expected, "masterchain state identity differs");
-        let bytes = base64_decode(source["boc"].as_str().context("masterchain state BOC required")?)?;
-        ensure!(UInt256::calc_file_hash(&bytes) == hash(&source["file_hash"])?,
-            "masterchain state file hash differs");
+        let bytes =
+            base64_decode(source["boc"].as_str().context("masterchain state BOC required")?)?;
+        ensure!(
+            UInt256::calc_file_hash(&bytes) == hash(&source["file_hash"])?,
+            "masterchain state file hash differs"
+        );
         let cell = read_single_root_boc(&bytes)?;
         ensure!(cell.repr_hash() == &state, "masterchain state differs from block state update");
         let snapshot = ShardStateUnsplit::construct_from_cell(cell)?;
-        ensure!(snapshot.shard().is_masterchain() && u64::from(snapshot.seq_no()) == expected.2
-            && snapshot.global_id() == block.global_id(), "masterchain state header differs");
+        ensure!(
+            snapshot.shard().is_masterchain()
+                && u64::from(snapshot.seq_no()) == expected.2
+                && snapshot.global_id() == block.global_id(),
+            "masterchain state header differs"
+        );
         let extra = snapshot.read_custom()?.context("masterchain state configuration required")?;
         let describe = |set: rtos_block::ValidatorSet| -> Result<Value> {
             Ok(json!({"since":set.utime_since(), "until":set.utime_until(),
@@ -177,49 +202,94 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
     let mut governing_chain = Vec::new();
     if let Some(sources) = value.get("certificates") {
         let governing_state = if info.prev_key_block_seqno() == 0 {
-        let genesis_bytes = base64_decode(value["governing_zerostate_boc"].as_str()
-            .context("governing zerostate body required")?)?;
-        ensure!(UInt256::calc_file_hash(&genesis_bytes) == zero.4, "governing zerostate file hash differs");
-        let genesis_root = read_single_root_boc(&genesis_bytes)?;
-        ensure!(genesis_root.repr_hash() == &zero.3, "governing zerostate cell hash differs");
-        let genesis = ShardStateUnsplit::construct_from_cell(genesis_root)?;
-        ensure!(genesis.seq_no() == 0 && genesis.shard().is_masterchain()
-            && genesis.global_id() == block.global_id(), "invalid governing zerostate header");
-        genesis
+            let genesis_bytes = base64_decode(
+                value["governing_zerostate_boc"]
+                    .as_str()
+                    .context("governing zerostate body required")?,
+            )?;
+            ensure!(
+                UInt256::calc_file_hash(&genesis_bytes) == zero.4,
+                "governing zerostate file hash differs"
+            );
+            let genesis_root = read_single_root_boc(&genesis_bytes)?;
+            ensure!(genesis_root.repr_hash() == &zero.3, "governing zerostate cell hash differs");
+            let genesis = ShardStateUnsplit::construct_from_cell(genesis_root)?;
+            ensure!(
+                genesis.seq_no() == 0
+                    && genesis.shard().is_masterchain()
+                    && genesis.global_id() == block.global_id(),
+                "invalid governing zerostate header"
+            );
+            genesis
         } else {
-            let governing = value.get("governing_key_block")
+            let governing = value
+                .get("governing_key_block")
                 .context("certificate needs an authenticated governing key block")?;
-            ensure!(identity(&governing["zerostate"])? == zero,
-                "governing key block belongs to another Genesis");
+            ensure!(
+                identity(&governing["zerostate"])? == zero,
+                "governing key block belongs to another Genesis"
+            );
             let governing_id = identity(&governing["block"]["id"])?;
-            ensure!(governing_id.0 == -1 && governing_id.1 == i64::MIN
-                && governing_id.2 == u64::from(info.prev_key_block_seqno())
-                && governing_id.2 < expected.2, "governing key-block identity differs from signed header");
-            ensure!(governing["certificates"].as_array().is_some_and(|sources| !sources.is_empty()),
-                "governing key block needs its own final certificate");
-            ensure!(governing.get("masterchain_state").is_some(),
-                "governing key block needs its complete resulting state");
+            ensure!(
+                governing_id.0 == -1
+                    && governing_id.1 == i64::MIN
+                    && governing_id.2 == u64::from(info.prev_key_block_seqno())
+                    && governing_id.2 < expected.2,
+                "governing key-block identity differs from signed header"
+            );
+            ensure!(
+                governing["certificates"].as_array().is_some_and(|sources| !sources.is_empty()),
+                "governing key block needs its own final certificate"
+            );
+            ensure!(
+                governing.get("masterchain_state").is_some(),
+                "governing key block needs its complete resulting state"
+            );
             let checked = check_request(governing, depth + 1)?;
             ensure!(checked["key_block"] == true, "governing block is not a key block");
-            ensure!(checked["global_id"].as_i64() == Some(i64::from(block.global_id())),
-                "governing key-block global ID differs");
-            ensure!(checked["prev_key_block_seqno"].as_u64().context("governing predecessor required")?
-                < governing_id.2, "governing key-block chain does not decrease");
-            governing_chain.extend(checked["verified_governing_key_blocks"].as_array()
-                .context("governing chain report required")?.iter().cloned());
+            ensure!(
+                checked["global_id"].as_i64() == Some(i64::from(block.global_id())),
+                "governing key-block global ID differs"
+            );
+            ensure!(
+                checked["prev_key_block_seqno"]
+                    .as_u64()
+                    .context("governing predecessor required")?
+                    < governing_id.2,
+                "governing key-block chain does not decrease"
+            );
+            governing_chain.extend(
+                checked["verified_governing_key_blocks"]
+                    .as_array()
+                    .context("governing chain report required")?
+                    .iter()
+                    .cloned(),
+            );
             governing_chain.push(json!({"block":governing["block"]["id"],
                 "state_root_hash":checked["state_root_hash"],
                 "verified_final_certificates":checked["verified_final_certificates"]}));
-            let bytes = base64_decode(governing["masterchain_state"]["boc"].as_str()
-                .context("governing state body required")?)?;
+            let bytes = base64_decode(
+                governing["masterchain_state"]["boc"]
+                    .as_str()
+                    .context("governing state body required")?,
+            )?;
             ShardStateUnsplit::construct_from_cell(read_single_root_boc(&bytes)?)?
         };
         let extra = governing_state.read_custom()?.context("masterchain configuration required")?;
-        let id = BlockIdExt::with_params(ShardIdent::masterchain(), expected.2.try_into()?,
-            expected.3.clone(), expected.4.clone());
+        let id = BlockIdExt::with_params(
+            ShardIdent::masterchain(),
+            expected.2.try_into()?,
+            expected.3.clone(),
+            expected.4.clone(),
+        );
         let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
-            block.global_id(), &extra.config, id.clone(), info.vert_seq_no(),
-            info.prev_key_block_seqno(), info.gen_catchain_seqno())?;
+            block.global_id(),
+            &extra.config,
+            id.clone(),
+            info.vert_seq_no(),
+            info.prev_key_block_seqno(),
+            info.gen_catchain_seqno(),
+        )?;
         let sources = sources.as_array().context("certificate sources required")?;
         ensure!(!sources.is_empty(), "empty certificate evidence");
         for source in sources {
@@ -227,37 +297,65 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             if source["kind"] == "rpc" {
                 let cert = &source["value"];
                 ensure!(identity(&cert["id"])? == expected, "certificate block identity differs");
-                ensure!(cert["@type"] == "blocks.blockSignatures.simplexPq", "native PQ final certificate required");
-                let signatures = cert["signatures"].as_array().context("signatures required")?
-                    .iter().map(|pair| -> Result<_> {
+                ensure!(
+                    cert["@type"] == "blocks.blockSignatures.simplexPq",
+                    "native PQ final certificate required"
+                );
+                let signatures = cert["signatures"]
+                    .as_array()
+                    .context("signatures required")?
+                    .iter()
+                    .map(|pair| -> Result<_> {
                         Ok(rtos_api::ton::lite_server::pqsignature::PqSignature {
                             validator_id: hash(&pair["validator_id"])?,
-                            algorithm_id: pair["algorithm_id"].as_i64().context("algorithm required")?.try_into()?,
-                            signature: base64_decode(pair["signature"].as_str().context("signature bytes required")?)?.into(),
+                            algorithm_id: pair["algorithm_id"]
+                                .as_i64()
+                                .context("algorithm required")?
+                                .try_into()?,
+                            signature: base64_decode(
+                                pair["signature"].as_str().context("signature bytes required")?,
+                            )?
+                            .into(),
                         })
-                    }).collect::<Result<Vec<_>>>()?;
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 matched.push(rtos_api::pq_finality::PqNetworkSignatureSet::from_lite(
                     rtos_api::ton::lite_server::signature_set::signatureset::SimplexPq {
                         cc_seqno: info.gen_catchain_seqno().try_into()?,
                         validator_set_hash: context.subset_hash() as i32,
-                        signatures, session_id: hash(&cert["session_id"])?,
+                        signatures,
+                        session_id: hash(&cert["session_id"])?,
                         slot: cert["slot"].as_i64().context("slot required")?.try_into()?,
-                        candidate: base64_decode(cert["candidate"].as_str().context("candidate required")?)?.into(),
-                    })?);
+                        candidate: base64_decode(
+                            cert["candidate"].as_str().context("candidate required")?,
+                        )?
+                        .into(),
+                    },
+                )?);
             } else {
                 ensure!(source["kind"] == "cpp_lite", "unknown certificate source");
-                for response in source["responses"].as_array().context("native proof responses required")? {
-                    let bytes = base64_decode(response.as_str().context("raw proof response required")?)?;
+                for response in
+                    source["responses"].as_array().context("native proof responses required")?
+                {
+                    let bytes =
+                        base64_decode(response.as_str().context("raw proof response required")?)?;
                     ensure!(bytes.len() <= 16 * 1024 * 1024, "native proof response too large");
                     let proof: rtos_api::ton::lite_server::PartialBlockProof =
                         rtos_api::WireProfile::T0.deserialize_typed(&bytes)?;
                     for step in proof.only().steps {
-                        if let rtos_api::ton::lite_server::BlockLink::LiteServer_BlockLinkForward(step) = step {
+                        if let rtos_api::ton::lite_server::BlockLink::LiteServer_BlockLinkForward(
+                            step,
+                        ) = step
+                        {
                             if step.to == id {
                                 let rtos_api::ton::lite_server::SignatureSet::LiteServer_SignatureSet_SimplexPq(signature) = step.signatures else {
                                     anyhow::bail!("native PQ final certificate required");
                                 };
-                                matched.push(rtos_api::pq_finality::PqNetworkSignatureSet::from_lite(signature)?);
+                                matched.push(
+                                    rtos_api::pq_finality::PqNetworkSignatureSet::from_lite(
+                                        signature,
+                                    )?,
+                                );
                             }
                         }
                     }
@@ -265,8 +363,12 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             }
             ensure!(matched.len() == 1, "exactly one target certificate per source required");
             let (_, verified) = context.verify_network(&matched[0])?.into_final()?;
-            let validator_ids: Vec<_> = matched[0].to_lite()?.signatures.iter()
-                .map(|pair| base64_encode(pair.validator_id.as_slice())).collect();
+            let validator_ids: Vec<_> = matched[0]
+                .to_lite()?
+                .signatures
+                .iter()
+                .map(|pair| base64_encode(pair.validator_id.as_slice()))
+                .collect();
             certificates.push(json!({"source":source["name"], "validator_ids":validator_ids, "verified_weight":verified.weight(),
                 "session_id":base64_encode(verified.session_id().as_slice()), "slot":verified.slot(),
                 "final_certificate_checked":true}));
@@ -285,52 +387,79 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
     let mut workchain_check = Value::Null;
     if let Some(workchain) = value.get("workchain") {
         let wc_id = identity(&workchain["block"]["id"])?;
-        ensure!(wc_id.0 == 0 && wc_id.1 == i64::MIN && wc_id.2 > 0,
-            "fixture needs a produced full workchain-0 block");
+        ensure!(
+            wc_id.0 == 0 && wc_id.1 == i64::MIN && wc_id.2 > 0,
+            "fixture needs a produced full workchain-0 block"
+        );
         let anchor_links = check_workchain_anchor(workchain, &shard_tops, block.global_id())?;
-        let bytes = base64_decode(workchain["block"]["boc"].as_str().context("workchain block BOC required")?)?;
+        let bytes = base64_decode(
+            workchain["block"]["boc"].as_str().context("workchain block BOC required")?,
+        )?;
         ensure!(UInt256::calc_file_hash(&bytes) == wc_id.4, "workchain block file hash differs");
         let cell = read_single_root_boc(&bytes)?;
         ensure!(cell.repr_hash() == &wc_id.3, "workchain block cell hash differs");
         let wc_block = Block::construct_from_cell(cell)?;
         let wc_info = wc_block.read_info()?;
-        ensure!(u64::from(wc_info.seq_no()) == wc_id.2
-            && wc_info.shard().workchain_id() == 0
-            && wc_info.shard().shard_prefix_with_tag() == 1_u64 << 63
-            && wc_block.global_id() == block.global_id(), "workchain block header differs");
+        ensure!(
+            u64::from(wc_info.seq_no()) == wc_id.2
+                && wc_info.shard().workchain_id() == 0
+                && wc_info.shard().shard_prefix_with_tag() == 1_u64 << 63
+                && wc_block.global_id() == block.global_id(),
+            "workchain block header differs"
+        );
         let wc_root = wc_block.read_state_update()?.new_hash;
         let states = workchain["states"].as_array().context("workchain state evidence required")?;
-        let names: std::collections::BTreeSet<_> = states.iter().map(|s| s["name"].as_str()
-            .context("state endpoint name required")).collect::<Result<_>>()?;
-        let required: std::collections::BTreeSet<_> = value["references"].as_object()
-            .context("all endpoint references required")?.keys().map(String::as_str).collect();
+        let names: std::collections::BTreeSet<_> = states
+            .iter()
+            .map(|s| s["name"].as_str().context("state endpoint name required"))
+            .collect::<Result<_>>()?;
+        let required: std::collections::BTreeSet<_> = value["references"]
+            .as_object()
+            .context("all endpoint references required")?
+            .keys()
+            .map(String::as_str)
+            .collect();
         let fixture_count = match value.get("fixture_validator_count") {
             Some(count) => {
                 let count = count.as_u64().context("integer fixture validator count required")?;
                 ensure!([3, 4, 6].contains(&count), "unsupported fixture validator count");
-                let members = configuration["current"]["members"].as_array()
+                let members = configuration["current"]["members"]
+                    .as_array()
                     .context("authenticated full committee required for explicit fixture count")?;
-                ensure!(members.len() as u64 == count,
-                    "fixture count differs from the authenticated current committee");
+                ensure!(
+                    members.len() as u64 == count,
+                    "fixture count differs from the authenticated current committee"
+                );
                 count as usize
             }
             None => 4,
         };
-        ensure!(names == required && names.len() == states.len() && names.len() == fixture_count,
-            "exactly one workchain state from every declared fixture endpoint required");
+        ensure!(
+            names == required && names.len() == states.len() && names.len() == fixture_count,
+            "exactly one workchain state from every declared fixture endpoint required"
+        );
         let mut checked_states = Vec::new();
         for source in states {
             ensure!(identity(&source["id"])? == wc_id, "workchain state identity differs");
-            let bytes = base64_decode(source["boc"].as_str().context("workchain state BOC required")?)?;
+            let bytes =
+                base64_decode(source["boc"].as_str().context("workchain state BOC required")?)?;
             let file_hash = UInt256::calc_file_hash(&bytes);
             ensure!(file_hash == hash(&source["file_hash"])?, "workchain state file hash differs");
             let cell = read_single_root_boc(&bytes)?;
-            ensure!(cell.repr_hash() == &wc_root, "workchain state differs from block state update");
+            ensure!(
+                cell.repr_hash() == &wc_root,
+                "workchain state differs from block state update"
+            );
             let state = ShardStateUnsplit::construct_from_cell(cell)?;
-            ensure!(u64::from(state.seq_no()) == wc_id.2
-                && state.shard() == wc_info.shard() && state.global_id() == block.global_id(),
-                "workchain state header differs");
-            checked_states.push(json!({"name":source["name"], "file_hash":base64_encode(file_hash.as_slice())}));
+            ensure!(
+                u64::from(state.seq_no()) == wc_id.2
+                    && state.shard() == wc_info.shard()
+                    && state.global_id() == block.global_id(),
+                "workchain state header differs"
+            );
+            checked_states.push(
+                json!({"name":source["name"], "file_hash":base64_encode(file_hash.as_slice())}),
+            );
         }
         workchain_check = json!({"block":workchain["block"]["id"],
             "gen_utime":wc_info.gen_utime(), "gen_catchain_seqno":wc_info.gen_catchain_seqno(),

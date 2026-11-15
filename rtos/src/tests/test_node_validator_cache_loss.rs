@@ -11,8 +11,15 @@ async fn floor_child() -> Result<()> {
     let id: rtos_block::BlockIdExt = fs::read_to_string(root.join("floor-input.txt"))?.parse()?;
     let db = Arc::new(open_db(&root).await?);
     let keeper = crate::shard_states_keeper::ShardStatesKeeper::new(
-        db.clone(), false, true, 0, 0, crate::config::ShardStatesCacheMode::Moderate,
-        3600.0, Arc::new(crate::engine::Stopper::new()), 100,
+        db.clone(),
+        false,
+        true,
+        0,
+        0,
+        crate::config::ShardStatesCacheMode::Moderate,
+        3600.0,
+        Arc::new(crate::engine::Stopper::new()),
+        100,
         #[cfg(feature = "telemetry")]
         crate::collator_test_bundle::create_engine_telemetry(),
         crate::collator_test_bundle::create_engine_allocated(),
@@ -27,19 +34,28 @@ async fn floor_child() -> Result<()> {
     assert_eq!(state.block_id(), &id);
     let bytes = db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?.unwrap();
     assert_eq!(bytes, encode_checkpoint(&id));
-    let omitted = std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal");
+    let omitted =
+        std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal");
     if omitted {
         let proof = fs::read_to_string(std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_MARKER")?)?;
         assert_eq!(proof.lines().count(), 1);
-        assert!(proof.contains(&format!("{}/node_db/catchains/", root.display())), "wrong validator WAL owner");
+        assert!(
+            proof.contains(&format!("{}/node_db/catchains/", root.display())),
+            "wrong validator WAL owner"
+        );
     }
     let ack = root.join("validator-floor-ack.json");
-    fs::write(&ack, serde_json::to_vec(&serde_json::json!({
-        "id": id.to_string(), "bytes": hex::encode(bytes), "pinned": true,
-        "sync_omission_before_ack": omitted,
-    }))?)?;
+    fs::write(
+        &ack,
+        serde_json::to_vec(&serde_json::json!({
+            "id": id.to_string(), "bytes": hex::encode(bytes), "pinned": true,
+            "sync_omission_before_ack": omitted,
+        }))?,
+    )?;
     fs::File::open(&ack)?.sync_all()?;
-    loop { tokio::time::sleep(Duration::from_secs(1)).await; }
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt) -> Result<()> {
@@ -60,8 +76,11 @@ pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt
                 assert_eq!(value["id"], id.to_string());
                 assert_eq!(value["bytes"], hex::encode(encode_checkpoint(id)));
                 assert_eq!(value["pinned"], true);
-                assert_eq!(value["sync_omission_before_ack"],
-                    std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref() == Ok("validator-wal"));
+                assert_eq!(
+                    value["sync_omission_before_ack"],
+                    std::env::var("RTOS_TEST_OMIT_MANIFEST_SYNC_FILE").as_deref()
+                        == Ok("validator-wal")
+                );
                 break;
             }
         }
@@ -82,24 +101,39 @@ pub(super) async fn write_and_interrupt(root: &Path, id: &rtos_block::BlockIdExt
     keep_evidence(root, &path)?;
     keep_evidence(root, &ack)?;
     let loss = match std::env::var("RTOS_TEST_CACHE_LOSS_ENABLED")?.as_str() {
-        "1" => true, "0" => false,
+        "1" => true,
+        "0" => false,
         _ => rtos_block::fail!("Invalid cache-loss mode"),
     };
-    if loss { cache_loss::clear(root).await?; }
+    if loss {
+        cache_loss::clear(root).await?;
+    }
     eprintln!("Acknowledged validator floor writer killed with physical pin and native owner alive; cache-loss={loss}");
     Ok(())
 }
 
-pub(super) fn verify(root: &Path, db: &InternalDb, id: &rtos_block::BlockIdExt, phase: &str) -> Result<()> {
+pub(super) fn verify(
+    root: &Path,
+    db: &InternalDb,
+    id: &rtos_block::BlockIdExt,
+    phase: &str,
+) -> Result<()> {
     let actual = db.load_validator_state_key_bounded(GC_FLOOR_KEY, 256)?;
     let expected = encode_checkpoint(id);
     let report = root.join(format!("validator-floor-{phase}.json"));
-    fs::write(&report, serde_json::to_vec(&serde_json::json!({
-        "expected": hex::encode(&expected), "actual": actual.as_ref().map(hex::encode),
-        "id": id.to_string(),
-    }))?)?;
+    fs::write(
+        &report,
+        serde_json::to_vec(&serde_json::json!({
+            "expected": hex::encode(&expected), "actual": actual.as_ref().map(hex::encode),
+            "id": id.to_string(),
+        }))?,
+    )?;
     keep_evidence(root, &report)?;
-    assert_eq!(actual, Some(expected), "Acknowledged validator cleanup floor lost after actual node restart");
+    assert_eq!(
+        actual,
+        Some(expected),
+        "Acknowledged validator cleanup floor lost after actual node restart"
+    );
     assert!(db.check_truncation_above_cleanup_floor(id.seq_no() - 1).is_err());
     db.check_truncation_above_cleanup_floor(id.seq_no())?;
     eprintln!("Validator cleanup floor bytes and truncation boundary preserved after {phase}");

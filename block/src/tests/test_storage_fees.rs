@@ -129,22 +129,17 @@ fn a_special_account_accrues_nothing() {
     assert_eq!(special, BigInt::default());
 }
 
-/// The largest inputs: every product exceeds 128 bits before the final shift.
+/// Unsigned maximum counts/prices become signed -1 in the node's partial
+/// payment arithmetic. Values are checked against actual CPP fee controls.
 #[test]
 fn the_largest_inputs_do_not_overflow() {
     let max = u64::MAX;
     let prices = [period(0, max, max, max, max)];
     let one_second = accrued_storage_fee(&prices, max, max, 1, 2, false, true).unwrap();
-    let max_big = BigInt::from(max);
-    let per_second: BigInt = &max_big * &max_big * 2;
-    let expected = (per_second.clone() + 0xffff) >> 16u8;
-    assert_eq!(one_second, expected);
-    assert!(one_second > BigInt::from(u128::MAX >> 16), "beyond what a u128 product holds");
+    assert_eq!(one_second, BigInt::from(1));
 
     let whole_range = accrued_storage_fee(&prices, max, max, 1, u32::MAX, false, false).unwrap();
-    let expected = (per_second * BigInt::from(u32::MAX - 1) + 0xffff) >> 16u8;
-    assert_eq!(whole_range, expected);
-    assert!(whole_range > BigInt::from(u128::MAX), "past u128 itself");
+    assert_eq!(whole_range, BigInt::from(131072));
 }
 
 fn refused(prices: &[StoragePrices], last_paid: u32, now: u32) -> String {
@@ -202,8 +197,11 @@ fn storage_price_keys_are_activation_times() {
 fn partial_storage_products_do_not_overflow() {
     let max = u64::MAX;
     let price = period(0, max, max, max, max);
-    let expected = BigInt::from(max).pow(3) * 2;
+    // The VM utility keeps counts unsigned, but price and delta are signed
+    // scalar operands. Two -1 factors leave each unsigned count unchanged.
+    let expected = BigInt::from(max) * 2;
     assert_eq!(price.calc_storage_fee_part(max, max, max, false), expected);
+    assert_eq!(price.calc_storage_fee_part(1, 1, 65536, false), BigInt::from(-131072));
 }
 
 #[test]

@@ -2,8 +2,7 @@
 //! Append-only archive writer. Admission covers Rust workspace and logical
 //! batch payload; native RocksDB caches and allocator overhead are excluded.
 use super::*;
-use crate::db::DbKey;
-use crate::{dynamic_boc_rc_db::BoundedStateWriteFailure, types::serialize_stored_cell};
+use crate::{db::DbKey, dynamic_boc_rc_db::BoundedStateWriteFailure, types::serialize_stored_cell};
 use rtos_block::{
     error, fail,
     merkle_apply_budget::{require_materialized, BudgetMap, BudgetStack, MerkleApplyLimitExceeded},

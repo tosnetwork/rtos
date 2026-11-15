@@ -7,7 +7,12 @@
 //! does not depend on visit order because every check must pass and the
 //! visit budget only bounds their total number.
 
-use crate::{Cell, CellType, SliceData};
+use crate::{Cell, CellType, SliceData, VarUIntegerCodec, VarUIntegerEncoding};
+use tlb::AugKind;
+
+#[path = "tlb_schema.rs"]
+mod tlb;
+pub use tlb::{tlb_type_is_valid, TlbProfile, TlbType};
 
 /// Reference visits allowed when checking one configuration parameter.
 pub(crate) const PARAM_VISIT_BUDGET: u32 = 1024;
@@ -15,13 +20,14 @@ pub(crate) const PARAM_VISIT_BUDGET: u32 = 1024;
 pub(crate) const CONFIG_SHAPE_VISIT_BUDGET: u32 = 10000;
 
 /// Every parameter index the schema defines.
-pub const SCHEMA_CONFIG_PARAMS: [u32; 50] = [
+pub const SCHEMA_CONFIG_PARAMS: [u32; 49] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 43, 44, 45, 47, 48, 71, 72, 73, 79, 81, 82, 83,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 43, 44, 45, 48, 71, 72, 73, 79, 81, 82, 83,
 ];
 
 #[derive(Clone, Copy)]
 enum Leaf {
+    Typed(TlbType, TlbProfile),
     /// `True` or `Unit`: no data.
     Empty,
     /// A fixed-width integer or bit string.
@@ -38,7 +44,13 @@ enum Leaf {
 
 #[derive(Clone, Copy)]
 enum Node {
+    HandwrittenAugHashmap(usize, AugKind),
+    CheckAugmentation(usize, AugKind),
+    GeneratedAugHashmap(usize, TlbType, TlbType),
+    Typed(TlbType, TlbProfile),
     Param(u32),
+    ConfigParams,
+    ValidatorDescr,
     Hashmap(usize, Leaf),
     ConfigProposalSetup,
     ValidatorTempKey,
@@ -48,29 +60,61 @@ enum Node {
 }
 
 struct Walker {
-    pending: Vec<(Cell, Node)>,
+    pending: Vec<(Cell, Node, bool)>,
+    weak: bool,
 }
 
 /// Checks a referenced parameter value as the schema type of `index`.
 pub fn config_param_is_valid(index: u32, cell: Cell) -> bool {
-    visit_all(cell, Node::Param(index), PARAM_VISIT_BUDGET)
+    config_param_is_valid_with_budget(index, cell, PARAM_VISIT_BUDGET)
+}
+
+/// The generated parameter validator with an explicit reference-visit budget.
+pub fn config_param_is_valid_with_budget(index: u32, cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::Param(index), budget)
+}
+
+/// Structural `ValidatorDescr` validation, independent of consensus policy.
+pub fn validator_descr_is_valid_with_budget(cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::ValidatorDescr, budget)
+}
+
+/// Checks a complete `ConfigParams` cell, including its dictionary reference.
+pub fn config_params_is_valid_with_budget(cell: Cell, budget: u32) -> bool {
+    visit_all(cell, Node::ConfigParams, budget)
 }
 
 /// Checks a `Hashmap 32 ^Cell` root as the `config` field of `ConfigParams`;
 /// the values are references that are not visited.
 pub(crate) fn config_dictionary_shape_is_valid(root: Cell) -> bool {
-    visit_all(root, Node::Hashmap(32, Leaf::AnyRef), CONFIG_SHAPE_VISIT_BUDGET)
+    config_dictionary_shape_is_valid_with_budget(root, CONFIG_SHAPE_VISIT_BUDGET)
+}
+
+/// Checks dictionary structure without following the untyped value references.
+pub fn config_dictionary_shape_is_valid_with_budget(root: Cell, budget: u32) -> bool {
+    visit_all(root, Node::Hashmap(32, Leaf::AnyRef), budget)
 }
 
 fn visit_all(root: Cell, node: Node, budget: u32) -> bool {
-    let mut walker = Walker { pending: vec![(root, node)] };
+    let mut walker = Walker { pending: vec![(root, node, false)], weak: false };
     let mut remaining = budget;
-    while let Some((cell, node)) = walker.pending.pop() {
+    while let Some((cell, node, weak)) = walker.pending.pop() {
+        walker.weak = weak;
+        if let Node::CheckAugmentation(n, kind) = node {
+            if !tlb::check_augmented_cell(cell, n, kind).unwrap_or(false) {
+                return false;
+            }
+            continue;
+        }
         remaining = match remaining.checked_sub(1) {
             Some(value) => value,
             None => return false,
         };
-        if cell.cell_type() != CellType::Ordinary {
+        if weak && cell.cell_type() == CellType::PrunedBranch {
+            continue;
+        }
+        let special = matches!(node, Node::Typed(TlbType::MerkleStateUpdate, _));
+        if (cell.cell_type() != CellType::Ordinary) != special {
             return false;
         }
         let Ok(mut slice) = SliceData::load_cell(cell) else {
@@ -102,16 +146,7 @@ fn leq_width(bound: usize) -> usize {
 
 /// `VarUInteger n`: `len:(#< n) value:(uint (len * 8))`, any encoding length.
 fn var_uinteger(slice: &mut SliceData, n: usize) -> bool {
-    let Some(bound) = n.checked_sub(1) else {
-        return false;
-    };
-    let Some(len) = uint(slice, leq_width(bound)) else {
-        return false;
-    };
-    match usize::try_from(len).ok().filter(|len| *len < n).and_then(|len| len.checked_mul(8)) {
-        Some(bits) => skip(slice, bits),
-        None => false,
-    }
+    VarUIntegerCodec::new(n).is_some_and(|codec| codec.skip(slice, VarUIntegerEncoding::Structural))
 }
 
 fn tomis(slice: &mut SliceData) -> bool {
@@ -183,7 +218,7 @@ impl Walker {
     fn push_ref(&mut self, slice: &mut SliceData, node: Node) -> bool {
         match slice.checked_drain_reference() {
             Ok(cell) => {
-                self.pending.push((cell, node));
+                self.pending.push((cell, node, self.weak));
                 true
             }
             Err(_) => false,
@@ -227,6 +262,7 @@ impl Walker {
 
     fn leaf(&mut self, slice: &mut SliceData, leaf: Leaf) -> bool {
         match leaf {
+            Leaf::Typed(kind, profile) => self.typed(kind, profile, slice),
             Leaf::Empty => true,
             Leaf::Bits(bits) => skip(slice, bits),
             Leaf::AnyRef => slice.checked_drain_reference().is_ok(),
@@ -263,7 +299,17 @@ impl Walker {
 
     fn node(&mut self, node: Node, slice: &mut SliceData) -> bool {
         match node {
+            Node::HandwrittenAugHashmap(n, kind) => self.handwritten_aug_hashmap(slice, n, kind),
+            Node::CheckAugmentation(..) => unreachable!("augmentation checks are post-order tasks"),
+            Node::GeneratedAugHashmap(n, value, extra) => {
+                self.generated_aug_hashmap(slice, n, value, extra)
+            }
+            Node::Typed(kind, profile) => self.typed(kind, profile, slice),
             Node::Param(index) => self.param(index, slice),
+            Node::ConfigParams => {
+                skip(slice, 256) && self.push_ref(slice, Node::Hashmap(32, Leaf::AnyRef))
+            }
+            Node::ValidatorDescr => validator_descr(slice),
             Node::Hashmap(n, leaf) => self.hashmap(slice, n, leaf),
             // cfg_vote_cfg#36 min_tot_rounds:(## 8) max_tot_rounds:(## 8)
             //   { min_tot_rounds <= max_tot_rounds } min_wins:uint8 max_losses:uint8
@@ -457,8 +503,6 @@ impl Walker {
             44 => tag(slice, 8, 0) && self.hashmap_e(slice, 288, Leaf::Empty) && skip(slice, 32),
             // precompiled_contracts_config#c0 list:(HashmapE 256 PrecompiledSmc)
             45 => tag(slice, 8, 0xc0) && self.hashmap_e(slice, 256, Leaf::PrecompiledSmc),
-            // validator_controller_policy_v1#_ controller_codes:(HashmapE 256 True)
-            47 => self.hashmap_e(slice, 256, Leaf::Empty),
             // auth_policy_v1#a1 network_tag:bits256 policy_sequence:uint64 retired:uint16
             //   retire_at:(HashmapE 8 uint32) policy_spec_hash:bits256
             48 => {
@@ -603,6 +647,7 @@ fn consensus_config(slice: &mut SliceData) -> bool {
 // size_limits_config#01 (160 bits), size_limits_config_v2#02 (360 bits),
 // size_limits_config_v3#03 360 bits, max_transaction_library_loads:(Maybe uint32),
 //   max_total_msg_bits:uint32 max_total_msg_cells:uint32
+//   out_msg_queue_size_hard_limit:uint32 out_msg_queue_size_soft_limit:uint32
 fn size_limits_config(slice: &mut SliceData) -> bool {
     match uint(slice, 8) {
         Some(1) => skip(slice, 160),
@@ -616,7 +661,7 @@ fn size_limits_config(slice: &mut SliceData) -> bool {
                 None => return false,
                 _ => {}
             }
-            skip(slice, 64)
+            skip(slice, 128)
         }
         _ => false,
     }

@@ -869,7 +869,8 @@ pub async fn get_block_proof(
 pub async fn get_last_liteserver_state(
     engine: &Arc<dyn EngineOperations>,
 ) -> Result<crate::shard_states_keeper::PinnedShardStateGuard> {
-    let cache = engine.served_masterchain_cache()
+    let cache = engine
+        .served_masterchain_cache()
         .ok_or_else(|| error!("Engine has no served masterchain state owner"))?;
     cache.load(engine.as_ref()).await
 }

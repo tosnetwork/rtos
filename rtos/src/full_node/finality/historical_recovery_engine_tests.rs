@@ -823,9 +823,12 @@ async fn recover_scenario(scenario: RecoveryScenario) {
     })
     .catch_unwind()
     .await;
-    let healthy_head = (run.is_ok() && matches!(scenario,
-        RecoveryScenario::CorruptOrdinaryState | RecoveryScenario::AutonomousColdStartup))
-        .then(|| pair.provider.load_last_applied_mc_block_id().unwrap().unwrap());
+    let healthy_head = (run.is_ok()
+        && matches!(
+            scenario,
+            RecoveryScenario::CorruptOrdinaryState | RecoveryScenario::AutonomousColdStartup
+        ))
+    .then(|| pair.provider.load_last_applied_mc_block_id().unwrap().unwrap());
     if matches!(
         scenario,
         RecoveryScenario::AutonomousColdStartup
@@ -979,8 +982,8 @@ async fn recover_scenario(scenario: RecoveryScenario) {
         let offline = open_engine(&directory.path().join("provider")).await;
         let check = offline.clone().authenticate_retired_source_with_history(record).await;
         let observed_head = offline.load_last_applied_mc_block_id();
-        let head_present = healthy_head.as_ref()
-            .map(|head| offline.db().test_contains_dynamic_state_record(head));
+        let head_present =
+            healthy_head.as_ref().map(|head| offline.db().test_contains_dynamic_state_record(head));
         offline.clone().wait_stop().await.unwrap();
         check.unwrap();
         if let Some(head) = &healthy_head {
@@ -1131,9 +1134,13 @@ async fn ordinary_corruption_cold_check(
     // Engine configuration lives at fixture_root; open_node_db expects the
     // actual internal_db_path and appends NODE_DB_NAME itself. Capture that
     // path from the warm Engine rather than guessing from the config directory.
-    assert!(db_root.join(storage::db::rocksdb::NODE_DB_NAME).join("CURRENT").is_file(),
-        "expected the existing cold node database under {}", db_root.display());
-    let open_raw = || open_node_db(db_root, &CellsDbConfig::default(), AccessType::ReadWrite).unwrap();
+    assert!(
+        db_root.join(storage::db::rocksdb::NODE_DB_NAME).join("CURRENT").is_file(),
+        "expected the existing cold node database under {}",
+        db_root.display()
+    );
+    let open_raw =
+        || open_node_db(db_root, &CellsDbConfig::default(), AccessType::ReadWrite).unwrap();
     let db = open_raw();
     let index =
         db.clone().table::<BlockIdExt>(crate::internal_db::SHARDSTATE_DB_NAME, false).unwrap();

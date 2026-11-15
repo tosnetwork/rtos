@@ -170,6 +170,12 @@ impl Serializable for MerkleUpdate {
 }
 
 impl MerkleUpdate {
+    /// Validate that the new skeleton's pruned branches are supplied by the old
+    /// skeleton, without requiring the complete previous state.
+    pub fn validate(&self) -> Result<()> {
+        self.check(&self.old.clone().virtualize(self.old.level()), None).map(|_| ())
+    }
+
     /// Creating of a Merkle update
     pub fn create(old: &Cell, new: &Cell) -> Result<MerkleUpdate> {
         if old.repr_hash() == new.repr_hash() {
@@ -380,10 +386,14 @@ impl MerkleUpdate {
                 if depth > depth_limit {
                     return Err(MerkleApplyLimitExceeded("check depth").into());
                 }
-                if seen.get(cell.repr_hash(), budget)?.is_some() {
+                if !crate::merkle_apply_budget::visit_at_merkle_depth(
+                    &mut seen,
+                    cell.repr_hash(),
+                    merkle_depth,
+                    budget,
+                )? {
                     continue;
                 }
-                seen.insert(cell.repr_hash().clone(), (), budget)?;
                 if is_old {
                     known.insert(cell.hash(merkle_depth as usize).clone(), (), budget)?;
                 }
@@ -466,10 +476,14 @@ impl MerkleUpdate {
             if depth > depth_limit {
                 return Err(MerkleApplyLimitExceeded("parent depth").into());
             }
-            if seen.get(cell.repr_hash(), budget)?.is_some() {
+            if !crate::merkle_apply_budget::visit_at_merkle_depth(
+                &mut seen,
+                cell.repr_hash(),
+                md,
+                budget,
+            )? {
                 continue;
             }
-            seen.insert(cell.repr_hash().clone(), (), budget)?;
             let hash = cell.hash(md as usize);
             if known.get(hash, budget)?.is_some() {
                 retained.insert(hash.clone(), cell.clone(), budget)?;
@@ -731,7 +745,7 @@ impl MerkleUpdate {
             &mut pruned_cells_count,
         )?;
         if let Some(metrics) = metrics.as_mut() {
-            metrics.old_cells = known_cells.len() - pruned_cells_count;
+            metrics.old_cells = visited.len() - pruned_cells_count;
             metrics.old_pruned = pruned_cells_count;
         }
         let mut new_cells_count = 0;
@@ -955,11 +969,11 @@ impl MerkleUpdate {
     fn traverse_old_on_check(
         cell: &Cell,
         known_cells: &mut ahash::AHashSet<UInt256>,
-        visited: &mut ahash::AHashSet<UInt256>,
+        visited: &mut ahash::AHashSet<(UInt256, u8)>,
         merkle_depth: u8,
         pruned_cells_count: &mut usize,
     ) -> Result<()> {
-        if visited.insert(cell.repr_hash().clone()) {
+        if visited.insert((cell.repr_hash().clone(), merkle_depth)) {
             known_cells.insert(cell.hash(merkle_depth as usize).clone());
             if cell.cell_type() != CellType::PrunedBranch {
                 let child_merkle_depth =
@@ -985,12 +999,12 @@ impl MerkleUpdate {
     fn traverse_new_on_check(
         cell: &Cell,
         known_cells: &ahash::AHashSet<UInt256>,
-        visited: &mut ahash::AHashSet<UInt256>,
+        visited: &mut ahash::AHashSet<(UInt256, u8)>,
         merkle_depth: u8,
         new_cells_count: &mut usize,
         pruned_cells_count: &mut usize,
     ) -> Result<()> {
-        if visited.insert(cell.repr_hash().clone()) {
+        if visited.insert((cell.repr_hash().clone(), merkle_depth)) {
             if cell.cell_type() == CellType::PrunedBranch {
                 *pruned_cells_count += 1;
                 if cell.level() == merkle_depth + 1
@@ -1022,10 +1036,10 @@ impl MerkleUpdate {
         cell: &Cell,
         known_cells_hashes: &ahash::AHashSet<UInt256>,
         known_cells: &mut ahash::AHashMap<UInt256, Cell>,
-        visited: &mut ahash::AHashSet<UInt256>,
+        visited: &mut ahash::AHashSet<(UInt256, u8)>,
         merkle_depth: u8,
     ) -> Result<()> {
-        if visited.insert(cell.repr_hash().clone()) {
+        if visited.insert((cell.repr_hash().clone(), merkle_depth)) {
             let hash = cell.hash(merkle_depth as usize).clone();
             if known_cells_hashes.contains(&hash) {
                 known_cells.insert(hash, cell.clone());

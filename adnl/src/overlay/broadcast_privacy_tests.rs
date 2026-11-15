@@ -154,6 +154,7 @@ pub(super) fn fec_parts(
             &chunk,
             seqno,
             date,
+            rtos_api::WireProfile::Legacy,
         )
         .unwrap();
         let bcast = BroadcastFec {
@@ -441,7 +442,9 @@ fn twostep_simple_bytes(
         &[],
     )
     .unwrap();
-    let to_sign = BroadcastTwostepSimpleProtocol::calc_to_sign(id, data).unwrap();
+    let to_sign =
+        BroadcastTwostepSimpleProtocol::calc_to_sign(id, data, rtos_api::WireProfile::Legacy)
+            .unwrap();
     let bcast = BroadcastTwostepSimple {
         date,
         flags: 0,

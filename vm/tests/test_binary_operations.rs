@@ -208,20 +208,26 @@ fn qpow2() {
 
 #[test]
 fn qpow2_nan() {
-    test_case(
-        "PUSHNAN
-         QPOW2",
-    )
-    .expect_failure(ExceptionCode::RangeCheckError);
+    for version in [12, 13, rtos_block::SUPPORTED_VERSION] {
+        let case = test_case("PUSHNAN QPOW2").with_block_version(version);
+        if version < 13 {
+            case.expect_failure(ExceptionCode::RangeCheckError);
+        } else {
+            case.expect_item(int!(nan));
+        }
+    }
 }
 
 #[test]
 fn qpow2_large() {
-    test_case(
-        "PUSHINT 1024
-         QPOW2",
-    )
-    .expect_failure(ExceptionCode::RangeCheckError);
+    for version in [12, 13, rtos_block::SUPPORTED_VERSION] {
+        let case = test_case("PUSHINT 1024 QPOW2").with_block_version(version);
+        if version < 13 {
+            case.expect_failure(ExceptionCode::RangeCheckError);
+        } else {
+            case.expect_item(int!(nan));
+        }
+    }
 }
 
 #[test]

@@ -89,10 +89,7 @@ async fn await_source_acceptance(
             let _ = sent.send(result);
         }),
     )?;
-    tokio::time::timeout(Duration::from_secs(20), received)
-        .await
-        .unwrap()
-        .unwrap()
+    tokio::time::timeout(Duration::from_secs(20), received).await.unwrap().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -101,14 +98,7 @@ async fn retired_service_routing_retry_reuses_actual_node_acceptance() {
         let fixture = SpoolFixture::new_for_transport(0, 0x60).await;
         let recovery = locator(&fixture);
         let valid = draft(&fixture, final_role);
-        let SpoolFixture {
-            dir,
-            engine,
-            runtime,
-            block,
-            state_root,
-            ..
-        } = fixture;
+        let SpoolFixture { dir, engine, runtime, block, state_root, .. } = fixture;
         engine.clone().wait_stop().await.unwrap();
         drop(engine);
         let path = dir.path().join("config.json");
@@ -148,71 +138,84 @@ async fn retired_service_routing_retry_reuses_actual_node_acceptance() {
 async fn retired_service_repeated_query_reuses_actual_typed_acceptance() {
     for final_role in [false, true] {
         let fixture = SpoolFixture::new_for_transport(0, 0x60).await;
-        let result =
-            std::panic::AssertUnwindSafe(async {
-                let authenticated =
-                    authenticate_retired_session(fixture.engine.as_ref(), &locator(&fixture))
-                        .await
-                        .unwrap();
-                let worker = fixture.engine.ensure_publication_worker().await.unwrap();
-                let sink = worker.historical_sink(&authenticated).unwrap();
-                let id = stage(&sink, draft(&fixture, final_role)).await.unwrap();
-                let accepted = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
-                assert_eq!(accepted.block(), &fixture.block);
-                assert_eq!(accepted.is_final(), final_role);
-                assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
-                let before = worker.test_actual_acceptance_runs();
-                assert!(before > 0, "first result must come from actual Engine acceptance");
-                for _ in 0..3 {
-                    let retry = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
-                    assert_eq!(retry.block(), accepted.block());
-                    assert_eq!(
-                        retry.proof().root_cell().repr_hash(),
-                        accepted.proof().root_cell().repr_hash()
-                    );
-                    assert_eq!(retry.is_final(), final_role);
-                    assert_eq!(retry.phase(), accepted.phase());
-                    assert_eq!(retry.already_present(), accepted.already_present());
-                }
+        let result = std::panic::AssertUnwindSafe(async {
+            let authenticated =
+                authenticate_retired_session(fixture.engine.as_ref(), &locator(&fixture))
+                    .await
+                    .unwrap();
+            let worker = fixture.engine.ensure_publication_worker().await.unwrap();
+            let sink = worker.historical_sink(&authenticated).unwrap();
+            let id = stage(&sink, draft(&fixture, final_role)).await.unwrap();
+            let accepted = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+            assert_eq!(accepted.block(), &fixture.block);
+            assert_eq!(accepted.is_final(), final_role);
+            assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
+            let before = worker.test_actual_acceptance_runs();
+            assert!(before > 0, "first result must come from actual Engine acceptance");
+            for _ in 0..3 {
+                let retry = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+                assert_eq!(retry.block(), accepted.block());
                 assert_eq!(
-                    fixture
-                        .engine
-                        .load_state(fixture.block.id())
-                        .await
-                        .unwrap()
-                        .root_cell()
-                        .repr_hash(),
-                    &fixture.state_root
+                    retry.proof().root_cell().repr_hash(),
+                    accepted.proof().root_cell().repr_hash()
                 );
-                assert_eq!(worker.test_actual_acceptance_runs(), before,
-                "repeated typed queries must reuse this worker's actual durable Engine acceptance");
-                worker.enable();
-                let domain = crate::propagation_outbox::OutboxDomain {
-                    zerostate: fixture.runtime.pin().zerostate.clone(),
-                    global_id: fixture.runtime.pin().global_id,
-                    wire_profile: fixture.runtime.wire_profile(),
-                };
-                let resolved = tokio::time::timeout(Duration::from_secs(20), async {
-                    loop {
-                        let (_, entry) = crate::propagation_outbox::inspect_delivery(
-                            fixture.engine.db(), &domain, &Limits::default(), &id,
-                        ).unwrap().unwrap();
-                        if matches!(entry.stage, PublicationStage::Ready | PublicationStage::Completed) {
-                            break entry;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                assert_eq!(retry.is_final(), final_role);
+                assert_eq!(retry.phase(), accepted.phase());
+                assert_eq!(retry.already_present(), accepted.already_present());
+            }
+            assert_eq!(
+                fixture
+                    .engine
+                    .load_state(fixture.block.id())
+                    .await
+                    .unwrap()
+                    .root_cell()
+                    .repr_hash(),
+                &fixture.state_root
+            );
+            assert_eq!(
+                worker.test_actual_acceptance_runs(),
+                before,
+                "repeated typed queries must reuse this worker's actual durable Engine acceptance"
+            );
+            worker.enable();
+            let domain = crate::propagation_outbox::OutboxDomain {
+                zerostate: fixture.runtime.pin().zerostate.clone(),
+                global_id: fixture.runtime.pin().global_id,
+                wire_profile: fixture.runtime.wire_profile(),
+            };
+            let resolved = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let (_, entry) = crate::propagation_outbox::inspect_delivery(
+                        fixture.engine.db(),
+                        &domain,
+                        &Limits::default(),
+                        &id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    if matches!(entry.stage, PublicationStage::Ready | PublicationStage::Completed)
+                    {
+                        break entry;
                     }
-                }).await.expect("actual routing owner did not resolve targets");
-                assert!(!resolved.record.effects.is_empty(), "actual routing must have resolved");
-                let routed = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
-                assert_eq!(routed.block(), accepted.block());
-                assert_eq!(routed.is_final(), final_role);
-                assert_eq!(worker.test_actual_acceptance_runs(), before,
-                    "routing resolution must preserve this actor's completed acceptance");
-                id
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             })
-            .catch_unwind()
-            .await;
+            .await
+            .expect("actual routing owner did not resolve targets");
+            assert!(!resolved.record.effects.is_empty(), "actual routing must have resolved");
+            let routed = fixture.engine.clone().await_publication(id.clone()).await.unwrap();
+            assert_eq!(routed.block(), accepted.block());
+            assert_eq!(routed.is_final(), final_role);
+            assert_eq!(
+                worker.test_actual_acceptance_runs(),
+                before,
+                "routing resolution must preserve this actor's completed acceptance"
+            );
+            id
+        })
+        .catch_unwind()
+        .await;
         fixture.engine.clone().wait_stop().await.unwrap();
         let id = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         let SpoolFixture { dir, engine, block, state_root, .. } = fixture;
@@ -250,9 +253,7 @@ async fn retired_service_repeated_acceptance_reuses_this_process_verification() 
         let result =
             std::panic::AssertUnwindSafe(async {
                 let authenticated =
-                    authenticate_retired_session(fixture.engine.as_ref(), &recovery)
-                        .await
-                        .unwrap();
+                    authenticate_retired_session(fixture.engine.as_ref(), &recovery).await.unwrap();
                 let worker = fixture.engine.ensure_publication_worker().await.unwrap();
                 let sink = worker.historical_sink(&authenticated).unwrap();
                 let id = stage(&sink, valid.clone()).await.unwrap();
@@ -289,13 +290,9 @@ async fn retired_service_repeated_acceptance_reuses_this_process_verification() 
                     },
                     source_validator: UInt256::from(*valid.source_info.source.id().data()),
                 };
-                await_source_acceptance(&sink, request.clone())
-                    .await
-                    .unwrap();
+                await_source_acceptance(&sink, request.clone()).await.unwrap();
                 let before = worker.test_acceptance_request_runs();
-                await_source_acceptance(&sink, request.clone())
-                    .await
-                    .unwrap();
+                await_source_acceptance(&sink, request.clone()).await.unwrap();
                 assert_eq!(worker.test_acceptance_request_runs(),before,
                 "a repeated bound source request must reuse this process's actual node acceptance");
                 let mut wrong_role = request.clone();

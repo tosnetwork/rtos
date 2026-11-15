@@ -63,6 +63,25 @@ impl ShardStateStuff {
         )
     }
 
+    /// Decode a state for ValidateQuery, which checks the committed root before header fields.
+    /// A supplied identity is a lookup key here, not proof that the state has that identity.
+    pub(crate) fn from_root_cell_for_validation(
+        block_id: BlockIdExt,
+        root: Cell,
+        #[cfg(feature = "telemetry")] telemetry: &EngineTelemetry,
+        allocated: &EngineAlloc,
+    ) -> Result<Arc<Self>> {
+        let state = ShardStateUnsplit::construct_from_cell(root.clone())?;
+        Self::with_params(
+            block_id,
+            state,
+            root,
+            #[cfg(feature = "telemetry")]
+            telemetry,
+            allocated,
+        )
+    }
+
     pub fn from_state(
         block_id: BlockIdExt,
         shard_state: ShardStateUnsplit,

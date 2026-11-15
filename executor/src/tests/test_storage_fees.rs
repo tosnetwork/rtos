@@ -121,7 +121,9 @@ fn the_executor_charges_what_the_node_charges() {
 /// A fee beyond u128 is an error, not a truncated or wrapped number.
 #[test]
 fn a_fee_beyond_u128_is_refused() {
-    let max = u64::MAX;
+    // Native partial products interpret the u64 operands as signed scalars.
+    // Stay in the positive domain so this is genuinely a fee beyond u128.
+    let max = i64::MAX as u64;
     let prices = AccStoragePrices {
         prices: vec![StoragePrices {
             utime_since: 0,

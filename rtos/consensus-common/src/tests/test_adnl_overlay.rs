@@ -68,6 +68,13 @@ impl crate::ConsensusOverlayListener for HeldListener {
     }
 }
 async fn real_overlay(listener: ConsensusOverlayListenerPtr, seed: u8) -> Arc<AdnlOverlay> {
+    real_overlay_with_profile(listener, seed, rtos_api::WireProfile::Legacy).await
+}
+async fn real_overlay_with_profile(
+    listener: ConsensusOverlayListenerPtr,
+    seed: u8,
+    profile: rtos_api::WireProfile,
+) -> Arc<AdnlOverlay> {
     let (_, config) = adnl::node::AdnlNodeConfig::from_ip_address_and_private_keys(
         "127.0.0.1:0",
         vec![([seed; 32], 0)],
@@ -76,7 +83,7 @@ async fn real_overlay(listener: ConsensusOverlayListenerPtr, seed: u8) -> Arc<Ad
     let adnl = AdnlNode::with_config(config).await.unwrap();
     let key = adnl.key_by_tag(0).unwrap();
     let dht = DhtNode::with_adnl_node(adnl.clone(), 0).unwrap();
-    let overlay = OverlayNode::with_params(adnl.clone(), &[1; 32], 0).unwrap();
+    let overlay = OverlayNode::with_params_and_profile(adnl.clone(), &[1; 32], 0, profile).unwrap();
     let rldp = adnl::RldpNode::with_params(adnl.clone(), vec![overlay.clone()], None).unwrap();
     overlay.set_rldp(rldp.clone()).unwrap();
     let stack = Arc::new(NetworkStack { adnl, dht, overlay, rldp, quic: None });
@@ -101,6 +108,60 @@ async fn real_overlay(listener: ConsensusOverlayListenerPtr, seed: u8) -> Arc<Ad
     .unwrap();
     overlay.clone().run_wait_broadcast();
     overlay
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlay_custom_control_dispatch_preserves_bundles_and_rejects_control_postfix() {
+    for (seed, profile) in [(88, rtos_api::WireProfile::Legacy), (90, rtos_api::WireProfile::T0)] {
+        let (_release_tx, release_rx) = std::sync::mpsc::channel();
+        let listener: Arc<dyn crate::ConsensusOverlayListener + Send + Sync> =
+            Arc::new(HeldListener {
+                entered: Mutex::new(None),
+                release: Mutex::new(release_rx),
+                callback: Mutex::new(None),
+            });
+        let overlay = real_overlay_with_profile(Arc::downgrade(&listener), seed, profile).await;
+        let peers =
+            AdnlPeers::with_keys(overlay.local_adnl_key.id().clone(), KeyId::from_data([89; 32]));
+        let consumer = AdnlOverlayConsumer::new(
+            overlay.overlay_id.clone(),
+            Arc::downgrade(&overlay),
+            overlay.stop_requested.clone(),
+        );
+        let profile = overlay.stack.overlay.wire_profile();
+        let mut bundle = profile.serialize(&rtos_api::ton::catchain::Update::default()).unwrap();
+        bundle.extend(
+            profile.serialize(&rtos_api::ton::validator_session::BlockUpdate::default()).unwrap(),
+        );
+        let bundle_result = consumer.try_consume_custom(&bundle, &peers).await;
+        bundle.push(3); // The legacy private-overlay hop postfix belongs to its bundle parser.
+        let hop_result = consumer.try_consume_custom(&bundle, &peers).await;
+        let mut controls = Vec::new();
+        for bytes in [
+            profile.serialize(&BroadcastWrapper::default()).unwrap(),
+            profile.serialize(&SimplexVote::default()).unwrap(),
+            profile.serialize(&SimplexCertificate::default()).unwrap(),
+        ] {
+            let accepted = consumer.try_consume_custom(&bytes, &peers).await;
+            let mut postfix = bytes.clone();
+            postfix.push(0);
+            let rejected = consumer.try_consume_custom(&postfix, &peers).await;
+            let truncated = consumer.try_consume_custom(&bytes[..bytes.len() - 1], &peers).await;
+            controls.push((accepted, rejected, truncated));
+        }
+        // Clean up before asserting: a deliberately failing admission regression
+        // must not leave UDP blocking-task joins hanging in Tokio teardown.
+        let owner = overlay.clone();
+        tokio::task::spawn_blocking(move || owner.stop_checked()).await.unwrap().unwrap();
+        overlay.stack.adnl.stop_checked().await.unwrap();
+        assert!(matches!(bundle_result, Ok(false)), "{bundle_result:?}");
+        assert!(matches!(hop_result, Ok(false)), "{hop_result:?}");
+        for (accepted, rejected, truncated) in controls {
+            assert!(matches!(accepted, Ok(true)), "{accepted:?}");
+            assert!(rejected.unwrap_err().to_string().contains("Trailing bytes"));
+            assert!(truncated.is_err());
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -5,8 +5,6 @@ pub(crate) mod cleanup_projection;
 pub(crate) mod cleanup_steps;
 mod closing;
 mod history_debt;
-pub(crate) use history_debt::NodeHistoryDebt;
-
 use crate::{
     engine::Engine,
     engine_traits::EngineOperations,
@@ -38,6 +36,7 @@ use consensus_common::{
     SessionFinality,
 };
 use futures::FutureExt;
+pub(crate) use history_debt::NodeHistoryDebt;
 use rtos_api::{pq_finality::PqNetworkSignatureSet, IntoBoxed};
 use rtos_block::{error, fail, BlockSignaturesVariant, Result, UInt256};
 use std::{
@@ -209,7 +208,9 @@ impl<T> Drop for ClosingCompletion<T> {
 }
 enum Submission {
     #[cfg(test)]
-    RetryBackground { response: oneshot::Sender<Result<()>> },
+    RetryBackground {
+        response: oneshot::Sender<Result<()>>,
+    },
     Acceptance {
         request: CanonicalFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -424,7 +425,9 @@ impl DurableFinalitySink for SessionSink {
         completion: Box<dyn FnOnce(Result<()>) + Send>,
     ) -> Result<()> {
         self.worker.admit_draft(Submission::Acceptance {
-            request, runtime: self.runtime.clone(), queued_at: std::time::Instant::now(),
+            request,
+            runtime: self.runtime.clone(),
+            queued_at: std::time::Instant::now(),
             completion: ClosingCompletion(Some(completion)),
         })
     }
@@ -799,7 +802,8 @@ impl PublicationWorker {
             return Err(error);
         }
         let sender = (|| {
-            let sender = self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
+            let sender =
+                self.sender.lock().map_err(|_| error!("Publication admission poisoned"))?;
             if self.state.fatal.load(Ordering::Acquire) {
                 fail!("Publication admission failed");
             }
@@ -811,8 +815,12 @@ impl PublicationWorker {
         let (rejected, reason) = match sender {
             Ok(sender) => match sender.try_send(request) {
                 Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Full(request)) => (request, "Publication draft queue full".to_owned()),
-                Err(mpsc::error::TrySendError::Closed(request)) => (request, "Publication draft channel closed".to_owned()),
+                Err(mpsc::error::TrySendError::Full(request)) => {
+                    (request, "Publication draft queue full".to_owned())
+                }
+                Err(mpsc::error::TrySendError::Closed(request)) => {
+                    (request, "Publication draft channel closed".to_owned())
+                }
             },
             Err(error) => (request, error.to_string()),
         };
@@ -899,12 +907,16 @@ impl PublicationWorker {
     #[cfg(test)]
     pub(crate) fn test_pause_background(&self, paused: bool) {
         self.state.background_paused.store(paused, Ordering::Release);
-        if !paused { self.state.wake.notify_one(); }
+        if !paused {
+            self.state.wake.notify_one();
+        }
     }
     #[cfg(test)]
     pub(crate) fn test_background_runs(&self) -> (usize, usize) {
-        (self.state.background_acceptance_runs.load(Ordering::Relaxed),
-         self.state.background_routing_turns.load(Ordering::Relaxed))
+        (
+            self.state.background_acceptance_runs.load(Ordering::Relaxed),
+            self.state.background_routing_turns.load(Ordering::Relaxed),
+        )
     }
     #[cfg(test)]
     pub(crate) async fn test_retry_background(&self) -> Result<()> {
@@ -938,16 +950,34 @@ impl PublicationWorker {
     }
 }
 impl State {
-    fn activity_scope(&self, phase: &'static str, record: Option<(u64, String)>) -> ActivityScope<'_> {
+    fn activity_scope(
+        &self,
+        phase: &'static str,
+        record: Option<(u64, String)>,
+    ) -> ActivityScope<'_> {
         let mut current = self.activity.lock().unwrap_or_else(|p| p.into_inner());
-        let next = WorkerActivity { phase, record: record.or_else(|| current.record.clone()), since: std::time::Instant::now() };
+        let next = WorkerActivity {
+            phase,
+            record: record.or_else(|| current.record.clone()),
+            since: std::time::Instant::now(),
+        };
         let previous = Some(std::mem::replace(&mut *current, next));
         ActivityScope { activity: &self.activity, previous }
     }
     fn activity_description(&self) -> String {
         let current = self.activity.lock().unwrap_or_else(|p| p.into_inner());
-        let (record, block) = current.record.as_ref().map(|(id, block)| (id.to_string(), block.as_str())).unwrap_or_else(|| ("none".to_owned(), "none"));
-        format!("worker_phase={} phase_ms={} record={} block={}", current.phase, current.since.elapsed().as_millis(), record, block)
+        let (record, block) = current
+            .record
+            .as_ref()
+            .map(|(id, block)| (id.to_string(), block.as_str()))
+            .unwrap_or_else(|| ("none".to_owned(), "none"));
+        format!(
+            "worker_phase={} phase_ms={} record={} block={}",
+            current.phase,
+            current.since.elapsed().as_millis(),
+            record,
+            block
+        )
     }
     fn fatal(&self, message: String) {
         self.fatal.store(true, Ordering::Release);
@@ -1015,11 +1045,18 @@ impl State {
             if self.engine.strong_count() == 0 {
                 break;
             }
-            let command = match next_worker_turn(&self.stop, &mut tick, &mut receiver, &self.wake).await {
-                WorkerTurn::Stop => { receiver.close(); None },
-                WorkerTurn::Command(command) => command,
-                WorkerTurn::Retry => { self.recover(&store, &mut receiver).await; continue; },
-            };
+            let command =
+                match next_worker_turn(&self.stop, &mut tick, &mut receiver, &self.wake).await {
+                    WorkerTurn::Stop => {
+                        receiver.close();
+                        None
+                    }
+                    WorkerTurn::Command(command) => command,
+                    WorkerTurn::Retry => {
+                        self.recover(&store, &mut receiver).await;
+                        continue;
+                    }
+                };
             if let Some(command) = command {
                 #[cfg(test)]
                 let command = match command {
@@ -1101,8 +1138,10 @@ impl State {
                         fail!("Publication shutdown before acceptance");
                     }
                     let id = request.node_receipt.clone();
-                    let (delivery, entry) = self.write(store, move |store| store.delivery(&id))
-                        .await?.ok_or_else(|| error!("Unknown acceptance delivery"))?;
+                    let (delivery, entry) = self
+                        .write(store, move |store| store.delivery(&id))
+                        .await?
+                        .ok_or_else(|| error!("Unknown acceptance delivery"))?;
                     log::debug!(target: "simplex_resolver",
                         "NODE_ACCEPT_LOOKUP: session={} node_receipt={} record={} elapsed_ms={}",
                         runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
@@ -1120,12 +1159,14 @@ impl State {
                     if self.acceptance_verified_in_process(&entry) {
                         return Ok(());
                     }
-                    let engine = self.engine.upgrade().ok_or_else(|| error!("Publication Engine gone"))?;
+                    let engine =
+                        self.engine.upgrade().ok_or_else(|| error!("Publication Engine gone"))?;
                     #[cfg(test)]
                     self.acceptance_request_runs.fetch_add(1, Ordering::Relaxed);
                     self.accept(store, engine, entry).await?;
                     Ok(())
-                }.await;
+                }
+                .await;
                 log::debug!(target: "simplex_resolver",
                     "NODE_ACCEPT_END: session={} node_receipt={} elapsed_ms={} error={:?}",
                     runtime.session_id().to_hex_string(), request.node_receipt.to_hex_string(),
@@ -1220,7 +1261,11 @@ impl State {
                 self.wake.notify_one();
             }
         }
-        log::debug!("Publication command phase={} elapsed_ms={}", phase, command_started.elapsed().as_millis());
+        log::debug!(
+            "Publication command phase={} elapsed_ms={}",
+            phase,
+            command_started.elapsed().as_millis()
+        );
     }
     async fn submit_legacy(&self, store: &Arc<PropagationOutbox>, command: LegacySubmission) {
         let result = async {
@@ -1327,14 +1372,18 @@ impl State {
         // acceptance and a successful WAL commit. Retain that same opaque
         // result rather than accepting the block again for its resolved plan.
         // Cache misses, eviction and cold starts still use normal acceptance.
-        self.accepted_receipts.lock().unwrap()
-            .resolved_routing(&entry, resolved_effects, &self.limits);
+        self.accepted_receipts.lock().unwrap().resolved_routing(
+            &entry,
+            resolved_effects,
+            &self.limits,
+        );
         Ok(true)
     }
     fn acceptance_verified_in_process(&self, entry: &UnverifiedRecord) -> bool {
-        matches!(entry.stage,
-            PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed)
-            && self.acceptance_verified.lock().unwrap().contains(&entry.id.0)
+        matches!(
+            entry.stage,
+            PublicationStage::AcceptedDraft | PublicationStage::Ready | PublicationStage::Completed
+        ) && self.acceptance_verified.lock().unwrap().contains(&entry.id.0)
     }
 
     async fn accept(
@@ -1343,7 +1392,10 @@ impl State {
         engine: Arc<Engine>,
         entry: UnverifiedRecord,
     ) -> Result<AcceptedSessionBlock> {
-        let activity = self.activity_scope("accept_history", Some((entry.id.0, entry.record.block_id.to_string())));
+        let activity = self.activity_scope(
+            "accept_history",
+            Some((entry.id.0, entry.record.block_id.to_string())),
+        );
         let started = std::time::Instant::now();
         let trace_record = entry.id.0;
         let trace_phase = |phase: &str| {
@@ -1380,8 +1432,8 @@ impl State {
         // Authentication and creator/origin binding above still run on every
         // request, including cache hits. A new worker starts with no receipts.
         let record = publication.entry().record.clone();
-        if let Some(receipt) = self.accepted_receipts.lock().unwrap()
-            .get(publication.entry(), engine.as_ref())?
+        if let Some(receipt) =
+            self.accepted_receipts.lock().unwrap().get(publication.entry(), engine.as_ref())?
         {
             trace_phase("cached_receipt");
             return Ok(receipt);
@@ -1400,7 +1452,8 @@ impl State {
             activity.phase("accept_durability");
             let durability = engine.clone().ensure_publication_acceptance_durable(&accepted);
             #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
-            let durability = crate::publication_io_test_control::acceptance_scope(&entry, durability).await;
+            let durability =
+                crate::publication_io_test_control::acceptance_scope(&entry, durability).await;
             #[cfg(not(all(target_os = "linux", feature = "isolated-consensus-signing")))]
             let durability = durability.await;
             if let Err(error) = durability {
@@ -1410,7 +1463,12 @@ impl State {
                 {
                     self.fatal(error.to_string());
                     #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
-                    crate::publication_io_test_control::after_fatal(&entry, store.as_ref(), &accepted, &error)?;
+                    crate::publication_io_test_control::after_fatal(
+                        &entry,
+                        store.as_ref(),
+                        &accepted,
+                        &error,
+                    )?;
                 }
                 return Err(error);
             }
@@ -1423,7 +1481,9 @@ impl State {
                 && entry.record.protocol == SimplexProtocol::PrivateObserversPlumtree
             {
                 activity.phase("accept_shard_description");
-                accepted.register_shard_description(engine.clone(), entry.record.locally_generated).await?;
+                accepted
+                    .register_shard_description(engine.clone(), entry.record.locally_generated)
+                    .await?;
             }
         }
         trace_phase("durability_done");
@@ -1510,8 +1570,11 @@ impl State {
             let mut cursor = self.cursor.lock().unwrap();
             let mut retry = self.retry_after.lock().unwrap();
             let mut closing = self.close_interest.lock().unwrap();
-            closing.retain(|id| entries.iter().any(|entry|
-                entry.id.0 == *id && entry.stage != PublicationStage::Completed));
+            closing.retain(|id| {
+                entries
+                    .iter()
+                    .any(|entry| entry.id.0 == *id && entry.stage != PublicationStage::Completed)
+            });
             cursor.1.retain(|id, _| entries.iter().any(|entry| entry.id.0 == *id));
             retry.retain(|(id, effect), _| {
                 entries.iter().any(|entry| entry.id.0 == *id && entry.pending.contains(effect))
@@ -1525,9 +1588,12 @@ impl State {
             for close_turn in [prefer_close, !prefer_close] {
                 for index in 0..entries.len() {
                     let entry = &entries[(start + index) % entries.len()];
-                    if closing.contains(&entry.id.0) != close_turn { continue; }
+                    if closing.contains(&entry.id.0) != close_turn {
+                        continue;
+                    }
                     // Expired intents stay durable, but cannot delay live work.
-                    if entry.stage != PublicationStage::Ready || entry.record.is_expired(now_unix_secs)
+                    if entry.stage != PublicationStage::Ready
+                        || entry.record.is_expired(now_unix_secs)
                     {
                         continue;
                     }
@@ -1549,7 +1615,9 @@ impl State {
                         break;
                     }
                 }
-                if selected.is_some() { break; }
+                if selected.is_some() {
+                    break;
+                }
             }
             selected
         }
@@ -1617,7 +1685,9 @@ impl State {
         receiver: &mut mpsc::Receiver<Submission>,
     ) {
         #[cfg(test)]
-        if self.background_paused.load(Ordering::Acquire) { return; }
+        if self.background_paused.load(Ordering::Acquire) {
+            return;
+        }
         self.recover_turn(store, receiver).await;
     }
     async fn recover_turn(
@@ -1701,7 +1771,8 @@ impl State {
         }
         let now_unix_secs =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let selected = self.select_retry_record(&entries, now_unix_secs, tokio::time::Instant::now());
+        let selected =
+            self.select_retry_record(&entries, now_unix_secs, tokio::time::Instant::now());
         let Some((entry, effects)) = selected else {
             return;
         };
@@ -1755,13 +1826,18 @@ impl State {
                 Ok(plan) => plan,
                 Err(_) => return,
             };
-            log::debug!("Publication retry record={} due_effects={} pending={}",
-                entry.id.0, effects.len(), entry.pending.len());
+            log::debug!(
+                "Publication retry record={} due_effects={} pending={}",
+                entry.id.0,
+                effects.len(),
+                entry.pending.len()
+            );
             for effect in effects {
                 if self.stop.is_cancelled() || !self.enabled.load(Ordering::Acquire) {
                     return;
                 }
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                let now =
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                 if entry.record.is_expired(now) {
                     metrics::counter!("rtos_publication_expired_pending_total").increment(1);
                     return;
@@ -1799,7 +1875,10 @@ impl State {
                         log::error!("Publication checkpoint failed: {error}");
                         return;
                     }
-                    log::debug!("Publication retry checkpoint record={} target={destination:?}", entry.id.0);
+                    log::debug!(
+                        "Publication retry checkpoint record={} target={destination:?}",
+                        entry.id.0
+                    );
                 } else {
                     metrics::counter!("rtos_publication_pending_send_attempts_total").increment(1);
                     log::debug!(
@@ -2254,10 +2333,16 @@ mod tests {
             done.store(true, Ordering::Release);
         };
         let result = tokio::time::timeout(
-            Duration::from_secs(1), service_while_sending(&mut sending, command),
-        ).await.expect("mailbox command stopped polling the send that owns its required lock");
+            Duration::from_secs(1),
+            service_while_sending(&mut sending, command),
+        )
+        .await
+        .expect("mailbox command stopped polling the send that owns its required lock");
         assert_eq!(result, Some(7));
-        assert!(completed.load(Ordering::Acquire), "admitted command must finish before send returns");
+        assert!(
+            completed.load(Ordering::Acquire),
+            "admitted command must finish before send returns"
+        );
         assert!(sending.is_none(), "completed send owner must be dropped before command drain");
     }
 
@@ -2265,12 +2350,11 @@ mod tests {
     async fn publication_worker_timed_out_send_releases_owner_before_command_drain() {
         let shared = Arc::new(tokio::sync::Mutex::new(()));
         let held = shared.clone();
-        let mut sending = Some(Box::pin(tokio::time::timeout(
-            Duration::from_millis(20), async move {
+        let mut sending =
+            Some(Box::pin(tokio::time::timeout(Duration::from_millis(20), async move {
                 let _guard = held.lock().await;
                 std::future::pending::<u8>().await
-            },
-        )));
+            })));
         assert!(futures::poll!(sending.as_mut().unwrap().as_mut()).is_pending());
         assert!(shared.try_lock().is_err());
         let completed = Arc::new(AtomicBool::new(false));
@@ -2280,8 +2364,11 @@ mod tests {
             done.store(true, Ordering::Release);
         };
         let result = tokio::time::timeout(
-            Duration::from_secs(1), service_while_sending(&mut sending, command),
-        ).await.expect("timed-out send retained the lock required by the admitted command");
+            Duration::from_secs(1),
+            service_while_sending(&mut sending, command),
+        )
+        .await
+        .expect("timed-out send retained the lock required by the admitted command");
         assert!(result.unwrap().is_err());
         assert!(completed.load(Ordering::Acquire));
         assert!(sending.is_none());
@@ -2293,7 +2380,9 @@ mod tests {
         let mut sending = Some(Box::pin(async move { received.await.unwrap() }));
         let completed = Arc::new(AtomicBool::new(false));
         let done = completed.clone();
-        let command = async move { done.store(true, Ordering::Release); };
+        let command = async move {
+            done.store(true, Ordering::Release);
+        };
         assert_eq!(service_while_sending(&mut sending, command).await, None);
         assert!(completed.load(Ordering::Acquire));
         assert!(sending.is_some(), "completing a command must not cancel its concurrent send");
@@ -2307,12 +2396,14 @@ mod tests {
         let wake = Notify::new();
         let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
         let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(60), RETRY_INTERVAL);
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            RETRY_INTERVAL,
+        );
         for index in 0..QUEUE_CAPACITY {
             let (response, _) = oneshot::channel();
-            sender.try_send(Submission::Query {
-                id: UInt256::from([index as u8; 32]), response,
-            }).unwrap();
+            sender
+                .try_send(Submission::Query { id: UInt256::from([index as u8; 32]), response })
+                .unwrap();
         }
         for index in 0..QUEUE_CAPACITY {
             wake.notify_one();
@@ -2323,8 +2414,13 @@ mod tests {
                 _ => panic!("eager maintenance overtook queued command {index}"),
             }
         }
-        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
-            WorkerTurn::Retry), "idle maintenance notification must remain available");
+        assert!(
+            matches!(
+                next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+                WorkerTurn::Retry
+            ),
+            "idle maintenance notification must remain available"
+        );
     }
 
     #[tokio::test]
@@ -2334,16 +2430,26 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (response, _) = oneshot::channel();
         sender.try_send(Submission::Query { id: UInt256::default(), response }).unwrap();
-        let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now() - RETRY_INTERVAL, RETRY_INTERVAL);
+        let mut tick =
+            tokio::time::interval_at(tokio::time::Instant::now() - RETRY_INTERVAL, RETRY_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
-            WorkerTurn::Retry), "the original due retry must not starve behind commands");
+        assert!(
+            matches!(
+                next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+                WorkerTurn::Retry
+            ),
+            "the original due retry must not starve behind commands"
+        );
         assert_eq!(receiver.len(), 1);
         wake.notify_one();
         stop.cancel();
-        assert!(matches!(next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
-            WorkerTurn::Stop), "shutdown must retain the queued request for rejection");
+        assert!(
+            matches!(
+                next_worker_turn(&stop, &mut tick, &mut receiver, &wake).await,
+                WorkerTurn::Stop
+            ),
+            "shutdown must retain the queued request for rejection"
+        );
         assert_eq!(receiver.len(), 1);
     }
     #[test]
@@ -2613,14 +2719,25 @@ mod tests {
         worker.close_interest.lock().unwrap().insert(2);
         assert_eq!(worker.select_retry(&entries, 100, now).unwrap().0.id, RecordId(2));
         assert_eq!(worker.select_retry(&entries, 100, now).unwrap().0.id, RecordId(1));
-        assert!(worker.select_retry(&entries, 100, now).is_none(), "focus cannot bypass target backoff");
-        assert_eq!(worker.select_retry(&entries, 100, now + RETRY_INTERVAL).unwrap().0.id, RecordId(2));
-        assert!(worker.select_retry(&entries, 201, now + RETRY_INTERVAL).is_none(),
-            "an expired focused record cannot be sent or discarded");
+        assert!(
+            worker.select_retry(&entries, 100, now).is_none(),
+            "focus cannot bypass target backoff"
+        );
+        assert_eq!(
+            worker.select_retry(&entries, 100, now + RETRY_INTERVAL).unwrap().0.id,
+            RecordId(2)
+        );
+        assert!(
+            worker.select_retry(&entries, 201, now + RETRY_INTERVAL).is_none(),
+            "an expired focused record cannot be sent or discarded"
+        );
         assert_eq!(entries[1].pending.len(), 1);
         let remaining = vec![entries[0].clone()];
         worker.select_retry(&remaining, 100, now + RETRY_INTERVAL);
-        assert!(worker.close_interest.lock().unwrap().is_empty(), "removed delivery interest must be pruned");
+        assert!(
+            worker.close_interest.lock().unwrap().is_empty(),
+            "removed delivery interest must be pruned"
+        );
     }
 
     #[test]
@@ -2628,8 +2745,14 @@ mod tests {
         let worker = state();
         let now = tokio::time::Instant::now();
         let mut first = scheduling_entry(1, 200);
-        let finality = PublicationEffect { kind: PublicationKind::Finality, target: PublicationTarget::FastSync };
-        let custom = PublicationEffect { kind: PublicationKind::Block, target: PublicationTarget::Custom("original".into()) };
+        let finality = PublicationEffect {
+            kind: PublicationKind::Finality,
+            target: PublicationTarget::FastSync,
+        };
+        let custom = PublicationEffect {
+            kind: PublicationKind::Block,
+            target: PublicationTarget::Custom("original".into()),
+        };
         first.pending.extend([finality.clone(), custom.clone()]);
         Arc::make_mut(&mut first.record).effects = first.pending.clone();
         let entries = vec![first.clone(), scheduling_entry(2, 200)];
@@ -2645,7 +2768,11 @@ mod tests {
         assert!(!effects.contains(&custom), "grouping must not bypass a target's later deadline");
         assert!(effects.iter().all(|effect| first.pending.contains(effect)));
         assert!(worker.select_retry_record(&entries, 201, now + RETRY_INTERVAL * 2).is_none());
-        assert_eq!(entries[0].pending.len(), 3, "expiry cannot acknowledge or discard unsent effects");
+        assert_eq!(
+            entries[0].pending.len(),
+            3,
+            "expiry cannot acknowledge or discard unsent effects"
+        );
     }
 
     #[test]

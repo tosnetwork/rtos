@@ -225,7 +225,10 @@ async fn candidate_validation_reference_top(
     if candidate.shard().is_masterchain() {
         Ok(Some(mc.block_id().clone()))
     } else {
-        Ok(mc.shard_state_extra()?.shards().find_shard(candidate.shard())?
+        Ok(mc
+            .shard_state_extra()?
+            .shards()
+            .find_shard(candidate.shard())?
             .map(|shard| shard.block_id().clone()))
     }
 }
@@ -635,8 +638,10 @@ impl ValidatorGroupImpl {
                 self.shard,
                 self.cc_seqno
             );
-            let (session_prevs, session_mc) = g.recovered_session_start.clone()
-                .unwrap_or_else(|| (self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone()));
+            let (session_prevs, session_mc) =
+                g.recovered_session_start.clone().unwrap_or_else(|| {
+                    (self.prev_block_ids.get_prevs().to_vec(), min_masterchain_block_id.clone())
+                });
             session.start(session_prevs, session_mc);
         }
 
@@ -1186,20 +1191,22 @@ impl ValidatorGroup {
         current: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<Self> {
         let root = std::path::PathBuf::from(self.engine.db_root_dir()?).join("catchains");
-        let namespace = current.runtime_directory(
-            root.to_str().ok_or_else(|| error!("Invalid consensus DB root"))?,
-        )?;
-        let record = simplex::finality_recovery::locate_session_start(
-            std::path::Path::new(&namespace),
-        )?;
+        let namespace = current
+            .runtime_directory(root.to_str().ok_or_else(|| error!("Invalid consensus DB root"))?)?;
+        let record =
+            simplex::finality_recovery::locate_session_start(std::path::Path::new(&namespace))?;
         let Some(record) = record else {
             return self.with_authenticated_runtime(current);
         };
         let authenticated = super::retired_session_auth::authenticate_retired_session(
-            self.engine.as_ref(), &record,
-        ).await?;
+            self.engine.as_ref(),
+            &record,
+        )
+        .await?;
         if let Some(field) = current.admission_mismatch(authenticated.runtime()) {
-            fail!("Recovered session admission differs from current authenticated admission: {field}");
+            fail!(
+                "Recovered session admission differs from current authenticated admission: {field}"
+            );
         }
         self.recovered_session_start = Some((
             authenticated.record().prev_blocks.clone(),
@@ -1615,11 +1622,12 @@ impl ValidatorGroup {
     /// that historical replay can overtake. This is only namespace ownership;
     /// the checked constructor still validates every runtime and DB invariant.
     fn reserve_namespace_before_worker(&self) -> Result<bool> {
-        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|_| self.is_simplex()) else {
+        let Some(runtime) = self.authenticated_runtime.as_ref().filter(|_| self.is_simplex())
+        else {
             return Ok(true);
         };
-        let mut admission = self.namespace_admission.lock()
-            .map_err(|_| error!("namespace admission poisoned"))?;
+        let mut admission =
+            self.namespace_admission.lock().map_err(|_| error!("namespace admission poisoned"))?;
         if admission.reservation.is_some() {
             return Ok(true);
         }
@@ -1627,7 +1635,10 @@ impl ValidatorGroup {
             fail!("Prior normal constructor lacks its retained namespace reservation");
         }
         match self.engine.reserve_normal_session_namespace(runtime)? {
-            Some(reservation) => { admission.reservation = Some(reservation); Ok(true) }
+            Some(reservation) => {
+                admission.reservation = Some(reservation);
+                Ok(true)
+            }
             None => Ok(false),
         }
     }
@@ -1704,6 +1715,7 @@ impl ValidatorGroup {
 
     /// Track descendants of an already admitted group operation. The parent
     /// keeps its token until all child tasks have been registered.
+    #[track_caller]
     pub(super) fn spawn_task<F>(
         &self,
         rt: &tokio::runtime::Handle,
@@ -1714,8 +1726,33 @@ impl ValidatorGroup {
         F::Output: Send + 'static,
     {
         let panicked = self.task_panicked.clone();
+        let caller = std::panic::Location::caller();
+        let trace = log::log_enabled!(target: "validator", log::Level::Debug)
+            .then(|| (self.session_id.clone(), caller));
         self.tasks.spawn_on(
             async move {
+                struct TaskTrace {
+                    session: UInt256,
+                    id: tokio::task::Id,
+                    started: Instant,
+                }
+                impl Drop for TaskTrace {
+                    fn drop(&mut self) {
+                        log::debug!(target: "validator",
+                            "GROUP_TASK_END: session={:x} task={:?} elapsed_ms={}",
+                            self.session, self.id, self.started.elapsed().as_millis());
+                    }
+                }
+                // Drop also records panic/cancellation. Pair begin/end by the
+                // runtime task ID to locate unfinished tasks, without adding
+                // a registry or cancelling any state writes.
+                let _trace = trace.map(|(session, caller)| {
+                    let id = tokio::task::id();
+                    log::debug!(target: "validator",
+                        "GROUP_TASK_BEGIN: session={session:x} task={id:?} caller={caller} future={}",
+                        std::any::type_name::<F>());
+                    TaskTrace { session, id, started: Instant::now() }
+                });
                 match std::panic::AssertUnwindSafe(future).catch_unwind().await {
                     Ok(value) => value,
                     Err(payload) => {
@@ -1728,6 +1765,7 @@ impl ValidatorGroup {
         )
     }
 
+    #[track_caller]
     pub(super) fn spawn_root_task<F>(&self, rt: &tokio::runtime::Handle, future: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -2903,13 +2941,19 @@ impl ValidatorGroup {
         let validation_task = self.spawn_task(&tokio::runtime::Handle::current(), async move {
             // C++ parity: bounded validation deadline.
             // Simplex: 60s (block-validator.cpp), legacy: 15s (validator-group.cpp).
-            let deadline = if use_candidate_native {
+            let validation_timeout = if use_candidate_native {
                 SIMPLEX_VALIDATION_TIMEOUT
             } else {
                 LEGACY_VALIDATION_TIMEOUT
             };
 
-            let validation_result = tokio::time::timeout(deadline, async {
+            let deadline = tokio::time::Instant::now() + validation_timeout;
+            let trace_phase = |phase: &str| {
+                log::debug!(target: "validator", "VALIDATION_PHASE: task={:?} candidate={} phase={}",
+                    tokio::task::id(), candidate_id, phase);
+            };
+            trace_phase("begin");
+            let validation_result = tokio::time::timeout_at(deadline, async {
                 if use_candidate_native {
                     // ---- Simplex candidate-native validation path ----
                     //
@@ -2940,6 +2984,7 @@ impl ValidatorGroup {
                     if is_masterchain {
                         let prev_ids = info.read_prev_ids()?;
                         if let Some(candidate_parent_block_id) = prev_ids.first() {
+                            trace_phase("mc_parent_wait");
                             wait_for_mc_validation_parent_until_stop(
                                 accepted_mc_block_rx.clone(),
                                 &candidate_block_id,
@@ -2956,6 +3001,7 @@ impl ValidatorGroup {
                     // catch-up before the full candidate-native validator runs.
                     // MC stale-branch protection above still uses the session's
                     // accepted head; ValidateQuery still checks the full state.
+                    trace_phase("reference_top");
                     let last_applied_block_opt = candidate_validation_reference_top(
                         engine.as_ref(), &info, &candidate_block_id,
                     ).await?;
@@ -2983,15 +3029,18 @@ impl ValidatorGroup {
                         candidate_block_id
                     );
 
+                    trace_phase("query");
                     let validation_completion_time = run_validate_query_any_candidate(
                         candidate.clone(),
                         engine.clone(),
                         state_resolver_cache.clone(),
                         is_simplex,
+                        deadline,
                     )
                     .await?;
 
                     // Post-validation: broadcast + save (shared with legacy path)
+                    trace_phase("post_validation");
                     Self::post_validation_actions(
                         &next_block_descr,
                         &source_info,
@@ -3070,6 +3119,7 @@ impl ValidatorGroup {
                         validator_set.clone(),
                         engine.clone(),
                         is_simplex,
+                        deadline,
                     )
                     .await?;
 
@@ -3091,6 +3141,7 @@ impl ValidatorGroup {
                 }
             })
             .await;
+            trace_phase("result");
 
             // Convert timeout to a validation failure so Simplex retry machinery
             // clears pending_approve and reschedules.
@@ -3101,9 +3152,9 @@ impl ValidatorGroup {
                     log::warn!(
                         target: "validator",
                         "({next_block_descr}): ValidatorGroup::on_candidate: {candidate_id}, \
-                         validation timed out after {deadline:?}"
+                         validation timed out after {validation_timeout:?}"
                     );
-                    Err(error!("validation timed out after {:?}", deadline))
+                    Err(error!("validation timed out after {:?}", validation_timeout))
                 }
             };
 
@@ -3120,6 +3171,7 @@ impl ValidatorGroup {
             );
 
             callback(validation_result);
+            trace_phase("callback_done");
 
             log::trace!(
                 target: "validator",

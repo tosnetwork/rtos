@@ -134,45 +134,34 @@ pub(super) fn execute_sha256c(engine: &mut Engine) -> Status {
 fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 3)?;
-    let pub_key =
-        engine.cmd.var(0).as_integer()?.as_vec(ED25519_PUBLIC_KEY_LENGTH * 8, false, true)?;
-    let signature = engine.cmd.var(1).as_slice()?;
-    if hash {
-        engine.cmd.var(2).as_integer()?;
-    } else {
-        engine.cmd.var(2).as_slice()?;
-    }
-    if signature.remaining_bits() < ED25519_SIGNATURE_LENGTH * 8 {
-        fail!(ExceptionCode::CellUnderflow)
-    }
+    engine.cmd.var(0).as_integer()?;
+    engine.cmd.var(1).as_slice()?;
     let data = if hash {
         engine.cmd.var(2).as_integer()?.as_u256()?
     } else {
-        if engine.cmd.var(2).as_slice()?.remaining_bits() % 8 != 0 {
+        let slice = engine.cmd.var(2).as_slice()?;
+        if slice.remaining_bits() % 8 != 0 {
             fail!(ExceptionCode::CellUnderflow)
         }
-        engine.cmd.var(2).as_slice()?.get_bytestring(0).into_vec()
+        slice.get_bytestring(0).into_vec()
     };
-    let is_identity_pub_key = engine.block_version() >= TVM_VERSION_14
-        && pub_key.as_slice() == ED25519_IDENTITY_PUBLIC_KEY;
-    let Ok(pub_key) = Ed25519PublicKey::from_bytes(pub_key.as_slice().try_into()?) else {
-        engine.cc.stack.push(boolean!(false));
-        return Ok(());
-    };
-    let signature = engine.cmd.var(1).as_slice()?.get_bytestring(0);
-    if signature.len() < ED25519_SIGNATURE_LENGTH {
-        engine.cc.stack.push(boolean!(false));
-        return Ok(());
-    };
-    engine.checked_signatures_count = engine.checked_signatures_count.saturating_add(1);
-    if engine.checked_signatures_count > Gas::check_signature_threshold() {
-        engine.try_use_gas(Gas::check_signature_price())?;
-    } else {
-        engine.use_free_gas(Gas::check_signature_price());
+    let signature_slice = engine.cmd.var(1).as_slice()?;
+    // get_bytestring rounds a partial final byte up; the reference requires
+    // all 512 signature bits before public-key export and signature gas.
+    if signature_slice.remaining_bits() < ED25519_SIGNATURE_LENGTH * 8 {
+        fail!(ExceptionCode::CellUnderflow)
     }
+    let signature = signature_slice.get_bytestring(0);
+    let key = engine.cmd.var(0).as_integer()?.as_vec(ED25519_PUBLIC_KEY_LENGTH * 8, false, true)?;
+    engine.register_signature_call()?;
+    let rejected_key = engine.block_version() >= TVM_VERSION_14
+        && (key.as_slice() == ED25519_IDENTITY_PUBLIC_KEY || key.iter().all(|b| *b == 0));
+    let signature: [u8; ED25519_SIGNATURE_LENGTH] =
+        signature[..ED25519_SIGNATURE_LENGTH].try_into()?;
     let result = engine.modifiers.chksig_always_succeed
-        || (!is_identity_pub_key
-            && pub_key.verify(&data, &signature[..ED25519_SIGNATURE_LENGTH].try_into()?));
+        || (!rejected_key
+            && Ed25519PublicKey::from_bytes(key.as_slice().try_into()?)
+                .is_ok_and(|key| key.verify(&data, &signature)));
     engine.cc.stack.push(boolean!(result));
     Ok(())
 }

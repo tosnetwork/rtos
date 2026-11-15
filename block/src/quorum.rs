@@ -11,9 +11,15 @@ pub const fn quorum_threshold(total: u64) -> u64 {
     ((2 * total as u128 + 2) / 3) as u64
 }
 
+/// Numeric predicate on explicit weights, matching TOS `tos::has_quorum`.
+/// This does not admit a validator set or authenticate its signed weight.
+pub const fn quorum_weight_reached(signed: u64, total: u64) -> bool {
+    signed >= quorum_threshold(total)
+}
+
 /// An empty or over-counted voting set cannot establish a quorum.
 pub const fn has_quorum(signed: u64, total: u64) -> bool {
-    total != 0 && signed <= total && signed >= quorum_threshold(total)
+    total != 0 && signed <= total && quorum_weight_reached(signed, total)
 }
 
 /// Add one admitted validator's positive weight within the protocol cap.
@@ -56,6 +62,21 @@ mod tests {
         }
         assert!(!has_quorum(0, 0));
         assert!(!has_quorum(4, 3));
+        // The raw predicate is distinct from the node's membership guards.
+        assert!(quorum_weight_reached(0, 0));
+        assert!(quorum_weight_reached(4, 3));
+        for total in [0, 1, 3, MAX_TOTAL_VALIDATOR_WEIGHT, u64::MAX] {
+            for signed in [0, 1, total, u64::MAX] {
+                assert_eq!(
+                    quorum_weight_reached(signed, total),
+                    u128::from(signed) * 3 >= u128::from(total) * 2
+                );
+                assert_eq!(
+                    has_quorum(signed, total),
+                    total != 0 && signed <= total && quorum_weight_reached(signed, total)
+                );
+            }
+        }
         for total in (1..=1000).chain([MAX_TOTAL_VALIDATOR_WEIGHT, u64::MAX - 1]) {
             let threshold = quorum_threshold(total);
             assert!(u128::from(threshold) * 3 >= u128::from(total) * 2);

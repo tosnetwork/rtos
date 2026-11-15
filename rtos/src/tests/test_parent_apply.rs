@@ -4,6 +4,60 @@ use crate::validator::validator_manager::emulator_network_bootstrap::EmulatorNet
 use std::collections::BTreeMap;
 use tokio::sync::{Notify, Semaphore};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeper_state_store_notifies_engine_waiters() -> Result<()> {
+    let bootstrap = EmulatorNetworkBootstrap::build(4)?;
+    let stopper = Arc::new(Stopper::new());
+    let (engine, join) = run(
+        bootstrap.load_node_config().await?,
+        bootstrap.config_dir().to_str(),
+        tokio::runtime::Handle::current(),
+        tokio::runtime::Handle::current(),
+        EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
+        stopper.clone(),
+        None,
+    )
+    .await?;
+    let result = async {
+        let id = engine.zerostate_id().clone();
+        let state = engine.load_state(&id).await?;
+        let expected_root = state.root_cell().repr_hash().clone();
+        let handle = engine.load_block_handle(&id)?.unwrap();
+        let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let waiter_engine = engine.clone();
+        let waiter_id = id.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiter_engine
+                .shard_states_awaiters()
+                .wait(&waiter_id, None, || {
+                    registered_tx.send(()).unwrap();
+                    Ok(false)
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), registered_rx.recv()).await?.unwrap();
+        // Recursive state recovery writes through the keeper directly, without
+        // returning through EngineOperations::store_state's notification path.
+        engine.shard_states_keeper().store_state(&handle, state, None, true).await?;
+        let observed = tokio::time::timeout(Duration::from_secs(2), &mut waiter).await;
+        if observed.is_err() {
+            waiter.abort();
+            let _ = waiter.await;
+        }
+        let observed =
+            observed.map_err(|_| error!("keeper state store omitted waiter notification"))???;
+        let observed = observed.ok_or_else(|| error!("state notification omitted its result"))?;
+        assert_eq!(observed.block_id(), &id);
+        assert_eq!(observed.root_cell().repr_hash(), &expected_root);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stopper.set_stop();
+    let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
+    engine.wait_stop().await?;
+    result
+}
+
 pub(crate) struct ApplyGate {
     pub(crate) seen: std::sync::Mutex<BTreeMap<u32, BlockIdExt>>,
     changed: Notify,

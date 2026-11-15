@@ -229,7 +229,7 @@ mod tests {
 
     fn create_number_entry(value: &str) -> StackEntry {
         StackEntry::Tvm_StackEntryNumber(StackEntryNumber {
-            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string() }),
+            number: Number::Tvm_NumberDecimal(NumberDecimal { number: value.to_string().into() }),
         })
     }
 

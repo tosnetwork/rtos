@@ -81,10 +81,14 @@ pub(crate) fn prepare_abort(
                     data = Some(inventory);
                 }
                 Record::ReadyIntent => {
-                    let mut version = [0;2];
-                    if length != 2 { fail!("Invalid Ready staging intent"); }
+                    let mut version = [0; 2];
+                    if length != 2 {
+                        fail!("Invalid Ready staging intent");
+                    }
                     input.read_exact(&mut version)?;
-                    if version != [1,0] { fail!("Unknown Ready staging version"); }
+                    if version != [1, 0] {
+                        fail!("Unknown Ready staging version");
+                    }
                 }
                 Record::Child => {
                     let stage = super::recovery_stages::Stage::decode(providers, input, length)?;

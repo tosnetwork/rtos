@@ -16,7 +16,7 @@ use crate::{
     },
     stack::{integer::IntegerData, StackItem},
 };
-use rtos_block::{fail, BuilderData, ExceptionCode, IBitstring, Status};
+use rtos_block::{fail, load_var_integer, BuilderData, ExceptionCode, IBitstring, Status};
 
 // slice - uint slice'
 fn load_var(engine: &mut Engine, name: &'static str, max_bytes: u8, sign: bool) -> Status {
@@ -24,12 +24,7 @@ fn load_var(engine: &mut Engine, name: &'static str, max_bytes: u8, sign: bool) 
     fetch_stack(engine, 1)?;
     let mut slice = engine.cmd.var(0).as_slice()?.clone();
     let len = 8 - (max_bytes - 1).leading_zeros() as usize;
-    let bytes = slice.get_next_int(len)? as usize;
-    let vec = slice.get_next_bytes(bytes)?;
-    let value = match sign {
-        true => num::BigInt::from_signed_bytes_be(&vec),
-        false => num::BigInt::from_bytes_be(num::bigint::Sign::Plus, &vec),
-    };
+    let value = load_var_integer(&mut slice, len, sign)?;
     engine.cc.stack.push(int!(value));
     engine.cc.stack.push(StackItem::Slice(slice));
     Ok(())
@@ -53,16 +48,19 @@ fn store_var(engine: &mut Engine, name: &'static str, max_bits: usize, sign: boo
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 2)?;
     let x = engine.cmd.var(0).as_integer()?;
+    let b = engine.cmd.var(1).as_builder()?;
     if x.is_nan() {
         fail!(ExceptionCode::RangeCheckError);
     }
-    let b = engine.cmd.var(1).as_builder()?;
     let (bits, vec) = match sign {
         false => {
             x.check_neg()?;
             (x.ubitsize()?, x.take_value_of(|x| Some(x.to_bytes_be().1))?)
         }
-        true => (x.bitsize()?, x.take_value_of(|x| Some(x.to_signed_bytes_be()))?),
+        true => (
+            if x.is_zero() { 0 } else { x.bitsize()? },
+            x.take_value_of(|x| Some(x.to_signed_bytes_be()))?,
+        ),
     };
     if bits > max_bits {
         fail!(ExceptionCode::RangeCheckError, "{} has {} bits, but max is {}", x, bits, max_bits)

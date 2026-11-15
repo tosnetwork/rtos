@@ -22,7 +22,9 @@ function find_block {
     LOOP_RES=0
     for (( N=1; N <= NODES; N++ ))
     do
-        if grep -E -q "Applied(.*)$1" < "$TEST_ROOT/tmp/output_$N.log" ; then
+        # Only the engine's completed application message qualifies. Session
+        # OnAppliedTop notifications can mention a future next-seqno as well.
+        if grep -E -q '\[rtos::engine\][^:]*: Applied (master )?block \('"$1"', rh ' < "$TEST_ROOT/tmp/output_$N.log" ; then
             if [ "$2" != "LOOP" ]; then
                 echo "Applied block ($1) - FOUND on node #$N!"
             else

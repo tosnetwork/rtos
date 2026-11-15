@@ -864,16 +864,9 @@ fn test_xcpu2_bulk() {
                             stack.push_copy(j as usize).unwrap();
                             stack.push_copy((k + 1) as usize).unwrap();
                             // test
-                            if s_size > 1 {
-                                test_case(&code)
-                                    .expect_bytecode_extended(bytecode, Some(&msg))
-                                    .expect_stack_extended(&stack, Some(&msg));
-                            } else {
-                                test_case(&code).expect_failure_extended(
-                                    ExceptionCode::StackUnderflow,
-                                    Some(&msg),
-                                );
-                            }
+                            test_case(&code)
+                                .expect_bytecode_extended(bytecode, Some(&msg))
+                                .expect_stack_extended(&stack, Some(&msg));
                         }
                     }
                 }

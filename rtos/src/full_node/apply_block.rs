@@ -111,7 +111,9 @@ pub async fn calc_and_store_state(
     } else {
         let prev_ss_root = match prev_ids {
             (prev1, Some(prev2)) => {
+                log::debug!("STATE_PHASE: block={} waiting_for_prev={}", block.id(), prev1);
                 let ss1 = engine.clone().wait_state(prev1, None, true).await?;
+                log::debug!("STATE_PHASE: block={} waiting_for_prev={}", block.id(), prev2);
                 let ss2 = engine.clone().wait_state(prev2, None, true).await?;
                 let root = ShardStateStuff::construct_split_root(
                     ss1.root_cell().clone(),
@@ -120,10 +122,12 @@ pub async fn calc_and_store_state(
                 root
             }
             (prev, None) => {
+                log::debug!("STATE_PHASE: block={} waiting_for_prev={}", block.id(), prev);
                 let ss = engine.clone().wait_state(prev, None, true).await?;
                 ss.root_cell().clone()
             }
         };
+        log::debug!("STATE_PHASE: block={} predecessors_ready", block.id());
 
         let merkle_update = block.block()?.read_state_update()?;
         if merkle_update.old_hash != *prev_ss_root.repr_hash() {
@@ -140,6 +144,7 @@ pub async fn calc_and_store_state(
 
         let block_descr_clone = block_descr.clone();
         let ss = tokio::task::spawn_blocking(move || -> Result<Arc<ShardStateStuff>> {
+            log::debug!("STATE_PHASE: block={} merkle_worker_started", block_id);
             let now = std::time::Instant::now();
             let cf = engine_cloned.db_cells_factory()?;
             let mut fast_attempt = true;

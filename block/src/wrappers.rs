@@ -190,13 +190,46 @@ pub fn ed25519_verify(pub_key: &[u8], data: &[u8], signature: &[u8]) -> Result<(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("degenerate public key")]
+pub struct DegeneratePublicKey;
+
+/// Network key agreement maps the unsigned wire Y coordinate modulo the field;
+/// it does not require the encoding to decompress to an Edwards point.
 pub fn x25519_shared_secret(exp_pvt_key: &[u8], other_pub_key: &[u8]) -> Result<[u8; 32]> {
-    let point = curve25519_dalek::edwards::CompressedEdwardsY(other_pub_key.try_into()?)
-        .decompress()
-        .ok_or_else(|| error!("Bad public key data"))?
-        .to_montgomery()
-        .to_bytes();
-    Ok(x25519_dalek::x25519(exp_pvt_key[..32].try_into()?, point))
+    use openssl::bn::{BigNum, BigNumContext};
+    let private = zeroize::Zeroizing::new(<[u8; 32]>::try_from(
+        exp_pvt_key.get(..32).ok_or_else(|| error!("expanded private key is too short"))?,
+    )?);
+    let mut public_y: [u8; 32] = other_pub_key.try_into()?;
+    public_y[31] &= 127;
+    public_y.reverse();
+    let y = BigNum::from_slice(&public_y)?;
+    let p =
+        BigNum::from_hex_str("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed")?;
+    let one = BigNum::from_u32(1)?;
+    let mut ctx = BigNumContext::new()?;
+    let mut denominator = BigNum::new()?;
+    denominator.mod_sub(&one, &y, &p, &mut ctx)?;
+    if denominator.num_bits() == 0 {
+        return Err(DegeneratePublicKey.into());
+    }
+    let mut inverse = BigNum::new()?;
+    inverse.mod_inverse(&denominator, &p, &mut ctx)?;
+    let mut numerator = BigNum::new()?;
+    numerator.checked_add(&y, &one)?;
+    let mut u = BigNum::new()?;
+    u.mod_mul(&numerator, &inverse, &p, &mut ctx)?;
+    let mut point: [u8; 32] = u
+        .to_vec_padded(32)?
+        .try_into()
+        .map_err(|_| error!("invalid Montgomery coordinate length"))?;
+    point.reverse();
+    let shared = x25519_dalek::x25519(*private, point);
+    if shared == [0; 32] {
+        return Err(DegeneratePublicKey.into());
+    }
+    Ok(shared)
 }
 
 // P256 -----------------------------------------------------------------

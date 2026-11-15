@@ -56,6 +56,22 @@ pub(crate) fn decode_repair_response(bytes: &[u8]) -> Result<Broadcast> {
     Ok(message)
 }
 
+/// A protocol publication refusal, distinct from transport or lifecycle failure.
+#[derive(Debug)]
+pub enum PlumtreeRefusal {
+    InvalidSendSize,
+    SourceNotAllowed,
+}
+impl std::fmt::Display for PlumtreeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidSendSize => "Invalid Plumtree send size",
+            Self::SourceNotAllowed => "Plumtree source is not allowed",
+        })
+    }
+}
+impl std::error::Error for PlumtreeRefusal {}
+
 pub const MAX_PLUMTREE_PAYLOAD: usize = 16 << 20;
 const K: usize = 30;
 const PARTS: usize = 45;
@@ -143,7 +159,7 @@ impl PlumtreeConfig {
             Instant::now(),
         );
         if verdict != BroadcastCheckResult::Allowed {
-            fail!("Plumtree source is not allowed");
+            return Err(PlumtreeRefusal::SourceNotAllowed.into());
         }
         Ok(())
     }
@@ -949,7 +965,7 @@ impl Engine {
         self.gc(mono);
         check_time(now, now)?;
         if data.is_empty() || data.len() > MAX_PLUMTREE_PAYLOAD {
-            fail!("Invalid Plumtree send size");
+            return Err(PlumtreeRefusal::InvalidSendSize.into());
         }
         self.policy.authorize(
             &self.verifier,
@@ -1794,18 +1810,36 @@ mod transport_tests {
         let roots = vec![a.key.id().clone(), b.key.id().clone()];
         let mut delayed = Vec::new();
         for local in [&a, &b] {
-            local.overlay.add_semiprivate_overlay(
-                OverlayParams::with_id_only(&id), Some(&local.key), &roots, &roots,
-                None, 1, true,
-            ).unwrap();
-            local.subscriptions.lock().unwrap()
+            local
+                .overlay
+                .add_semiprivate_overlay(
+                    OverlayParams::with_id_only(&id),
+                    Some(&local.key),
+                    &roots,
+                    &roots,
+                    None,
+                    1,
+                    true,
+                )
+                .unwrap();
+            local
+                .subscriptions
+                .lock()
+                .unwrap()
                 .push(local.overlay.subscribe_broadcast(&id).unwrap());
-            local.overlay.configure_plumtree(&id, config(&a.key),
-                &tokio::runtime::Handle::current()).unwrap();
-            assert!(local.overlay.get_overlay(&id, "late root").unwrap()
-                .plumtree_neighbours().is_empty());
+            local
+                .overlay
+                .configure_plumtree(&id, config(&a.key), &tokio::runtime::Handle::current())
+                .unwrap();
+            assert!(local
+                .overlay
+                .get_overlay(&id, "late root")
+                .unwrap()
+                .plumtree_neighbours()
+                .is_empty());
             let raw = local.overlay.get_overlay(&id, "late initialization").unwrap();
-            let pending = raw.pending_peers.pop().expect("the authenticated remote root is pending");
+            let pending =
+                raw.pending_peers.pop().expect("the authenticated remote root is pending");
             assert!(raw.pending_peers.pop().is_none());
             delayed.push((raw, pending));
         }
@@ -1813,7 +1847,9 @@ mod transport_tests {
         // maintenance task first observes an empty queue. Restore only the
         // same root that the authenticated constructor originally enqueued.
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        for (raw, pending) in delayed { raw.pending_peers.push(pending); }
+        for (raw, pending) in delayed {
+            raw.pending_peers.push(pending);
+        }
         for (local, remote) in [(&a, &b), (&b, &a)] {
             local.quic.add_peer_key(remote.key.id().clone(), remote.addr).unwrap();
             let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
@@ -1821,19 +1857,35 @@ mod transport_tests {
         }
         let ready = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if [&a, &b].iter().all(|local|
-                    local.overlay.get_overlay(&id, "late root").unwrap()
-                        .plumtree_neighbours().len() == 1) { break; }
+                if [&a, &b].iter().all(|local| {
+                    local.overlay.get_overlay(&id, "late root").unwrap().plumtree_neighbours().len()
+                        == 1
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await;
+        })
+        .await;
         if ready.is_ok() {
             let data = b"authenticated root became reachable after creation";
             let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
-            a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
-                0, Some([134; 32]), data).await.unwrap();
+            a.overlay
+                .broadcast_plumtree(
+                    &id,
+                    &a.key,
+                    Certificate::Overlay_EmptyCertificate,
+                    0,
+                    Some([134; 32]),
+                    data,
+                )
+                .await
+                .unwrap();
             let delivered = tokio::time::timeout(Duration::from_secs(5), received.recv())
-                .await.expect("actual semiprivate broadcast delivery").unwrap().unwrap();
+                .await
+                .expect("actual semiprivate broadcast delivery")
+                .unwrap()
+                .unwrap();
             assert_eq!(delivered.data, data);
             assert_eq!(delivered.recv_from, *a.key.id());
         }
@@ -1843,16 +1895,32 @@ mod transport_tests {
             local.quic.shutdown_and_wait().await.unwrap();
             local.overlay.adnl.stop_checked().await.unwrap();
         }
-        assert!(ready.is_ok(), "semiprivate pending roots never consumed their late ADNL addresses");
+        assert!(
+            ready.is_ok(),
+            "semiprivate pending roots never consumed their late ADNL addresses"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlay_retirement_releases_real_quic_stream_credit_wait() {
         let (a, b, id) = pair().await;
         let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
-        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
-            0, Some([111; 32]), b"establish fixture connection").await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        a.overlay
+            .broadcast_plumtree(
+                &id,
+                &a.key,
+                Certificate::Overlay_EmptyCertificate,
+                0,
+                Some([111; 32]),
+                b"establish fixture connection",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
         let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
         let generation = a.overlay.overlay_generation(&id).unwrap();
@@ -1860,13 +1928,28 @@ mod transport_tests {
         let key = a.key.clone();
         let send_id = id.clone();
         let mut send = tokio::spawn(async move {
-            overlay.broadcast_plumtree(&send_id, &key, Certificate::Overlay_EmptyCertificate,
-                0, Some([112; 32]), b"credit-blocked relay").await
+            overlay
+                .broadcast_plumtree(
+                    &send_id,
+                    &key,
+                    Certificate::Overlay_EmptyCertificate,
+                    0,
+                    Some([112; 32]),
+                    b"credit-blocked relay",
+                )
+                .await
         });
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
-            "the actual transport send must be waiting for stream credit");
-        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
-            .await.expect("retirement cannot wait for global QUIC shutdown").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "the actual transport send must be waiting for stream credit"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            a.overlay.delete_private_overlay_checked(&generation),
+        )
+        .await
+        .expect("retirement cannot wait for global QUIC shutdown")
+        .unwrap();
         let error = send.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("retired during send"), "{error}");
         assert!(generation.drained());
@@ -1883,9 +1966,22 @@ mod transport_tests {
     async fn assert_retirement_releases_direct_quic_io(query: bool) {
         let (a, b, id) = pair().await;
         let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
-        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
-            0, Some([113; 32]), b"establish direct I/O fixture connection").await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        a.overlay
+            .broadcast_plumtree(
+                &id,
+                &a.key,
+                Certificate::Overlay_EmptyCertificate,
+                0,
+                Some([113; 32]),
+                b"establish direct I/O fixture connection",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
         let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
         let generation = a.overlay.overlay_generation(&id).unwrap();
@@ -1895,20 +1991,34 @@ mod transport_tests {
         let mut send = tokio::spawn(async move {
             if query {
                 let request = crate::common::TaggedTlObject::from(
-                    rtos_api::ton::rpc::adnl::Ping { value: 7 }.into_tl_object());
+                    rtos_api::ton::rpc::adnl::Ping { value: 7 }.into_tl_object(),
+                );
                 overlay.query_via_quic(&dst, &request, &send_id, Some(60_000)).await.map(|_| ())
             } else {
-                overlay.message_via_quic(&dst, &crate::common::TaggedByteSlice {
-                    object: b"direct message blocked on real stream credit",
-                    #[cfg(feature = "telemetry")]
-                    tag: 0,
-                }, &send_id).await
+                overlay
+                    .message_via_quic(
+                        &dst,
+                        &crate::common::TaggedByteSlice {
+                            object: b"direct message blocked on real stream credit",
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                        &send_id,
+                    )
+                    .await
             }
         });
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
-            "direct I/O must wait on actual stream credit");
-        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
-            .await.expect("overlay retirement must cancel its pending direct I/O").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "direct I/O must wait on actual stream credit"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            a.overlay.delete_private_overlay_checked(&generation),
+        )
+        .await
+        .expect("overlay retirement must cancel its pending direct I/O")
+        .unwrap();
         let error = send.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("Overlay retired during QUIC"), "{error}");
         assert!(generation.drained());
@@ -1936,24 +2046,50 @@ mod transport_tests {
     async fn overlay_retirement_releases_two_step_quic_broadcast() {
         let (a, b, id) = pair().await;
         let mut received = b.subscriptions.lock().unwrap().pop().unwrap();
-        a.overlay.broadcast_plumtree(&id, &a.key, Certificate::Overlay_EmptyCertificate,
-            0, Some([114; 32]), b"establish two-step connection").await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), received.recv()).await.unwrap().unwrap().unwrap();
+        a.overlay
+            .broadcast_plumtree(
+                &id,
+                &a.key,
+                Certificate::Overlay_EmptyCertificate,
+                0,
+                Some([114; 32]),
+                b"establish two-step connection",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
         let held = a.quic.hold_stream_credit_for_test(&peers).await.unwrap();
         let generation = a.overlay.overlay_generation(&id).unwrap();
         let overlay = a.overlay.clone();
         let send_id = id.clone();
         let mut send = tokio::spawn(async move {
-            overlay.broadcast_twostep(&send_id, &crate::common::TaggedByteSlice {
-                object: b"two-step reliable broadcast waiting for stream credit",
-                #[cfg(feature = "telemetry")]
-                tag: 0,
-            }, None, 0, Vec::new()).await
+            overlay
+                .broadcast_twostep(
+                    &send_id,
+                    &crate::common::TaggedByteSlice {
+                        object: b"two-step reliable broadcast waiting for stream credit",
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    None,
+                    0,
+                    Vec::new(),
+                )
+                .await
         });
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err());
-        tokio::time::timeout(Duration::from_secs(5), a.overlay.delete_private_overlay_checked(&generation))
-            .await.expect("two-step broadcast must release its overlay on retirement").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            a.overlay.delete_private_overlay_checked(&generation),
+        )
+        .await
+        .expect("two-step broadcast must release its overlay on retirement")
+        .unwrap();
         let error = send.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("retired during broadcast distribution"), "{error}");
         assert!(generation.drained());
@@ -2130,46 +2266,93 @@ mod transport_tests {
     async fn certified_receiver_remains_eligible_for_plumtree_publication() {
         let local = endpoint_with_profile(131, rtos_api::WireProfile::T0).await;
         let remote = endpoint_with_profile(132, rtos_api::WireProfile::T0).await;
-        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[134; 32]).unwrap();
+        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<
+            rtos_block::ZeroizingBytes,
+        >::from_private_key(&[134; 32])
+        .unwrap();
         local.overlay.adnl.add_key(transport.clone(), 1).unwrap();
         let id = OverlayShortId::from_data([133; 32]);
         let fields = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
-            node: rtos_api::ton::adnl::id::short::Short { id: UInt256::from_slice(remote.key.id().data()) },
-            flags: 0, slot: 0, expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
+            node: rtos_api::ton::adnl::id::short::Short {
+                id: UInt256::from_slice(remote.key.id().data()),
+            },
+            flags: 0,
+            slot: 0,
+            expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
         };
         let certificate = rtos_api::ton::overlay::membercertificate::MemberCertificate {
-            issued_by: (&transport).try_into().unwrap(), flags: 0, slot: 0,
+            issued_by: (&transport).try_into().unwrap(),
+            flags: 0,
+            slot: 0,
             expire_at: fields.expire_at,
             signature: transport.sign(&serialize_boxed(&fields.into_boxed()).unwrap()).unwrap(),
         };
         let roots = vec![transport.id().clone()];
-        for (endpoint, key, cert, original) in [(&local, &transport, None, true), (&remote, &remote.key, Some(certificate.clone()), false)] {
-            endpoint.overlay.add_semiprivate_overlay(OverlayParams::with_id_only(&id), Some(key),
-                &roots, &roots, cert, 5, true).unwrap();
-            endpoint.subscriptions.lock().unwrap().push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
-            let mut cfg = config(&transport);cfg.fixed_members = false;cfg.original_sender = original;
-            endpoint.overlay.configure_plumtree(&id, cfg, &tokio::runtime::Handle::current()).unwrap();
+        for (endpoint, key, cert, original) in [
+            (&local, &transport, None, true),
+            (&remote, &remote.key, Some(certificate.clone()), false),
+        ] {
+            endpoint
+                .overlay
+                .add_semiprivate_overlay(
+                    OverlayParams::with_id_only(&id),
+                    Some(key),
+                    &roots,
+                    &roots,
+                    cert,
+                    5,
+                    true,
+                )
+                .unwrap();
+            endpoint
+                .subscriptions
+                .lock()
+                .unwrap()
+                .push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
+            let mut cfg = config(&transport);
+            cfg.fixed_members = false;
+            cfg.original_sender = original;
+            endpoint
+                .overlay
+                .configure_plumtree(&id, cfg, &tokio::runtime::Handle::current())
+                .unwrap();
         }
         let node = remote.overlay.get_signed_node(&id, false).unwrap();
         let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
         local.overlay.adnl.add_peer(local.key.id(), &ip, None, &remote.key).unwrap();
-        assert!(local.overlay.add_public_peer_from_known_adnl(&node, &id).unwrap().is_none(),
-            "a different local identity's address is not an overlay connection");
+        assert!(
+            local.overlay.add_public_peer_from_known_adnl(&node, &id).unwrap().is_none(),
+            "a different local identity's address is not an overlay connection"
+        );
         let quic_ip = IpAddress::from_versioned_string("127.0.0.1:19001", None).unwrap();
         local.overlay.adnl.add_peer(transport.id(), &ip, Some(&quic_ip), &remote.key).unwrap();
         let before = local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap();
         assert!(local.overlay.add_public_peer_from_known_adnl(&node, &id).unwrap().is_some());
-        assert_eq!(local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap(), before,
-            "cached admission must preserve the actual ADNL and QUIC addresses");
+        assert_eq!(
+            local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap(),
+            before,
+            "cached admission must preserve the actual ADNL and QUIC addresses"
+        );
         let overlay = local.overlay.get_overlay(&id, "certified receiver").unwrap();
         overlay.check_peer(remote.key.id(), Some(&certificate)).unwrap();
-        assert_eq!(overlay.plumtree_neighbours(), vec![*remote.key.id().data()],
-            "publication must retain the authenticated receiver's member certificate");
+        assert_eq!(
+            overlay.plumtree_neighbours(),
+            vec![*remote.key.id().data()],
+            "publication must retain the authenticated receiver's member certificate"
+        );
         let super::super::OverlayNodeInfo::V1(mut forged) = node else { unreachable!() };
         forged.flags ^= 2;
-        assert!(local.overlay.add_public_peer_from_known_adnl(
-            &super::super::OverlayNodeInfo::<_, super::super::NodeV2>::V1(forged), &id,
-        ).unwrap().is_none(), "known address cannot bypass advertisement signature checks");
+        assert!(
+            local
+                .overlay
+                .add_public_peer_from_known_adnl(
+                    &super::super::OverlayNodeInfo::<_, super::super::NodeV2>::V1(forged),
+                    &id,
+                )
+                .unwrap()
+                .is_none(),
+            "known address cannot bypass advertisement signature checks"
+        );
         assert_eq!(overlay.plumtree_neighbours(), vec![*remote.key.id().data()]);
         local.overlay.delete_public_overlay(&id).unwrap();
         remote.overlay.delete_public_overlay(&id).unwrap();
@@ -2179,21 +2362,38 @@ mod transport_tests {
     async fn semiprivate_peer_address_stays_bound_to_overlay_transport() {
         let local = endpoint_with_profile(121, rtos_api::WireProfile::T0).await;
         let remote = endpoint_with_profile(122, rtos_api::WireProfile::T0).await;
-        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<rtos_block::ZeroizingBytes>::from_private_key(&[123; 32]).unwrap();
+        let transport: Arc<dyn KeyOption> = rtos_block::Ed25519KeyOption::<
+            rtos_block::ZeroizingBytes,
+        >::from_private_key(&[123; 32])
+        .unwrap();
         local.overlay.adnl.add_key(transport.clone(), 1).unwrap();
         let id = OverlayShortId::from_data([124; 32]);
         let roots = vec![transport.id().clone(), remote.key.id().clone()];
         for (endpoint, key) in [(&local, &transport), (&remote, &remote.key)] {
-            endpoint.overlay.add_semiprivate_overlay(OverlayParams::with_id_only(&id), Some(key),
-                &roots, &roots, None, 5, true).unwrap();
+            endpoint
+                .overlay
+                .add_semiprivate_overlay(
+                    OverlayParams::with_id_only(&id),
+                    Some(key),
+                    &roots,
+                    &roots,
+                    None,
+                    5,
+                    true,
+                )
+                .unwrap();
         }
         let node = remote.overlay.get_signed_node(&id, false).unwrap();
         let ip = IpAddress::from_versioned_string(&remote.addr.to_string(), None).unwrap();
         assert!(local.overlay.add_public_peer(&ip, &node, &id).unwrap().is_some());
-        assert!(local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap().is_some(),
-            "discovered peer must be reachable under the overlay transport identity");
-        assert!(local.overlay.adnl.peer_ip_address(local.key.id(), remote.key.id()).unwrap().is_none(),
-            "semiprivate discovery must not populate the unrelated default identity");
+        assert!(
+            local.overlay.adnl.peer_ip_address(transport.id(), remote.key.id()).unwrap().is_some(),
+            "discovered peer must be reachable under the overlay transport identity"
+        );
+        assert!(
+            local.overlay.adnl.peer_ip_address(local.key.id(), remote.key.id()).unwrap().is_none(),
+            "semiprivate discovery must not populate the unrelated default identity"
+        );
         local.overlay.delete_public_overlay(&id).unwrap();
         remote.overlay.delete_public_overlay(&id).unwrap();
     }
@@ -2202,37 +2402,74 @@ mod transport_tests {
     async fn target_peer_discovery_uses_native_request_with_flags_and_certificates() {
         use super::super::{Nodes, OverlayNodeInfo};
         use rtos_api::ton::rpc::overlay::GetRandomPeers;
-        for (semiprivate, original_sender) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (semiprivate, original_sender) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let endpoint = endpoint_with_profile(111, rtos_api::WireProfile::T0).await;
             let issuer = endpoint_with_profile(110, rtos_api::WireProfile::T0).await;
             let id = OverlayShortId::from_data([112; 32]);
             let certificate = if semiprivate && !original_sender {
                 let fields = rtos_api::ton::overlay::membercertificateid::MemberCertificateId {
-                    node: rtos_api::ton::adnl::id::short::Short { id: UInt256::from_slice(endpoint.key.id().data()) },
-                    flags: 0, slot: 0, expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
+                    node: rtos_api::ton::adnl::id::short::Short {
+                        id: UInt256::from_slice(endpoint.key.id().data()),
+                    },
+                    flags: 0,
+                    slot: 0,
+                    expire_at: (rtos_block::UnixTime::now() + 3600) as i32,
                 };
                 Some(rtos_api::ton::overlay::membercertificate::MemberCertificate {
-                    issued_by: (&issuer.key).try_into().unwrap(), flags: 0, slot: 0,
+                    issued_by: (&issuer.key).try_into().unwrap(),
+                    flags: 0,
+                    slot: 0,
                     expire_at: fields.expire_at,
-                    signature: issuer.key.sign(&serialize_boxed(&fields.into_boxed()).unwrap()).unwrap(),
+                    signature: issuer
+                        .key
+                        .sign(&serialize_boxed(&fields.into_boxed()).unwrap())
+                        .unwrap(),
                 })
-            } else { None };
-            if semiprivate {
-                let roots = if original_sender { vec![endpoint.key.id().clone()] } else { vec![issuer.key.id().clone()] };
-                endpoint.overlay.add_semiprivate_overlay(
-                    OverlayParams::with_id_only(&id), Some(&endpoint.key),
-                    &roots, &roots, certificate.clone(), 5, true,
-                ).unwrap();
             } else {
-                endpoint.overlay.add_local_workchain_overlay(OverlayParams::with_id_only(&id)).unwrap();
+                None
+            };
+            if semiprivate {
+                let roots = if original_sender {
+                    vec![endpoint.key.id().clone()]
+                } else {
+                    vec![issuer.key.id().clone()]
+                };
+                endpoint
+                    .overlay
+                    .add_semiprivate_overlay(
+                        OverlayParams::with_id_only(&id),
+                        Some(&endpoint.key),
+                        &roots,
+                        &roots,
+                        certificate.clone(),
+                        5,
+                        true,
+                    )
+                    .unwrap();
+            } else {
+                endpoint
+                    .overlay
+                    .add_local_workchain_overlay(OverlayParams::with_id_only(&id))
+                    .unwrap();
             }
             let mut cfg = config(&endpoint.key);
             cfg.fixed_members = false;
             cfg.original_sender = original_sender;
-            endpoint.subscriptions.lock().unwrap().push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
-            endpoint.overlay.configure_plumtree(&id, cfg, &tokio::runtime::Handle::current()).unwrap();
+            endpoint
+                .subscriptions
+                .lock()
+                .unwrap()
+                .push(endpoint.overlay.subscribe_broadcast(&id).unwrap());
+            endpoint
+                .overlay
+                .configure_plumtree(&id, cfg, &tokio::runtime::Handle::current())
+                .unwrap();
             let overlay = endpoint.overlay.get_overlay(&id, "target peer discovery").unwrap();
-            let peers = overlay.prepare_random_peers(&endpoint.key, overlay.use_v2_peer_advertisements()).unwrap();
+            let peers = overlay
+                .prepare_random_peers(&endpoint.key, overlay.use_v2_peer_advertisements())
+                .unwrap();
             let Nodes::V1(peers) = peers else {
                 panic!("pinned C++ target supports overlay.getRandomPeers, not getRandomPeersV2");
             };
@@ -2240,17 +2477,24 @@ mod transport_tests {
             // Only a public overlay adds its Plumtree flag; a certificated-member
             // overlay signs its configured flags.
             assert_eq!(peers.nodes[0].flags, if original_sender && !semiprivate { 2 } else { 0 });
-            assert_eq!(peers.nodes[0].certificate, certificate.clone().map(IntoBoxed::into_boxed).unwrap_or_default());
+            assert_eq!(
+                peers.nodes[0].certificate,
+                certificate.clone().map(IntoBoxed::into_boxed).unwrap_or_default()
+            );
             let bytes = rtos_api::WireProfile::T0.serialize(&GetRandomPeers { peers }).unwrap();
             // Native generated tos_api.h overlay_getRandomPeers::ID, baseline8812403.
             assert_eq!(&bytes[..4], &1223582891u32.to_le_bytes());
-            let parsed: GetRandomPeers = rtos_api::WireProfile::T0.deserialize_typed(&bytes).unwrap();
+            let parsed: GetRandomPeers =
+                rtos_api::WireProfile::T0.deserialize_typed(&bytes).unwrap();
             OverlayUtils::verify_node(&id, &parsed.peers.nodes[0]).unwrap();
             overlay.check_peer(endpoint.key.id(), certificate.as_ref()).unwrap();
             let mut forged = parsed.peers.nodes[0].clone();
             forged.flags ^= 2;
             assert!(OverlayUtils::verify_node(&id, &forged).is_err());
-            let OverlayNodeInfo::V1(node) = overlay.get_signed_node(&endpoint.key, false).unwrap() else { unreachable!() };
+            let OverlayNodeInfo::V1(node) = overlay.get_signed_node(&endpoint.key, false).unwrap()
+            else {
+                unreachable!()
+            };
             assert_eq!(node.flags, if original_sender && !semiprivate { 2 } else { 0 });
             endpoint.overlay.delete_public_overlay(&id).unwrap();
         }

@@ -2,7 +2,10 @@
 //! Real Engine context refusals at local read and authenticated write admission.
 use super::*;
 use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits};
-use std::{collections::BTreeMap, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use storage::archives::{
     bounded_read::ArchiveReadNotStarted,
     context::ArchiveContextError,
@@ -14,7 +17,9 @@ use storage::archives::{
 fn artifact_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn walk(root: &Path, path: &Path, inside: bool, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
         let inside = inside || path.file_name().is_some_and(|name| name == "archive");
-        if inside { out.insert(path.strip_prefix(root).unwrap().to_owned(), None); }
+        if inside {
+            out.insert(path.strip_prefix(root).unwrap().to_owned(), None);
+        }
         for entry in std::fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -23,7 +28,10 @@ fn artifact_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
             if kind.is_dir() {
                 walk(root, &path, inside, out);
             } else if inside {
-                out.insert(path.strip_prefix(root).unwrap().to_owned(), Some(std::fs::read(path).unwrap()));
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    Some(std::fs::read(path).unwrap()),
+                );
             }
         }
     }
@@ -114,7 +122,8 @@ async fn archive_context_actual_late_refusal_stops_authenticated_repair_effects(
 async fn refusal_cases(late: bool) {
     for epoch in [false, true] {
         for mode in 0..3 {
-            let Fixture { dir, engine, parent, target, request } = fixture_backend(false, epoch).await;
+            let Fixture { dir, engine, parent, target, request } =
+                fixture_backend(false, epoch).await;
             let mut gate = None;
             let mut task = None;
             let run = std::panic::AssertUnwindSafe(async {
@@ -202,8 +211,12 @@ async fn refusal_cases(late: bool) {
                     engine.db().has_repair_state_index(target.id()).unwrap()), indexes);
                 eprintln!("context_refusal epoch={epoch} late={late} mode={mode} typed={expected:?} publication_fallback=0 history_fallback=0 after_admission=0 syncs=0 artifacts_unchanged=true state_unchanged=true");
             }).catch_unwind().await;
-            if let Some(gate) = gate { gate.release.add_permits(1); }
-            if let Some(task) = task { let _ = task.await; }
+            if let Some(gate) = gate {
+                gate.release.add_permits(1);
+            }
+            if let Some(task) = task {
+                let _ = task.await;
+            }
             engine.db().set_publication_sync_observer(None);
             // A pre-gate error leaves a registry entry; remove only after the
             // actual Engine-owned worker has terminated, not just its observer.

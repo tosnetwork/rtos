@@ -157,6 +157,15 @@ pub fn derive_consensus_key_id(algorithm_id: u16, public_key: &[u8]) -> UInt256 
     UInt256::from(sha256_digest(&preimage))
 }
 
+/// Admitted-suite derivation, matching C++ derive_key_id. The raw commitment
+/// above remains available for decoding and diagnosing unadmitted descriptors.
+pub fn try_derive_consensus_key_id(algorithm_id: u16, public_key: &[u8]) -> Option<UInt256> {
+    if algorithm_id != MLDSA44_ALGORITHM_ID || public_key.len() != MLDSA44_PUBLIC_KEY_BYTES {
+        return None;
+    }
+    Some(derive_consensus_key_id(algorithm_id, public_key))
+}
+
 /// The post-quantum consensus key a validator currently holds.
 ///
 /// This describes a key and nothing else. The validator that holds it is named by
@@ -472,6 +481,18 @@ validators_ext#12
 */
 
 define_HashmapE! {ValidatorDescriptions, 16, ValidatorDescr}
+
+// Match the reference's maximal-index check before reading descriptors. The
+// subsequent dense 0..total reads prove there are no gaps or hidden entries.
+fn check_validator_dictionary_total(values: &ValidatorDescriptions, total: u16) -> Result<()> {
+    let last = values.0.find_leaf(u16::MAX.write_to_bitstring()?, false, true, false, &mut 0)?;
+    let (key, _) = last.ok_or_else(|| crate::error!("empty validator dictionary"))?;
+    let key = u16::construct_from(&mut SliceData::load_builder(key)?)?;
+    if u32::from(key) + 1 != u32::from(total) {
+        fail!("validator dictionary maximal index differs from total");
+    }
+    Ok(())
+}
 
 ///
 /// ValidatorSet
@@ -808,6 +829,7 @@ impl Deserializable for ValidatorSet {
             self.total_weight = u64::construct_from(cell)?;
             validators.read_from(cell)?; // HashmapE
         }
+        check_validator_dictionary_total(&validators, self.total.as_u16())?;
         self.list.clear();
         let mut total_weight = 0;
         for i in 0..self.total.as_u16() {

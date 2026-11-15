@@ -18,6 +18,13 @@ pub mod server;
 pub mod telemetry;
 #[cfg(feature = "node")]
 pub mod transport;
+pub(crate) mod wire;
+pub mod wire_keys;
 
 #[cfg(feature = "node")]
 pub(crate) mod tasks;
+
+pub mod packet;
+
+pub mod channel;
+pub mod routing;

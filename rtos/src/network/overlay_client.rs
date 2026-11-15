@@ -1147,13 +1147,20 @@ async fn resolve_peer_ips(
         // membership/signature checks remain identical to ordinary discovery.
         match ctx.overlay_node().add_public_peer_from_known_adnl(peer.node(), &ctx.id) {
             Ok(Some(key)) => {
-                log::debug!("{}: resolve_peer_ips: reused known ADNL address for peer {key}", ctx.id);
+                log::debug!(
+                    "{}: resolve_peer_ips: reused known ADNL address for peer {key}",
+                    ctx.id
+                );
                 ctx.neighbours_manager.add_overlay_peer(key);
                 continue;
             }
             Ok(None) => {}
             Err(error) => {
-                log::warn!("{}: known ADNL peer {} admission failed: {error}", ctx.id, peer.key_id());
+                log::warn!(
+                    "{}: known ADNL peer {} admission failed: {error}",
+                    ctx.id,
+                    peer.key_id()
+                );
                 continue;
             }
         }

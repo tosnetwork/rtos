@@ -196,12 +196,16 @@ async fn liteserver_transaction_boundary_reference() -> Result<()> {
                     .map_err(|_| error!("reference error, Rust success"))?;
                 if count < 0 {
                     assert!(
-                        error.message().contains("negative"),
+                        error.message().as_str().unwrap().contains("negative"),
                         "negative count is rejected before workchain validation"
                     );
                 }
                 if workchain == INVALID_WORKCHAIN_ID && count >= 0 {
-                    assert!(error.message().contains("invalid workchain specified"));
+                    assert!(error
+                        .message()
+                        .as_str()
+                        .unwrap()
+                        .contains("invalid workchain specified"));
                 }
             } else {
                 let mut bytes = unhex(fields[1]);
@@ -306,7 +310,7 @@ async fn liteserver_one_transaction_boundary_reference() -> Result<()> {
                         "{name}: public error code"
                     );
                     let error = reply.downcast::<ErrorEnum>().expect("wrong workchain is an error");
-                    if !error.message().contains("cannot contain account") {
+                    if !error.message().as_str().unwrap().contains("cannot contain account") {
                         failures.push(format!("{name}: {}", error.message()));
                     }
                     continue;
@@ -446,9 +450,9 @@ async fn liteserver_transaction_error_reference() -> Result<()> {
                         let category_matches = if variant == "positive-count-truncated"
                             || variant.starts_with("count-truncated-")
                         {
-                            !error.message().contains("negative")
+                            !error.message().as_str().unwrap().contains("negative")
                         } else {
-                            error.message().contains(message)
+                            error.message().as_str().unwrap().contains(message)
                         };
                         if !category_matches {
                             failures
@@ -512,7 +516,7 @@ async fn liteserver_transaction_decode_profile_boundaries() -> Result<()> {
             let bytes = serialize_boxed(&reply)?;
             let error = reply.downcast::<ErrorEnum>().expect("decode error is a public reply");
             assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
-            assert_eq!(error.message().contains("negative"), count < 0);
+            assert_eq!(error.message().as_str().unwrap().contains("negative"), count < 0);
         }
     }
     for profile in [WireProfile::Legacy, WireProfile::T0] {
@@ -540,7 +544,7 @@ async fn liteserver_transaction_decode_profile_boundaries() -> Result<()> {
                 i32::from_le_bytes(bytes[4..8].try_into().unwrap()),
                 fields[2].parse::<i32>()?
             );
-            assert!(!error.message().contains("negative"));
+            assert!(!error.message().as_str().unwrap().contains("negative"));
         }
     }
     for constructor in [GetOneTransaction::constructor_const(), 0xdeadbeef] {

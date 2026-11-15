@@ -98,7 +98,10 @@ fn ld_int(engine: &mut Engine, name: &'static str, mut len: usize, how: u8) -> S
 fn ld_slice(engine: &mut Engine, name: &'static str, mut len: usize, how: u8) -> Status {
     load_slice(engine, name, &mut len, how)?;
     proc_slice(engine, len, how, |slice, _| {
-        let value = slice.get_next_slice(len)?;
+        let mut value = slice.clone();
+        value.shrink_data(..len);
+        value.shrink_references(..0)?;
+        slice.move_by(len)?;
         Ok(StackItem::Slice(value))
     })
 }
@@ -558,7 +561,7 @@ fn schkbits(engine: &mut Engine, name: &'static str, limit: usize, quiet: bool) 
 fn schkrefs(engine: &mut Engine, name: &'static str, quiet: bool) -> Status {
     engine.load_instruction(Instruction::new(name))?;
     fetch_stack(engine, 2)?;
-    let r = engine.cmd.var(0).as_integer_value(0..=4)?;
+    let r = engine.cmd.var(0).as_integer_value(0..=1023)?;
     let s = engine.cmd.var(1).as_slice()?;
     let refs_count = s.remaining_references();
     if quiet {
@@ -836,7 +839,7 @@ fn datasize(engine: &mut Engine, name: &'static str, how: u8) -> Status {
     if let Ok(slice) = engine.cmd.var(1).as_slice() {
         refs = slice.remaining_references();
         bits = slice.remaining_bits();
-        for i in 0..slice.remaining_references() {
+        for i in (0..slice.remaining_references()).rev() {
             if let Ok(cell) = slice.reference(i) {
                 cell_stack.push(cell);
             }
@@ -854,7 +857,7 @@ fn datasize(engine: &mut Engine, name: &'static str, how: u8) -> Status {
             let slice = engine.load_hashed_cell(cell, false)?;
             refs = refs.saturating_add(slice.remaining_references());
             bits = bits.saturating_add(slice.remaining_bits());
-            for i in 0..slice.remaining_references() {
+            for i in (0..slice.remaining_references()).rev() {
                 if let Ok(cell) = slice.reference(i) {
                     cell_stack.push(cell);
                 }

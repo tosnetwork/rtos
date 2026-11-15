@@ -715,7 +715,13 @@ fn try_delete_active_account(mut acc: Account, bounce: bool) -> Account {
         acc_balance_before + if bounce { 0 } else { msg_income as u128 },
     ));
     good_trans.orig_status = AccountStatus::AccStateActive;
-    good_trans.set_end_status(AccountStatus::AccStateUninit);
+    // The state is physically uninit when its frozen hash equals its address;
+    // v12 retains the logical frozen status in the transaction.
+    good_trans.set_end_status(if BLOCKCHAIN_CONFIG.block_version() < 13 {
+        AccountStatus::AccStateFrozen
+    } else {
+        AccountStatus::AccStateUninit
+    });
     good_trans.set_logical_time(BLOCK_LT + 2);
     good_trans.set_now(BLOCK_UT);
 

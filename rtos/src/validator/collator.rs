@@ -949,6 +949,7 @@ impl ExecutionManager {
             tokio::sync::mpsc::unbounded_channel::<(Arc<AsyncMessage>, Option<MsgMetadata>)>();
         let engine = self.engine.clone();
         let dict_hash_min_cells = self.config.size_limits_config().acc_state_cells_for_storage_dict;
+        let block_version = self.config.block_version();
         let lt_compatible = self.lt_compatible;
         let cancel_ext = self.cancel_ext.clone();
         let handle = tokio::spawn(async move {
@@ -965,6 +966,7 @@ impl ExecutionManager {
                     full_collated_data,
                     lt_compatible,
                     dict_hash_min_cells,
+                    block_version,
                 )
             });
             let mut account_stuff: Option<ShardAccountStuff> = None;

@@ -3,8 +3,10 @@
 //! real Released close and its durable custody lease: the fresh path, a stop
 //! or restart at every boundary, custody refusals on resume, a busy or
 //! uncertain lease release, and uncertain journal writes.
-use super::retirement_preparation::{pin_floor, store_synthetic_mc_state};
-use super::*;
+use super::{
+    retirement_preparation::{pin_floor, store_synthetic_mc_state},
+    *,
+};
 use crate::{
     propagation_outbox::closing::ClosingRecord,
     publication_dependency_leases::LeaseBinding,

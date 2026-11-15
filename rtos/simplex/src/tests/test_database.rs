@@ -806,7 +806,10 @@ fn pq_strict_bootstrap_preserves_records_and_classical_loader_policy() {
         block_id: create_block_id(3),
         parent: Some(missing_parent.clone()),
         is_final: true,
-    }).unwrap().wait().unwrap();
+    })
+    .unwrap()
+    .wait()
+    .unwrap();
     let sparse = load().unwrap();
     assert_eq!(sparse.finalized_blocks.len(), 2);
     assert_eq!(sparse.finalized_blocks[1].candidate_id, sparse_id);

@@ -12,6 +12,41 @@ use super::*;
 use crate::Serializable;
 
 #[test]
+fn pruned_dictionary_lookup_is_not_an_absent_key() -> Result<()> {
+    let mut full = HashmapE::with_bit_len(8);
+    let key = SliceData::from_raw(vec![0xff], 8);
+    full.set(key.clone(), &SliceData::new(vec![0xaa, 0x80]))?;
+    let root = full.data().unwrap();
+    let pruned = crate::MerkleUpdate::make_pruned_branch_cell(root, 0)?.into_cell()?.virtualize(1);
+    let partial = HashmapE::with_hashmap(8, Some(pruned));
+    for key in [key, SliceData::from_raw(vec![0], 8)] {
+        let error = partial.get(key).expect_err("unknown pruned contents must not become absence");
+        assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+    }
+    Ok(())
+}
+
+#[test]
+fn pruned_dictionary_child_preserves_known_sibling() -> Result<()> {
+    let left = SliceData::from_raw(vec![0], 8);
+    let right = SliceData::from_raw(vec![0xff], 8);
+    let value = SliceData::new(vec![0xaa, 0x80]);
+    let mut full = HashmapE::with_bit_len(8);
+    full.set(left.clone(), &value)?;
+    full.set(right.clone(), &value)?;
+    let root = full.data().unwrap();
+    let mut partial = BuilderData::from_cell(root)?;
+    let pruned =
+        crate::MerkleUpdate::make_pruned_branch_cell(&root.reference(1)?, 0)?.into_cell()?;
+    partial.replace_reference_cell(1, pruned);
+    let partial = HashmapE::with_hashmap(8, Some(partial.into_cell()?.virtualize(1)));
+    assert_eq!(partial.get(left)?, Some(value));
+    let error = partial.get(right).expect_err("a pruned child is unknown");
+    assert_eq!(error.downcast_ref::<ExceptionCode>(), Some(&ExceptionCode::PrunedCellAccess));
+    Ok(())
+}
+
+#[test]
 fn test_hmlabel() {
     fn check_label(key: SliceData, max: usize, value: usize) {
         let label = hm_label(&key, max).unwrap();

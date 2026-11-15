@@ -131,8 +131,10 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retained_finality_cancelled_waiter_keeps_source_io_owned() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
         let engine = Arc::new(IoEngine(crate::types::service_tasks::ServiceTasks::new(Arc::new(
             crate::engine::Stopper::default(),
         ))));

@@ -35,7 +35,10 @@ fn write_config_durable(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         match options.open(&temporary) {
             Ok(file) => break (temporary, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -44,7 +47,9 @@ fn write_config_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     };
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
-        if let Some(permissions) = permissions { file.set_permissions(permissions)?; }
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, &path)?;
@@ -52,7 +57,9 @@ fn write_config_durable(path: &Path, bytes: &[u8]) -> Result<()> {
         Ok(())
     })();
     // Never remove the published destination after an uncertain directory sync.
-    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
     result
 }
 
@@ -1363,7 +1370,10 @@ impl TonNodeConfig {
                 shards.push(serde_json::Value::Object(map));
             }
             let mut map = serde_json::Map::new();
-            map.insert("name".to_string(), serde_json::Value::String(overlay.name.clone()));
+            map.insert(
+                "name".to_string(),
+                serde_json::Value::String(overlay.name.as_str()?.to_owned()),
+            );
             map.insert("nodes".to_string(), serde_json::Value::Array(nodes));
             map.insert("sender_shards".to_string(), serde_json::Value::Array(shards));
             map.insert(
@@ -1428,7 +1438,7 @@ impl TonNodeConfig {
             Err(_) => false,
         };
         let overlay = CustomOverlay {
-            name,
+            name: name.into(),
             nodes,
             sender_shards,
             skip_public_msg_send: skip_public_msg_send.into(),
@@ -2877,6 +2887,9 @@ impl NodeConfigHandler {
         config: &mut TonNodeConfig,
         overlay: CustomOverlay,
     ) -> Result<CustomOverlaysConfigBoxed> {
+        // Reject non-text names before mutating actor state. A rejected value
+        // must not poison subsequent valid configuration saves.
+        overlay.name.as_str()?;
         let CustomOverlaysConfigBoxed::Engine_Validator_CustomOverlaysConfig(conf) =
             &mut config.custom_overlays;
         conf.overlays.push(overlay);

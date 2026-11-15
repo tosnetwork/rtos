@@ -173,10 +173,12 @@ async fn historical_closing_first_cold_full_canonical_recovers_without_source_ru
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!(
+            .unwrap_or_else(|_| {
+                panic!(
                 "ordinary state must finish persistence before GC: {id}; saved={}, contains={:?}",
                 handle.has_saved_state(), engine.db().test_contains_dynamic_state_record(id)
-            ));
+            )
+            });
             assert!(engine.db().test_contains_dynamic_state_record(id).unwrap());
         }
         engine.shard_states_keeper().test_retire_history_state(&target);

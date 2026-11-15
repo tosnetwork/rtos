@@ -85,6 +85,14 @@ use std::{
 };
 
 mod broadcast;
+mod clock;
+#[cfg(test)]
+mod transport_tests;
+pub use clock::{BroadcastClock, SystemBroadcastClock};
+mod transport;
+pub use transport::{
+    BroadcastTransportMethod, FixedMemberOverlayOptions, OverlayBroadcastTransport,
+};
 mod plumtree;
 mod privacy;
 use broadcast::{
@@ -120,7 +128,8 @@ impl Drop for BroadcastSubscription {
     }
 }
 
-pub use plumtree::PlumtreeConfig;
+pub use plumtree::{PlumtreeConfig, PlumtreeRefusal};
+pub mod records;
 
 const TARGET: &str = "overlay";
 const TARGET_BROADCAST: &str = "overlay_broadcast";
@@ -293,7 +302,7 @@ impl OverlayUtils {
         sorted.dedup();
         let id = CustomOverlayId {
             zero_state_file_hash: UInt256::with_array(*zero_state_file_hash),
-            name: name.to_string(),
+            name: name.to_string().into(),
             nodes: sorted.into_iter().collect(),
         };
         let overlay_key = OverlayKey { name: hash(id)?.to_vec() };
@@ -320,7 +329,7 @@ impl OverlayUtils {
         overlay_id: &Arc<OverlayShortId>,
         node: &T,
     ) -> Result<()> {
-        if (node.flags() as u32) & !3 != 0 {
+        if !records::MemberFlags::valid(node.flags() as u32) {
             fail!("Unsupported overlay member flags {}", node.flags())
         }
         let key: Arc<dyn KeyOption> = node.get_key()?;
@@ -435,6 +444,8 @@ enum OverlayType {
         key: Arc<dyn KeyOption>,
         use_quic: bool,
         bcast_check: Option<Arc<dyn BroadcastCheck>>,
+        fixed_member_list: bool,
+        twostep_enabled: bool,
     },
     // Overlay with externally certified members
     CertifiedMembers {
@@ -513,6 +524,18 @@ impl OverlayType {
         matches!(self, OverlayType::Private { .. })
     }
 
+    fn is_fixed_member_list(&self) -> bool {
+        matches!(self, OverlayType::Private { fixed_member_list: true, .. })
+    }
+
+    fn twostep_sender_enabled(&self) -> bool {
+        matches!(self, Self::Private { fixed_member_list: true, twostep_enabled: true, .. })
+    }
+
+    fn accepts_twostep(&self) -> bool {
+        !self.is_fixed_member_list() || self.twostep_sender_enabled()
+    }
+
     fn has_certified_members(&self) -> bool {
         matches!(self, OverlayType::CertifiedMembers { .. })
     }
@@ -568,6 +591,8 @@ declare_counted!(
         options: Arc<AtomicU32>,
         overlay_type: OverlayType,
         wire_profile: rtos_api::WireProfile,
+        clock: Arc<dyn BroadcastClock>,
+        broadcast_transport: Option<Arc<dyn OverlayBroadcastTransport>>,
         flags: u8,
         hops: Option<u8>,
         // All known peers in overlay (for private overlay - all peers except ourself)
@@ -626,6 +651,10 @@ declare_counted!(
 );
 
 impl Overlay {
+    fn broadcast_time(&self) -> i32 {
+        self.clock.unix_seconds() as u32 as i32
+    }
+
     const MEMBER_DO_NOT_RECEIVE_BROADCASTS: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_BROADCASTS;
     const MEMBER_DO_NOT_RECEIVE_PLUMTREE: u32 = OverlayNode::MEMBER_DO_NOT_RECEIVE_PLUMTREE;
     const MEMBER_PLUMTREE_DENY: u32 =
@@ -640,8 +669,11 @@ impl Overlay {
         if !self.overlay_type.is_public() {
             return configured;
         }
-        let plumtree_receiver = self.plumtree.get().is_some_and(|p| !p.original_sender);
-        configured | if plumtree_receiver { 0 } else { Self::MEMBER_DO_NOT_RECEIVE_PLUMTREE }
+        records::MemberFlags::public_flags(
+            configured,
+            self.plumtree.get().is_some(),
+            self.plumtree.get().is_some_and(|p| p.original_sender),
+        )
     }
 
     const FLAG_OVERLAY_OTHER_WORKCHAIN: u8 = 0x01;
@@ -677,9 +709,9 @@ impl Overlay {
         let Ok(certificate) = OverlayCertificate::from_tl(certificate) else {
             return BroadcastCheckResult::Forbidden;
         };
-        self.verifier.check_source_eligible(
+        self.verifier.check_source_eligible_at(
             &policy.rules(),
-            false,
+            self.overlay_type.is_private(),
             self.overlay_id.data(),
             source.id().data(),
             certificate.as_ref(),
@@ -687,6 +719,8 @@ impl Overlay {
             is_fec,
             is_any_sender,
             Some(from),
+            self.broadcast_time(),
+            Instant::now(),
         )
     }
 
@@ -700,7 +734,8 @@ impl Overlay {
     }
 
     /// Sender admission of an ordinary broadcast: `Forbidden` is refused,
-    /// `NeedCheck` must pass the application check on the local payload.
+    /// `NeedCheck` passes the application check here unless local protocol
+    /// processing owns that check together with delivery and propagation.
     async fn admit_ordinary_send(
         &self,
         source: &Arc<dyn KeyOption>,
@@ -708,14 +743,15 @@ impl Overlay {
         data: &[u8],
         is_fec: bool,
         is_any_sender: bool,
+        check_in_local_protocol: bool,
     ) -> Result<()> {
         let Some(policy) = &self.public_policy else {
             return Ok(());
         };
         let size = u32::try_from(data.len()).map_err(|_| error!("Broadcast is too large"))?;
-        let verdict = self.verifier.check_source_eligible(
+        let verdict = self.verifier.check_source_eligible_at(
             &policy.rules(),
-            false,
+            self.overlay_type.is_private(),
             self.overlay_id.data(),
             source.id().data(),
             certificate,
@@ -723,9 +759,12 @@ impl Overlay {
             is_fec,
             is_any_sender,
             None,
+            self.broadcast_time(),
+            Instant::now(),
         );
         match verdict {
             BroadcastCheckResult::Allowed => Ok(()),
+            BroadcastCheckResult::NeedCheck if check_in_local_protocol => Ok(()),
             BroadcastCheckResult::NeedCheck => policy.check(source.id(), data).await,
             BroadcastCheckResult::Forbidden => {
                 fail!(
@@ -845,6 +884,10 @@ impl Overlay {
                 neighbours.push(node);
             }
             neighbour = self.known_peers.next(&mut iter);
+        }
+        if self.wire_profile == rtos_api::WireProfile::T0 {
+            // CPP iterates its peer DecTree in key order when assigning parts.
+            neighbours.sort_unstable_by(|a, b| a.data().cmp(b.data()));
         }
         neighbours
     }
@@ -967,24 +1010,32 @@ impl Overlay {
                 biased;
                 _ = self.tasks.cancelled() => fail!("Overlay retired during broadcast distribution"),
                 result = async {
-                    Ok::<_, anyhow::Error>(
-                    match method {
-                BroadcastSendMethod::Fast => {
-                    self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err()
-                }
-                BroadcastSendMethod::QuicOrRldp => {
-                    if let Some(quic) = self.quic.as_ref() {
-                        quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
-                    } else if let Some(rldp) = self.rldp.as_ref() {
-                        rldp.message(data, peers, true, None).await.err()
-                    } else {
-                        fail!("Neither QUIC nor RLDP sender is set in overlay {}", self.overlay_id);
+                    if let Some(transport) = &self.broadcast_transport {
+                        let method = match method {
+                            BroadcastSendMethod::Fast => BroadcastTransportMethod::Datagram,
+                            BroadcastSendMethod::Safe => BroadcastTransportMethod::Stream,
+                            BroadcastSendMethod::TwostepUnreliable => BroadcastTransportMethod::Sender { reliable: false },
+                            BroadcastSendMethod::TwostepReliable => BroadcastTransportMethod::Sender { reliable: true },
+                        };
+                        return Ok::<_, anyhow::Error>(
+                            transport.send_message(data.object, peers, method).await.err(),
+                        );
                     }
-                }
-                BroadcastSendMethod::Safe => {
-                    self.adnl.send_custom_get_status(data, peers, AdnlSendMethod::Safe).await.err()
-                }
-            })
+                    Ok(match method {
+                        BroadcastSendMethod::Fast | BroadcastSendMethod::TwostepUnreliable => self.adnl
+                            .send_custom_get_status(data, peers, AdnlSendMethod::Fast).await.err(),
+                        BroadcastSendMethod::TwostepReliable => {
+                            if let Some(quic) = &self.quic {
+                                quic.message(data.object.to_vec(), Some(&self.adnl), peers).await.err()
+                            } else if let Some(rldp) = &self.rldp {
+                                rldp.message(data, peers, true, None).await.err()
+                            } else {
+                                fail!("Neither QUIC nor RLDP sender is set in overlay {}", self.overlay_id);
+                            }
+                        }
+                        BroadcastSendMethod::Safe => self.adnl
+                            .send_custom_get_status(data, peers, AdnlSendMethod::Safe).await.err(),
+                    })
                 } => result?,
             };
             if let Some(e) = err {
@@ -1281,7 +1332,12 @@ impl Overlay {
     }
 
     fn try_add_peer(&self, our_key: &Arc<KeyId>, peer: &Arc<KeyId>) -> Result<bool> {
-        if self.adnl.have_peer(our_key, peer)? {
+        if self
+            .broadcast_transport
+            .as_ref()
+            .is_some_and(|transport| transport.has_peer(our_key.data(), peer.data()))
+            || self.adnl.have_peer(our_key, peer)?
+        {
             self.known_peers.add(peer)?;
             Ok(true)
         } else {
@@ -1310,7 +1366,7 @@ impl Overlay {
     // }
 
     fn validate_certificate(&self, peer: &Arc<KeyId>, cert: &MemberCertificate) -> Result<()> {
-        let utime = UnixTime::now() as u32;
+        let utime = UnixTime::now();
         let (max_slaves, root_public_keys) =
             if let OverlayType::CertifiedMembers { max_slaves, root_public_keys, .. } =
                 &self.overlay_type
@@ -1322,7 +1378,7 @@ impl Overlay {
 
         // 1) Expire check
         // "3" is a magic gap from cpp implementation
-        if (cert.expire_at as u32) < utime - 3 {
+        if records::certificate_expired(cert.expire_at, utime as f64) {
             fail!("Certificate is expired, expire_at: {}, current time: {}", cert.expire_at, utime);
         }
 
@@ -1624,6 +1680,8 @@ pub struct OverlayNode {
     generations: std::sync::Mutex<()>,
     retired: std::sync::Mutex<HashMap<Arc<OverlayShortId>, std::sync::Weak<AdnlTasks>>>,
     wire_profile: rtos_api::WireProfile,
+    clock: Arc<dyn BroadcastClock>,
+    broadcast_transport: OnceLock<Arc<dyn OverlayBroadcastTransport>>,
     adnl: Arc<AdnlNode>,
     consumers: lockfree::map::Map<Arc<OverlayShortId>, ConsumerObject>,
     node_key: Arc<dyn KeyOption>,
@@ -1647,6 +1705,7 @@ impl Drop for OverlayNode {
 
 impl OverlayNode {
     pub const FLAG_BCAST_ANY_SENDER: u32 = 0x01;
+    pub const FLAG_BCAST_NO_TWOSTEP: u32 = 0x100;
     #[cfg(feature = "xp25")]
     pub const FLAG_BCAST_REPEATED: u32 = 0x80;
 
@@ -1684,6 +1743,23 @@ impl OverlayNode {
         key_tag: usize,
         wire_profile: rtos_api::WireProfile,
     ) -> Result<Arc<Self>> {
+        Self::with_params_profile_and_clock(
+            adnl,
+            zero_state_file_hash,
+            key_tag,
+            wire_profile,
+            Arc::new(SystemBroadcastClock),
+        )
+    }
+
+    /// Bind a broadcast wall clock before any overlay or owned task is created.
+    pub fn with_params_profile_and_clock(
+        adnl: Arc<AdnlNode>,
+        zero_state_file_hash: &[u8; 32],
+        key_tag: usize,
+        wire_profile: rtos_api::WireProfile,
+        clock: Arc<dyn BroadcastClock>,
+    ) -> Result<Arc<Self>> {
         let node_key = adnl.key_by_tag(key_tag)?;
         #[cfg(feature = "telemetry")]
         let telemetry = OverlayTelemetry {
@@ -1712,6 +1788,8 @@ impl OverlayNode {
             #[cfg(test)]
             receive_admission_gate: std::sync::Mutex::new(None),
             wire_profile,
+            clock,
+            broadcast_transport: OnceLock::new(),
             adnl,
             consumers: lockfree::map::Map::new(),
             node_key,
@@ -1747,6 +1825,21 @@ impl OverlayNode {
     }
     pub fn wire_profile(&self) -> rtos_api::WireProfile {
         self.wire_profile
+    }
+
+    /// Bind the network edge before creating the first overlay. Every overlay
+    /// generation keeps its original transport until its tasks drain.
+    pub fn install_broadcast_transport(
+        &self,
+        transport: Arc<dyn OverlayBroadcastTransport>,
+    ) -> Result<()> {
+        let _generation = self.generations.lock().unwrap();
+        if self.overlays.iter().next().is_some() {
+            fail!("Broadcast transport must be installed before overlays");
+        }
+        self.broadcast_transport
+            .set(transport)
+            .map_err(|_| error!("Broadcast transport is already bound"))
     }
 
     /// Add overlay data consumer
@@ -1823,6 +1916,9 @@ impl OverlayNode {
         rules: OverlayPrivacyRules,
     ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Setting privacy rules of unknown overlay")?;
+        if !overlay.overlay_type.is_public() {
+            fail!("Public privacy rule update requires a public overlay");
+        }
         let Some(policy) = &overlay.public_policy else {
             fail!("Overlay {overlay_id} was created without privacy rules");
         };
@@ -1873,6 +1969,15 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>,
         check: Option<Arc<dyn PublicBroadcastCheck>>,
     ) -> Result<()> {
+        self.set_broadcast_check(overlay_id, check)
+    }
+
+    /// Bind the application check of a public or fixed-member broadcast policy.
+    pub fn set_broadcast_check(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        check: Option<Arc<dyn PublicBroadcastCheck>>,
+    ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Setting broadcast check of unknown overlay")?;
         let Some(policy) = &overlay.public_policy else {
             fail!("Overlay {overlay_id} was created without privacy rules");
@@ -1895,8 +2000,57 @@ impl OverlayNode {
         use_quic: bool,
         bcast_check: Option<Arc<dyn BroadcastCheck>>,
     ) -> Result<bool> {
-        let overlay_type = OverlayType::Private { key: overlay_key.clone(), use_quic, bcast_check };
+        let overlay_type = OverlayType::Private {
+            key: overlay_key.clone(),
+            use_quic,
+            bcast_check,
+            fixed_member_list: false,
+            twostep_enabled: true,
+        };
         self.add_typed_private_overlay(overlay_type, params, peers)
+    }
+
+    /// Fixed members with ordinary broadcast source rules. Membership still
+    /// passes the ordinary private-overlay peer check; source certificates do
+    /// not expand authority in a fixed-member overlay.
+    pub fn add_fixed_member_overlay(
+        &self,
+        params: OverlayParams,
+        overlay_key: &Arc<dyn KeyOption>,
+        peers: &[Arc<KeyId>],
+        rules: OverlayPrivacyRules,
+    ) -> Result<bool> {
+        self.add_fixed_member_overlay_with_options(
+            params,
+            overlay_key,
+            peers,
+            rules,
+            FixedMemberOverlayOptions::default(),
+        )
+    }
+
+    pub fn add_fixed_member_overlay_with_options(
+        &self,
+        params: OverlayParams,
+        overlay_key: &Arc<dyn KeyOption>,
+        peers: &[Arc<KeyId>],
+        rules: OverlayPrivacyRules,
+        options: FixedMemberOverlayOptions,
+    ) -> Result<bool> {
+        let sender_available = self.broadcast_transport.get().is_some()
+            || if options.use_quic { self.quic.get().is_some() } else { self.rldp.get().is_some() };
+        let twostep_enabled = options.twostep && sender_available;
+        if options.twostep && !sender_available {
+            log::warn!(target: TARGET, "Two-step sender is not set; retaining ordinary broadcasts");
+        }
+        let overlay_type = OverlayType::Private {
+            key: overlay_key.clone(),
+            use_quic: options.use_quic,
+            bcast_check: None,
+            fixed_member_list: true,
+            twostep_enabled,
+        };
+        self.add_typed_private_overlay_with_rules(overlay_type, params, peers, Some(rules))
     }
 
     /// Add private peers to ADNL layer
@@ -2066,9 +2220,47 @@ impl OverlayNode {
         flags: u32,
         method: AdnlSendMethod,
     ) -> Result<BroadcastSendInfo> {
+        self.broadcast_impl(overlay_id, data, src_key, flags, method, false).await
+    }
+
+    /// Explicit FEC carrier, including payloads small enough for a simple carrier.
+    pub async fn broadcast_fec(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        data: &TaggedByteSlice<'_>,
+        src_key: Option<&Arc<dyn KeyOption>>,
+        flags: u32,
+    ) -> Result<BroadcastSendInfo> {
+        self.broadcast_impl(overlay_id, data, src_key, flags, AdnlSendMethod::Fast, true).await
+    }
+
+    async fn broadcast_impl(
+        &self,
+        overlay_id: &Arc<OverlayShortId>,
+        data: &TaggedByteSlice<'_>,
+        src_key: Option<&Arc<dyn KeyOption>>,
+        flags: u32,
+        method: AdnlSendMethod,
+        force_fec: bool,
+    ) -> Result<BroadcastSendInfo> {
         log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let overlay = self.get_overlay(overlay_id, "Trying broadcast to unknown overlay")?;
         let _lease = overlay.tasks.enter()?;
+        let is_fec = force_fec
+            || (matches!(&method, AdnlSendMethod::Fast)
+                && data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST);
+        if is_fec
+            && self.wire_profile == rtos_api::WireProfile::T0
+            && overlay.overlay_type.twostep_sender_enabled()
+            && flags & Self::FLAG_BCAST_NO_TWOSTEP == 0
+        {
+            return self.broadcast_twostep(overlay_id, data, src_key, flags, Vec::new()).await;
+        }
+        let flags = if self.wire_profile == rtos_api::WireProfile::T0 {
+            flags & !Self::FLAG_BCAST_NO_TWOSTEP
+        } else {
+            flags
+        };
         let src_key = self.calc_src_key_for_broadcast(&overlay, src_key);
         let certificate = overlay.local_certificate(src_key.id());
         let mut ctx = BroadcastSendContext {
@@ -2085,9 +2277,7 @@ impl OverlayNode {
         if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
             check.on_send(ctx.src_key.id(), data.object.len())?;
         }
-        let is_fec = matches!(&method, AdnlSendMethod::Fast)
-            && data.object.len() > Self::MAX_SIZE_ORDINARY_BROADCAST;
-        if !is_fec {
+        if !is_fec && self.wire_profile == rtos_api::WireProfile::Legacy {
             // Ignore ANY_SENDER flag for non-FEC broadcasts
             ctx.flags &= !Self::FLAG_BCAST_ANY_SENDER;
         }
@@ -2098,6 +2288,8 @@ impl OverlayNode {
                 data.object,
                 is_fec,
                 (ctx.flags & Self::FLAG_BCAST_ANY_SENDER) != 0,
+                self.wire_profile == rtos_api::WireProfile::T0
+                    && matches!(method, AdnlSendMethod::Fast),
             )
             .await?;
         if is_fec {
@@ -2137,11 +2329,37 @@ impl OverlayNode {
         if let OverlayType::Private { bcast_check: Some(check), .. } = &overlay.overlay_type {
             check.on_send(ctx.src_key.id(), data.object.len())?;
         }
+        if self.wire_profile == rtos_api::WireProfile::T0 {
+            overlay
+                .admit_ordinary_send(
+                    ctx.src_key,
+                    overlay.local_certificate(src_key.id()).as_ref(),
+                    data.object,
+                    true,
+                    false,
+                    true,
+                )
+                .await?;
+        }
         let neighbours = overlay.calc_broadcast_twostep_neighbours();
         let big_data = data.object.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-        let reliable = big_data || overlay.overlay_type.quic_requested();
-        if big_data && (neighbours >= Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST) {
-            BroadcastTwostepFecProtocol::for_send(data.object, neighbours, extra)?.send(ctx).await
+        let reliable = self.wire_profile == rtos_api::WireProfile::T0
+            || big_data
+            || overlay.overlay_type.quic_requested();
+        let min_nodes = if self.wire_profile == rtos_api::WireProfile::T0 {
+            5
+        } else {
+            Self::MIN_NODES_FEC_TWO_STEPS_BROADCAST
+        };
+        if big_data && neighbours >= min_nodes {
+            BroadcastTwostepFecProtocol::for_send(
+                data.object,
+                neighbours,
+                extra,
+                self.wire_profile,
+            )?
+            .send(ctx)
+            .await
         } else {
             BroadcastTwostepSimpleProtocol::for_send(reliable, extra).send(ctx).await
         }
@@ -2628,8 +2846,8 @@ impl OverlayNode {
         params: OverlayParams,
         public_rules: Option<OverlayPrivacyRules>,
     ) -> Result<bool> {
-        if public_rules.is_some() && !overlay_type.is_public() {
-            fail!("Privacy rules apply to public overlays only");
+        if public_rules.is_some() && !(overlay_type.is_public() || overlay_type.is_private()) {
+            fail!("Privacy rules require a public or fixed-member overlay");
         }
         {
             let mut retired = self.retired.lock().unwrap();
@@ -2654,6 +2872,8 @@ impl OverlayNode {
         };
         let quic = if overlay_type.quic_requested() { self.quic.get().cloned() } else { None };
         let overlay = Overlay {
+            clock: self.clock.clone(),
+            broadcast_transport: self.broadcast_transport.get().cloned(),
             consumer: OnceLock::new(),
             tasks: AdnlTasks::with_runtime(
                 params.runtime.clone().unwrap_or_else(tokio::runtime::Handle::current),
@@ -2913,9 +3133,19 @@ impl OverlayNode {
         params: OverlayParams,
         peers: &[Arc<KeyId>],
     ) -> Result<bool> {
+        self.add_typed_private_overlay_with_rules(overlay_type, params, peers, None)
+    }
+
+    fn add_typed_private_overlay_with_rules(
+        &self,
+        overlay_type: OverlayType,
+        params: OverlayParams,
+        peers: &[Arc<KeyId>],
+        rules: Option<OverlayPrivacyRules>,
+    ) -> Result<bool> {
         let _generation = self.generations.lock().unwrap();
         let overlay_id = params.overlay_id.clone();
-        if !self.add_overlay_locked(overlay_type, params, None)? {
+        if !self.add_overlay_locked(overlay_type, params, rules)? {
             return Ok(false);
         }
         let initialization = (|| -> Result<()> {
@@ -3142,7 +3372,12 @@ impl Subscriber for OverlayNode {
             }
             Err(_) => return Ok(false),
         };
-        if suffix_offset == data.len() {
+        if suffix_offset == data.len()
+            && !self
+                .overlays
+                .get(&overlay_id)
+                .is_some_and(|entry| entry.val().overlay_type.is_fixed_member_list())
+        {
             log::warn!("Empty message in overlay {overlay_id}");
             return Ok(true);
         }
@@ -3176,7 +3411,7 @@ impl Subscriber for OverlayNode {
         let suffix = &data[suffix_offset..];
         let consumer = if let Some(consumer) = overlay.consumer.get() {
             let consumer = consumer.clone();
-            if overlay.overlay_type.is_private() {
+            if overlay.overlay_type.is_private() && !overlay.overlay_type.is_fixed_member_list() {
                 match consumer.try_consume_custom(suffix, peers).await {
                     Err(e) => {
                         log::warn!("Unsupported custom data in overlay {overlay_id}: {e}");
@@ -3201,7 +3436,27 @@ impl Subscriber for OverlayNode {
             None
         };
 
-        let (first, mut postfix_offset) = self.wire_profile.deserialize_with_suffix(suffix)?;
+        let (first, mut postfix_offset) = match self.wire_profile.deserialize_with_suffix(suffix) {
+            Ok(value) => value,
+            Err(error) => {
+                if overlay.overlay_type.is_fixed_member_list() {
+                    if let Some(consumer) = &consumer {
+                        return consumer.try_consume_custom(suffix, peers).await;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        // A fixed-member overlay hands opaque application messages through raw.
+        // Catchain bundles/hop postfixes belong to the older private profile.
+        if overlay.overlay_type.is_fixed_member_list()
+            && (!first.is::<Broadcast>() || postfix_offset != suffix.len())
+        {
+            if let Some(consumer) = &consumer {
+                return consumer.try_consume_custom(suffix, peers).await;
+            }
+            fail!("No dedicated consumer for custom fixed-member overlay message");
+        }
         let mut second: Option<TLObject> = None;
         let mut have_postfix = false;
         if postfix_offset < suffix.len() {
@@ -3278,6 +3533,20 @@ impl Subscriber for OverlayNode {
                 {
                     return Ok(true);
                 }
+                Ok(Broadcast::Overlay_Unicast(message)) => {
+                    let Some(consumer) = consumer else {
+                        fail!("No dedicated consumer for unicast in overlay {overlay_id}");
+                    };
+                    // Unicast is an application message, not a signed broadcast.
+                    // The authenticated peer was checked above; pass its inner
+                    // bytes unchanged, even when they contain another TL object.
+                    return consumer.try_consume_custom(&message.data, peers).await;
+                }
+                Ok(Broadcast::Overlay_Fec_Received(_) | Broadcast::Overlay_Fec_Completed(_)) => {
+                    // C++ accepts these receipt carriers without application or
+                    // relay effects. They confer no source or delivery authority.
+                    return Ok(true);
+                }
                 Ok(Broadcast::Overlay_BroadcastFec(bcast)) => {
                     if let Err(e) = Self::check_fec_broadcast_message(&bcast) {
                         // Ignore invalid messages as early as possible
@@ -3301,13 +3570,21 @@ impl Subscriber for OverlayNode {
                     BroadcastStreamSimpleProtocol.recv(bcast, ctx).await?;
                     return Ok(true);
                 }
+                Ok(
+                    Broadcast::Overlay_BroadcastTwostepFec(_)
+                    | Broadcast::Overlay_BroadcastTwostepSimple(_),
+                ) if !overlay.overlay_type.accepts_twostep() => {
+                    fail!("Two-step broadcast is disabled on this overlay")
+                }
                 Ok(Broadcast::Overlay_BroadcastTwostepFec(bcast)) => {
                     BroadcastTwostepFecProtocol::for_recv().recv(bcast, ctx).await?;
                     return Ok(true);
                 }
                 Ok(Broadcast::Overlay_BroadcastTwostepSimple(bcast)) => {
                     let big_data = bcast.data.len() >= Self::MIN_BYTES_FEC_TWO_STEPS_BROADCAST;
-                    let reliable = big_data || ctx.overlay.overlay_type.quic_requested();
+                    let reliable = self.wire_profile == rtos_api::WireProfile::T0
+                        || big_data
+                        || ctx.overlay.overlay_type.quic_requested();
                     BroadcastTwostepSimpleProtocol::for_recv(reliable).recv(bcast, ctx).await?;
                     return Ok(true);
                 }
@@ -3321,7 +3598,7 @@ impl Subscriber for OverlayNode {
                         bcast,
                         None,
                         &neighbours,
-                        plumtree_now(),
+                        overlay.clock.unix_seconds(),
                         Instant::now(),
                     )?;
                     overlay.execute_plumtree(actions).await?;
@@ -3455,7 +3732,7 @@ impl Subscriber for OverlayNode {
                 let answer = overlay.plumtree_engine()?.repair_query(
                     *peers.other().data(),
                     query,
-                    plumtree_now(),
+                    overlay.clock.unix_seconds(),
                     Instant::now(),
                 )?;
                 return QueryResult::consume_boxed(
@@ -3514,13 +3791,14 @@ impl Subscriber for OverlayNode {
 }
 
 struct PlumtreeTransport {
-    quic: Arc<QuicNode>,
+    quic: Option<Arc<QuicNode>>,
     engine: std::sync::Mutex<plumtree::Engine>,
     local: Arc<KeyId>,
     original_sender: bool,
     stopped: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(test)]
 fn plumtree_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3555,7 +3833,8 @@ impl Overlay {
                 // A permanent member that has not advertised itself carries the
                 // overlay's default permanent member flags.
                 !self.overlay_type.is_public()
-                    && self.permanent_member_flags.load(Ordering::Relaxed) & Self::MEMBER_PLUMTREE_DENY
+                    && self.permanent_member_flags.load(Ordering::Relaxed)
+                        & Self::MEMBER_PLUMTREE_DENY
                         == 0
             };
             if eligible && self.check_peer(&peer, None).is_ok() {
@@ -3613,7 +3892,14 @@ impl Overlay {
                         let sent = tokio::select! {
                             biased;
                             _ = self.tasks.cancelled() => Err(error!("Plumtree overlay retired during send")),
-                            result = quic.message(bytes, Some(&self.adnl), &peers) => result,
+                            result = async {
+                                if let Some(edge) = &self.broadcast_transport {
+                                    edge.send_message(&bytes, &peers, BroadcastTransportMethod::Sender { reliable: true }).await
+                                } else {
+                                    quic.as_ref().ok_or_else(|| error!("Plumtree sender is unavailable"))?
+                                        .message(bytes, Some(&self.adnl), &peers).await.map(|_| ())
+                                }
+                            } => result,
                         };
                         if let Err(err) = sent {
                             if first_error.is_none() {
@@ -3624,6 +3910,7 @@ impl Overlay {
                     plumtree::Action::Query { peer, key, query, answer_limit } => {
                         let overlay = Arc::downgrade(self);
                         let quic = quic.clone();
+                        let edge = self.broadcast_transport.clone();
                         let adnl = self.adnl.clone();
                         let peers =
                             AdnlPeers::with_keys(transport.local.clone(), KeyId::from_data(peer));
@@ -3638,16 +3925,21 @@ impl Overlay {
                         serialize_boxed_append(&mut bytes, &query)?;
                         self.tasks.spawn_cancelable("plumtree repair query", async move {
                             // The total budget also bounds the QUIC helper's reconnect/retry.
-                            let response = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                quic.query_with_answer_limit(
-                                    bytes,
-                                    Some(&adnl),
-                                    &peers,
-                                    Some(5000),
-                                    answer_limit,
-                                ),
-                            )
+                            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                                if let Some(edge) = edge {
+                                    edge.query(&bytes, &peers, answer_limit).await
+                                } else {
+                                    quic.ok_or_else(|| error!("Plumtree sender is unavailable"))?
+                                        .query_with_answer_limit(
+                                            bytes,
+                                            Some(&adnl),
+                                            &peers,
+                                            Some(5000),
+                                            answer_limit,
+                                        )
+                                        .await
+                                }
+                            })
                             .await
                             .unwrap_or_else(|_| Err(error!("Plumtree repair deadline exceeded")));
                             let Some(overlay) = overlay.upgrade() else {
@@ -3657,6 +3949,10 @@ impl Overlay {
                             let result = (|| -> Result<Vec<plumtree::Action>> {
                                 let mut engine = overlay.plumtree_engine()?;
                                 match response {
+                                    Ok(Some(bytes)) if bytes.len() > answer_limit => {
+                                        engine.query_failed(key, peer, Instant::now());
+                                        Err(error!("Plumtree repair answer exceeds its byte limit"))
+                                    }
                                     Ok(Some(bytes)) => {
                                         match plumtree::decode_repair_response(&bytes) {
                                             Ok(message) => engine.receive(
@@ -3664,7 +3960,7 @@ impl Overlay {
                                                 message,
                                                 Some(key),
                                                 &neighbours,
-                                                plumtree_now(),
+                                                overlay.clock.unix_seconds(),
                                                 Instant::now(),
                                             ),
                                             Err(err) => {
@@ -3753,11 +4049,10 @@ impl OverlayNode {
         if !overlay.received_rawbytes.has_subscription() {
             fail!("Plumtree requires an owned broadcast consumer subscription before activation");
         }
-        let quic = self
-            .quic
-            .get()
-            .ok_or_else(|| error!("Plumtree requires an installed QUIC sender"))?
-            .clone();
+        let quic = self.quic.get().cloned();
+        if quic.is_none() && overlay.broadcast_transport.is_none() {
+            fail!("Plumtree requires an installed QUIC sender or owned broadcast edge");
+        }
         // The largest supported member-certificate prefix is 160 bytes:
         // message/query tag + overlay ID + flags + 120-byte Ed25519 certificate.
         if overlay.message_prefix.len() > 160 || overlay.query_prefix.len() > 160 {
@@ -3778,7 +4073,7 @@ impl OverlayNode {
                     break;
                 };
                 let actions = match overlay.plumtree_engine() {
-                    Ok(mut engine) => engine.tick(plumtree_now(), Instant::now()),
+                    Ok(mut engine) => engine.tick(overlay.clock.unix_seconds(), Instant::now()),
                     Err(err) => {
                         log::error!(target: TARGET, "Plumtree timer terminated: {err}");
                         break;
@@ -3826,7 +4121,7 @@ impl OverlayNode {
             simple_id,
             data,
             &neighbours,
-            plumtree_now(),
+            overlay.clock.unix_seconds(),
             Instant::now(),
         )?;
         if !actions.iter().any(|action| matches!(action, plumtree::Action::Send { .. })) {

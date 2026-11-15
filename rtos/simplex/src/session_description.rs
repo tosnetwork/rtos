@@ -299,7 +299,9 @@ impl SessionDescription {
         }
         Ok(self)
     }
-    pub(crate) fn authenticated_runtime(&self) -> Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime> {
+    pub(crate) fn authenticated_runtime(
+        &self,
+    ) -> Option<&consensus_common::session_runtime::AuthenticatedSessionRuntime> {
         self.authenticated_runtime.as_ref()
     }
 
@@ -344,7 +346,9 @@ impl SessionDescription {
     }
 
     pub fn recover_own_journal(&self, bootstrap: &mut crate::database::Bootstrap) -> Result<()> {
-        if self.recovery_only { return self.verify_own_journal(&bootstrap.own_journal); }
+        if self.recovery_only {
+            return self.verify_own_journal(&bootstrap.own_journal);
+        }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         match guard.as_ref() {
             Some(signer) => signer.recover_bootstrap(bootstrap, self.require_validator_index()?),
@@ -355,7 +359,12 @@ impl SessionDescription {
 
     pub fn verify_own_journal(&self, raw: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         if self.recovery_only {
-            return crate::signing_coordinator::verify_recovery_journal(self.authenticated_runtime.as_ref().ok_or_else(|| error!("Recovery requires authenticated runtime"))?, raw);
+            return crate::signing_coordinator::verify_recovery_journal(
+                self.authenticated_runtime
+                    .as_ref()
+                    .ok_or_else(|| error!("Recovery requires authenticated runtime"))?,
+                raw,
+            );
         }
         let guard = self.own_signing.lock().map_err(|_| error!("signer capability poisoned"))?;
         match guard.as_ref() {
@@ -483,12 +492,17 @@ impl SessionDescription {
     pub fn local_validator_index(&self) -> Option<ValidatorIndex> {
         self.self_idx
     }
-    pub(crate) fn with_recovery_only(mut self, enabled: bool) -> Self { self.recovery_only = enabled; self }
+    pub(crate) fn with_recovery_only(mut self, enabled: bool) -> Self {
+        self.recovery_only = enabled;
+        self
+    }
     pub fn is_validator(&self) -> bool {
         !self.recovery_only && self.self_idx.is_some()
     }
     pub fn require_validator_index(&self) -> Result<ValidatorIndex> {
-        if self.recovery_only { fail!("Retired recovery has no signing or voting authority"); }
+        if self.recovery_only {
+            fail!("Retired recovery has no signing or voting authority");
+        }
         self.self_idx.ok_or_else(|| error!("Observer has no signing or voting authority"))
     }
     pub fn local_role_label(&self) -> String {

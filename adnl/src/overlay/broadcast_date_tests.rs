@@ -77,7 +77,16 @@ async fn broadcast_outside_the_date_window_is_neither_delivered_nor_relayed() {
     let adnl = node(71).await;
     let sender = node(72).await;
     let overlay_node = OverlayNode::with_params(adnl.clone(), &[7; 32], 0).unwrap();
-    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay_node.clone()], None).unwrap();
+    let rldp = RldpNode::with_params(
+        adnl.clone(),
+        vec![overlay_node.clone()],
+        None,
+        #[cfg(feature = "debug")]
+        None,
+        #[cfg(feature = "debug")]
+        None,
+    )
+    .unwrap();
     overlay_node.set_rldp(rldp).unwrap();
     let id = KeyId::from_data([73; 32]);
     let local = adnl.key_by_tag(0).unwrap();
@@ -93,7 +102,7 @@ async fn broadcast_outside_the_date_window_is_neither_delivered_nor_relayed() {
         .unwrap());
     let overlay = overlay_node.get_overlay(&id, "date window test").unwrap();
     let peers = AdnlPeers::with_keys(local.id().clone(), source.id().clone());
-    let now = system_clock_secs() as i64;
+    let now = overlay.clock.unix_seconds() as i64;
 
     for (name, offset, delivered) in
         [("too old", -40i64, false), ("too new", 40, false), ("current", 0, true)]

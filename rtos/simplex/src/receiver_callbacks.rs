@@ -151,7 +151,12 @@ impl ReceiverListener for ReceiverCallbacks {
         }));
     }
 
-    fn on_transport_certificate(&self, peer: consensus_common::PublicKeyHash, source_idx: Option<u32>, certificate: Certificate) {
+    fn on_transport_certificate(
+        &self,
+        peer: consensus_common::PublicKeyHash,
+        source_idx: Option<u32>,
+        certificate: Certificate,
+    ) {
         self.task_queue.post_closure(Box::new(move |processor: &mut SessionProcessor| {
             processor.on_transport_certificate(peer, source_idx, certificate);
         }));

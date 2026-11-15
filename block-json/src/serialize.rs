@@ -1045,6 +1045,20 @@ fn serialize_limits(limits: &SizeLimitsConfig) -> Result<Value> {
     if limits.max_total_msg_cells != defaults.max_total_msg_cells {
         serialize_field(&mut map, "max_total_msg_cells", limits.max_total_msg_cells);
     }
+    if limits.out_msg_queue_size_hard_limit != defaults.out_msg_queue_size_hard_limit {
+        serialize_field(
+            &mut map,
+            "out_msg_queue_size_hard_limit",
+            limits.out_msg_queue_size_hard_limit,
+        );
+    }
+    if limits.out_msg_queue_size_soft_limit != defaults.out_msg_queue_size_soft_limit {
+        serialize_field(
+            &mut map,
+            "out_msg_queue_size_soft_limit",
+            limits.out_msg_queue_size_soft_limit,
+        );
+    }
     Ok(map.into())
 }
 
@@ -1383,6 +1397,12 @@ pub fn serialize_known_config_param(
         }
         ConfigParamEnum::ConfigParam45(ref c) => {
             return Ok(Some(serialize_precompiled_contracts_list(c)?));
+        }
+        ConfigParamEnum::ConfigParam48(ref c) => {
+            serialize_field(&mut map, "network", c.network.to_hex_string());
+            serialize_u64(&mut map, "sequence", &c.sequence, mode);
+            serialize_field(&mut map, "retired", c.retired);
+            serialize_field(&mut map, "deadline", c.deadline);
         }
         ConfigParamEnum::ConfigParam71(ref c) => {
             return Ok(Some(serialize_oracle_bridge_params(c)?));

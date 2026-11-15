@@ -321,7 +321,8 @@ pub struct InternalDb {
     archive_enqueue_test_gate:
         std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
-    archive_queue_drain_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ArchiveQueueDrainEvent>>>,
+    archive_queue_drain_events:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ArchiveQueueDrainEvent>>>,
     #[cfg(test)]
     archive_queue_boundary_count: std::sync::atomic::AtomicUsize,
     shard_top_blocks_db: ShardTopBlocksDb,
@@ -360,7 +361,9 @@ impl InternalDb {
     }
     #[cfg(test)]
     pub(crate) fn test_reset_read_refusal_effects(&self) {
-        for counter in &self.read_refusal_effects { counter.store(0, Ordering::SeqCst); }
+        for counter in &self.read_refusal_effects {
+            counter.store(0, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn repair_leases(
@@ -457,14 +460,23 @@ impl InternalDb {
         let can_create_db = access_type == AccessType::ReadWrite;
         // Existing dynamic counter CFs still need their merge operator when
         // this startup selects archival state storage.
-        let mut bootstrap = open_node_db_for_bootstrap(&config.db_directory, &config.cells_db_config, access_type.clone())?;
+        let mut bootstrap = open_node_db_for_bootstrap(
+            &config.db_directory,
+            &config.cells_db_config,
+            access_type.clone(),
+        )?;
         let db = bootstrap.database().clone();
         let repair_leases = crate::publication_dependency_leases::DependencyLeases::open(
             db.clone(),
             can_create_db && !bootstrap.requires_recovery(),
         )?;
         if bootstrap.requires_recovery() {
-            bootstrap.inspect_recovery_providers(config.archival_mode.as_ref(), repair_leases.protection()).await?;
+            bootstrap
+                .inspect_recovery_providers(
+                    config.archival_mode.as_ref(),
+                    repair_leases.protection(),
+                )
+                .await?;
             bootstrap.recover_pending().await?;
         }
         // Keep this exact ledger/protection Arc for recovery and normal startup.
@@ -770,14 +782,20 @@ impl InternalDb {
 
     #[cfg(test)]
     pub(crate) fn test_panic_archive_after_handle_enqueue(
-        &self, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
     ) {
         *self.archive_enqueue_test_gate.lock().unwrap() = Some((entered, release));
     }
     #[cfg(test)]
-    pub(crate) fn test_archive_io_outstanding(&self) -> usize { self.archive_io_owners.outstanding() }
+    pub(crate) fn test_archive_io_outstanding(&self) -> usize {
+        self.archive_io_owners.outstanding()
+    }
     #[cfg(test)]
-    pub(crate) fn test_observe_archive_queue_drain(&self) -> tokio::sync::mpsc::UnboundedReceiver<ArchiveQueueDrainEvent> {
+    pub(crate) fn test_observe_archive_queue_drain(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ArchiveQueueDrainEvent> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         *self.archive_queue_drain_events.lock().unwrap() = Some(sender);
         self.archive_queue_boundary_count.store(usize::MAX, Ordering::SeqCst);
@@ -794,7 +812,9 @@ impl InternalDb {
         self.archive_queue_boundary_count.load(Ordering::SeqCst)
     }
     #[cfg(test)]
-    pub(crate) async fn test_join_archive_tasks(&self) -> Result<()> { self.archive_tasks.wait().await }
+    pub(crate) async fn test_join_archive_tasks(&self) -> Result<()> {
+        self.archive_tasks.wait().await
+    }
 
     fn store_block_handle(
         &self,
@@ -1205,9 +1225,7 @@ impl InternalDb {
                 handle.set_proof();
             }
         }
-        self.archive_manager
-            .sync_file(&handle, &entry, self.publication_sync_observer())
-            .await?;
+        self.archive_manager.sync_file(&handle, &entry, self.publication_sync_observer()).await?;
         self.sync_publication_metadata(&handle).await
     }
 
@@ -2189,7 +2207,11 @@ impl InternalDb {
                     let enqueue_test_gate = enqueue_test_gate.clone();
                     async move {
                         if handle.set_archived() {
-                            handles.save_handle_with_archive_custody(&handle, callback, queue_custody.clone())?;
+                            handles.save_handle_with_archive_custody(
+                                &handle,
+                                callback,
+                                queue_custody.clone(),
+                            )?;
                         }
                         #[cfg(test)]
                         if let Some((entered, release)) = enqueue_test_gate {
@@ -2197,7 +2219,9 @@ impl InternalDb {
                             release.notified().await;
                             panic!("controlled archive owner panic after handle enqueue");
                         }
-                        handles.sync_pending_observed_with_archive_custody(observer, queue_custody).await
+                        handles
+                            .sync_pending_observed_with_archive_custody(observer, queue_custody)
+                            .await
                     }
                 },
             ))
@@ -2560,9 +2584,11 @@ impl InternalDb {
         let top_blocks: Arc<[BlockIdExt]> = prev_block.shard_hashes()?.top_blocks_all()?.into();
 
         // truncate archives
-        let selection = Arc::new(storage::archives::truncation_selection::TruncationSelection::new(
-            mc_block_id.clone(), top_blocks.clone(),
-        )?);
+        let selection =
+            Arc::new(storage::archives::truncation_selection::TruncationSelection::new(
+                mc_block_id.clone(),
+                top_blocks.clone(),
+            )?);
         self.archive_manager.trunc(selection).await?;
 
         // truncate handles and prev/next links

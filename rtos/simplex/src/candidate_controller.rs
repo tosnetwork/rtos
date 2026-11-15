@@ -852,16 +852,18 @@ impl CandidateController {
             };
             observed = Some(CandidateObserved {
                 block_id: block_id.clone(),
-                authentication: leader_key.pq_key().map(|_| consensus_common::CandidateAuthenticationEvidence {
-                    session_id: self.session_id().clone(),
-                    slot: slot.value(),
-                    creator_index: leader_idx.value(),
-                    creator_adnl: self.description.get_source_adnl_id(leader_idx).clone(),
-                    candidate_hash_data: candidate_hash_data_bytes_for_db.clone(),
-                    signature: raw_candidate.signature.clone(),
-                    block_id: block_id.clone(),
-                    data: observed_data.clone(),
-                    collated_data: observed_collated_data.clone(),
+                authentication: leader_key.pq_key().map(|_| {
+                    consensus_common::CandidateAuthenticationEvidence {
+                        session_id: self.session_id().clone(),
+                        slot: slot.value(),
+                        creator_index: leader_idx.value(),
+                        creator_adnl: self.description.get_source_adnl_id(leader_idx).clone(),
+                        candidate_hash_data: candidate_hash_data_bytes_for_db.clone(),
+                        signature: raw_candidate.signature.clone(),
+                        block_id: block_id.clone(),
+                        data: observed_data.clone(),
+                        collated_data: observed_collated_data.clone(),
+                    }
                 }),
                 data: observed_data,
                 collated_data: observed_collated_data,
@@ -1118,14 +1120,9 @@ impl CandidateController {
     ) {
         let delay = initial_delay.unwrap_or(CANDIDATE_REQUEST_DELAY);
 
-        let key = RawCandidateId {
-            slot,
-            hash: block_hash.clone(),
-        };
+        let key = RawCandidateId { slot, hash: block_hash.clone() };
 
-        if !for_finality
-            && b.simplex_state()
-                .has_skip_certificate_for_slot(&self.description, slot)
+        if !for_finality && b.simplex_state().has_skip_certificate_for_slot(&self.description, slot)
         {
             log::trace!(
                 "Session {} request_candidate: slot={} hash={} - skipped already, not requesting",
@@ -1154,18 +1151,14 @@ impl CandidateController {
 
         // Check if we already have what we need (stubs don't count as real bodies)
         let have_body = self.book.has_real_body(&key);
-        let have_notar = b
-            .simplex_state()
-            .get_notarize_certificate(slot, &block_hash)
-            .is_some();
+        let have_notar = b.simplex_state().get_notarize_certificate(slot, &block_hash).is_some();
 
         if have_body && have_notar {
             return;
         }
 
         if delay.is_zero() {
-            self.requested_candidates
-                .insert(key.clone(), now + CANDIDATE_REQUEST_RETRY_INTERVAL);
+            self.requested_candidates.insert(key.clone(), now + CANDIDATE_REQUEST_RETRY_INTERVAL);
 
             log::debug!(
                 "Session {} request_candidate: requesting slot={slot} hash={} immediately \
@@ -1193,10 +1186,7 @@ impl CandidateController {
             let expiration_time = now + delay;
 
             self.queue.post_delayed(expiration_time, move |c, b| {
-                let candidate_id = RawCandidateId {
-                    slot,
-                    hash: block_hash.clone(),
-                };
+                let candidate_id = RawCandidateId { slot, hash: block_hash.clone() };
                 if !c.requested_candidates.contains_key(&candidate_id) {
                     log::trace!(
                         "Session {} delayed_request_candidate: slot={slot} hash={} \
@@ -1207,8 +1197,7 @@ impl CandidateController {
                     return;
                 }
                 if !for_finality
-                    && b.simplex_state()
-                        .has_skip_certificate_for_slot(&c.description, slot)
+                    && b.simplex_state().has_skip_certificate_for_slot(&c.description, slot)
                 {
                     log::trace!(
                         "Session {} delayed_request_candidate: slot={slot} hash={} \
@@ -1220,10 +1209,8 @@ impl CandidateController {
                     return;
                 }
                 let have_body = c.book.has_real_body(&candidate_id);
-                let have_notar = b
-                    .simplex_state()
-                    .get_notarize_certificate(slot, &block_hash)
-                    .is_some();
+                let have_notar =
+                    b.simplex_state().get_notarize_certificate(slot, &block_hash).is_some();
 
                 if have_body && have_notar {
                     log::trace!(

@@ -1757,11 +1757,20 @@ impl RecvPipeline {
             .allocated
             .packets
             .update(self.adnl.allocated.packets.load(Ordering::Relaxed));
-        let subchannel = self
-            .adnl
-            .channels_recv
-            .get(&data.buf[0..32])
-            .map_or(Subchannel::None, |subchannel| subchannel.val().clone());
+        let subchannel = match super::routing::route_datagram(
+            &data.buf,
+            |id| self.adnl.config.keys.get(&KeyId::from_data(*id)).map(|_| ()),
+            |id| self.adnl.channels_recv.get(id).map(|entry| entry.val().clone()),
+        ) {
+            Ok(super::routing::Destination::Local(())) => Subchannel::None,
+            Ok(super::routing::Destination::Channel(subchannel)) => subchannel,
+            Err(e) => {
+                log::trace!(target: TARGET, "Dropping inbound ADNL datagram: {e}");
+                #[cfg(feature = "telemetry")]
+                self.adnl.telemetry.normal.proc_unknown.update(1);
+                return;
+            }
+        };
         if let Subchannel::Urgent(_) = &subchannel {
             self.urgent.put((data, subchannel));
         } else {

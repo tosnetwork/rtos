@@ -376,7 +376,7 @@ struct MockShardState {
 }
 
 struct LiteServerTestEngine {
-        served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     current_time: u32,
     internal_db: Arc<InternalDb>,
     last_mc_block_id: BlockIdExt,
@@ -454,7 +454,8 @@ impl LiteServerTestEngine {
         let mut accounts_map = HashMap::new();
         accounts_map.insert(account_id.clone(), vec![0x01, 0x02, 0x03, 0x04]);
 
-        let mut ret = Self { served_masterchain: Default::default(),
+        let mut ret = Self {
+            served_masterchain: Default::default(),
             current_time: 1640995200,
             internal_db: Arc::new(db),
             last_mc_block_id: mc_state_id.clone(),
@@ -540,9 +541,9 @@ impl LiteServerTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for LiteServerTestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
-            Some(&self.served_masterchain)
-        }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
 
     async fn lookup_block_by_seqno(
         &self,
@@ -875,12 +876,16 @@ async fn test_get_masterchain_info() -> Result<()> {
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        fn served_masterchain_cache(
+            &self,
+        ) -> Option<&crate::served_masterchain::ServedMasterchain> {
             Some(&self.served_masterchain)
         }
         async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
+            PinnedShardStateGuard::new(
+                self.load_state(id).await?,
+                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+            )
         }
 
         fn zerostate_id(&self) -> Result<&BlockIdExt> {
@@ -1215,12 +1220,16 @@ async fn test_get_state_returns_expected_boc_and_hashes() -> Result<()> {
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        fn served_masterchain_cache(
+            &self,
+        ) -> Option<&crate::served_masterchain::ServedMasterchain> {
             Some(&self.served_masterchain)
         }
         async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
+            PinnedShardStateGuard::new(
+                self.load_state(id).await?,
+                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+            )
         }
 
         async fn load_state(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
@@ -1261,14 +1270,26 @@ async fn test_get_state_supports_shardchain_with_existing_limits() -> Result<()>
     #[async_trait::async_trait]
     impl EngineOperations for StateEngine {
         async fn load_state(&self, id: &BlockIdExt) -> Result<Arc<ShardStateStuff>> {
-            if id != self.0.block_id() { fail!("Unexpected state lookup") }
+            if id != self.0.block_id() {
+                fail!("Unexpected state lookup")
+            }
             Ok(self.0.clone())
         }
     }
-    let id = BlockIdExt::with_params(ShardIdent::full(0), 1,
-        UInt256::from([1; 32]), UInt256::from([2; 32]));
-    let (_, state) = gen_shard_state(Some(id.clone()), &[],
-        #[cfg(feature = "telemetry")] None, None, None);
+    let id = BlockIdExt::with_params(
+        ShardIdent::full(0),
+        1,
+        UInt256::from([1; 32]),
+        UInt256::from([2; 32]),
+    );
+    let (_, state) = gen_shard_state(
+        Some(id.clone()),
+        &[],
+        #[cfg(feature = "telemetry")]
+        None,
+        None,
+        None,
+    );
     let engine: Arc<dyn EngineOperations> = Arc::new(StateEngine(state.clone()));
     let got = LiteServerQuerySubscriber::get_state(&engine, id.clone()).await?;
     assert_eq!(got.id, id);
@@ -1277,10 +1298,12 @@ async fn test_get_state_supports_shardchain_with_existing_limits() -> Result<()>
     let decoded = ShardStateUnsplit::construct_from_cell(read_single_root_boc(&got.data)?)?;
     assert_eq!(decoded.shard(), id.shard());
     assert_eq!(decoded.seq_no(), 1);
-    let mut oversized = id.clone(); oversized.seq_no = 1001;
+    let mut oversized = id.clone();
+    oversized.seq_no = 1001;
     let error = LiteServerQuerySubscriber::get_state(&engine, oversized).await.unwrap_err();
     assert!(error.to_string().contains("cannot request total state"));
-    let mut invalid = id; invalid.root_hash = UInt256::default();
+    let mut invalid = id;
+    invalid.root_hash = UInt256::default();
     let error = LiteServerQuerySubscriber::get_state(&engine, invalid).await.unwrap_err();
     assert!(error.to_string().contains("invalid BlockIdExt"));
     Ok(())
@@ -1309,12 +1332,16 @@ async fn test_get_libraries_empty() -> Result<()> {
 
     #[async_trait::async_trait]
     impl EngineOperations for TestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        fn served_masterchain_cache(
+            &self,
+        ) -> Option<&crate::served_masterchain::ServedMasterchain> {
             Some(&self.served_masterchain)
         }
         async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
+            PinnedShardStateGuard::new(
+                self.load_state(id).await?,
+                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+            )
         }
 
         fn load_shard_client_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
@@ -1570,7 +1597,7 @@ fn create_out_msg_queue_with_size(size: usize) -> OutMsgQueue {
 }
 
 struct DispatchQueueTestEngine {
-        served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     state_id: BlockIdExt,
     state: Arc<ShardStateStuff>,
     zerostate_id: BlockIdExt,
@@ -1620,13 +1647,15 @@ impl DispatchQueueTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for DispatchQueueTestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
-            Some(&self.served_masterchain)
-        }
-        async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
-        }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        PinnedShardStateGuard::new(
+            self.load_state(id).await?,
+            Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+        )
+    }
 
     fn zerostate_id(&self) -> Result<&BlockIdExt> {
         Ok(&self.zerostate_id)
@@ -1804,7 +1833,7 @@ async fn test_get_dispatch_queue_messages_after_lt() -> Result<()> {
 }
 
 struct OutMsgQueueSizesTestEngine {
-        served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     mc_state: Arc<ShardStateStuff>,
     shard_state: Arc<ShardStateStuff>,
 }
@@ -1866,13 +1895,15 @@ impl OutMsgQueueSizesTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for OutMsgQueueSizesTestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
-            Some(&self.served_masterchain)
-        }
-        async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
-        }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        PinnedShardStateGuard::new(
+            self.load_state(id).await?,
+            Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+        )
+    }
 
     fn load_last_applied_mc_block_id(&self) -> Result<Option<Arc<BlockIdExt>>> {
         Ok(Some(Arc::new(self.mc_state.block_id().clone())))
@@ -1935,7 +1966,7 @@ async fn test_get_out_msg_queue_sizes_with_len_fallback() -> Result<()> {
 }
 
 struct ConfigParamsTestEngine {
-        served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     state_id: BlockIdExt,
     state: Arc<ShardStateStuff>,
     zerostate_id: BlockIdExt,
@@ -1952,19 +1983,26 @@ impl ConfigParamsTestEngine {
 
         let actual_id = state.block_id().clone();
 
-        Self { served_masterchain: Default::default(), state_id: actual_id.clone(), state, zerostate_id: actual_id }
+        Self {
+            served_masterchain: Default::default(),
+            state_id: actual_id.clone(),
+            state,
+            zerostate_id: actual_id,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl EngineOperations for ConfigParamsTestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
-            Some(&self.served_masterchain)
-        }
-        async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            PinnedShardStateGuard::new(self.load_state(id).await?,
-                Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
-        }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        PinnedShardStateGuard::new(
+            self.load_state(id).await?,
+            Arc::new(AllowStateGcSmartResolver::new(u64::MAX)),
+        )
+    }
 
     fn zerostate_id(&self) -> Result<&BlockIdExt> {
         Ok(&self.zerostate_id)
@@ -2189,7 +2227,7 @@ async fn test_get_config_params_from_prev_key_block() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct WaitRegistryTestEngine {
-        served_masterchain: crate::served_masterchain::ServedMasterchain,
+    served_masterchain: crate::served_masterchain::ServedMasterchain,
     current_time: u32,
     internal_db: Arc<InternalDb>,
     tip_seqno: std::sync::atomic::AtomicU32,
@@ -2253,7 +2291,8 @@ impl WaitRegistryTestEngine {
         blocks.insert(block_id.clone(), data);
         handles.insert(block_id, handle);
 
-        let engine = Self { served_masterchain: Default::default(),
+        let engine = Self {
+            served_masterchain: Default::default(),
             current_time: 1640995200,
             internal_db: db,
             tip_seqno: std::sync::atomic::AtomicU32::new(initial_seqno),
@@ -2293,15 +2332,18 @@ impl WaitRegistryTestEngine {
 
 #[async_trait::async_trait]
 impl EngineOperations for WaitRegistryTestEngine {
-        fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
-            Some(&self.served_masterchain)
-        }
-        async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
-            let state = gen_master_state(GenMasterStateParams {
-                master_state_id: Some(id.clone()), ..Default::default()
-            }, #[cfg(feature = "telemetry")] None, None);
-            PinnedShardStateGuard::new(state, Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
-        }
+    fn served_masterchain_cache(&self) -> Option<&crate::served_masterchain::ServedMasterchain> {
+        Some(&self.served_masterchain)
+    }
+    async fn load_and_pin_state(&self, id: &BlockIdExt) -> Result<PinnedShardStateGuard> {
+        let state = gen_master_state(
+            GenMasterStateParams { master_state_id: Some(id.clone()), ..Default::default() },
+            #[cfg(feature = "telemetry")]
+            None,
+            None,
+        );
+        PinnedShardStateGuard::new(state, Arc::new(AllowStateGcSmartResolver::new(u64::MAX)))
+    }
 
     #[cfg(feature = "telemetry")]
     fn engine_telemetry(&self) -> &Arc<EngineTelemetry> {
@@ -3248,10 +3290,16 @@ async fn run_smc_method_uses_node_context_and_pinned_identifier() -> Result<()> 
                     14
                 } else if version < 11 {
                     17
-                } else {
+                } else if version < 16 {
                     18
-                }
+                } else {
+                    19
+                },
+                "getter context v{version}: full={full}"
             );
+            if version >= 16 {
+                assert!(context[18].is_null(), "getter has no authenticated external import");
+            }
             if version >= 4 {
                 let root = context[13].as_tuple()?[0].as_tuple()?[0].as_tuple()?[3].as_integer()?;
                 assert_eq!(

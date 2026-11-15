@@ -7,12 +7,12 @@
  *
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
-use crate::async_owner::AsyncOwner;
 use crate::{
-    utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory, ConsensusNode, ConsensusOverlay,
-    ConsensusOverlayListenerPtr, ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager,
-    ConsensusOverlayManagerPtr, ConsensusOverlayPtr, OverlayTransportType, PrivateKey,
-    PublicKeyHash, QueryResponseCallback, Result,
+    async_owner::AsyncOwner, utils::MetricsHandle, BlockPayloadPtr, ConsensusCommonFactory,
+    ConsensusNode, ConsensusOverlay, ConsensusOverlayListenerPtr,
+    ConsensusOverlayLogReplayListenerPtr, ConsensusOverlayManager, ConsensusOverlayManagerPtr,
+    ConsensusOverlayPtr, OverlayTransportType, PrivateKey, PublicKeyHash, QueryResponseCallback,
+    Result,
 };
 use adnl::{
     common::{
@@ -727,7 +727,20 @@ impl AdnlOverlayConsumer {
 impl Subscriber for AdnlOverlayConsumer {
     async fn try_consume_custom(&self, data: &[u8], peers: &AdnlPeers) -> Result<bool> {
         let overlay = self.overlay.upgrade().ok_or_else(|| error!("Overlay stopped"))?;
-        let object = overlay.stack.overlay.wire_profile().deserialize(data)?;
+        let (object, consumed) =
+            overlay.stack.overlay.wire_profile().deserialize_with_suffix(data)?;
+        // This subscriber recognizes only our control envelopes. Other valid
+        // prefixes may belong to a catchain bundle and its legacy hop postfix;
+        // the private-overlay parser owns that framing, including its errors.
+        if !object.is::<BroadcastWrapper>()
+            && !object.is::<SimplexVote>()
+            && !object.is::<SimplexCertificate>()
+        {
+            return Ok(false);
+        }
+        if consumed != data.len() {
+            fail!("Trailing bytes after wire object");
+        }
 
         // Handle catchain broadcast wrapper
         let object = match object.downcast::<BroadcastWrapper>() {

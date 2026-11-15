@@ -12,7 +12,11 @@ use simplex::finality_delivery::{
 use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
 
 async fn history_fixture() -> (SpoolFixture, BlockIdExt) {
-    let mut fixture = SpoolFixture::new(0).await;
+    // This signed history chain is rooted in the original public zerostate.
+    // Historical authentication deliberately needs no retired consensus key.
+    let anchor =
+        serde_json::from_str(include_str!("testdata/v2-publication-history-anchor.json")).unwrap();
+    let mut fixture = SpoolFixture::from_transport_fixture(anchor, 0, 0x61).await;
     let input: serde_json::Value =
         serde_json::from_str(include_str!("testdata/v2-publication-history.json")).unwrap();
     let setup = std::panic::AssertUnwindSafe(async {
@@ -183,7 +187,9 @@ async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
         assert!(ordinary.is_file(), "expected actual ordinary proof file before simulation");
         std::fs::rename(&ordinary, dir.path().join("unavailable-key-proof")).unwrap();
         retain_pending_finality(&recovery.namespace, &source).unwrap();
-        let source_path = recovery.namespace.join("finality-pending")
+        let source_path = recovery
+            .namespace
+            .join("finality-pending")
             .join(format!("{}.json", source.id().unwrap().to_hex_string()));
         let original_source = std::fs::read(&source_path).unwrap();
         if interrupted_retention {
@@ -233,7 +239,10 @@ async fn publication_history_capsule_real_engine_wal_reopen_and_revocation() {
             if interrupted_retention {
                 assert!(!source_path.exists());
                 assert!(!source_path.with_extension("acked").exists());
-                assert_eq!(std::fs::read(source_path.with_extension("tmp")).unwrap(), original_source);
+                assert_eq!(
+                    std::fs::read(source_path.with_extension("tmp")).unwrap(),
+                    original_source
+                );
             }
             std::fs::rename(&withdrawn, &capsule).unwrap();
             let id = stage(&sink, input.clone()).await.unwrap();

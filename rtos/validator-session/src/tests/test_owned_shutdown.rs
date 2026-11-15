@@ -1,4 +1,3 @@
-use rtos_block::BlockSignaturesVariant;
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use consensus_common::{
@@ -6,6 +5,7 @@ use consensus_common::{
     SessionListener, SessionStats, ValidatorBlockCandidateCallback,
     ValidatorBlockCandidateDecisionCallback,
 };
+use rtos_block::BlockSignaturesVariant;
 use std::sync::mpsc;
 struct Listener;
 impl SessionListener for Listener {

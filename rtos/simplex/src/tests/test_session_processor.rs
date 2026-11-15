@@ -139,17 +139,33 @@ fn make_start_prev_blocks(shard: &ShardIdent, initial_block_seqno: u32) -> Vec<B
 #[allow(dead_code)]
 enum ReceiverAction {
     /// send_vote() was called
-    SendVote { vote: TlVote },
+    SendVote {
+        vote: TlVote,
+    },
     /// cache_our_vote_for_standstill() was called
-    CacheOurVoteForStandstill { vote: TlVote },
+    CacheOurVoteForStandstill {
+        vote: TlVote,
+    },
     /// send_block_broadcast() was called
-    SendBlockBroadcast { slot: u32, candidate_hash: UInt256 },
+    SendBlockBroadcast {
+        slot: u32,
+        candidate_hash: UInt256,
+    },
     /// cache_notarization_cert() was called
-    CacheNotarizationCert { slot: u32, block_hash: UInt256 },
+    CacheNotarizationCert {
+        slot: u32,
+        block_hash: UInt256,
+    },
     /// cache_candidate_bytes() was called (full bytes captured for roundtrip checks)
-    CacheCandidateBytes { slot: u32, block_hash: UInt256, candidate_data: Vec<u8> },
+    CacheCandidateBytes {
+        slot: u32,
+        block_hash: UInt256,
+        candidate_data: Vec<u8>,
+    },
     /// send_certificate() was called
-    SendCertificate { certificate: CertificateBoxed },
+    SendCertificate {
+        certificate: CertificateBoxed,
+    },
     /// cache_standstill_certificate() was called
     CacheStandstillCertificate {
         slot: u32,
@@ -157,24 +173,48 @@ enum ReceiverAction {
         bytes_len: usize,
     },
     /// cache_last_final_certificate() was called
-    CacheLastFinalCertificate { slot: u32, bytes_len: usize },
+    CacheLastFinalCertificate {
+        slot: u32,
+        bytes_len: usize,
+    },
     /// cleanup() was called
-    Cleanup { up_to_slot: u32 },
+    Cleanup {
+        up_to_slot: u32,
+    },
     /// set_ingress_slot_begin() was called
-    SetIngressSlotBegin { slot: u32 },
+    SetIngressSlotBegin {
+        slot: u32,
+    },
     /// set_ingress_progress_slot() was called
-    SetIngressProgressSlot { slot: u32 },
+    SetIngressProgressSlot {
+        slot: u32,
+    },
     /// cancel_candidate_requests_for_slot() was called
-    CancelCandidateRequestsForSlot { slot: u32 },
+    CancelCandidateRequestsForSlot {
+        slot: u32,
+    },
     /// set_standstill_slots() was called
-    SetStandstillSlots { begin: u32, end: u32 },
+    SetStandstillSlots {
+        begin: u32,
+        end: u32,
+    },
     /// request_candidate() was called
-    RequestCandidate { slot: u32, block_hash: UInt256 },
+    RequestCandidate {
+        slot: u32,
+        block_hash: UInt256,
+    },
     /// notify_certificate_accepted() was called
-    NotifyCertificateAccepted { slot: u32, kind: crate::receiver::StandstillCertificateType },
+    NotifyCertificateAccepted {
+        slot: u32,
+        kind: crate::receiver::StandstillCertificateType,
+    },
     /// ban_source_for_bad_signature() was called
-    BanSourceForBadSignature { source_idx: u32 },
-    BanPeerForBadSignature { peer: consensus_common::PublicKeyHash },
+    BanSourceForBadSignature {
+        source_idx: u32,
+    },
+    BanPeerForBadSignature {
+        peer: consensus_common::PublicKeyHash,
+    },
 }
 
 /// Mock receiver that records all outbound calls
@@ -413,7 +453,10 @@ struct RecordingListener {
 #[allow(dead_code)]
 impl RecordingListener {
     fn new() -> Arc<Self> {
-        Arc::new(Self { events: Arc::new(Mutex::new(Vec::new())), authenticated: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            authenticated: Mutex::new(Vec::new()),
+        })
     }
 
     /// Get all recorded events (drains the list)
@@ -428,7 +471,10 @@ impl RecordingListener {
 }
 
 impl consensus_common::SessionListener for RecordingListener {
-    fn on_authenticated_candidate(&self, evidence: consensus_common::CandidateAuthenticationEvidence) {
+    fn on_authenticated_candidate(
+        &self,
+        evidence: consensus_common::CandidateAuthenticationEvidence,
+    ) {
         self.authenticated.lock().unwrap().push(evidence);
     }
     fn on_candidate(
@@ -606,12 +652,16 @@ fn drain_processor_storage_and_messages(processor: &mut SessionProcessor) {
     let mut last_warning = SystemTime::now();
     loop {
         processor.process_pending_async_db_results();
-        while let Some(task) = processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning) {
+        while let Some(task) = processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning)
+        {
             assert!(std::time::Instant::now() < deadline, "actor completion drain watchdog");
             task(processor);
         }
-        if processor.database.pending_is_empty() && processor.task_queue.is_empty() { break; }
-        let remaining = deadline.checked_duration_since(std::time::Instant::now())
+        if processor.database.pending_is_empty() && processor.task_queue.is_empty() {
+            break;
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
             .expect("storage completion drain watchdog");
         processor.database.db().sync(Some(remaining)).unwrap();
     }
@@ -1561,45 +1611,91 @@ fn test_queued_certificate_duplicates_skip_verification_and_effects_like_cpp() {
                     1 => unsignedvote::SkipVote { slot: slot as i32 }.into_boxed(),
                     _ => unsignedvote::FinalizeVote { id }.into_boxed(),
                 };
-                let preimage = crate::utils::create_data_to_sign(session,
-                    &crate::utils::serialize_unsigned_vote(&vote));
-                let signatures = (0..3).map(|index| VoteSignature {
-                    who: index as i32,
-                    signature: fixture.nodes[index].public_key.sign(&preimage).unwrap().to_vec(),
-                }.into_boxed()).collect();
-                Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }.into_boxed()
+                let preimage = crate::utils::create_data_to_sign(
+                    session,
+                    &crate::utils::serialize_unsigned_vote(&vote),
+                );
+                let signatures = (0..3)
+                    .map(|index| {
+                        VoteSignature {
+                            who: index as i32,
+                            signature: fixture.nodes[index]
+                                .public_key
+                                .sign(&preimage)
+                                .unwrap()
+                                .to_vec(),
+                        }
+                        .into_boxed()
+                    })
+                    .collect();
+                Certificate {
+                    vote,
+                    signatures: VoteSignatureSet { votes: signatures }.into_boxed(),
+                }
+                .into_boxed()
             };
             let hash = UInt256::from([0x51; 32]);
             let valid = make(fixture.description.get_session_id(), kind, 5, hash.clone());
             let other_slot = make(fixture.description.get_session_id(), kind, 6, hash.clone());
-            let wrong_context = make(&UInt256::from([0x91; 32]), kind, 5, UInt256::from([0x52; 32]));
+            let wrong_context =
+                make(&UInt256::from([0x91; 32]), kind, 5, UInt256::from([0x52; 32]));
             let unknown_wrong_context = make(&UInt256::from([0x91; 32]), kind, 6, hash.clone());
-            let other_kind_wrong_context = make(&UInt256::from([0x91; 32]), 1 - kind.min(1), 5, hash);
+            let other_kind_wrong_context =
+                make(&UInt256::from([0x91; 32]), 1 - kind.min(1), 5, hash);
             // Call the actor ingress directly: these messages already passed
             // the receiver before its acceptance notification could filter them.
-            assert!(fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, valid.clone())));
+            assert!(fixture.processor.with_consensus_backend(|c, b| c.on_certificate(
+                b,
+                source,
+                valid.clone()
+            )));
             fixture.drain_receiver_actions();
             let queued = fixture.task_queue.tasks.lock().unwrap().len();
             let progress = fixture.processor.simplex_state.get_first_non_progressed_slot();
             for duplicate in [valid, wrong_context] {
-                assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, duplicate)),
-                    "a known kind/slot must not verify again or pump the FSM");
+                assert!(
+                    !fixture
+                        .processor
+                        .with_consensus_backend(|c, b| c.on_certificate(b, source, duplicate)),
+                    "a known kind/slot must not verify again or pump the FSM"
+                );
             }
-            assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0,
-                "known-kind ingress must stop before crypto, including another hash/context");
+            assert_eq!(
+                fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed),
+                0,
+                "known-kind ingress must stop before crypto, including another hash/context"
+            );
             assert!(fixture.drain_receiver_actions().is_empty());
             assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), queued);
             assert_eq!(fixture.processor.simplex_state.get_first_non_progressed_slot(), progress);
-            assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, unknown_wrong_context)));
-            assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 1,
-                "a new slot still requires full verification");
+            assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(
+                b,
+                source,
+                unknown_wrong_context
+            )));
+            assert_eq!(
+                fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed),
+                1,
+                "a new slot still requires full verification"
+            );
             if kind != 2 {
-                assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, other_kind_wrong_context)));
-                assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 2,
-                    "another kind in the same live slot still requires verification");
+                assert!(!fixture.processor.with_consensus_backend(|c, b| c.on_certificate(
+                    b,
+                    source,
+                    other_kind_wrong_context
+                )));
+                assert_eq!(
+                    fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed),
+                    2,
+                    "another kind in the same live slot still requires verification"
+                );
             }
-            assert!(fixture.processor.with_consensus_backend(|c, b| c.on_certificate(b, source, other_slot)),
-                "a valid new slot remains admissible");
+            assert!(
+                fixture
+                    .processor
+                    .with_consensus_backend(|c, b| c.on_certificate(b, source, other_slot)),
+                "a valid new slot remains admissible"
+            );
         }
     }
 }
@@ -1614,33 +1710,70 @@ fn test_certificate_ingress_excludes_upper_boundary_before_verification() {
         fixture.drain_receiver_actions();
         let boundary = fixture.processor.simplex_state.first_too_new_vote_slot().value();
         assert_eq!(boundary, 12);
-        let id = TlCandidateId { slot: boundary as i32, hash: UInt256::from([42;32]) }.into_boxed();
+        let id =
+            TlCandidateId { slot: boundary as i32, hash: UInt256::from([42; 32]) }.into_boxed();
         let votes: Vec<rtos_api::ton::consensus::simplex::UnsignedVote> = vec![
             SkipVote { slot: boundary as i32 }.into_boxed(),
-            rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote { id: id.clone() }.into_boxed(),
+            rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote { id: id.clone() }
+                .into_boxed(),
             rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote { id }.into_boxed(),
         ];
         for vote in votes {
-            for session in [SessionId::default(), UInt256::from([77;32])] {
-                let preimage = crate::utils::create_data_to_sign(&session, &crate::utils::serialize_unsigned_vote(&vote));
-                let signatures = (0..3).map(|index| VoteSignature {
-                    who: index as i32,
-                    signature: fixture.nodes[index].public_key.sign(&preimage).unwrap().to_vec(),
-                }.into_boxed()).collect();
-                let certificate = Certificate { vote: vote.clone(), signatures: VoteSignatureSet { votes: signatures }.into_boxed() }.into_boxed();
+            for session in [SessionId::default(), UInt256::from([77; 32])] {
+                let preimage = crate::utils::create_data_to_sign(
+                    &session,
+                    &crate::utils::serialize_unsigned_vote(&vote),
+                );
+                let signatures = (0..3)
+                    .map(|index| {
+                        VoteSignature {
+                            who: index as i32,
+                            signature: fixture.nodes[index]
+                                .public_key
+                                .sign(&preimage)
+                                .unwrap()
+                                .to_vec(),
+                        }
+                        .into_boxed()
+                    })
+                    .collect();
+                let certificate = Certificate {
+                    vote: vote.clone(),
+                    signatures: VoteSignatureSet { votes: signatures }.into_boxed(),
+                }
+                .into_boxed();
                 fixture.processor.on_certificate(source, certificate);
             }
         }
         fixture.drain_pending_async_db_results();
-        assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
-            "exclusive ingress boundary cannot be admitted");
-        assert!(!fixture.processor.simplex_state.has_finalize_certificate(SlotIndex::new(boundary)));
-        assert_eq!(fixture.processor.simplex_state.get_notarize_weight(SlotIndex::new(boundary), &UInt256::from([42;32])), 0);
-        assert_eq!(fixture.processor.simplex_state.get_first_non_progressed_slot(), SlotIndex::new(0));
-        assert_eq!(fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0,
-            "out-of-window certificate must not reach signature verification");
-        assert!(fixture.drain_receiver_actions().is_empty(),
-            "rejected ingress cannot persist, relay, request candidates or ban its source");
+        assert!(
+            !fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
+            "exclusive ingress boundary cannot be admitted"
+        );
+        assert!(!fixture
+            .processor
+            .simplex_state
+            .has_finalize_certificate(SlotIndex::new(boundary)));
+        assert_eq!(
+            fixture
+                .processor
+                .simplex_state
+                .get_notarize_weight(SlotIndex::new(boundary), &UInt256::from([42; 32])),
+            0
+        );
+        assert_eq!(
+            fixture.processor.simplex_state.get_first_non_progressed_slot(),
+            SlotIndex::new(0)
+        );
+        assert_eq!(
+            fixture.processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed),
+            0,
+            "out-of-window certificate must not reach signature verification"
+        );
+        assert!(
+            fixture.drain_receiver_actions().is_empty(),
+            "rejected ingress cannot persist, relay, request candidates or ban its source"
+        );
     }
 }
 
@@ -1652,23 +1785,28 @@ fn test_certificate_ingress_accepts_inside_boundary_and_after_progress() {
     let mut fixture = TestFixture::new_with_opts(4, opts);
     fixture.drain_receiver_actions();
     let boundary = fixture.processor.simplex_state.first_too_new_vote_slot().value();
-    let at_boundary = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary, &[0,1,2]);
+    let at_boundary =
+        build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary, &[0, 1, 2]);
     fixture.processor.on_certificate(1, at_boundary.clone());
     assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)));
-    let inside = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary-1, &[0,1,2]);
+    let inside =
+        build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, boundary - 1, &[0, 1, 2]);
     fixture.processor.on_certificate(1, inside);
     fixture.drain_pending_async_db_results();
-    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary-1)));
+    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary - 1)));
     for slot in 0..4 {
-        let cert = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0,1,2]);
+        let cert =
+            build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, slot, &[0, 1, 2]);
         fixture.processor.on_certificate(1, cert);
         fixture.drain_pending_async_db_results();
     }
     assert!(fixture.processor.simplex_state.first_too_new_vote_slot().value() > boundary);
     fixture.processor.on_certificate(1, at_boundary);
     fixture.drain_pending_async_db_results();
-    assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
-        "the same certificate becomes admissible when real progress opens its window");
+    assert!(
+        fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)),
+        "the same certificate becomes admissible when real progress opens its window"
+    );
 }
 
 // ============================================================================
@@ -4325,9 +4463,14 @@ fn test_self_collation_failure_only_on_terminal_drop() {
         now,
     );
 
-    fixture.processor.collation.insert_precollated(slot, PrecollatedBlock {
-        request: AsyncRequestImpl::new(request_id, false, now), result: None, parent: None,
-    });
+    fixture.processor.collation.insert_precollated(
+        slot,
+        PrecollatedBlock {
+            request: AsyncRequestImpl::new(request_id, false, now),
+            result: None,
+            parent: None,
+        },
+    );
 
     // A genuine error while the slot is still current schedules a single
     // restart sharing the window-end budget - it is NOT terminal, so the
@@ -4340,9 +4483,14 @@ fn test_self_collation_failure_only_on_terminal_drop() {
     // The consumed failed request has no further rights. A real retry owns a
     // new request id at this same slot while retaining the slot's one funnel.
     let retry_id = request_id + 1;
-    fixture.processor.collation.insert_precollated(slot, PrecollatedBlock {
-        request: AsyncRequestImpl::new(retry_id, false, now), result: None, parent: None,
-    });
+    fixture.processor.collation.insert_precollated(
+        slot,
+        PrecollatedBlock {
+            request: AsyncRequestImpl::new(retry_id, false, now),
+            result: None,
+            parent: None,
+        },
+    );
     fixture.processor.on_collation_failed_impl(slot, request_id, error!("obsolete callback"));
     assert!(fixture.processor.collation.precollated_contains(slot));
 
@@ -4886,9 +5034,10 @@ fn test_has_real_candidate_body_returns_false_for_stub() {
         "hash metadata alone must not suppress body retrieval"
     );
     fixture.processor.candidate_book_mut().received_mut(&candidate_id).unwrap().data =
-        consensus_common::ConsensusCommonFactory::create_block_payload(
-            make_test_boc(b"candidate-body", BocFlags::Crc32),
-        );
+        consensus_common::ConsensusCommonFactory::create_block_payload(make_test_boc(
+            b"candidate-body",
+            BocFlags::Crc32,
+        ));
     assert!(
         fixture.processor.candidate_book().has_real_body(&candidate_id),
         "metadata and actual body must count as present"
@@ -5506,36 +5655,56 @@ fn test_recovery_reconstructed_pq_certificates_survive_repeated_bootstrap_withou
                 data,
                 node_idx: ValidatorIndex::new(index as u32),
                 seqno: index as i64,
-            }).unwrap();
+            })
+            .unwrap();
         }
         db.sync(Some(Duration::from_secs(10))).unwrap();
         let mut bootstrap = db.load_bootstrap().unwrap();
-        assert!(bootstrap.notar_certs.is_empty() && bootstrap.final_certs.is_empty()
-            && bootstrap.skip_certs.is_empty());
+        assert!(
+            bootstrap.notar_certs.is_empty()
+                && bootstrap.final_certs.is_empty()
+                && bootstrap.skip_certs.is_empty()
+        );
         for restart in 0..2 {
             let receiver = MockReceiver::new();
-            let mut processor = make_pq_processor_with_description_for_test(db.clone(), description.clone());
+            let mut processor =
+                make_pq_processor_with_description_for_test(db.clone(), description.clone());
             processor.receiver = receiver.clone();
             crate::startup_recovery::SessionStartupRecoveryProcessor::new(
-                f::session(), description.clone(), bootstrap,
-            ).apply_bootstrap(&mut processor).unwrap();
+                f::session(),
+                description.clone(),
+                bootstrap,
+            )
+            .apply_bootstrap(&mut processor)
+            .unwrap();
             db.sync(Some(Duration::from_secs(10))).unwrap();
             processor.process_pending_async_db_results();
-            assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
-                ReceiverAction::SendCertificate { .. }
-            )), "historical certificates must not be relayed on restart {restart}");
+            assert!(
+                !receiver
+                    .drain_actions()
+                    .iter()
+                    .any(|action| matches!(action, ReceiverAction::SendCertificate { .. })),
+                "historical certificates must not be relayed on restart {restart}"
+            );
             bootstrap = db.load_bootstrap().unwrap();
             let records = match role {
                 "notarize" => bootstrap.notar_certs.len(),
                 "finalize" => bootstrap.final_certs.len(),
                 _ => bootstrap.skip_certs.len(),
             };
-            assert_eq!(records, 1, "reconstructed {role} certificate must be durable on restart {restart}");
+            assert_eq!(
+                records, 1,
+                "reconstructed {role} certificate must be durable on restart {restart}"
+            );
             // A second reader independently checks membership, quorum, session
             // and signatures in the newly stored bootstrap.
             crate::startup_recovery::SessionStartupRecoveryProcessor::new(
-                f::session(), description.clone(), bootstrap.clone(),
-            ).authenticate_pq_input().unwrap();
+                f::session(),
+                description.clone(),
+                bootstrap.clone(),
+            )
+            .authenticate_pq_input()
+            .unwrap();
         }
         db.close(Some(Duration::from_secs(10))).unwrap();
     }
@@ -6681,9 +6850,7 @@ fn recursive_parent_body_recovery_case(skipped_parent: bool) {
 
     let recording = RecordingListener::new();
     let listener: Arc<dyn consensus_common::SessionListener + Send + Sync> = recording.clone();
-    fixture
-        .processor
-        .set_listener_for_test(Arc::downgrade(&listener));
+    fixture.processor.set_listener_for_test(Arc::downgrade(&listener));
 
     let (parent_leader, parent_id, parent_broadcast) =
         make_signed_block_broadcast(&fixture, 41, vec![1u8, 2, 3]);
@@ -6694,9 +6861,7 @@ fn recursive_parent_body_recovery_case(skipped_parent: bool) {
         Some(parent_id.clone()),
     );
 
-    fixture
-        .processor
-        .on_candidate_received(child_leader, child_broadcast, None);
+    fixture.processor.on_candidate_received(child_leader, child_broadcast, None);
     let child_block = fixture
         .processor
         .candidate_book()
@@ -6719,40 +6884,29 @@ fn recursive_parent_body_recovery_case(skipped_parent: bool) {
             .is_some());
     }
 
-    fixture
-        .processor
-        .handle_block_finalized(BlockFinalizedEvent {
-            slot: child_id.slot,
-            block_hash: child_id.hash.clone(),
-            block_id: Some(child_block.clone()),
-            certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
-        });
+    fixture.processor.handle_block_finalized(BlockFinalizedEvent {
+        slot: child_id.slot,
+        block_hash: child_id.hash.clone(),
+        block_id: Some(child_block.clone()),
+        certificate: make_test_final_cert(child_id.slot, child_id.hash.clone()),
+    });
     // Drain the deferred `request_candidate` bounce so the missing-parent
     // repair request reaches the (fake) receiver before we inspect its actions.
     fixture.run_pending_tasks();
 
     let initial_events = drain_finalized_events(&recording);
+    assert!(initial_events.is_empty(), "C++ WC child waits for the parent finalization");
     assert!(
-        initial_events.is_empty(),
-        "C++ WC child waits for the parent finalization"
-    );
-    assert!(
-        fixture
-            .processor
-            .consensus
-            .finalized_pending_body_contains(&child_id),
+        fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "trigger must remain in pending journal while parent body is missing"
     );
     assert!(
-        fixture
-            .drain_receiver_actions()
-            .iter()
-            .any(|action| match action {
-                ReceiverAction::RequestCandidate { slot, block_hash } => {
-                    *slot == parent_id.slot.value() && block_hash == &parent_id.hash
-                }
-                _ => false,
-            }),
+        fixture.drain_receiver_actions().iter().any(|action| match action {
+            ReceiverAction::RequestCandidate { slot, block_hash } => {
+                *slot == parent_id.slot.value() && block_hash == &parent_id.hash
+            }
+            _ => false,
+        }),
         "missing parent body must trigger immediate requestCandidate"
     );
 
@@ -6765,9 +6919,7 @@ fn recursive_parent_body_recovery_case(skipped_parent: bool) {
             &[0, 1, 2],
         )
     });
-    fixture
-        .processor
-        .on_candidate_received(parent_leader, parent_broadcast, parent_notar);
+    fixture.processor.on_candidate_received(parent_leader, parent_broadcast, parent_notar);
     let parent_block = fixture
         .processor
         .candidate_book()
@@ -6783,10 +6935,7 @@ fn recursive_parent_body_recovery_case(skipped_parent: bool) {
         "C++ WC FinalizeBlock order is parent approval before child final"
     );
     assert!(
-        !fixture
-            .processor
-            .consensus
-            .finalized_pending_body_contains(&child_id),
+        !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear after recursive completion"
     );
 }
@@ -6872,8 +7021,11 @@ fn test_recursive_finalization_defers_until_parent_notar_cert_arrives() {
     fixture.drain_pending_async_db_results();
 
     let finalized_events = drain_finalized_events(&recording);
-    assert_eq!(finalized_events, vec![(parent_block, false), (child_block, true)],
-        "C++ WC FinalizeBlock order is parent approval before child final");
+    assert_eq!(
+        finalized_events,
+        vec![(parent_block, false), (child_block, true)],
+        "C++ WC FinalizeBlock order is parent approval before child final"
+    );
     assert!(
         !fixture.processor.consensus.finalized_pending_body_contains(&child_id),
         "pending journal entry must clear once notar cert arrives and retry runs"
@@ -6885,16 +7037,21 @@ fn test_recovery_ancestry_requires_parent_evidence_even_below_applied_floor() {
     let mut opts = SessionOptions::default();
     opts.use_callback_thread = false;
     let mut fixture = TestFixture::new_with_shard_and_local_idx(
-        4, 0, ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(), opts,
+        4,
+        0,
+        ShardIdent::with_tagged_prefix(0, 0x8000_0000_0000_0000).unwrap(),
+        opts,
     );
     let (parent_leader, parent, parent_data) =
         make_signed_block_broadcast(&fixture, 51, vec![7, 7, 7]);
-    let (leader, child, data) = make_signed_block_broadcast_with_parent(
-        &fixture, 69, vec![8, 8, 8], Some(parent.clone()),
-    );
+    let (leader, child, data) =
+        make_signed_block_broadcast_with_parent(&fixture, 69, vec![8, 8, 8], Some(parent.clone()));
     fixture.processor.on_candidate_received(leader, data, None);
     fixture.processor.set_mc_finalized_block(BlockIdExt::with_params(
-        fixture.description.get_shard().clone(), 1000, UInt256::rand(), UInt256::rand(),
+        fixture.description.get_shard().clone(),
+        1000,
+        UInt256::rand(),
+        UInt256::rand(),
     ));
     // Exercise the production materialization gate as well as the resolver.
     // CandidateBook is an already-verified input boundary here; cryptographic
@@ -6902,43 +7059,78 @@ fn test_recovery_ancestry_requires_parent_evidence_even_below_applied_floor() {
     let (nodes, keys) = crate::pq_fixture::members();
     let members = nodes.iter().map(|n| n.descriptor.clone().unwrap()).collect();
     let (runtime, key, options) = crate::authenticated_fixture::runtime_with_members_on_shard(
-        members, keys[0].clone(), fixture.description.get_shard().clone(),
+        members,
+        keys[0].clone(),
+        fixture.description.get_shard().clone(),
     );
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
-    let description = Arc::new(SessionDescription::new_with_runtime(
-        &options, runtime.session_id().clone(), 1, &nodes, key, runtime.shard(),
-        SystemTime::now(), None, Some(&runtime),
-    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>()
+        .unwrap();
+    let description = Arc::new(
+        SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            key,
+            runtime.shard(),
+            SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap(),
+    );
     let db = MockDb::new();
     let mut authenticated = make_pq_processor_with_description_for_test(db.clone(), description);
     authenticated.candidate_book_mut().insert_received(
-        child.clone(), fixture.processor.candidate_book().received(&child).unwrap().clone(),
+        child.clone(),
+        fixture.processor.candidate_book().received(&child).unwrap().clone(),
     );
-    assert!(!authenticated.with_consensus_backend(|c, b| c.maybe_apply_finalized_state(b, &child, true)),
-        "never persist a record whose required recovery ancestry is missing");
+    assert!(
+        !authenticated
+            .with_consensus_backend(|c, b| c.maybe_apply_finalized_state(b, &child, true)),
+        "never persist a record whose required recovery ancestry is missing"
+    );
     assert!(db.load_finalized_blocks().unwrap().is_empty());
     fixture.run_pending_tasks();
     for _ in 0..1000 {
-        assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)));
+        assert!(!fixture
+            .processor
+            .with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)));
     }
-    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
-        "repeated finality-ancestry retries must not enqueue repeated repairs");
+    assert_eq!(
+        fixture.task_queue.tasks.lock().unwrap().len(),
+        1,
+        "repeated finality-ancestry retries must not enqueue repeated repairs"
+    );
     fixture.run_pending_tasks();
     assert!(fixture.drain_receiver_actions().iter().any(|action| matches!(action,
         ReceiverAction::RequestCandidate { slot, block_hash }
             if *slot == parent.slot.value() && block_hash == &parent.hash)));
 
     fixture.processor.on_candidate_received(parent_leader, parent_data, None);
-    assert!(!fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
-        "a signed proposal alone cannot support an ancestor's finality");
+    assert!(
+        !fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
+        "a signed proposal alone cannot support an ancestor's finality"
+    );
     let notar = make_notar_vote_signature_set_bytes(
-        fixture.processor.session_id(), &fixture.nodes, parent.slot, parent.hash.clone(), &[0, 1, 2],
+        fixture.processor.session_id(),
+        &fixture.nodes,
+        parent.slot,
+        parent.hash.clone(),
+        &[0, 1, 2],
     );
     fixture.processor.process_received_notar_cert(parent.slot, &parent.hash, &notar);
     fixture.drain_pending_async_db_results();
-    assert!(fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
-        "the authenticated parent and its durably ingested NotarCert close the recovery gap");
+    assert!(
+        fixture.processor.with_consensus_backend(|c, b| c.ensure_recoverable_ancestry(b, &child)),
+        "the authenticated parent and its durably ingested NotarCert close the recovery gap"
+    );
 }
 
 #[test]
@@ -6958,8 +7150,11 @@ fn test_deferred_candidate_repairs_coalesce_across_controllers_and_keep_urgent_d
             b.request_parent_candidate(slot, hash.clone());
         });
     }
-    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
-        "throttling after dequeue cannot bound the repair backlog");
+    assert_eq!(
+        fixture.task_queue.tasks.lock().unwrap().len(),
+        1,
+        "throttling after dequeue cannot bound the repair backlog"
+    );
     fixture.processor.with_consensus_backend(|_, b| {
         b.request_candidate(slot, hash.clone(), Some(Duration::ZERO));
     });
@@ -6967,21 +7162,36 @@ fn test_deferred_candidate_repairs_coalesce_across_controllers_and_keep_urgent_d
     fixture.processor.with_consensus_backend(|_, b| {
         b.request_candidate(slot, other_hash.clone(), Some(Duration::ZERO));
     });
-    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 2,
-        "different candidate hashes in the same slot remain distinct");
+    assert_eq!(
+        fixture.task_queue.tasks.lock().unwrap().len(),
+        2,
+        "different candidate hashes in the same slot remain distinct"
+    );
     fixture.run_pending_tasks();
-    let requests: Vec<_> = fixture.drain_receiver_actions().into_iter().filter_map(|action| {
-        match action { ReceiverAction::RequestCandidate { slot: s, block_hash } if s == slot.value()
-            => Some(block_hash), _ => None }
-    }).collect();
-    assert_eq!(requests, vec![hash.clone(), other_hash],
-        "an urgent retry must not inherit the first delayed request");
+    let requests: Vec<_> = fixture
+        .drain_receiver_actions()
+        .into_iter()
+        .filter_map(|action| match action {
+            ReceiverAction::RequestCandidate { slot: s, block_hash } if s == slot.value() => {
+                Some(block_hash)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        requests,
+        vec![hash.clone(), other_hash],
+        "an urgent retry must not inherit the first delayed request"
+    );
     assert!(fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty());
     fixture.processor.with_consensus_backend(|_, b| {
         b.request_candidate(slot, hash, Some(Duration::ZERO));
     });
-    assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1,
-        "dequeued repairs must permit future retries through the normal limiter");
+    assert_eq!(
+        fixture.task_queue.tasks.lock().unwrap().len(),
+        1,
+        "dequeued repairs must permit future retries through the normal limiter"
+    );
 }
 
 #[test]
@@ -6996,8 +7206,10 @@ fn test_deferred_candidate_repair_discard_releases_ticket() {
         });
         assert_eq!(fixture.task_queue.tasks.lock().unwrap().len(), 1);
         crate::task_queue::TaskQueue::flush(&*fixture.task_queue);
-        assert!(fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty(),
-            "discarding a queued closure must not suppress the next repair");
+        assert!(
+            fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty(),
+            "discarding a queued closure must not suppress the next repair"
+        );
     }
 }
 
@@ -10458,8 +10670,10 @@ fn pq_live_processor_candidate_persistence_and_authenticated_recovery() {
     )
     .apply_bootstrap(&mut restored)
     .unwrap();
-    assert!(!restored.runtime.is_generated(SlotIndex::new(99)),
-        "restored peer candidate must not fence our local production slot");
+    assert!(
+        !restored.runtime.is_generated(SlotIndex::new(99)),
+        "restored peer candidate must not fence our local production slot"
+    );
     for alteration in 0..3 {
         let mut bad = bootstrap.clone();
         match alteration {
@@ -10475,8 +10689,10 @@ fn pq_live_processor_candidate_persistence_and_authenticated_recovery() {
         )
         .apply_bootstrap(&mut target)
         .is_err());
-        assert!(!target.runtime.is_generated(SlotIndex::new(99)),
-            "unauthenticated payload or metadata cannot set a local production fence");
+        assert!(
+            !target.runtime.is_generated(SlotIndex::new(99)),
+            "unauthenticated payload or metadata cannot set a local production fence"
+        );
     }
     drop(restored);
     db.close(Some(Duration::from_secs(10))).unwrap();
@@ -10736,8 +10952,7 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
             serialize_boxed(
                 &Certificate {
                     vote: FinalizeVote {
-                        id: TlCandidateId { slot: 99, hash: id.hash.clone() }
-                            .into_boxed(),
+                        id: TlCandidateId { slot: 99, hash: id.hash.clone() }.into_boxed(),
                     }
                     .into_boxed(),
                     signatures: signatures(proof_kind, "finalize", count),
@@ -10759,7 +10974,9 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                 3 => bootstrap.final_certs[0].cert_bytes = final_cert(kind, &child.candidate_id, 1),
                 4 => bootstrap.finalized_blocks[0].is_final = true,
                 5 => bootstrap.final_certs[0].cert_bytes.push(0),
-                6 => { bootstrap.finalized_blocks.remove(0); }
+                6 => {
+                    bootstrap.finalized_blocks.remove(0);
+                }
                 7 => {
                     bootstrap.finalized_blocks.remove(0);
                     bootstrap.candidate_infos.remove(0);
@@ -10776,15 +10993,25 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                     for index in if alteration == 11 { vec![0, 0] } else { vec![0, 1] } {
                         let signed = TlVote {
                             vote: rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote {
-                                id: TlCandidateId { slot: 98, hash: parent.candidate_id.hash.clone() }.into_boxed(),
-                            }.into_boxed(),
+                                id: TlCandidateId {
+                                    slot: 98,
+                                    hash: parent.candidate_id.hash.clone(),
+                                }
+                                .into_boxed(),
+                            }
+                            .into_boxed(),
                             signature: f::bytes(row("parent", "notarize", index), "signature"),
-                        }.into_boxed();
+                        }
+                        .into_boxed();
                         let mut data = serialize_boxed(&signed).unwrap();
-                        if alteration == 12 { *data.last_mut().unwrap() ^= 1; }
+                        if alteration == 12 {
+                            *data.last_mut().unwrap() ^= 1;
+                        }
                         bootstrap.votes.push(crate::database::VoteRecord {
-                            vote_hash: UInt256::calc_file_hash(&data), data,
-                            node_idx: ValidatorIndex::new(index as u32), seqno: index as i64,
+                            vote_hash: UInt256::calc_file_hash(&data),
+                            data,
+                            node_idx: ValidatorIndex::new(index as u32),
+                            seqno: index as i64,
                         });
                     }
                 }
@@ -10814,7 +11041,10 @@ fn pq_live_recovery_authenticates_finalized_parent_chains_and_role_flags() {
                 bootstrap,
             )
             .apply_bootstrap(&mut target);
-            let succeeds = alteration == 0 || alteration == 6 || alteration == 10 || (alteration == 4 && kind == "empty");
+            let succeeds = alteration == 0
+                || alteration == 6
+                || alteration == 10
+                || (alteration == 4 && kind == "empty");
             assert_eq!(result.is_ok(), succeeds, "{kind}/{alteration}: {result:?}");
             let expected = match alteration {
                 7 => Some("finalized ancestor metadata missing"),
@@ -11665,10 +11895,14 @@ fn custody_real_candidate_recovery_uses_durable_carrier() {
                 )
                 .apply_bootstrap(&mut target)
                 .unwrap();
-                assert!(target.runtime.is_generated(SlotIndex::new(99)),
-                    "restored durable own candidate must fence re-collation of its slot");
-                assert!(!target.runtime.is_sent_generated(SlotIndex::new(99)),
-                    "recovery must not manufacture evidence of network publication");
+                assert!(
+                    target.runtime.is_generated(SlotIndex::new(99)),
+                    "restored durable own candidate must fence re-collation of its slot"
+                );
+                assert!(
+                    !target.runtime.is_sent_generated(SlotIndex::new(99)),
+                    "recovery must not manufacture evidence of network publication"
+                );
                 let actions = receiver.drain_actions();
                 assert!(
                     !actions.iter().any(|a| matches!(
@@ -11774,40 +12008,70 @@ fn custody_retired_backend_stops_real_vote_publication() {
 #[test]
 fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing() {
     let directory = crate::authenticated_fixture::TestDirectory::new();
-    let stores: Vec<_> = [0xa1, 0xa2].into_iter().map(|seed| {
-        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[seed; 32], 0).unwrap()
-    }).collect();
+    let stores: Vec<_> = [0xa1, 0xa2]
+        .into_iter()
+        .map(|seed| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[seed; 32], 0).unwrap())
+        .collect();
     let (_, keys) = crate::pq_fixture::members();
-    let members = stores.iter().enumerate().map(|(index, store)| {
-        rtos_block::ValidatorDescr::with_pq_params(
-            UInt256::from([index as u8 + 1; 32]), store.consensus_key().clone(),
-            index as u64 + 1, UInt256::from(*keys[index].id().data()),
-        )
-    }).collect();
+    let members = stores
+        .iter()
+        .enumerate()
+        .map(|(index, store)| {
+            rtos_block::ValidatorDescr::with_pq_params(
+                UInt256::from([index as u8 + 1; 32]),
+                store.consensus_key().clone(),
+                index as u64 + 1,
+                UInt256::from(*keys[index].id().data()),
+            )
+        })
+        .collect();
     let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
     let (runtime, transport, options) =
         crate::authenticated_fixture::runtime_with_members(members, observer);
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<Result<Vec<_>>>().unwrap();
-    let description = Arc::new(SessionDescription::new_with_runtime(
-        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
-        SystemTime::now(), None, Some(&runtime),
-    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let description = Arc::new(
+        SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            transport,
+            runtime.shard(),
+            SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap(),
+    );
     assert!(description.local_validator_index().is_none());
-    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-cert").unwrap();
+    let db =
+        crate::database::SimplexDb::open(directory.path().join("db"), "observer-cert").unwrap();
     let receiver = MockReceiver::new();
     let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
     processor.receiver = receiver.clone();
     let make_certificate_at = |slot: u32, session: &SessionId, signers: &[usize], corrupt: bool| {
         let vote = SkipVote { slot: slot as i32 }.into_boxed();
         let preimage = crate::utils::create_data_to_sign(
-            session, &crate::utils::serialize_unsigned_vote(&vote),
+            session,
+            &crate::utils::serialize_unsigned_vote(&vote),
         );
-        let signatures = signers.iter().map(|&index| {
-            let mut signature = stores[index].sign_consensus(&preimage).unwrap().bytes.to_vec();
-            if corrupt { signature[0] ^= 1; }
-            VoteSignature { who: index as i32, signature }.into_boxed()
-        }).collect();
+        let signatures = signers
+            .iter()
+            .map(|&index| {
+                let mut signature = stores[index].sign_consensus(&preimage).unwrap().bytes.to_vec();
+                if corrupt {
+                    signature[0] ^= 1;
+                }
+                VoteSignature { who: index as i32, signature }.into_boxed()
+            })
+            .collect();
         Certificate { vote, signatures: VoteSignatureSet { votes: signatures }.into_boxed() }
             .into_boxed()
     };
@@ -11815,7 +12079,7 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
         make_certificate_at(0, session, signers, corrupt)
     };
     let boundary = processor.simplex_state.first_too_new_vote_slot().value();
-    let boundary_cert = make_certificate_at(boundary, runtime.session_id(), &[0,1], false);
+    let boundary_cert = make_certificate_at(boundary, runtime.session_id(), &[0, 1], false);
     let invalid = [
         make_certificate(runtime.session_id(), &[0], false), // weight 1 < quorum 2
         make_certificate(runtime.session_id(), &[0, 0], false), // duplicate cannot add weight
@@ -11828,15 +12092,22 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
     receiver.drain_actions();
     processor.on_certificate(None::<u32>, boundary_cert);
     assert!(!processor.simplex_state.has_skip_certificate(SlotIndex::new(boundary)));
-    assert!(db.load_skip_cert_by_slot(SlotIndex::new(boundary), Duration::from_secs(5)).unwrap().is_none());
+    assert!(db
+        .load_skip_cert_by_slot(SlotIndex::new(boundary), Duration::from_secs(5))
+        .unwrap()
+        .is_none());
     assert!(receiver.drain_actions().is_empty());
     assert_eq!(processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), 0);
     for certificate in invalid {
         // None is a transport observer, not a forged committee index zero.
         processor.on_certificate(None::<u32>, certificate);
         assert!(!processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
-        assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_none());
-        assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+        assert!(db
+            .load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        assert!(!receiver.drain_actions().iter().any(|action| matches!(
+            action,
             ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
         )));
     }
@@ -11845,29 +12116,48 @@ fn authenticated_observer_processor_accepts_only_valid_pq_quorum_without_signing
         for _ in 0..16 {
             db.sync(Some(Duration::from_secs(5))).unwrap();
             processor.process_pending_async_db_results();
-            if processor.database.pending_is_empty() { return; }
+            if processor.database.pending_is_empty() {
+                return;
+            }
         }
         panic!("certificate continuations did not drain after actual storage barriers");
     };
     drain(&mut processor);
     assert!(processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
-    assert!(db.load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5)).unwrap().is_some());
+    assert!(db
+        .load_skip_cert_by_slot(SlotIndex::new(0), Duration::from_secs(5))
+        .unwrap()
+        .is_some());
     let actions = receiver.drain_actions();
-    assert_eq!(actions.iter().filter(|action| matches!(action, ReceiverAction::SendCertificate { .. })).count(), 1);
-    assert!(!actions.iter().any(|action| matches!(action,
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(action, ReceiverAction::SendCertificate { .. }))
+            .count(),
+        1
+    );
+    assert!(!actions.iter().any(|action| matches!(
+        action,
         ReceiverAction::SendVote { .. } | ReceiverAction::CacheOurVoteForStandstill { .. }
     )));
     let verify_failures = processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed);
     processor.on_certificate(None::<u32>, queued_duplicate);
-    assert_eq!(processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed), verify_failures,
-        "queued known-kind PQ certificate must stop before repeated verification");
+    assert_eq!(
+        processor.telemetry.cert_verify_fails_total.load(Ordering::Relaxed),
+        verify_failures,
+        "queued known-kind PQ certificate must stop before repeated verification"
+    );
     assert!(receiver.drain_actions().is_empty());
     processor.on_certificate(None::<u32>, valid);
     drain(&mut processor);
-    assert!(!receiver.drain_actions().iter().any(|action| matches!(action,
+    assert!(!receiver.drain_actions().iter().any(|action| matches!(
+        action,
         ReceiverAction::SendVote { .. } | ReceiverAction::SendCertificate { .. }
     )));
-    assert_eq!(calls, stores.iter().map(|store| store.consensus_signatures_produced()).collect::<Vec<_>>());
+    assert_eq!(
+        calls,
+        stores.iter().map(|store| store.consensus_signatures_produced()).collect::<Vec<_>>()
+    );
     drop(processor);
     db.close(None).unwrap();
 }
@@ -11880,26 +12170,48 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
     let (mut nodes, _) = crate::pq_fixture::members();
     nodes[1] = crate::SimplexSessionNode::from_descriptor(
         &crate::signing_coordinator::tests::custody_descriptor(&store),
-    ).unwrap();
+    )
+    .unwrap();
     let observer = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
     let (runtime, transport, options) = crate::authenticated_fixture::runtime_with_members(
-        nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(), observer,
+        nodes.iter().map(|node| node.descriptor.clone().unwrap()).collect(),
+        observer,
     );
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
-    let description = Arc::new(SessionDescription::new_with_runtime(
-        &options, runtime.session_id().clone(), 1, &nodes, transport, runtime.shard(),
-        SystemTime::now(), None, Some(&runtime),
-    ).unwrap().bind_pq_session(runtime.catchain_seqno()).unwrap());
-    let db = crate::database::SimplexDb::open(directory.path().join("db"), "observer-body").unwrap();
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>()
+        .unwrap();
+    let description = Arc::new(
+        SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            transport,
+            runtime.shard(),
+            SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap(),
+    );
+    let db =
+        crate::database::SimplexDb::open(directory.path().join("db"), "observer-body").unwrap();
     let receiver = MockReceiver::new();
     let mut processor = make_pq_processor_with_description_for_test(db.clone(), description);
     processor.receiver = receiver.clone();
     let listener = RecordingListener::new();
     let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
     processor.callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(
-        runtime.session_id().clone(), Arc::new(AtomicBool::new(false)), false,
-        Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn),
+        runtime.session_id().clone(),
+        Arc::new(AtomicBool::new(false)),
+        false,
+        Arc::new(TestCallbackQueue),
+        Arc::downgrade(&listener_dyn),
     ));
     let mut block = rtos_block::Block::default();
     block.set_global_id(runtime.pin().global_id);
@@ -11911,27 +12223,59 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
     let data = rtos_block::write_boc(&cell).unwrap();
     let collated = make_test_boc(b"authenticated-observer", BocFlags::Crc32);
     let slot = SlotIndex::new(options.slots_per_leader_window);
-    let bytes = make_validator_session_candidate_bytes(1, cell.repr_hash().clone(), data.clone(), collated.clone());
+    let bytes = make_validator_session_candidate_bytes(
+        1,
+        cell.repr_hash().clone(),
+        data.clone(),
+        collated.clone(),
+    );
     let hash = crate::utils::compute_candidate_id_hash_from_bytes(
-        slot, &bytes, None, runtime.shard(), 1 << 20, options.proto_version,
-    ).unwrap();
-    let signature = store.sign_consensus(&crate::utils::create_data_to_sign(
-        runtime.session_id(), &crate::utils::create_candidate_id_to_sign(slot, &hash),
-    )).unwrap().bytes.to_vec();
+        slot,
+        &bytes,
+        None,
+        runtime.shard(),
+        1 << 20,
+        options.proto_version,
+    )
+    .unwrap();
+    let signature = store
+        .sign_consensus(&crate::utils::create_data_to_sign(
+            runtime.session_id(),
+            &crate::utils::create_candidate_id_to_sign(slot, &hash),
+        ))
+        .unwrap()
+        .bytes
+        .to_vec();
     let candidate = rtos_api::ton::consensus::candidatedata::Block {
         slot: slot.value() as i32,
         parent: rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents,
         candidate: bytes,
         signature,
-    }.into_boxed();
+    }
+    .into_boxed();
     let vote = rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote {
         id: TlCandidateId { slot: slot.value() as i32, hash: hash.clone() }.into_boxed(),
-    }.into_boxed();
-    let cert = Certificate { signatures: VoteSignatureSet { votes: vec![VoteSignature {
-        who: 1, signature: store.sign_consensus(&crate::utils::create_data_to_sign(
-            runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote),
-        )).unwrap().bytes.to_vec(),
-    }.into_boxed()] }.into_boxed(), vote }.into_boxed();
+    }
+    .into_boxed();
+    let cert = Certificate {
+        signatures: VoteSignatureSet {
+            votes: vec![VoteSignature {
+                who: 1,
+                signature: store
+                    .sign_consensus(&crate::utils::create_data_to_sign(
+                        runtime.session_id(),
+                        &crate::utils::serialize_unsigned_vote(&vote),
+                    ))
+                    .unwrap()
+                    .bytes
+                    .to_vec(),
+            }
+            .into_boxed()],
+        }
+        .into_boxed(),
+        vote,
+    }
+    .into_boxed();
     let certificate = options.wire_profile.serialize(&cert).unwrap();
     let mut bad = candidate.clone();
     let CandidateData::Consensus_Block(ref mut value) = bad else { unreachable!() };
@@ -11951,7 +12295,10 @@ fn authenticated_observer_nonempty_query_emits_leader_evidence_after_pq_verifica
     drop(evidence);
     db.sync(Some(Duration::from_secs(5))).unwrap();
     processor.process_pending_async_db_results();
-    assert!(!receiver.drain_actions().iter().any(|action| matches!(action, ReceiverAction::SendVote { .. })));
+    assert!(!receiver
+        .drain_actions()
+        .iter()
+        .any(|action| matches!(action, ReceiverAction::SendVote { .. })));
     drop(processor);
     db.close(None).unwrap();
 }
@@ -11973,99 +12320,220 @@ fn source_finality_controller_failed_certificate_save_retries_before_wal_handoff
     source_finality_controller_case(false, false, true, None);
 }
 #[derive(Clone, Copy)]
-enum CertificateGateCase { LiveSuccess, LiveFailure, ReplaySuccess, ReplayFailure, ReplaySeededCandidate, ReplaySeededSeqno, ReplaySeededBoth }
+enum CertificateGateCase {
+    LiveSuccess,
+    LiveFailure,
+    ReplaySuccess,
+    ReplayFailure,
+    ReplaySeededCandidate,
+    ReplaySeededSeqno,
+    ReplaySeededBoth,
+}
 #[test]
 fn source_finality_authenticated_replay_requires_own_ack_despite_startup_delivery_seed() {
-    for case in [CertificateGateCase::ReplaySeededCandidate, CertificateGateCase::ReplaySeededSeqno,
-        CertificateGateCase::ReplaySeededBoth] {
+    for case in [
+        CertificateGateCase::ReplaySeededCandidate,
+        CertificateGateCase::ReplaySeededSeqno,
+        CertificateGateCase::ReplaySeededBoth,
+    ] {
         source_finality_controller_case(false, false, false, Some(case));
     }
 }
 #[test]
 fn source_finality_cpp_save_certificate_gates_live_and_replay_before_materialization() {
-    for case in [CertificateGateCase::LiveSuccess, CertificateGateCase::LiveFailure,
-        CertificateGateCase::ReplaySuccess, CertificateGateCase::ReplayFailure] {
+    for case in [
+        CertificateGateCase::LiveSuccess,
+        CertificateGateCase::LiveFailure,
+        CertificateGateCase::ReplaySuccess,
+        CertificateGateCase::ReplayFailure,
+    ] {
         source_finality_controller_case(false, false, false, Some(case));
     }
 }
-fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain: bool, gate: Option<CertificateGateCase>) {
+fn source_finality_controller_case(
+    upgrade: bool,
+    high_floor: bool,
+    fail_retain: bool,
+    gate: Option<CertificateGateCase>,
+) {
     use crate::finality_delivery::tests::{fixture, fixture_role, HeldSink};
     let temp = crate::authenticated_fixture::TestDirectory::new();
-    let (runtime, draft) = if upgrade || high_floor { fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap()) } else { fixture() };
+    let (runtime, draft) = if upgrade || high_floor {
+        fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap())
+    } else {
+        fixture()
+    };
     let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<rtos_block::Result<Vec<_>>>().unwrap();
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<rtos_block::Result<Vec<_>>>()
+        .unwrap();
     let key = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
-    let options = SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
-        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
-        ..Default::default() };
-    let description = Arc::new(SessionDescription::new_with_runtime(&options, runtime.session_id().clone(),
-        1, &nodes, key, runtime.shard(), SystemTime::now(), None, Some(&runtime)).unwrap()
-        .bind_pq_session(runtime.catchain_seqno()).unwrap());
+    let options = SessionOptions {
+        protocol: runtime.protocol(),
+        proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        slots_per_leader_window: runtime.slots_per_leader_window(),
+        ..Default::default()
+    };
+    let description = Arc::new(
+        SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            key,
+            runtime.shard(),
+            SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap(),
+    );
     let db = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
-    let mut processor = make_pq_processor_with_description_for_test(db.clone(), description.clone());
+    let mut processor =
+        make_pq_processor_with_description_for_test(db.clone(), description.clone());
     let receiver = MockReceiver::new();
     processor.receiver = receiver.clone();
     let listener = RecordingListener::new();
     let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
     let sink = Arc::new(HeldSink::default());
-    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
-        Arc::new(AtomicBool::new(false)), false, Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn))
-        .with_delivery_sink(Some(sink.clone())));
+    let callbacks = Arc::new(
+        crate::session_callbacks::SessionCallbacks::new(
+            runtime.session_id().clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Arc::new(TestCallbackQueue),
+            Arc::downgrade(&listener_dyn),
+        )
+        .with_delivery_sink(Some(sink.clone())),
+    );
     callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
     callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
     processor.consensus.set_callbacks_for_test(callbacks.clone());
     processor.callbacks = callbacks;
-    let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
-    let wire = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof).unwrap().to_node();
+    let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) =
+        &draft.finality
+    else {
+        unreachable!()
+    };
+    let wire =
+        rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof).unwrap().to_node();
     let candidate_bytes = rtos_api::serialize_boxed(&wire.candidate).unwrap();
-    let candidate_id = RawCandidateId { slot: SlotIndex::new(proof.slot), hash: UInt256::calc_file_hash(&candidate_bytes) };
-    processor.candidate_book_mut().insert_received(candidate_id.clone(), ReceivedCandidate {
-        slot: candidate_id.slot, source_idx: ValidatorIndex::new(0), candidate_hash_data_bytes: candidate_bytes,
-        block_id: draft.block_id.clone(), root_hash: draft.block_id.root_hash().clone(),
-        file_hash: draft.block_id.file_hash().clone(), data: draft.data.clone(),
-        collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
-        gen_utime_ms: None, receive_time: SystemTime::now(), is_empty: false, parent_id: None,
-    });
+    let candidate_id = RawCandidateId {
+        slot: SlotIndex::new(proof.slot),
+        hash: UInt256::calc_file_hash(&candidate_bytes),
+    };
+    processor.candidate_book_mut().insert_received(
+        candidate_id.clone(),
+        ReceivedCandidate {
+            slot: candidate_id.slot,
+            source_idx: ValidatorIndex::new(0),
+            candidate_hash_data_bytes: candidate_bytes,
+            block_id: draft.block_id.clone(),
+            root_hash: draft.block_id.root_hash().clone(),
+            file_hash: draft.block_id.file_hash().clone(),
+            data: draft.data.clone(),
+            collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                Vec::new(),
+            ),
+            gen_utime_ms: None,
+            receive_time: SystemTime::now(),
+            is_empty: false,
+            parent_id: None,
+        },
+    );
     let certificate = Arc::new(crate::certificate::Certificate {
-        vote: crate::simplex_state::FinalizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
-        signatures: proof.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
-            validator_idx: ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
-        }).collect(),
+        vote: crate::simplex_state::FinalizeVote {
+            slot: candidate_id.slot,
+            block_hash: candidate_id.hash.clone(),
+        },
+        signatures: proof
+            .signatures
+            .iter()
+            .enumerate()
+            .map(|(index, signature)| crate::certificate::VoteSignature {
+                validator_idx: ValidatorIndex::new(index as u32),
+                signature: signature.signature.clone(),
+            })
+            .collect(),
     });
-    let event = BlockFinalizedEvent { slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
-        block_id: Some(draft.block_id.clone()), certificate };
+    let event = BlockFinalizedEvent {
+        slot: candidate_id.slot,
+        block_hash: candidate_id.hash.clone(),
+        block_id: Some(draft.block_id.clone()),
+        certificate,
+    };
     if upgrade {
         let (_, approval) = fixture_role(false, runtime.shard().clone());
-        let consensus_common::SessionFinality::PqApproval(proof) = approval.finality else { unreachable!() };
-        let wire = rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(&proof).unwrap().to_node();
+        let consensus_common::SessionFinality::PqApproval(proof) = approval.finality else {
+            unreachable!()
+        };
+        let wire =
+            rtos_api::pq_finality::PqNetworkSignatureSet::from_approval(&proof).unwrap().to_node();
         let cert = Arc::new(crate::certificate::Certificate {
-            vote: crate::simplex_state::NotarizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
-            signatures: wire.signatures.iter().enumerate().map(|(index, signature)| crate::certificate::VoteSignature {
-                validator_idx: ValidatorIndex::new(index as u32), signature: signature.signature.clone(),
-            }).collect(),
+            vote: crate::simplex_state::NotarizeVote {
+                slot: candidate_id.slot,
+                block_hash: candidate_id.hash.clone(),
+            },
+            signatures: wire
+                .signatures
+                .iter()
+                .enumerate()
+                .map(|(index, signature)| crate::certificate::VoteSignature {
+                    validator_idx: ValidatorIndex::new(index as u32),
+                    signature: signature.signature.clone(),
+                })
+                .collect(),
         });
-        processor.simplex_state.set_notarize_certificate(&description, candidate_id.slot, &candidate_id.hash, cert).unwrap();
+        processor
+            .simplex_state
+            .set_notarize_certificate(&description, candidate_id.slot, &candidate_id.hash, cert)
+            .unwrap();
         let received = processor.candidate_book().received(&candidate_id).unwrap().clone();
         let mut complete = true;
-        processor.try_emit_recursive_finalized_callback(&candidate_id, &received, &event, false,
-            candidate_id.slot, &received.candidate_hash_data_bytes, &mut complete);
+        processor.try_emit_recursive_finalized_callback(
+            &candidate_id,
+            &received,
+            &event,
+            false,
+            candidate_id.slot,
+            &received.candidate_hash_data_bytes,
+            &mut complete,
+        );
         assert!(!complete);
         let (staged, complete_stage) = sink.0.lock().unwrap().pop().unwrap();
         assert!(matches!(staged.finality, consensus_common::SessionFinality::PqApproval(_)));
         complete_stage(Ok(UInt256::from([6; 32])));
         complete = true;
-        processor.try_emit_recursive_finalized_callback(&candidate_id, &received, &event, false,
-            candidate_id.slot, &received.candidate_hash_data_bytes, &mut complete);
+        processor.try_emit_recursive_finalized_callback(
+            &candidate_id,
+            &received,
+            &event,
+            false,
+            candidate_id.slot,
+            &received.candidate_hash_data_bytes,
+            &mut complete,
+        );
         assert!(complete);
-        assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id), "Approval cannot suppress Final");
-        processor.with_consensus_backend(|controller, backend| assert!(controller.maybe_apply_finalized_state(backend, &candidate_id, false)));
+        assert!(
+            !processor.consensus.finalized_delivery_sent_contains(&candidate_id),
+            "Approval cannot suppress Final"
+        );
+        processor.with_consensus_backend(|controller, backend| {
+            assert!(controller.maybe_apply_finalized_state(backend, &candidate_id, false))
+        });
         db.sync(Some(Duration::from_secs(5))).unwrap();
         assert!(!db.load_finalized_blocks().unwrap()[0].is_final);
     }
     let blocked_intents = std::path::Path::new(&namespace).join("finality-intents");
     if fail_retain {
-        std::fs::write(&blocked_intents, b"fixture obstruction before certificate retention").unwrap();
+        std::fs::write(&blocked_intents, b"fixture obstruction before certificate retention")
+            .unwrap();
     }
     if high_floor {
         let mut later = draft.block_id.clone();
@@ -12076,18 +12544,37 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     if let Some(result) = &pending_certificate {
         processor.database.insert_final_cert_store(candidate_id.clone(), result.clone());
     }
-    if matches!(gate, Some(CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededBoth)) {
+    if matches!(
+        gate,
+        Some(CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededBoth)
+    ) {
         processor.consensus.insert_finalized_delivery_sent(candidate_id.clone());
     }
-    if matches!(gate, Some(CertificateGateCase::ReplaySeededSeqno | CertificateGateCase::ReplaySeededBoth)) {
-        processor.consensus.insert_finalized_delivery_sent_seqno(draft.block_id.seq_no(), candidate_id.slot, draft.block_id.clone());
+    if matches!(
+        gate,
+        Some(CertificateGateCase::ReplaySeededSeqno | CertificateGateCase::ReplaySeededBoth)
+    ) {
+        processor.consensus.insert_finalized_delivery_sent_seqno(
+            draft.block_id.seq_no(),
+            candidate_id.slot,
+            draft.block_id.clone(),
+        );
     }
-    let replay = high_floor || matches!(gate,
-        Some(CertificateGateCase::ReplaySuccess | CertificateGateCase::ReplayFailure
-            | CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededSeqno
-            | CertificateGateCase::ReplaySeededBoth));
+    let replay = high_floor
+        || matches!(
+            gate,
+            Some(
+                CertificateGateCase::ReplaySuccess
+                    | CertificateGateCase::ReplayFailure
+                    | CertificateGateCase::ReplaySeededCandidate
+                    | CertificateGateCase::ReplaySeededSeqno
+                    | CertificateGateCase::ReplaySeededBoth
+            )
+        );
     if replay {
-        processor.simplex_state.set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
+        processor
+            .simplex_state
+            .set_first_non_finalized_slot(SlotIndex::new(candidate_id.slot.value() + 100));
         processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
     } else if gate.is_some() {
         processor.simplex_state.push_event_front(SimplexEvent::BlockFinalized(event.clone()));
@@ -12099,38 +12586,71 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         assert!(sink.0.lock().unwrap().is_empty(), "SaveCertificate pending: no node WAL handoff");
         assert!(!processor.consensus.finalized_pending_body_contains(&candidate_id));
         assert_eq!(processor.pending_finality_materialization_count(), 1);
-        assert!(db.load_finalized_blocks().unwrap().is_empty(), "SaveCertificate pending: no finalized marker");
+        assert!(
+            db.load_finalized_blocks().unwrap().is_empty(),
+            "SaveCertificate pending: no finalized marker"
+        );
         assert!(db.load_final_certs().unwrap().is_empty());
         if matches!(gate, Some(CertificateGateCase::LiveSuccess)) {
             let notar_vote = Vote::Notarize(crate::simplex_state::NotarizeVote {
-                slot: candidate_id.slot, block_hash: candidate_id.hash.clone(),
+                slot: candidate_id.slot,
+                block_hash: candidate_id.hash.clone(),
             });
-            let signed = crate::utils::create_data_to_sign(runtime.session_id(),
-                &crate::utils::serialize_unsigned_vote(&crate::utils::vote_to_tl_unsigned(&notar_vote).unwrap()));
-            let signatures = [0xa9, 0xaa].iter().enumerate().map(|(index, seed)| {
-                let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap();
-                crate::certificate::VoteSignature { validator_idx: ValidatorIndex::new(index as u32),
-                    signature: store.sign_consensus(&signed).unwrap().bytes.to_vec() }
-            }).collect();
+            let signed = crate::utils::create_data_to_sign(
+                runtime.session_id(),
+                &crate::utils::serialize_unsigned_vote(
+                    &crate::utils::vote_to_tl_unsigned(&notar_vote).unwrap(),
+                ),
+            );
+            let signatures = [0xa9, 0xaa]
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    let store =
+                        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap();
+                    crate::certificate::VoteSignature {
+                        validator_idx: ValidatorIndex::new(index as u32),
+                        signature: store.sign_consensus(&signed).unwrap().bytes.to_vec(),
+                    }
+                })
+                .collect();
             let notar_cert = Arc::new(crate::certificate::Certificate {
-                    vote: crate::simplex_state::NotarizeVote { slot: candidate_id.slot, block_hash: candidate_id.hash.clone() },
-                    signatures,
-                });
+                vote: crate::simplex_state::NotarizeVote {
+                    slot: candidate_id.slot,
+                    block_hash: candidate_id.hash.clone(),
+                },
+                signatures,
+            });
             crate::certificate::Certificate::<Vote>::from_tl(
-                &notar_cert.to_tl().unwrap(), &description, runtime.session_id(),
-            ).unwrap();
+                &notar_cert.to_tl().unwrap(),
+                &description,
+                runtime.session_id(),
+            )
+            .unwrap();
             processor.handle_notarization_reached(NotarizationReachedEvent {
-                slot: candidate_id.slot, block_hash: candidate_id.hash.clone(), certificate: notar_cert,
+                slot: candidate_id.slot,
+                block_hash: candidate_id.hash.clone(),
+                certificate: notar_cert,
             });
             db.sync(Some(TEST_DB_WATCHDOG)).unwrap();
             processor.process_pending_async_db_results();
             let mut last_warning = SystemTime::now();
-            while let Some(task) = processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning) { task(&mut processor); }
+            while let Some(task) =
+                processor.task_queue.pull_closure(Duration::ZERO, &mut last_warning)
+            {
+                task(&mut processor);
+            }
             assert!(db.load_notar_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
-            assert!(sink.0.lock().unwrap().is_empty(), "NotarCert completion cannot release a pending FinalCert");
+            assert!(
+                sink.0.lock().unwrap().is_empty(),
+                "NotarCert completion cannot release a pending FinalCert"
+            );
             assert!(db.load_finalized_blocks().unwrap().is_empty());
         }
-        let failed = matches!(gate, Some(CertificateGateCase::LiveFailure | CertificateGateCase::ReplayFailure));
+        let failed = matches!(
+            gate,
+            Some(CertificateGateCase::LiveFailure | CertificateGateCase::ReplayFailure)
+        );
         if failed {
             result.complete_err("injected certificate storage failure");
             drain_processor_storage_and_messages(&mut processor);
@@ -12140,10 +12660,16 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
             if replay {
                 processor.replay_finality_intent(event.certificate.to_tl().unwrap()).unwrap();
             } else {
-                processor.simplex_state.push_event_front(SimplexEvent::FinalizationReached(FinalizationReachedEvent {
-                    slot: event.slot, block_hash: event.block_hash.clone(), certificate: event.certificate.clone(),
-                }));
-                processor.simplex_state.push_event_front(SimplexEvent::BlockFinalized(event.clone()));
+                processor.simplex_state.push_event_front(SimplexEvent::FinalizationReached(
+                    FinalizationReachedEvent {
+                        slot: event.slot,
+                        block_hash: event.block_hash.clone(),
+                        certificate: event.certificate.clone(),
+                    },
+                ));
+                processor
+                    .simplex_state
+                    .push_event_front(SimplexEvent::BlockFinalized(event.clone()));
                 processor.process_simplex_events();
             }
         } else {
@@ -12152,30 +12678,58 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
             db.save_final_cert_async(&candidate_id, &event.certificate).unwrap().wait().unwrap();
             result.complete_ok();
             processor.process_pending_async_db_results();
-            assert_eq!(processor.pending_finality_materialization_count(), 1,
-                "saved-but-not-yet-dispatched finalization is still in flight");
+            assert_eq!(
+                processor.pending_finality_materialization_count(),
+                1,
+                "saved-but-not-yet-dispatched finalization is still in flight"
+            );
             assert!(sink.0.lock().unwrap().is_empty());
         }
         drain_processor_storage_and_messages(&mut processor);
         assert!(db.load_final_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
         assert!(!processor.pending_saved_finalizations.contains_key(&candidate_id));
-        assert_eq!(sink.0.lock().unwrap().len(), 1, "duplicate completion must not repeat WAL handoff");
-        if matches!(gate, Some(CertificateGateCase::ReplaySeededCandidate | CertificateGateCase::ReplaySeededSeqno | CertificateGateCase::ReplaySeededBoth)) {
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            1,
+            "duplicate completion must not repeat WAL handoff"
+        );
+        if matches!(
+            gate,
+            Some(
+                CertificateGateCase::ReplaySeededCandidate
+                    | CertificateGateCase::ReplaySeededSeqno
+                    | CertificateGateCase::ReplaySeededBoth
+            )
+        ) {
             processor.consensus.prune_below(SlotIndex::new(candidate_id.slot.value() + 100));
-            assert!(processor.consensus.finalized_pending_body_contains(&candidate_id),
-                "slot cleanup cannot discard an authenticated source handoff before its own ACK");
-            processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
-            assert_eq!(sink.0.lock().unwrap().len(), 1, "old-slot retries must join the same node handoff");
+            assert!(
+                processor.consensus.finalized_pending_body_contains(&candidate_id),
+                "slot cleanup cannot discard an authenticated source handoff before its own ACK"
+            );
+            processor.with_consensus_backend(|controller, backend| {
+                controller.retry_pending_recursive_finalization(backend)
+            });
+            assert_eq!(
+                sink.0.lock().unwrap().len(),
+                1,
+                "old-slot retries must join the same node handoff"
+            );
         }
         let final_broadcasts = receiver.drain_actions().into_iter().filter(|action| matches!(action,
             ReceiverAction::SendCertificate { certificate }
                 if matches!(certificate.vote(), rtos_api::ton::consensus::simplex::UnsignedVote::Consensus_Simplex_FinalizeVote(_))
         )).count();
-        assert_eq!(final_broadcasts, usize::from(!replay),
-            "live completion relays once; C++ startup replay suppresses certificate broadcasts");
+        assert_eq!(
+            final_broadcasts,
+            usize::from(!replay),
+            "live completion relays once; C++ startup replay suppresses certificate broadcasts"
+        );
     }
     if fail_retain {
-        assert!(sink.0.lock().unwrap().is_empty(), "failed retention cannot authorize node handoff");
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "failed retention cannot authorize node handoff"
+        );
         assert_eq!(processor.callbacks.finality_retention_attempts(), 1);
         assert!(processor.consensus.finalized_pending_body_contains(&candidate_id));
         // Unrelated actor callbacks must not each restart the same blocked
@@ -12186,12 +12740,18 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
         for _ in 0..16 {
             processor.check_all();
         }
-        assert_eq!(processor.callbacks.finality_retention_attempts(), 2,
-            "unrelated wakeups must join pending finalization between periodic retries");
+        assert_eq!(
+            processor.callbacks.finality_retention_attempts(),
+            2,
+            "unrelated wakeups must join pending finalization between periodic retries"
+        );
         processor.advance_time(Duration::from_millis(250));
         processor.check_all();
-        assert_eq!(processor.callbacks.finality_retention_attempts(), 3,
-            "the original retry horizon must still retry failed certificate retention");
+        assert_eq!(
+            processor.callbacks.finality_retention_attempts(),
+            3,
+            "the original retry horizon must still retry failed certificate retention"
+        );
         std::fs::remove_file(&blocked_intents).unwrap();
         processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
     }
@@ -12201,15 +12761,24 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     // C++ attaches a duplicate to its existing InFlight finalization. It does
     // not redo a successful SaveCertificate phase while the node WAL is held.
     processor.handle_block_finalized(event);
-    assert_eq!(processor.callbacks.finality_retention_attempts(), if fail_retain { 4 } else { 1 },
-        "parent/WAL retries must reuse the completed C++ certificate-save phase");
+    assert_eq!(
+        processor.callbacks.finality_retention_attempts(),
+        if fail_retain { 4 } else { 1 },
+        "parent/WAL retries must reuse the completed C++ certificate-save phase"
+    );
     assert_eq!(sink.0.lock().unwrap().len(), 1);
     assert_eq!(processor.consensus.is_finalized_block(&candidate_id), upgrade);
     assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
     db.sync(Some(Duration::from_secs(5))).unwrap();
-    assert!(db.load_finalized_blocks().unwrap().iter().all(|record| !record.is_final), "source Final must wait for its own node WAL");
+    assert!(
+        db.load_finalized_blocks().unwrap().iter().all(|record| !record.is_final),
+        "source Final must wait for its own node WAL"
+    );
     processor.cleanup_old_slots(SlotIndex::new(1000));
-    assert!(processor.candidate_book().received(&candidate_id).is_some(), "held finality must retain body ancestry");
+    assert!(
+        processor.candidate_book().received(&candidate_id).is_some(),
+        "held finality must retain body ancestry"
+    );
     let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
     processor.set_time(processor.now());
     let now = processor.now(); // The fixture stores timestamps at microsecond precision.
@@ -12217,22 +12786,40 @@ fn source_finality_controller_case(upgrade: bool, high_floor: bool, fail_retain:
     complete(Ok(UInt256::from([7; 32])));
     assert!(!processor.consensus.finalized_delivery_sent_contains(&candidate_id));
     processor.on_finality_delivery_ready();
-    assert_eq!(processor.now(), now, "completed delivery must resume without advancing the fallback clock");
+    assert_eq!(
+        processor.now(),
+        now,
+        "completed delivery must resume without advancing the fallback clock"
+    );
     assert!(processor.consensus.is_finalized_block(&candidate_id));
     assert!(processor.consensus.finalized_delivery_sent_contains(&candidate_id));
-    db.sync(Some(Duration::from_secs(5))).unwrap(); processor.process_pending_async_db_results();
+    db.sync(Some(Duration::from_secs(5))).unwrap();
+    processor.process_pending_async_db_results();
     let finalized = db.load_finalized_blocks().unwrap();
     assert_eq!(finalized.len(), 1);
     assert!(finalized[0].is_final, "Final must upgrade earlier Approval persistence");
-    processor.with_consensus_backend(|controller, backend| controller.retry_pending_recursive_finalization(backend));
+    processor.with_consensus_backend(|controller, backend| {
+        controller.retry_pending_recursive_finalization(backend)
+    });
     assert!(sink.0.lock().unwrap().is_empty(), "duplicate retry must not stage again");
-    drop(processor); db.close(None).unwrap();
+    drop(processor);
+    db.close(None).unwrap();
     if gate.is_some() {
         drop(db);
         let reopened = crate::database::SimplexDb::open(&namespace, "source-ack").unwrap();
-        assert!(reopened.load_final_certs().unwrap().iter().any(|c| c.candidate_id == candidate_id));
-        assert!(reopened.load_finalized_blocks().unwrap().iter().any(|b| b.candidate_id == candidate_id && b.is_final),
-            "cold read must retain both the certificate and its later materialized marker");
+        assert!(reopened
+            .load_final_certs()
+            .unwrap()
+            .iter()
+            .any(|c| c.candidate_id == candidate_id));
+        assert!(
+            reopened
+                .load_finalized_blocks()
+                .unwrap()
+                .iter()
+                .any(|b| b.candidate_id == candidate_id && b.is_final),
+            "cold read must retain both the certificate and its later materialized marker"
+        );
         reopened.close(None).unwrap();
     }
 }
@@ -12246,9 +12833,16 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     let listener = RecordingListener::new();
     let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
     let sink = Arc::new(HeldSink::default());
-    let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
-        Arc::new(AtomicBool::new(false)), false, Arc::new(TestCallbackQueue), Arc::downgrade(&listener_dyn))
-        .with_delivery_sink(Some(sink.clone())));
+    let callbacks = Arc::new(
+        crate::session_callbacks::SessionCallbacks::new(
+            runtime.session_id().clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            Arc::new(TestCallbackQueue),
+            Arc::downgrade(&listener_dyn),
+        )
+        .with_delivery_sink(Some(sink.clone())),
+    );
     let main_worker = callbacks.delivery_lifetime();
     callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
     callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
@@ -12257,15 +12851,18 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     drop(main_worker);
     assert!(!callbacks.source_namespace_drained());
     assert!(!old_handle.source_namespace_drained());
-    assert!(callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).is_err(),
-        "accepted node work must retain source lock after main worker joins");
+    assert!(
+        callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).is_err(),
+        "accepted node work must retain source lock after main worker joins"
+    );
     assert!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().is_empty());
     let (_, complete) = sink.0.lock().unwrap().pop().unwrap();
     complete(Err(rtos_block::error!("Node WAL failed after source stop")));
     assert!(callbacks.source_namespace_drained());
     assert!(old_handle.source_namespace_drained());
     let recoverable = crate::finality_delivery::scan_pending_finality(temp.path()).unwrap();
-    assert_eq!(recoverable.len(), 1); drop(recoverable);
+    assert_eq!(recoverable.len(), 1);
+    drop(recoverable);
     let next_worker = callbacks.delivery_lifetime();
     callbacks.initialize_delivery(runtime, std::path::Path::new(&namespace)).unwrap();
     assert!(!callbacks.source_namespace_drained());
@@ -12281,78 +12878,181 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
 /// input, while source intent/ACK/output files are reopened from disk.
 #[test]
 fn source_finality_controller_empty_trigger_seals_all_roles_after_cold_retry() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        false,
+        false,
+        false,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_controller_cold_retry_keeps_ancestor_handoff_below_applied_floor() {
-    source_finality_empty_trigger_cold_retry_case(true, false, false, false, false, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        true,
+        false,
+        false,
+        false,
+        false,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_controller_replay_stops_at_materialized_parent_without_its_body() {
-    source_finality_empty_trigger_cold_retry_case(true, true, false, false, false, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        true,
+        true,
+        false,
+        false,
+        false,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_replayed_children_share_only_fresh_accepted_ancestor_approval() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, false, false, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        true,
+        false,
+        false,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_replay_reuses_materialized_ancestry_without_truncating_outputs() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, true, false, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        true,
+        true,
+        false,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_replay_pruning_keeps_inflight_accepted_ancestor_receipts() {
-    source_finality_empty_trigger_cold_retry_case(false, false, true, true, true, PresealedColdPlan::None);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        true,
+        true,
+        true,
+        PresealedColdPlan::None,
+    );
 }
 
 #[test]
 fn source_finality_cold_replay_preserves_presealed_outputs_after_parent_materialization() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::Exact);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        false,
+        false,
+        false,
+        PresealedColdPlan::Exact,
+    );
 }
 
 #[test]
 fn source_finality_cold_replay_does_not_accept_changed_sealed_output_role() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::ChangedParentRole);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        false,
+        false,
+        false,
+        PresealedColdPlan::ChangedParentRole,
+    );
 }
 
 #[test]
 fn source_finality_long_empty_plan_keeps_uncached_full_walk() {
-    source_finality_empty_trigger_cold_retry_case(false, false, false, false, false, PresealedColdPlan::LongUncachedChain);
+    source_finality_empty_trigger_cold_retry_case(
+        false,
+        false,
+        false,
+        false,
+        false,
+        PresealedColdPlan::LongUncachedChain,
+    );
 }
 
-enum PresealedColdPlan { None, Exact, ChangedParentRole, LongUncachedChain }
+enum PresealedColdPlan {
+    None,
+    Exact,
+    ChangedParentRole,
+    LongUncachedChain,
+}
 
-fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_parent: bool, shared_approvals: bool, reuse_materialized_plan: bool, prune_after_acceptance: bool, presealed_case: PresealedColdPlan) {
+fn source_finality_empty_trigger_cold_retry_case(
+    high_floor: bool,
+    materialized_parent: bool,
+    shared_approvals: bool,
+    reuse_materialized_plan: bool,
+    prune_after_acceptance: bool,
+    presealed_case: PresealedColdPlan,
+) {
     let long_uncached_chain = matches!(presealed_case, PresealedColdPlan::LongUncachedChain);
-    let presealed_cold_plan = matches!(presealed_case, PresealedColdPlan::Exact | PresealedColdPlan::ChangedParentRole);
+    let presealed_cold_plan =
+        matches!(presealed_case, PresealedColdPlan::Exact | PresealedColdPlan::ChangedParentRole);
     use crate::finality_delivery::tests::{fixture_role, HeldSink};
     use rtos_block::Serializable;
     let temp = crate::authenticated_fixture::TestDirectory::new();
-    let (runtime, _) = fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
+    let (runtime, _) =
+        fixture_role(true, ShardIdent::with_tagged_prefix(0, 0x8000000000000000).unwrap());
     assert!(runtime.recovery_binding().is_some());
     let namespace = runtime.runtime_directory(temp.path().to_str().unwrap()).unwrap();
-    let nodes = runtime.committee().iter().map(crate::SimplexSessionNode::from_descriptor)
-        .collect::<Result<Vec<_>>>().unwrap();
-    let options = SessionOptions { protocol: runtime.protocol(), proto_version: runtime.carrier_version(),
-        wire_profile: runtime.wire_profile(), slots_per_leader_window: runtime.slots_per_leader_window(),
-        ..Default::default() };
-    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71;32]).unwrap();
-    let description = Arc::new(SessionDescription::new_with_runtime(&options, runtime.session_id().clone(),
-        1, &nodes, transport, runtime.shard(), SystemTime::now(), None, Some(&runtime)).unwrap()
-        .bind_pq_session(runtime.catchain_seqno()).unwrap());
-    let stores: Vec<_> = [0xa9, 0xaa].iter().map(|seed|
-        rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed;32],0).unwrap()).collect();
+    let nodes = runtime
+        .committee()
+        .iter()
+        .map(crate::SimplexSessionNode::from_descriptor)
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let options = SessionOptions {
+        protocol: runtime.protocol(),
+        proto_version: runtime.carrier_version(),
+        wire_profile: runtime.wire_profile(),
+        slots_per_leader_window: runtime.slots_per_leader_window(),
+        ..Default::default()
+    };
+    let transport = Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x71; 32]).unwrap();
+    let description = Arc::new(
+        SessionDescription::new_with_runtime(
+            &options,
+            runtime.session_id().clone(),
+            1,
+            &nodes,
+            transport,
+            runtime.shard(),
+            SystemTime::now(),
+            None,
+            Some(&runtime),
+        )
+        .unwrap()
+        .bind_pq_session(runtime.catchain_seqno())
+        .unwrap(),
+    );
+    let stores: Vec<_> = [0xa9, 0xaa]
+        .iter()
+        .map(|seed| rtos_pq_consensus::ConsensusKeyStore::from_seed(&[*seed; 32], 0).unwrap())
+        .collect();
     let mut chain: Vec<(RawCandidateId, ReceivedCandidate)> = Vec::new();
     let layout = if long_uncached_chain {
-        std::iter::once((0,false)).chain((1..=1024).map(|slot| (slot,true))).collect()
-    } else if shared_approvals { vec![(0,false),(1,true),(2,false),(3,true),(4,false)] }
-        else { vec![(0,false),(1,true),(2,false),(3,true)] };
+        std::iter::once((0, false)).chain((1..=1024).map(|slot| (slot, true))).collect()
+    } else if shared_approvals {
+        vec![(0, false), (1, true), (2, false), (3, true), (4, false)]
+    } else {
+        vec![(0, false), (1, true), (2, false), (3, true)]
+    };
     for (slot, empty) in layout {
-        let parent = chain.last().map(|(id,_)| id.clone());
+        let parent = chain.last().map(|(id, _)| id.clone());
         let (block_id, data) = if empty {
             let previous = &chain.last().unwrap().1;
             (previous.block_id.clone(), previous.data.clone())
@@ -12360,120 +13060,238 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             let mut block = rtos_block::Block::default();
             block.set_global_id(runtime.pin().global_id);
             let mut info = rtos_block::BlockInfo::default();
-            info.set_seq_no(slot + 1).unwrap(); info.set_shard(runtime.shard().clone());
+            info.set_seq_no(slot + 1).unwrap();
+            info.set_shard(runtime.shard().clone());
             block.write_info(&info).unwrap();
-            let cell = block.serialize().unwrap(); let bytes = rtos_block::write_boc(&cell).unwrap();
-            (BlockIdExt::with_params(runtime.shard().clone(), slot + 1, cell.repr_hash().clone(),
-                UInt256::calc_file_hash(&bytes)), consensus_common::ConsensusCommonFactory::create_block_payload(bytes))
+            let cell = block.serialize().unwrap();
+            let bytes = rtos_block::write_boc(&cell).unwrap();
+            (
+                BlockIdExt::with_params(
+                    runtime.shard().clone(),
+                    slot + 1,
+                    cell.repr_hash().clone(),
+                    UInt256::calc_file_hash(&bytes),
+                ),
+                consensus_common::ConsensusCommonFactory::create_block_payload(bytes),
+            )
         };
-        let hash_data = if empty { make_candidate_hash_data_empty(block_id.clone(), parent.clone().unwrap()) }
-            else { make_candidate_hash_data_with_parent(block_id.clone(), UInt256::default(), parent.clone()) };
+        let hash_data = if empty {
+            make_candidate_hash_data_empty(block_id.clone(), parent.clone().unwrap())
+        } else {
+            make_candidate_hash_data_with_parent(
+                block_id.clone(),
+                UInt256::default(),
+                parent.clone(),
+            )
+        };
         let bytes = rtos_api::serialize_boxed(&hash_data).unwrap();
-        let id = RawCandidateId { slot: SlotIndex::new(slot), hash: UInt256::calc_file_hash(&bytes) };
-        chain.push((id.clone(), ReceivedCandidate { slot:id.slot, source_idx:ValidatorIndex::new(0),
-            candidate_hash_data_bytes:bytes, root_hash:block_id.root_hash().clone(),file_hash:block_id.file_hash().clone(),
-            block_id,data,collated_data:consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new()),
-            gen_utime_ms:None,receive_time:SystemTime::now(),is_empty:empty,parent_id:parent }));
+        let id =
+            RawCandidateId { slot: SlotIndex::new(slot), hash: UInt256::calc_file_hash(&bytes) };
+        chain.push((
+            id.clone(),
+            ReceivedCandidate {
+                slot: id.slot,
+                source_idx: ValidatorIndex::new(0),
+                candidate_hash_data_bytes: bytes,
+                root_hash: block_id.root_hash().clone(),
+                file_hash: block_id.file_hash().clone(),
+                block_id,
+                data,
+                collated_data: consensus_common::ConsensusCommonFactory::create_block_payload(
+                    Vec::new(),
+                ),
+                gen_utime_ms: None,
+                receive_time: SystemTime::now(),
+                is_empty: empty,
+                parent_id: parent,
+            },
+        ));
     }
-    let sign = |id:&RawCandidateId, final_vote:bool| {
-        let boxed = TlCandidateId { slot:id.slot.value() as i32,hash:id.hash.clone() }.into_boxed();
-        let vote = if final_vote { rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote{id:boxed}.into_boxed() }
-            else { rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote{id:boxed}.into_boxed() };
-        let bytes = crate::utils::create_data_to_sign(runtime.session_id(), &crate::utils::serialize_unsigned_vote(&vote));
-        stores.iter().enumerate().map(|(i,s)| crate::certificate::VoteSignature {
-            validator_idx:ValidatorIndex::new(i as u32),signature:s.sign_consensus(&bytes).unwrap().bytes.to_vec()
-        }).collect::<Vec<_>>()
+    let sign = |id: &RawCandidateId, final_vote: bool| {
+        let boxed =
+            TlCandidateId { slot: id.slot.value() as i32, hash: id.hash.clone() }.into_boxed();
+        let vote = if final_vote {
+            rtos_api::ton::consensus::simplex::unsignedvote::FinalizeVote { id: boxed }.into_boxed()
+        } else {
+            rtos_api::ton::consensus::simplex::unsignedvote::NotarizeVote { id: boxed }.into_boxed()
+        };
+        let bytes = crate::utils::create_data_to_sign(
+            runtime.session_id(),
+            &crate::utils::serialize_unsigned_vote(&vote),
+        );
+        stores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::certificate::VoteSignature {
+                validator_idx: ValidatorIndex::new(i as u32),
+                signature: s.sign_consensus(&bytes).unwrap().bytes.to_vec(),
+            })
+            .collect::<Vec<_>>()
     };
-    let trigger = chain[if long_uncached_chain { chain.len()-1 } else { 3 }].0.clone();
-    let event = BlockFinalizedEvent {slot:trigger.slot,block_hash:trigger.hash.clone(),block_id:None,
-        certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
-            slot:trigger.slot,block_hash:trigger.hash.clone()},signatures:sign(&trigger,true) })};
+    let trigger = chain[if long_uncached_chain { chain.len() - 1 } else { 3 }].0.clone();
+    let event = BlockFinalizedEvent {
+        slot: trigger.slot,
+        block_hash: trigger.hash.clone(),
+        block_id: None,
+        certificate: Arc::new(crate::certificate::Certificate {
+            vote: crate::simplex_state::FinalizeVote {
+                slot: trigger.slot,
+                block_hash: trigger.hash.clone(),
+            },
+            signatures: sign(&trigger, true),
+        }),
+    };
     let second_event = shared_approvals.then(|| {
         let id = &chain[4].0;
-        BlockFinalizedEvent {slot:id.slot,block_hash:id.hash.clone(),block_id:None,
-            certificate:Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::FinalizeVote {
-                slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,true) })}
+        BlockFinalizedEvent {
+            slot: id.slot,
+            block_hash: id.hash.clone(),
+            block_id: None,
+            certificate: Arc::new(crate::certificate::Certificate {
+                vote: crate::simplex_state::FinalizeVote {
+                    slot: id.slot,
+                    block_hash: id.hash.clone(),
+                },
+                signatures: sign(id, true),
+            }),
+        }
     });
     let listener = RecordingListener::new();
-    let listener_dyn:Arc<dyn consensus_common::SessionListener+Send+Sync> = listener.clone();
-    let make_processor = |sink:Arc<HeldSink>| {
-        let db = crate::database::SimplexDb::open(&namespace,"sealed-cold").unwrap();
-        let mut processor = make_pq_processor_with_description_for_test(db.clone(),description.clone());
-        let callbacks = Arc::new(crate::session_callbacks::SessionCallbacks::new(runtime.session_id().clone(),
-            Arc::new(AtomicBool::new(false)),false,Arc::new(TestCallbackQueue),Arc::downgrade(&listener_dyn))
-            .with_delivery_sink(Some(sink)));
-        callbacks.initialize_delivery(runtime.clone(),std::path::Path::new(&namespace)).unwrap();
+    let listener_dyn: Arc<dyn consensus_common::SessionListener + Send + Sync> = listener.clone();
+    let make_processor = |sink: Arc<HeldSink>| {
+        let db = crate::database::SimplexDb::open(&namespace, "sealed-cold").unwrap();
+        let mut processor =
+            make_pq_processor_with_description_for_test(db.clone(), description.clone());
+        let callbacks = Arc::new(
+            crate::session_callbacks::SessionCallbacks::new(
+                runtime.session_id().clone(),
+                Arc::new(AtomicBool::new(false)),
+                false,
+                Arc::new(TestCallbackQueue),
+                Arc::downgrade(&listener_dyn),
+            )
+            .with_delivery_sink(Some(sink)),
+        );
+        callbacks.initialize_delivery(runtime.clone(), std::path::Path::new(&namespace)).unwrap();
         callbacks.bind_delivery_start(runtime.pin().zerostate.clone()).unwrap();
-        processor.consensus.set_callbacks_for_test(callbacks.clone()); processor.callbacks=callbacks;
-        for (index,(id,received)) in chain.iter().enumerate() {
-            if materialized_parent && index==0 {
+        processor.consensus.set_callbacks_for_test(callbacks.clone());
+        processor.callbacks = callbacks;
+        for (index, (id, received)) in chain.iter().enumerate() {
+            if materialized_parent && index == 0 {
                 processor.consensus.insert_finalized_block(id.clone());
             } else {
-                processor.candidate_book_mut().insert_received(id.clone(),received.clone());
+                processor.candidate_book_mut().insert_received(id.clone(), received.clone());
             }
         }
         // Rehydrate every ancestor's quorum evidence, including empty nodes.
         // Body-callback suppression never replaces recovery authentication.
-        for (id, _) in chain.iter().take(if shared_approvals {4} else {3}) {
-            processor.simplex_state.set_notarize_certificate(&description,id.slot,&id.hash,
-                Arc::new(crate::certificate::Certificate { vote:crate::simplex_state::NotarizeVote {
-                    slot:id.slot,block_hash:id.hash.clone()},signatures:sign(id,false) })).unwrap();
+        for (id, _) in chain.iter().take(if shared_approvals { 4 } else { 3 }) {
+            processor
+                .simplex_state
+                .set_notarize_certificate(
+                    &description,
+                    id.slot,
+                    &id.hash,
+                    Arc::new(crate::certificate::Certificate {
+                        vote: crate::simplex_state::NotarizeVote {
+                            slot: id.slot,
+                            block_hash: id.hash.clone(),
+                        },
+                        signatures: sign(id, false),
+                    }),
+                )
+                .unwrap();
         }
         if high_floor {
             processor.set_mc_finalized_block(BlockIdExt::with_params(
-                runtime.shard().clone(), 1000, UInt256::rand(), UInt256::rand(),
+                runtime.shard().clone(),
+                1000,
+                UInt256::rand(),
+                UInt256::rand(),
             ));
         }
-        (db,processor)
+        (db, processor)
     };
-    let map = std::path::Path::new(&namespace).join("finality-intents/outputs-v1")
-        .join(format!("{}-{}.outputs",trigger.slot.value(),trigger.hash.to_hex_string()));
-    let sink=Arc::new(HeldSink::default());
-    let (db,mut processor)=make_processor(sink.clone());
+    let map = std::path::Path::new(&namespace).join("finality-intents/outputs-v1").join(format!(
+        "{}-{}.outputs",
+        trigger.slot.value(),
+        trigger.hash.to_hex_string()
+    ));
+    let sink = Arc::new(HeldSink::default());
+    let (db, mut processor) = make_processor(sink.clone());
     processor.handle_block_finalized(event.clone());
-    if let Some(second) = &second_event { processor.handle_block_finalized(second.clone()); }
+    if let Some(second) = &second_event {
+        processor.handle_block_finalized(second.clone());
+    }
     if long_uncached_chain {
         assert_eq!(chain.len(), 1025);
-        assert_eq!(processor.consensus.continuation_cursor_for_test(&trigger), None,
-            "oversized valid plans must use the full resolver rather than a partial continuation");
+        assert_eq!(
+            processor.consensus.continuation_cursor_for_test(&trigger),
+            None,
+            "oversized valid plans must use the full resolver rather than a partial continuation"
+        );
         assert!(!map.exists());
         assert!(!processor.consensus.is_finalized_block(&chain[0].0));
-        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+        let staged = std::mem::take(&mut *sink.0.lock().unwrap());
         assert_eq!(staged.len(), 1, "the long empty chain still owes its original Final handoff");
         assert_eq!(staged[0].0.block_id, chain[0].1.block_id);
         assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::Carrier(_)));
-        for (_,done) in staged { done(Ok(UInt256::from([0x35;32]))); }
-        for _ in 0..8 {
-            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-            if map.exists() { break; }
+        for (_, done) in staged {
+            done(Ok(UInt256::from([0x35; 32])));
         }
-        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
-        let outputs=value["outputs"].as_array().unwrap();
+        for _ in 0..8 {
+            processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+            if map.exists() {
+                break;
+            }
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        let outputs = value["outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["block_id"], chain[0].1.block_id.to_string());
         assert_eq!(outputs[0]["is_final"], true);
         assert!(processor.consensus.finalized_pending_body_is_empty());
-        drop(processor); db.close(None).unwrap(); return;
+        drop(processor);
+        db.close(None).unwrap();
+        return;
     }
     if materialized_parent {
-        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
-        assert_eq!(staged.len(),1,"C++ persisted parent marker must terminate recovery before a pruned body lookup");
-        assert_eq!(staged[0].0.block_id,chain[2].1.block_id);
-        assert!(matches!(staged[0].0.finality,consensus_common::SessionFinality::Carrier(_)));
-        for (_,done) in staged { done(Ok(UInt256::from([3;32]))); }
-        for _ in 0..8 {
-            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-            if map.exists() { break; }
+        let staged = std::mem::take(&mut *sink.0.lock().unwrap());
+        assert_eq!(
+            staged.len(),
+            1,
+            "C++ persisted parent marker must terminate recovery before a pruned body lookup"
+        );
+        assert_eq!(staged[0].0.block_id, chain[2].1.block_id);
+        assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::Carrier(_)));
+        for (_, done) in staged {
+            done(Ok(UInt256::from([3; 32])));
         }
-        assert!(map.exists(),"current source still needs its own node handoff before closure");
-        let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
-        assert_eq!(value["outputs"].as_array().unwrap().len(),1);
-        drop(processor);db.close(None).unwrap();return;
+        for _ in 0..8 {
+            processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+            if map.exists() {
+                break;
+            }
+        }
+        assert!(map.exists(), "current source still needs its own node handoff before closure");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        assert_eq!(value["outputs"].as_array().unwrap().len(), 1);
+        drop(processor);
+        db.close(None).unwrap();
+        return;
     }
-    assert!(!map.exists(),"a held node handoff cannot seal a complete walk");
-    let pending_path = std::path::Path::new(&namespace).join("finality-intents")
-        .join(format!("{}-{}.json", trigger.slot.value(), trigger.hash.to_hex_string()));
-    let completed_path = pending_path.parent().unwrap().join("completed-v1")
+    assert!(!map.exists(), "a held node handoff cannot seal a complete walk");
+    let pending_path = std::path::Path::new(&namespace).join("finality-intents").join(format!(
+        "{}-{}.json",
+        trigger.slot.value(),
+        trigger.hash.to_hex_string()
+    ));
+    let completed_path = pending_path
+        .parent()
+        .unwrap()
+        .join("completed-v1")
         .join(pending_path.with_extension("complete").file_name().unwrap());
     let presealed_bytes = if presealed_cold_plan {
         // The existing IO fault leaves the exact crash window: the full plan
@@ -12486,8 +13304,10 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
                 warm_handoffs += 1;
                 done(Ok(UInt256::from([0x28; 32])));
             }
-            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-            if map.exists() && completed_path.exists() { break; }
+            processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+            if map.exists() && completed_path.exists() {
+                break;
+            }
         }
         assert_eq!(warm_handoffs, 2, "both original roles must cross the warm node sink");
         assert!(pending_path.exists() && completed_path.exists());
@@ -12496,8 +13316,12 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["outputs"].as_array().unwrap().len(), 2);
         if matches!(presealed_case, PresealedColdPlan::ChangedParentRole) {
-            let parent = value["outputs"].as_array_mut().unwrap().iter_mut()
-                .find(|output| output["block_id"] == chain[0].1.block_id.to_string()).unwrap();
+            let parent = value["outputs"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|output| output["block_id"] == chain[0].1.block_id.to_string())
+                .unwrap();
             parent["is_final"] = serde_json::json!(true);
             bytes = serde_json::to_vec(&value).unwrap();
             std::fs::write(&map, &bytes).unwrap();
@@ -12505,26 +13329,33 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         Some(bytes)
     } else {
         // Resolve only Final. Approval is a separate debt and must keep the map absent.
-        let staged=std::mem::take(&mut *sink.0.lock().unwrap());
+        let staged = std::mem::take(&mut *sink.0.lock().unwrap());
         assert_eq!(staged.len(), 1, "C++ WC parent must be the sole pending handoff");
-        assert_eq!(staged[0].0.block_id, chain[0].1.block_id, "C++ WC parent must precede child final");
+        assert_eq!(
+            staged[0].0.block_id, chain[0].1.block_id,
+            "C++ WC parent must precede child final"
+        );
         assert!(matches!(staged[0].0.finality, consensus_common::SessionFinality::PqApproval(_)));
-        for (draft,done) in staged {
-            if matches!(draft.finality,consensus_common::SessionFinality::PqApproval(_)) {
+        for (draft, done) in staged {
+            if matches!(draft.finality, consensus_common::SessionFinality::PqApproval(_)) {
                 done(Err(rtos_block::error!("held approval before restart")));
-            } else { done(Ok(UInt256::from([1;32]))); }
+            } else {
+                done(Ok(UInt256::from([1; 32])));
+            }
         }
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-        assert!(!map.exists(),"Final ACK must not fill an ancestor Approval hole");
-        for (_,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+        assert!(!map.exists(), "Final ACK must not fill an ancestor Approval hole");
+        for (_, done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
             done(Err(rtos_block::error!("restart with source debt")));
         }
         None
     };
-    drop(processor); db.close(None).unwrap(); drop(db);
-    let sink=Arc::new(HeldSink::default());
+    drop(processor);
+    db.close(None).unwrap();
+    drop(db);
+    let sink = Arc::new(HeldSink::default());
     *sink.1.lock().unwrap() = Some(Vec::new());
-    let (db,mut processor)=make_processor(sink.clone());
+    let (db, mut processor) = make_processor(sink.clone());
     if presealed_cold_plan {
         processor.consensus.insert_finalized_block(chain[0].0.clone());
     }
@@ -12532,85 +13363,134 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
         // A startup delivery seed is deliberately insufficient: both replays
         // must first obtain this boot's real ancestor node acceptance.
         processor.consensus.insert_finalized_delivery_sent(chain[0].0.clone());
-        processor.consensus.insert_finalized_delivery_sent_seqno(chain[0].1.block_id.seq_no(),
-            chain[0].0.slot,chain[0].1.block_id.clone());
+        processor.consensus.insert_finalized_delivery_sent_seqno(
+            chain[0].1.block_id.seq_no(),
+            chain[0].0.slot,
+            chain[0].1.block_id.clone(),
+        );
     }
     let retained = processor.callbacks.pending_finality_intents().unwrap();
-    assert_eq!(retained.len(), if shared_approvals {2} else {1}, "cold replay comes from the durable source certificate");
-    for wire in &retained { processor.replay_finality_intent(runtime.wire_profile().deserialize_typed(wire).unwrap()).unwrap(); }
+    assert_eq!(
+        retained.len(),
+        if shared_approvals { 2 } else { 1 },
+        "cold replay comes from the durable source certificate"
+    );
+    for wire in &retained {
+        processor
+            .replay_finality_intent(runtime.wire_profile().deserialize_typed(wire).unwrap())
+            .unwrap();
+    }
     drain_processor_storage_and_messages(&mut processor);
-    assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
-        "cold recovery must establish persistence again instead of inheriting a warm phase");
+    assert_eq!(
+        processor.callbacks.finality_retention_attempts(),
+        if shared_approvals { 2 } else { 1 },
+        "cold recovery must establish persistence again instead of inheriting a warm phase"
+    );
     if matches!(presealed_case, PresealedColdPlan::ChangedParentRole) {
         for _ in 0..4 {
-            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+            processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
         }
-        assert!(sink.0.lock().unwrap().is_empty(), "a declared role cannot manufacture a node handoff");
-        assert!(sink.1.lock().unwrap().as_ref().unwrap().is_empty(),
-            "a declared role cannot seed this boot's node acceptance");
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "a declared role cannot manufacture a node handoff"
+        );
+        assert!(
+            sink.1.lock().unwrap().as_ref().unwrap().is_empty(),
+            "a declared role cannot seed this boot's node acceptance"
+        );
         assert!(pending_path.exists(), "inconsistent original debt must remain pending");
         assert_eq!(std::fs::read(&map).unwrap(), presealed_bytes.unwrap());
-        drop(processor); db.close(None).unwrap(); return;
+        drop(processor);
+        db.close(None).unwrap();
+        return;
     }
     if shared_approvals {
         // Both authenticated source intents wait on this same held parent WAL.
         // C++ attaches the second finalization to the existing InFlight work.
         for _ in 0..3 {
             let before = processor.callbacks.finality_poll_attempts();
-            let built_before = crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test();
+            let built_before =
+                crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test();
             let reads_before = CandidateBook::received_lookup_count_for_test();
-            processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-            assert_eq!(CandidateBook::received_lookup_count_for_test() - reads_before, 2,
-                "two in-flight sources must read only their actual current waiting candidates");
+            processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+            assert_eq!(
+                CandidateBook::received_lookup_count_for_test() - reads_before,
+                2,
+                "two in-flight sources must read only their actual current waiting candidates"
+            );
             assert!(crate::finality_recovery::ExpectedFinalityOutput::construction_count_for_test() - built_before <= 4,
                 "an exact output identity must not be rebuilt for a shared or already resolved plan");
-            assert_eq!(processor.callbacks.finality_poll_attempts() - before, 1,
-                "one recovery pass must poll a shared pending ancestor only once");
+            assert_eq!(
+                processor.callbacks.finality_poll_attempts() - before,
+                1,
+                "one recovery pass must poll a shared pending ancestor only once"
+            );
         }
         for id in [&trigger, &chain[4].0] {
-            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0),
-                "a held WAL cannot advance a source continuation");
+            assert_eq!(
+                processor.consensus.continuation_cursor_for_test(id),
+                Some(0),
+                "a held WAL cannot advance a source continuation"
+            );
         }
         let data = processor.candidate_book().received(&chain[0].0).unwrap().data.clone();
         processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data =
             consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new());
         let before = processor.callbacks.finality_poll_attempts();
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-        assert_eq!(processor.callbacks.finality_poll_attempts(), before,
-            "missing pending body must request repair before polling the node");
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+        assert_eq!(
+            processor.callbacks.finality_poll_attempts(),
+            before,
+            "missing pending body must request repair before polling the node"
+        );
         for id in [&trigger, &chain[4].0] {
             assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0));
         }
         processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data = data;
         // A changed dependency edge cannot reuse a previously resolved plan.
-        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().parent_id = Some(chain[4].0.clone());
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().parent_id =
+            Some(chain[4].0.clone());
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
         for id in [&trigger, &chain[4].0] {
-            assert_eq!(processor.consensus.continuation_cursor_for_test(id), None,
-                "changed live metadata must invalidate the cached plan before any child handoff");
+            assert_eq!(
+                processor.consensus.continuation_cursor_for_test(id),
+                None,
+                "changed live metadata must invalidate the cached plan before any child handoff"
+            );
         }
         assert_eq!(processor.callbacks.finality_poll_attempts(), before);
         processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().parent_id = None;
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
         for id in [&trigger, &chain[4].0] {
             assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0));
         }
         assert!(processor.consensus.finalized_pending_body_contains(&trigger));
         assert!(processor.consensus.finalized_pending_body_contains(&chain[4].0));
-        assert!(!processor.consensus.is_finalized_block(&chain[0].0),
-            "joining an in-flight ancestor must not grant acceptance");
+        assert!(
+            !processor.consensus.is_finalized_block(&chain[0].0),
+            "joining an in-flight ancestor must not grant acceptance"
+        );
     }
-    let second_map = second_event.as_ref().map(|e|std::path::Path::new(&namespace)
-        .join("finality-intents/outputs-v1").join(format!("{}-{}.outputs",e.slot.value(),e.block_hash.to_hex_string())));
+    let second_map = second_event.as_ref().map(|e| {
+        std::path::Path::new(&namespace).join("finality-intents/outputs-v1").join(format!(
+            "{}-{}.outputs",
+            e.slot.value(),
+            e.block_hash.to_hex_string()
+        ))
+    });
     let mut final_slots = std::collections::BTreeSet::new();
     let mut parent_accepted = false;
     let mut rejected_parent_acceptance = false;
     let mut ancestor_body_evicted = false;
     for _ in 0..16 {
-        if reuse_materialized_plan && !ancestor_body_evicted
+        if reuse_materialized_plan
+            && !ancestor_body_evicted
             && processor.consensus.is_finalized_block(&chain[0].0)
         {
-            assert!(parent_accepted, "only actual fresh node acceptance can make ancestry reusable");
+            assert!(
+                parent_accepted,
+                "only actual fresh node acceptance can make ancestry reusable"
+            );
             processor.candidate_book_mut().received_mut(&chain[0].0).unwrap().data =
                 consensus_common::ConsensusCommonFactory::create_block_payload(Vec::new());
             ancestor_body_evicted = true;
@@ -12619,37 +13499,55 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
                 // already resolved output plan. Slot cleanup may advance while
                 // its child handoff is still in flight, as during catch-up.
                 processor.consensus.prune_below(SlotIndex::new(1000));
-                assert!(processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
-                    "retained sources must keep their actual accepted ancestor receipt");
+                assert!(
+                    processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
+                    "retained sources must keep their actual accepted ancestor receipt"
+                );
             }
         }
-        for (draft,done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
+        for (draft, done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
             if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
                 assert!(parent_accepted, "child final cannot precede parent node acceptance");
-                let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(proof)) = &draft.finality else { unreachable!() };
+                let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                    proof,
+                )) = &draft.finality
+                else {
+                    unreachable!()
+                };
                 final_slots.insert(proof.slot);
             }
-            done(Ok(UInt256::from([2;32])));
+            done(Ok(UInt256::from([2; 32])));
         }
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
         let acceptance = std::mem::take(sink.1.lock().unwrap().as_mut().unwrap());
-        for (request,done) in acceptance {
+        for (request, done) in acceptance {
             for _ in 0..3 {
-                processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
+                processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
             }
             if request.block_id == chain[0].1.block_id {
-                assert!(!parent_accepted, "replayed children must join one fresh accepted ancestor approval");
-                assert!(sink.0.lock().unwrap().is_empty(), "WAL custody does not release the WC child");
+                assert!(
+                    !parent_accepted,
+                    "replayed children must join one fresh accepted ancestor approval"
+                );
+                assert!(
+                    sink.0.lock().unwrap().is_empty(),
+                    "WAL custody does not release the WC child"
+                );
                 if !presealed_cold_plan {
-                    assert!(!processor.consensus.is_finalized_block(&chain[0].0),
-                        "WAL custody cannot materialize the parent before node acceptance");
+                    assert!(
+                        !processor.consensus.is_finalized_block(&chain[0].0),
+                        "WAL custody cannot materialize the parent before node acceptance"
+                    );
                 }
                 if !rejected_parent_acceptance {
                     done(Err(rtos_block::error!("injected parent node acceptance failure")));
                     if shared_approvals {
                         for id in [&trigger, &chain[4].0] {
-                            assert_eq!(processor.consensus.continuation_cursor_for_test(id), Some(0),
-                                "failed node acceptance must preserve the exact waiting position");
+                            assert_eq!(
+                                processor.consensus.continuation_cursor_for_test(id),
+                                Some(0),
+                                "failed node acceptance must preserve the exact waiting position"
+                            );
                         }
                     }
                     rejected_parent_acceptance = true;
@@ -12660,62 +13558,103 @@ fn source_finality_empty_trigger_cold_retry_case(high_floor: bool, materialized_
             }
             done(Ok(()));
         }
-        if map.exists() && second_map.as_ref().is_none_or(|p|p.exists())
-            && (!presealed_cold_plan || !pending_path.exists()) { break; }
+        if map.exists()
+            && second_map.as_ref().is_none_or(|p| p.exists())
+            && (!presealed_cold_plan || !pending_path.exists())
+        {
+            break;
+        }
     }
     assert!(parent_accepted, "presealed obligations still require this boot's node acceptance");
     if let Some(original) = presealed_bytes {
-        assert_eq!(std::fs::read(&map).unwrap(), original,
-            "cold replay must preserve the exact original full output set");
+        assert_eq!(
+            std::fs::read(&map).unwrap(),
+            original,
+            "cold replay must preserve the exact original full output set"
+        );
         assert!(!pending_path.exists(), "normal replay must finish the original intent");
     }
     if reuse_materialized_plan {
         assert!(ancestor_body_evicted, "regression must remove the already accepted ancestor body");
-        assert!(map.exists(), "accepted ancestor reuse must finish the retained source with its complete output set");
+        assert!(
+            map.exists(),
+            "accepted ancestor reuse must finish the retained source with its complete output set"
+        );
     }
     if prune_after_acceptance {
-        processor.with_consensus_backend(|c,b|c.retry_pending_recursive_finalization(b));
-        assert!(processor.consensus.finalized_pending_body_is_empty(),
-            "all retained source plans must have finished before testing reclamation");
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+        assert!(
+            processor.consensus.finalized_pending_body_is_empty(),
+            "all retained source plans must have finished before testing reclamation"
+        );
         processor.consensus.prune_below(SlotIndex::new(1000));
-        assert!(!processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
-            "unreferenced old receipts must be reclaimed after source completion");
+        assert!(
+            !processor.consensus.accepted_ancestor_approval_contains_for_test(&chain[0].0),
+            "unreferenced old receipts must be reclaimed after source completion"
+        );
     }
-    let value:serde_json::Value=serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
-    assert_eq!(processor.callbacks.finality_retention_attempts(), if shared_approvals {2} else {1},
-        "cold-recovery retries reuse only their own successful certificate-save phase");
-    let outputs=value["outputs"].as_array().unwrap();
-    assert_eq!(outputs.len(),2,"empty nodes produce no output; both nonempty ancestors do");
-    for (index,role) in [(0,false),(2,true)] {
-        assert!(outputs.iter().any(|v|v["block_id"]==chain[index].1.block_id.to_string() && v["is_final"]==role));
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+    assert_eq!(
+        processor.callbacks.finality_retention_attempts(),
+        if shared_approvals { 2 } else { 1 },
+        "cold-recovery retries reuse only their own successful certificate-save phase"
+    );
+    let outputs = value["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(), 2, "empty nodes produce no output; both nonempty ancestors do");
+    for (index, role) in [(0, false), (2, true)] {
+        assert!(
+            outputs
+                .iter()
+                .any(|v| v["block_id"] == chain[index].1.block_id.to_string()
+                    && v["is_final"] == role)
+        );
     }
-    assert_eq!(value["released"],false,"sealed handoff is not Delivered confirmation");
+    assert_eq!(value["released"], false, "sealed handoff is not Delivered confirmation");
     if let Some(second_map) = second_map {
         assert!(second_map.exists(), "both original triggers must seal their complete output sets");
-        let second:serde_json::Value=serde_json::from_slice(&std::fs::read(second_map).unwrap()).unwrap();
-        let second_outputs=second["outputs"].as_array().unwrap();
-        assert_eq!(second_outputs.len(),3,"the later child retains both ancestor approvals and its own Final");
-        for (index,role) in [(0,false),(2,false),(4,true)] {
-            assert!(second_outputs.iter().any(|v|v["block_id"]==chain[index].1.block_id.to_string() && v["is_final"]==role));
+        let second: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(second_map).unwrap()).unwrap();
+        let second_outputs = second["outputs"].as_array().unwrap();
+        assert_eq!(
+            second_outputs.len(),
+            3,
+            "the later child retains both ancestor approvals and its own Final"
+        );
+        for (index, role) in [(0, false), (2, false), (4, true)] {
+            assert!(second_outputs
+                .iter()
+                .any(|v| v["block_id"] == chain[index].1.block_id.to_string()
+                    && v["is_final"] == role));
         }
-        assert_eq!(final_slots,std::collections::BTreeSet::from([3,4]),
-            "each FinalCert context still needs its separate original source handoff");
+        assert_eq!(
+            final_slots,
+            std::collections::BTreeSet::from([3, 4]),
+            "each FinalCert context still needs its separate original source handoff"
+        );
     }
-    drop(processor); db.close(None).unwrap();
+    drop(processor);
+    db.close(None).unwrap();
 }
-
 
 #[test]
 fn test_transport_certificate_rejection_bans_observer_peer_without_validator_index() {
     let mut fixture = TestFixture::new(4);
     fixture.drain_receiver_actions();
     let peer = rtos_block::KeyId::from_data([0x71; 32]);
-    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0,1,2]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0, 1, 2]);
     fixture.processor.on_transport_certificate(peer.clone(), None, cert);
     let actions = fixture.drain_receiver_actions();
-    assert_eq!(actions.iter().filter(|action| matches!(action,
-        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer)).count(), 1);
-    assert!(!actions.iter().any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer))
+            .count(),
+        1
+    );
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
     assert!(!fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
 }
 
@@ -12724,12 +13663,15 @@ fn test_transport_certificate_valid_observer_forwarding_is_accepted_without_ban(
     let mut fixture = TestFixture::new(4);
     fixture.drain_receiver_actions();
     let peer = rtos_block::KeyId::from_data([0x71; 32]);
-    let cert = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, 0, &[0,1,2]);
+    let cert = build_skip_certificate_tl(&SessionId::default(), &fixture.nodes, 0, &[0, 1, 2]);
     fixture.processor.on_transport_certificate(peer, None, cert);
     fixture.drain_pending_async_db_results();
     assert!(fixture.processor.simplex_state.has_skip_certificate(SlotIndex::new(0)));
-    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(action,
-        ReceiverAction::BanPeerForBadSignature { .. } | ReceiverAction::BanSourceForBadSignature { .. })));
+    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(
+        action,
+        ReceiverAction::BanPeerForBadSignature { .. }
+            | ReceiverAction::BanSourceForBadSignature { .. }
+    )));
 }
 
 #[test]
@@ -12737,12 +13679,20 @@ fn test_transport_certificate_rejection_attributes_ban_to_transport_peer() {
     let mut fixture = TestFixture::new(4);
     fixture.drain_receiver_actions();
     let peer = rtos_block::KeyId::from_data([0x72; 32]);
-    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0,1,2]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, 0, &[0, 1, 2]);
     fixture.processor.on_transport_certificate(peer.clone(), Some(1), cert);
     let actions = fixture.drain_receiver_actions();
-    assert_eq!(actions.iter().filter(|action| matches!(action,
-        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer)).count(), 1);
-    assert!(!actions.iter().any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(action,
+        ReceiverAction::BanPeerForBadSignature { peer: actual } if actual == &peer))
+            .count(),
+        1
+    );
+    assert!(!actions
+        .iter()
+        .any(|action| matches!(action, ReceiverAction::BanSourceForBadSignature { .. })));
 }
 
 #[test]
@@ -12751,26 +13701,21 @@ fn test_transport_certificate_outside_ingress_window_does_not_ban() {
     fixture.drain_receiver_actions();
     let slot = fixture.processor.simplex_state.first_too_new_vote_slot().value();
     let peer = rtos_block::KeyId::from_data([0x71; 32]);
-    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, slot, &[0,1,2]);
+    let cert = build_skip_certificate_tl(&SessionId::rand(), &fixture.nodes, slot, &[0, 1, 2]);
     fixture.processor.on_transport_certificate(peer, None, cert);
-    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(action,
-        ReceiverAction::BanPeerForBadSignature { .. } | ReceiverAction::BanSourceForBadSignature { .. })));
+    assert!(!fixture.drain_receiver_actions().iter().any(|action| matches!(
+        action,
+        ReceiverAction::BanPeerForBadSignature { .. }
+            | ReceiverAction::BanSourceForBadSignature { .. }
+    )));
 }
 
 #[test]
 fn test_candidate_query_fallback_reads_cold_disk_body_and_notar() {
     let mut fixture = TestFixture::new(4);
     let (_leader, id, candidate) = make_signed_block_broadcast(&fixture, 9, vec![7, 9, 11]);
-    let wire = fixture
-        .description
-        .opts()
-        .wire_profile
-        .serialize(&candidate)
-        .unwrap();
-    let vote = crate::simplex_state::NotarizeVote {
-        slot: id.slot,
-        block_hash: id.hash.clone(),
-    };
+    let wire = fixture.description.opts().wire_profile.serialize(&candidate).unwrap();
+    let vote = crate::simplex_state::NotarizeVote { slot: id.slot, block_hash: id.hash.clone() };
     let signed_vote = crate::simplex_state::Vote::Notarize(vote.clone());
     let bytes = crate::utils::create_data_to_sign(
         fixture.processor.session_id(),
@@ -12789,25 +13734,11 @@ fn test_candidate_query_fallback_reads_cold_disk_body_and_notar() {
             .collect(),
     };
     let db = fixture.processor.database.db().clone();
-    db.save_candidate_payload_async(&id, &wire)
-        .unwrap()
-        .wait()
-        .unwrap();
-    db.save_notar_cert_async(&id, &cert)
-        .unwrap()
-        .wait()
-        .unwrap();
+    db.save_candidate_payload_async(&id, &wire).unwrap().wait().unwrap();
+    db.save_notar_cert_async(&id, &cert).unwrap().wait().unwrap();
     assert!(!fixture.processor.candidate_book().contains_received(&id));
-    assert!(fixture
-        .processor
-        .candidate_book()
-        .cached_data(&id)
-        .is_none());
-    assert!(fixture
-        .processor
-        .simplex_state
-        .get_notarize_certificate(id.slot, &id.hash)
-        .is_none());
+    assert!(fixture.processor.candidate_book().cached_data(&id).is_none());
+    assert!(fixture.processor.simplex_state.get_notarize_certificate(id.slot, &id.hash).is_none());
     let (tx, rx) = channel();
     fixture.processor.handle_candidate_query_fallback(
         id.slot,
@@ -12868,10 +13799,9 @@ fn test_deferred_finality_repair_cannot_be_downgraded_by_ordinary_requests() {
             .drain_receiver_actions()
             .into_iter()
             .filter_map(|action| match action {
-                ReceiverAction::RequestCandidate {
-                    slot: s,
-                    block_hash,
-                } if s == slot.value() => Some(block_hash),
+                ReceiverAction::RequestCandidate { slot: s, block_hash } if s == slot.value() => {
+                    Some(block_hash)
+                }
                 _ => None,
             })
             .collect();
@@ -12880,12 +13810,7 @@ fn test_deferred_finality_repair_cannot_be_downgraded_by_ordinary_requests() {
             vec![hash],
             "ordinary delay/skip policy cannot downgrade the finality dependency"
         );
-        assert!(fixture
-            .processor
-            .deferred_candidate_requests
-            .lock()
-            .unwrap()
-            .is_empty());
+        assert!(fixture.processor.deferred_candidate_requests.lock().unwrap().is_empty());
     }
 }
 
@@ -12913,9 +13838,7 @@ fn test_query_repair_restores_absent_body_despite_retained_validation_decision()
             id.hash.clone(),
             &[0, 1, 2],
         );
-        fixture
-            .processor
-            .on_candidate_received(leader, candidate, Some(notar));
+        fixture.processor.on_candidate_received(leader, candidate, Some(notar));
         assert!(
             fixture.processor.candidate_book().has_real_body(&id),
             "a retained validation decision is not the missing candidate body"

@@ -460,7 +460,7 @@ async fn control_query<Q: rtos_api::AnyBoxedSerialize>(
 fn control_refusal(answer: rtos_api::TLObject) -> Option<(i32, String)> {
     answer.downcast::<rtos_api::ton::engine::validator::ControlQueryError>().ok().map(|error| {
         let error = error.only();
-        (error.code, error.message)
+        (error.code, error.message.into_string().unwrap())
     })
 }
 

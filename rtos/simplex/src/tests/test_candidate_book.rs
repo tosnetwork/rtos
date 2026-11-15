@@ -543,8 +543,12 @@ fn restored_metadata_does_not_suppress_body_hydration() {
     let mut restored = make_received_real(4, 0, make_block_id(44, 0x04), None);
     restored.data = ConsensusCommonFactory::create_block_payload(vec![]);
     book.insert_received(id.clone(), restored);
-    assert!(!book.has_real_body(&id), "authenticated hash metadata still needs ordinary block bytes");
-    book.received_mut(&id).unwrap().data = ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]);
+    assert!(
+        !book.has_real_body(&id),
+        "authenticated hash metadata still needs ordinary block bytes"
+    );
+    book.received_mut(&id).unwrap().data =
+        ConsensusCommonFactory::create_block_payload(vec![1, 2, 3]);
     assert!(book.has_real_body(&id));
     let restored = book.received_mut(&id).unwrap();
     restored.data = ConsensusCommonFactory::create_block_payload(vec![]);
