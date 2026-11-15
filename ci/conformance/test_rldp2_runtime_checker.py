@@ -10,14 +10,23 @@ from check_rldp2_runtime import read_frozen
 
 class FrozenProvenanceTests(unittest.TestCase):
     def test_native_reference_and_each_provenance_mutation(self):
+        for corpus in ("cases", "boundaries"):
+            with self.subTest(corpus=corpus):
+                self.check_corpus(corpus)
+
+    def check_corpus(self, corpus):
         root = Path(__file__).parent
-        cases = root / "rldp2_runtime_cases.tsv"
+        cases = root / f"rldp2_runtime_{corpus}.tsv"
         ids = [
             line.split()[0]
             for line in cases.read_text().splitlines()
             if line.strip() and not line.startswith("#")
         ]
-        reference = root / "rldp2_runtime_expected.json"
+        reference = root / (
+            "rldp2_runtime_expected.json"
+            if corpus == "cases"
+            else "rldp2_runtime_boundaries_expected.json"
+        )
         self.assertEqual(len(read_frozen(reference, cases, ids)), len(ids))
         for field in ("reference_commit", "input_sha256", "probe_source_sha256"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:

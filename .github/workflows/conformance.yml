@@ -87,6 +87,17 @@ jobs:
             --frozen-reference ci/conformance/rldp2_runtime_expected.json \
             --actual "$task_runtime_out/effects.jsonl" \
             > "$task_runtime_out/comparison.json"
+          target/release/examples/rldp2_runtime \
+            < ci/conformance/rldp2_runtime_boundaries.tsv \
+            > "$task_runtime_out/boundaries.jsonl" 2> "$task_runtime_out/boundaries.log"
+          sha256sum ci/conformance/rldp2_runtime_boundaries.tsv \
+            ci/conformance/rldp2_runtime_boundaries_expected.json \
+            >> "$task_runtime_out/sha256.txt"
+          python3 ci/conformance/check_rldp2_runtime.py \
+            --cases ci/conformance/rldp2_runtime_boundaries.tsv \
+            --frozen-reference ci/conformance/rldp2_runtime_boundaries_expected.json \
+            --actual "$task_runtime_out/boundaries.jsonl" \
+            > "$task_runtime_out/boundaries-comparison.json"
 
       - name: Retain conformance evidence
         if: always()

@@ -1,0 +1,139 @@
+{
+  "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+  "probe_source_sha256": "058fb4f446fc2d79da63111d5bfd369047c99b4f6b10bb7cd101438638c676db",
+  "input_sha256": "961221a2f3320bde8a340d50eb3279b08dbd089b2d475b2d145fe12c15db4ad6",
+  "scope": "Native sequential TL-length and zero-limit caller effects; not hostile-peer or cross-language socket qualification",
+  "effects": [
+    {
+      "id": "tl_0_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_0_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "tl_252_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_252_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 252,
+      "payload_sha256": "2532a2bf0a389dda8c47f22993f8d8520375fe2be9ac64d30b3ce16924948c00"
+    },
+    {
+      "id": "tl_253_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_253_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 253,
+      "payload_sha256": "46de91969ca01e769084ffa445e68356ca18406b6feae7e168b1f7cbed6d4f43"
+    },
+    {
+      "id": "tl_254_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_254_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 254,
+      "payload_sha256": "89b99cd5e0f9188bfea6b5f58e1416621f0184db2960c6b6271417eefacdf097"
+    },
+    {
+      "id": "tl_255_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_255_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 255,
+      "payload_sha256": "857df204175f077a9986709897f00ee0bcc0449585248e4b42498337e9329999"
+    },
+    {
+      "id": "tl_256_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "tl_256_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 256,
+      "payload_sha256": "5bc31b283cef0072274e97d74916552954c935794536cab632641e5ea071379d"
+    },
+    {
+      "id": "default_1",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "default_7639",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "default_7640",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "default_7641",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "recovery_after_default",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 64,
+      "payload_sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    }
+  ],
+  "query_timeout_ms": 10000,
+  "timeout_tolerance_ms": 500
+}
