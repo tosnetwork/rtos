@@ -51,7 +51,13 @@ pub async fn run_validate_query_any_candidate(
     let info = real_block.read_info()?;
     let prev_blocks_ids = info.read_prev_ids()?;
     let (_, master_ref) = info.read_master_id()?.master_block_id();
+    let trace_phase = |phase: &str| {
+        log::debug!(target: "validator", "VALIDATION_QUERY_PHASE: task={:?} block={} phase={}",
+            tokio::task::try_id(), block_id, phase);
+    };
+    trace_phase("load_master_state");
     let mc_state = engine.load_state(&master_ref).await?;
+    trace_phase("master_state_loaded");
     let mc_state_extra = mc_state.shard_state_extra()?;
     let mut cc_seqno_with_delta = 0;
     let cc_seqno_from_state = if info.shard().is_masterchain() {
@@ -93,7 +99,9 @@ pub async fn run_validate_query_any_candidate(
         true,
         is_simplex,
     );
+    trace_phase("try_validate");
     let validator_result = query.with_dependency_deadline(dependency_deadline).try_validate().await;
+    trace_phase("validated");
 
     metrics::gauge!("rtos_node_validator_active", &labels).decrement(1.0);
 
@@ -121,6 +129,7 @@ pub async fn run_validate_query_any_candidate(
 
             if is_simplex {
                 if let Some(next_state) = next_state_opt {
+                    trace_phase("cache_store");
                     state_resolver_cache.lock().await.store_validated_state(&block_id, next_state);
                 }
             }
@@ -128,6 +137,7 @@ pub async fn run_validate_query_any_candidate(
             // Store block data so accept_block_routine can find it without a network download.
             // Note: download_and_apply_block_worker also requires a proof/link on the handle
             // to skip the download path; storing data alone is not sufficient for that path.
+            trace_phase("store_validated_block");
             if let Err(e) = store_validated_block(&engine, &block_id, &block_data).await {
                 log::warn!(
                     "run_validate_query_any_candidate: failed to store validated block \

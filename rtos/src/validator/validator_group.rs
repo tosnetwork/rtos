@@ -2948,6 +2948,11 @@ impl ValidatorGroup {
             };
 
             let deadline = tokio::time::Instant::now() + validation_timeout;
+            let trace_phase = |phase: &str| {
+                log::debug!(target: "validator", "VALIDATION_PHASE: task={:?} candidate={} phase={}",
+                    tokio::task::id(), candidate_id, phase);
+            };
+            trace_phase("begin");
             let validation_result = tokio::time::timeout_at(deadline, async {
                 if use_candidate_native {
                     // ---- Simplex candidate-native validation path ----
@@ -2979,6 +2984,7 @@ impl ValidatorGroup {
                     if is_masterchain {
                         let prev_ids = info.read_prev_ids()?;
                         if let Some(candidate_parent_block_id) = prev_ids.first() {
+                            trace_phase("mc_parent_wait");
                             wait_for_mc_validation_parent_until_stop(
                                 accepted_mc_block_rx.clone(),
                                 &candidate_block_id,
@@ -2995,6 +3001,7 @@ impl ValidatorGroup {
                     // catch-up before the full candidate-native validator runs.
                     // MC stale-branch protection above still uses the session's
                     // accepted head; ValidateQuery still checks the full state.
+                    trace_phase("reference_top");
                     let last_applied_block_opt = candidate_validation_reference_top(
                         engine.as_ref(), &info, &candidate_block_id,
                     ).await?;
@@ -3022,6 +3029,7 @@ impl ValidatorGroup {
                         candidate_block_id
                     );
 
+                    trace_phase("query");
                     let validation_completion_time = run_validate_query_any_candidate(
                         candidate.clone(),
                         engine.clone(),
@@ -3032,6 +3040,7 @@ impl ValidatorGroup {
                     .await?;
 
                     // Post-validation: broadcast + save (shared with legacy path)
+                    trace_phase("post_validation");
                     Self::post_validation_actions(
                         &next_block_descr,
                         &source_info,
@@ -3132,6 +3141,7 @@ impl ValidatorGroup {
                 }
             })
             .await;
+            trace_phase("result");
 
             // Convert timeout to a validation failure so Simplex retry machinery
             // clears pending_approve and reschedules.
@@ -3161,6 +3171,7 @@ impl ValidatorGroup {
             );
 
             callback(validation_result);
+            trace_phase("callback_done");
 
             log::trace!(
                 target: "validator",
