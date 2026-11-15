@@ -1068,7 +1068,6 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
                 .unwrap();
             addresses.push(address);
         }
-        let previous_advertisement_version = adnl::common::Version::get();
         for (index, engine) in engines.iter().enumerate() {
             let stack = &engine.network().context().stack;
             for (remote_index, remote) in engines.iter().enumerate() {
@@ -1128,8 +1127,9 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
                 )
                 .unwrap();
         }
-        // All four nodes advertised before manual Plumtree activation. Publish
-        // the actual new capabilities through normal signed peer admission.
+        // Capture after all initial advertisements: setup itself may cross a
+        // second boundary. Every refreshed record must supersede all of them.
+        let previous_advertisement_version = adnl::common::Version::get();
         wait_for_fixture_advertisement_version(previous_advertisement_version).await;
         refresh_fixture_public_advertisements(&engines, &[pair.shard.id().shard()]).await;
         let prefix = rtos_api::serialize_boxed(
