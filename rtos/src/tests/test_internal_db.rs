@@ -1722,9 +1722,15 @@ async fn test_shard_state_persistent_gc_impl() -> Result<()> {
     ];
 
     let mut prev_time = key_blocks[0].1;
-    for (id, time) in &key_blocks[1..] {
+    for (offset, (id, time)) in key_blocks[1..].iter().enumerate() {
         if engine.is_persistent_state(*time, prev_time, crate::boot::PSS_PERIOD_BITS) {
-            let id = BlockIdExt { root_hash: id.parse()?, ..Default::default() };
+            // These synthetic payloads test ordinary snapshot expiry. Sequence
+            // zero instead identifies an original genesis BOC with pinned bytes.
+            let id = BlockIdExt {
+                seq_no: u32::try_from(key_blocks.len() - 1 - offset)?,
+                root_hash: id.parse()?,
+                ..Default::default()
+            };
             let mut meta = BlockMeta::default();
             meta.gen_utime = *time;
             let handle = db.block_handle_storage.create_handle(id.clone(), meta, None)?.unwrap();
