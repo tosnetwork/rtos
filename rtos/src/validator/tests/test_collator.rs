@@ -1205,7 +1205,9 @@ fn collated_fixture_v2_reference(block: &Block) -> Result<Block> {
     Ok(migrated)
 }
 
-async fn try_validate_historical_bundle(bundle: Arc<CollatorTestBundle>) {
+async fn try_validate_historical_bundle(mut bundle: CollatorTestBundle) {
+    bundle.use_native_size_limits_fixture().unwrap();
+    let bundle = Arc::new(bundle);
     let error =
         try_validate_by_bundle(bundle.clone()).await.err().expect("legacy hash is rejected");
     assert!(error.to_string().contains("validator set hash"), "{error}");
@@ -1446,12 +1448,10 @@ async fn test_collated_data2() {
     )
     .await;
 
-    let bundle = Arc::new(
-        CollatorTestBundle::load(
-            "src/tests/static/0.6000000000000000_439_d27493e2_collator_test_bundle",
-        )
-        .unwrap(),
-    );
+    let bundle = CollatorTestBundle::load(
+        "src/tests/static/0.6000000000000000_439_d27493e2_collator_test_bundle",
+    )
+    .unwrap();
     try_validate_historical_bundle(bundle).await;
 }
 
@@ -1477,7 +1477,7 @@ async fn test_collated_data_validate_unchanged_account() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_66163599_2bc2034d_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 // full-collated-data validation where a subtree shared with the new state is pruned in
@@ -1489,7 +1489,7 @@ async fn test_validate_pruned_shared_subtree_storage_stat() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76189835_5ca9034e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1498,7 +1498,7 @@ async fn test_validate_pruned_dispatch_queue() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76770988_db9fc78e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1506,7 +1506,9 @@ async fn test_validate_pruned_dispatch_queue() {
 async fn test_collated_data_add_removed_cells_to_proof() {
     init_test_log();
     let path = "src/tests/static/0.e000000000000000_67704975_6cea4ad1_collator_test_bundle";
-    let bundle = CollatorTestBundle::load(path).unwrap();
+    let mut bundle = CollatorTestBundle::load(path).unwrap();
+    assert!(bundle.use_native_size_limits_fixture().unwrap());
+    assert!(!bundle.use_native_size_limits_fixture().unwrap(), "migration must be idempotent");
     try_collate_by_bundle(Arc::new(bundle), false).await.unwrap();
 }
 

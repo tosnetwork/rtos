@@ -1008,3 +1008,34 @@ it is not an acceptance or whole-history replay result. Capture instrumentation
 and raw input hashes are retained under
 `/datax/rtos-conformance/2026-11-15-collated-proof-selection`, rather than adding
 tracing paths to production code.
+
+### Legacy collator size-limit fixtures
+
+`collator_size_limits_reference.py --cpp-build <pinned-TOS-Ninja-build> --out <empty-directory>`
+reads the three public collator bundles named in the script. It virtualizes their
+actual masterchain-state Merkle proofs and requires native TOS to reject the old
+configuration43. TON857b8a57's version2 includes a trailing optional library-load
+limit; TOS5af405d carries that field in version3. These are different reference
+schemas, not evidence that the original TON inputs are corrupt.
+
+The native helper validates the version2 common prefix, preserves every remaining
+optional-limit bit, switches to version3 and appends the four new fields from
+native `SizeLimitsConfig` defaults. Native decoding must accept the result and
+recover the same optional library limit. Output contains the old/new cells and
+hashes, source-file hashes and a pinned build receipt. Input files are capped at
+64MiB before allocation and must not grow during the exact-length read. Each input
+is released before the next; no operational key or network is used.
+
+After checking the receipt, install the separate `migrations.json` output as
+`rtos/src/tests/data/collator-size-limits-migrations.json`. The test-only
+`CollatorTestBundle::use_native_size_limits_fixture` explicitly applies this
+small hash-indexed table to the trusted masterchain test context, verifies every
+legacy field including the optional limit, and reproduces the native replacement
+cell exactly. Unknown invalid configurations still fail. Ordinary bundle loading
+and production decoders do not perform this conversion.
+
+This is a synthetic trusted-context migration for the existing pruned-subtree,
+message-queue and storage-stat regressions. It does not authenticate a rewritten
+historical chain or qualify a native full-block replay. Original trace files stay
+unchanged. Original proof/count assertions stay intact; the independent collated
+root-count mismatch remains a separate follow-up.
