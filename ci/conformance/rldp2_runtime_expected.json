@@ -23,14 +23,16 @@
       "status": "timeout",
       "error_code": 652,
       "payload_bytes": 0,
-      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
     },
     {
       "id": "wire_below",
       "status": "timeout",
       "error_code": 652,
       "payload_bytes": 0,
-      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
     },
     {
       "id": "wire_exact",
@@ -65,7 +67,8 @@
       "status": "timeout",
       "error_code": 652,
       "payload_bytes": 0,
-      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
     },
     {
       "id": "recovery",
@@ -81,5 +84,7 @@
       "payload_bytes": 64,
       "payload_sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
     }
-  ]
+  ],
+  "query_timeout_ms": 10000,
+  "timeout_tolerance_ms": 500
 }

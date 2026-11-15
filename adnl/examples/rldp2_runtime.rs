@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
             let (status, payload, diagnostic) = match result {
                 Ok(Ok((Some(bytes), _))) => ("answer", hex::encode(bytes), String::new()),
                 Ok(Ok((None, _))) => ("no_answer", String::new(), String::new()),
+                Ok(Err(error)) if error.downcast_ref::<adnl::RldpQueryTimeout>().is_some() => ("timeout", String::new(), error.to_string()),
                 Ok(Err(error)) => ("error", String::new(), format!("{error:#}")),
                 Err(error) => ("harness_timeout", String::new(), error.to_string()),
             };

@@ -67,6 +67,26 @@ jobs:
           python3 ci/conformance/run.py --tos ../tos-reference \
             --out "$RUNNER_TEMP/conformance" --jobs 2
 
+      - name: Compare real RLDP2 queries with frozen native effects
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          task_runtime_out="$RUNNER_TEMP/conformance/rldp2-runtime"
+          mkdir -p "$task_runtime_out"
+          git rev-parse HEAD > "$task_runtime_out/head.txt"
+          cargo run --release --package adnl --example rldp2_runtime --jobs 2 \
+            < ci/conformance/rldp2_runtime_cases.tsv \
+            > "$task_runtime_out/effects.jsonl" 2> "$task_runtime_out/run.log"
+          sha256sum ci/conformance/rldp2_runtime_cases.tsv \
+            ci/conformance/rldp2_runtime_expected.json \
+            adnl/examples/rldp2_runtime.rs target/release/examples/rldp2_runtime \
+            > "$task_runtime_out/sha256.txt"
+          python3 ci/conformance/check_rldp2_runtime.py \
+            --cases ci/conformance/rldp2_runtime_cases.tsv \
+            --frozen-reference ci/conformance/rldp2_runtime_expected.json \
+            --actual "$task_runtime_out/effects.jsonl" \
+            > "$task_runtime_out/comparison.json"
+
       - name: Retain conformance evidence
         if: always()
         uses: actions/upload-artifact@v4

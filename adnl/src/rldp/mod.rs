@@ -270,6 +270,17 @@ struct RldpTelemetry {
 
 pub use rtos_api::DecodeLimitExceeded as ResponseLimitExceeded;
 
+#[derive(Debug)]
+pub struct RldpQueryTimeout;
+
+impl std::fmt::Display for RldpQueryTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RLDP2 query deadline expired")
+    }
+}
+
+impl std::error::Error for RldpQueryTimeout {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct QueryResponseLimits {
     pub wire_bytes: usize,
@@ -1121,6 +1132,8 @@ impl RldpNode {
         bounded: Option<BoundedReceive>,
         control: Option<Arc<SendControl>>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
+        let query_deadline = (v2 && max_answer_size.is_some())
+            .then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
         let response_limits = bounded.as_ref().map(|scope| scope.limits);
         let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
         #[cfg(feature = "telemetry")]
@@ -1266,8 +1279,10 @@ impl RldpNode {
             peers.other(),
             query_id.is_some(),
         );
-        let res = match tokio::time::timeout(
-            control.deadline(),
+        let hard_deadline = tokio::time::Instant::now() + control.deadline();
+        let deadline = query_deadline.map_or(hard_deadline, |query| query.min(hard_deadline));
+        let res = match tokio::time::timeout_at(
+            deadline,
             self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer, bounded),
         )
         .await
@@ -1277,14 +1292,18 @@ impl RldpNode {
                 control.cancel(SendCancelled::Deadline);
                 log::warn!(
                     target: TARGET,
-                    "outbound HARD TIMEOUT after {} ms: transfer {} to {}, query={}, \
+                    "outbound deadline after {} ms: transfer {} to {}, query={}, \
                      total_to_send={total_to_send}",
-                    Self::TIMEOUT_OUTBOUND_HARD_MS,
+                    outbound_started_at.elapsed().as_millis(),
                     base64_encode(&send_transfer_id),
                     peers.other(),
                     query_id.is_some(),
                 );
-                Err(SendCancelled::Deadline.into())
+                if query_deadline.is_some_and(|query| query <= deadline) {
+                    Err(RldpQueryTimeout.into())
+                } else {
+                    Err(SendCancelled::Deadline.into())
+                }
             }
         };
         log::debug!(
@@ -1400,7 +1419,13 @@ impl RldpNode {
             self.adnl.tasks().spawn_admitted("RLDP outbound receiver", token, async move {
                 let _registration = registration;
                 let _permit = permit;
-                Self::receive_loop_controlled(&mut recv_context, v2, Some(&control)).await;
+                Self::receive_loop_controlled(
+                    &mut recv_context,
+                    v2,
+                    Some(&control),
+                    v2 && !propagate_failure,
+                )
+                .await;
                 let _ = ping.send(recv_context.recv_transfer);
                 if let Some(scope) = bounded {
                     let _ = scope.done.send(());
@@ -1501,7 +1526,7 @@ impl RldpNode {
                 }
                 peer.stats.v1.update(self.min_timeout_ms);
                 updates = new_updates;
-            } else if peer.stats.v1.try_timeout(start_ms) {
+            } else if !v2 && peer.stats.v1.try_timeout(start_ms) {
                 log::warn!(
                     target: TARGET,
                     "Weak activity in RLDP {transfer_str} last {} ms, aborting",
@@ -1538,13 +1563,14 @@ impl RldpNode {
     fn print_stats(&self) {}
 
     async fn receive_loop(context: &mut RecvContext, v2: bool) {
-        Self::receive_loop_controlled(context, v2, None).await;
+        Self::receive_loop_controlled(context, v2, None, false).await;
     }
 
     async fn receive_loop_controlled(
         context: &mut RecvContext,
         v2: bool,
         control: Option<&Arc<SendControl>>,
+        discard_oversize: bool,
     ) {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
@@ -1602,6 +1628,11 @@ impl RldpNode {
             }
             match context.recv_transfer.process_chunk(job) {
                 Err(e) => {
+                    if discard_oversize && e.downcast_ref::<ResponseLimitExceeded>().is_some() {
+                        // Invalid response parts do not complete a query. Its
+                        // absolute deadline remains in charge of completion.
+                        continue;
+                    }
                     log::warn!(
                         target: TARGET,
                         "{rldp} error in {transfer_str}: {e}, dropping transfer"

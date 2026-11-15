@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare caller-visible completion and complete payloads from runtime probes.
 
-Implementation-specific diagnostics are retained in the original JSONL files;
-this check does not qualify timing, packet traces, or resource/lifecycle effects.
+Implementation-specific diagnostics are retained in the original JSONL files.
+Frozen timeout cases enforce their declared minimum wait; packet traces and
+resource/lifecycle effects are not covered by this checker.
 """
 
 import argparse
@@ -46,6 +47,11 @@ def read_frozen(path, cases, ids):
             raise ValueError("invalid frozen payload digest")
         if row["status"] != "answer" and row["payload_bytes"] != 0:
             raise ValueError("frozen failure carries payload")
+        if row["status"] == "timeout" and (
+            not isinstance(row.get("timeout_not_before_ms"), int)
+            or row["timeout_not_before_ms"] <= 0
+        ):
+            raise ValueError("frozen timeout has no minimum wait")
     return rows
 
 
@@ -78,6 +84,12 @@ def main():
             for key in ("status", "payload_bytes", "payload_sha256")
             if left[key] != right[key]
         ]
+        if "timeout_not_before_ms" in left:
+            elapsed = right.get("elapsed_ms")
+            if not isinstance(elapsed, (int, float)) or not (
+                elapsed >= left["timeout_not_before_ms"]
+            ):
+                fields.append("completion_deadline")
         if fields:
             differences.append(
                 {
