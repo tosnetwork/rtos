@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 
-def main():
+def main(probe_source=None, target="test-rldp2"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpp-build", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -17,7 +17,7 @@ def main():
     args = parser.parse_args()
     build = args.cpp_build.resolve()
     out = args.out.resolve()
-    source = Path(__file__).with_suffix(".cpp")
+    source = probe_source or Path(__file__).with_suffix(".cpp")
     cache = (build / "CMakeCache.txt").read_text()
     source_root = Path(
         next(
@@ -38,20 +38,20 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with (out / "build.log").open("w") as log:
         subprocess.run(
-            ["ninja", "-C", str(build), "-j32", "test-rldp2"],
+            ["ninja", "-C", str(build), "-j32", target],
             stdout=log,
             stderr=subprocess.STDOUT,
             check=True,
         )
         commands = subprocess.check_output(
-            ["ninja", "-C", str(build), "-t", "commands", "test-rldp2"],
+            ["ninja", "-C", str(build), "-t", "commands", target],
             text=True,
         ).splitlines()
         compile_args = shlex.split(
             next(
                 line
                 for line in commands
-                if "test-rldp2.cpp.o" in line and " -c " in line
+                if f"{target}.cpp.o" in line and " -c " in line
             )
         )
         compiler = (
@@ -78,7 +78,7 @@ def main():
             compile_command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True
         )
         link_args = shlex.split(
-            next(line for line in commands if " -o test-rldp2 " in line)
+            next(line for line in commands if f" -o {target} " in line)
         )
         libraries = [
             arg for arg in link_args if arg.endswith(".a") or arg.startswith("-l")
@@ -104,6 +104,7 @@ def main():
     ):
         result = subprocess.run(
             [str(out / "probe"), str(out / "db")],
+            cwd=out,
             stdin=inputs,
             stdout=effects,
             stderr=log,

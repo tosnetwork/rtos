@@ -99,6 +99,13 @@ jobs:
             --actual "$task_runtime_out/boundaries.jsonl" \
             > "$task_runtime_out/boundaries-comparison.json"
 
+      - name: Check RLDP response lifetime and ownership
+        timeout-minutes: 15
+        run: |
+          mkdir -p "$RUNNER_TEMP/conformance/rldp2-lifetime"
+          cargo test --release --package adnl --lib --jobs 2 rldp:: -- --nocapture \
+            > "$RUNNER_TEMP/conformance/rldp2-lifetime/tests.log" 2>&1
+
       - name: Retain conformance evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -256,6 +256,8 @@ declare_counted!(
 );
 
 struct RldpAlloc {
+    #[cfg(test)]
+    response_lifecycle: Arc<(AtomicU64, AtomicU64)>, // (senders started, inbound handlers finished)
     peers: Arc<AtomicU64>,
     send_transfers: Arc<AtomicU64>,
     recv_transfers: Arc<AtomicU64>,
@@ -358,6 +360,8 @@ impl RldpNode {
             send_transfers: adnl.add_metric("Alloc RLDP send"),
         };
         let allocated = RldpAlloc {
+            #[cfg(test)]
+            response_lifecycle: Arc::new((AtomicU64::new(0), AtomicU64::new(0))),
             peers: Arc::new(AtomicU64::new(0)),
             recv_transfers: Arc::new(AtomicU64::new(0)),
             send_transfers: Arc::new(AtomicU64::new(0)),
@@ -901,6 +905,8 @@ impl RldpNode {
         #[cfg(feature = "telemetry")]
         let send_metric = self.telemetry.send_transfers.clone();
         let send_counter = self.allocated.send_transfers.clone();
+        #[cfg(test)]
+        let response_lifecycle = self.allocated.response_lifecycle.clone();
         let subscribers = self.subscribers.clone();
         let transfers = self.transfers.clone();
         let owner = self.adnl.tasks().clone();
@@ -919,6 +925,8 @@ impl RldpNode {
                 #[cfg(feature = "telemetry")]
                 send_metric,
                 send_counter,
+                #[cfg(test)]
+                &response_lifecycle,
             )
             .await
             .unwrap_or_else(|e| {
@@ -930,6 +938,8 @@ impl RldpNode {
                 );
                 None
             });
+            #[cfg(test)]
+            response_lifecycle.1.fetch_add(1, Ordering::Release);
             #[cfg(feature = "telemetry")]
             let all = stats.transfers_recv_all.load(Ordering::Relaxed);
             #[cfg(feature = "telemetry")]
@@ -971,6 +981,7 @@ impl RldpNode {
         peer: &Arc<RldpPeer>,
         #[cfg(feature = "telemetry")] send_metric: Arc<Metric>,
         send_counter: Arc<AtomicU64>,
+        #[cfg(test)] response_lifecycle: &(AtomicU64, AtomicU64),
     ) -> Result<Option<TransferId>> {
         fn try_decompress(context: &mut RecvContext, data: &mut Vec<u8>) -> bool {
             if let Some(decompressed) = DataCompression::decompress_raw(data) {
@@ -1031,6 +1042,11 @@ impl RldpNode {
             },
         };
         let Some(mut answer) = answer.answer else { return Ok(None) };
+        // Match the native response path: a subscriber may finish after the
+        // wire query deadline, in which case no new transfer may be opened.
+        if v2 && Version::get() >= query.timeout {
+            return Ok(None);
+        }
         if compression {
             answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
         }
@@ -1057,6 +1073,8 @@ impl RldpNode {
             SendTransfer::new(data, send_transfer_id.clone(), send_counter.clone(), ping, v2)?;
         #[cfg(feature = "telemetry")]
         send_metric.update(send_counter.load(Ordering::Relaxed));
+        #[cfg(test)]
+        response_lifecycle.0.fetch_add(1, Ordering::Release);
         transfers.insert(send_transfer_id, RldpTransfer::Send(send_transfer_state));
         let control = SendControl::new();
         let _cancel = control.guard();
@@ -2152,3 +2170,6 @@ impl Subscriber for RldpNode {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests;
