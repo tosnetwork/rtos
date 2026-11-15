@@ -263,6 +263,7 @@ fn main() {
     let zero = id(&state_root, 0, ShardIdent::masterchain());
     let zero_boc = write_boc(&state_root).unwrap();
     let mut previous = zero.clone();
+    let mut previous_key = true;
     let mut epoch = 0;
     let mut last_key = None;
     let mut rows = vec![];
@@ -338,14 +339,8 @@ fn main() {
             .prev_blocks
             .set(
                 &previous.seq_no,
-                &KeyExtBlkRef {
-                    key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
-                    blk_ref: reference(&previous),
-                },
-                &KeyMaxLt {
-                    key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
-                    max_end_lt: reference(&previous).end_lt,
-                },
+                &KeyExtBlkRef { key: previous_key, blk_ref: reference(&previous) },
+                &KeyMaxLt { key: previous_key, max_end_lt: reference(&previous).end_lt },
             )
             .unwrap();
         custom.shards = shards.clone();
@@ -496,6 +491,7 @@ fn main() {
             last_key = Some(reference(&blockid));
         }
         previous = blockid;
+        previous_key = key;
         state_root = next_state;
         wcprevious = wcid;
         wcroot = nextwc;

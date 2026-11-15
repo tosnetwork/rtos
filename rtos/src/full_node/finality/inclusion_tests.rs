@@ -63,6 +63,57 @@ fn full_proof(block: &BlockStuff, carrier: BlockSignaturesSimplexPq) -> BlockPro
     .unwrap()
 }
 
+fn configure_fixture_transport(dir: &std::path::Path, seed: u8, root: &Cell) {
+    let file = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let (key, transport) =
+        Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32]).unwrap();
+    for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
+        if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
+            entry["data"] = serde_json::to_value(&key).unwrap();
+        }
+    }
+    if seed != 0x70 {
+        // Register the held validator transport through normal
+        // configuration, as the native full node requires for
+        // signing a shard-source certificate. The public observer
+        // stays unregistered. This grants no PQ voting custody.
+        let governing = ShardStateUnsplit::construct_from_cell(root.clone())
+            .unwrap()
+            .read_custom()
+            .unwrap()
+            .unwrap()
+            .config;
+        let validator = governing
+            .validator_set()
+            .unwrap()
+            .list()
+            .iter()
+            .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
+            .expect("source circulation key must belong to the governing committee")
+            .validator_id()
+            .unwrap();
+        config["validator_key_ring"][base64_encode(transport.id().data())] =
+            serde_json::to_value(&key).unwrap();
+        config["validator_keys"] = serde_json::json!([{
+            // Election IDs are also ADNL tags; avoid DHT/overlay 1/2.
+            "election_id": 1000 + i32::from(seed),
+            "expire_at": i32::MAX,
+            "validator_key_id": base64_encode(transport.id().data()),
+            "validator_adnl_key_id": base64_encode(transport.id().data()),
+        }]);
+        config["consensus_transport_bindings"] = serde_json::json!([{
+            "validator_id": base64_encode(validator.as_slice()),
+            "adnl_key_id": base64_encode(transport.id().data()),
+        }]);
+    }
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
+    drop(socket);
+    std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+}
+
 struct Pair {
     _dir: tempfile::TempDir,
     receiver: Arc<Engine>,
@@ -75,6 +126,7 @@ struct Pair {
     shard_state_root: UInt256,
     master: BlockStuff,
     master_state_root: UInt256,
+    applied_through: Option<BlockIdExt>,
 }
 
 async fn stop_fixture_engines(engines: Vec<Arc<Engine>>) {
@@ -216,7 +268,11 @@ impl Pair {
         v2: bool,
         history_gc: bool,
     ) -> Self {
-        Self::with_source_options(variant, corrupt_signature, v2, history_gc, false).await
+        if history_gc {
+            assert!(v2 && variant == "included" && !corrupt_signature);
+            return native_gc_fixture::pair().await;
+        }
+        Self::with_source_options(variant, corrupt_signature, v2, false, false).await
     }
 
     async fn with_source_transport(variant: &str) -> Self {
@@ -293,55 +349,7 @@ impl Pair {
                 configurations.push((path, 0x70));
             }
             for (dir, seed) in configurations {
-                let file = dir.join("config.json");
-                let mut config: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-                let (key, transport) =
-                    Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32])
-                        .unwrap();
-                for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
-                    if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
-                        entry["data"] = serde_json::to_value(&key).unwrap();
-                    }
-                }
-                if seed != 0x70 {
-                    // Register the held validator transport through normal
-                    // configuration, as the native full node requires for
-                    // signing a shard-source certificate. The public observer
-                    // stays unregistered. This grants no PQ voting custody.
-                    let governing = ShardStateUnsplit::construct_from_cell(mc_root.clone())
-                        .unwrap()
-                        .read_custom()
-                        .unwrap()
-                        .unwrap()
-                        .config;
-                    let validator = governing
-                        .validator_set()
-                        .unwrap()
-                        .list()
-                        .iter()
-                        .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
-                        .expect("source circulation key must belong to the governing committee")
-                        .validator_id()
-                        .unwrap();
-                    config["validator_key_ring"][base64_encode(transport.id().data())] =
-                        serde_json::to_value(&key).unwrap();
-                    config["validator_keys"] = serde_json::json!([{
-                        // Election IDs are also ADNL tags; avoid DHT/overlay 1/2.
-                        "election_id": 1000 + i32::from(seed),
-                        "expire_at": i32::MAX,
-                        "validator_key_id": base64_encode(transport.id().data()),
-                        "validator_adnl_key_id": base64_encode(transport.id().data()),
-                    }]);
-                    config["consensus_transport_bindings"] = serde_json::json!([{
-                        "validator_id": base64_encode(validator.as_slice()),
-                        "adnl_key_id": base64_encode(transport.id().data()),
-                    }]);
-                }
-                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-                config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
-                drop(socket);
-                std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+                configure_fixture_transport(dir, seed, &mc_root);
             }
         }
         if history_gc {
@@ -505,6 +513,7 @@ impl Pair {
                 .clone(),
             master,
             master_state_root,
+            applied_through: None,
         }
     }
 
@@ -512,6 +521,7 @@ impl Pair {
         &self,
     ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
         assert!(self.receiver.load_block_handle(self.master.id()).unwrap().is_none());
+        let applied_through = self.applied_through.as_ref().unwrap_or(self.master.id());
         let ops: Arc<dyn EngineOperations> = self.receiver.clone();
         let master = crate::full_node::shard_client::start_masterchain_client(
             ops.clone(),
@@ -520,28 +530,44 @@ impl Pair {
         .unwrap();
         let shards =
             crate::full_node::shard_client::start_shards_client(ops, self.anchor.clone()).unwrap();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if self.receiver.load_shard_client_mc_block_id().unwrap().as_deref()
-                    == Some(self.master.id())
-                {
-                    break;
+        let result = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if self.receiver.load_shard_client_mc_block_id().unwrap().as_deref()
+                        == Some(applied_through)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            })
+            .await
+            .expect("normal authenticated masterchain and shard clients must advance");
+            let mc_handle = self.receiver.load_block_handle(self.master.id()).unwrap().unwrap();
+            assert!(mc_handle.is_applied());
+            assert_eq!(
+                self.receiver.load_state(self.master.id()).await.unwrap().root_cell().repr_hash(),
+                &self.master_state_root
+            );
+            assert_eq!(
+                self.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
+                Some(applied_through)
+            );
         })
-        .await
-        .expect("normal authenticated masterchain and shard clients must advance");
-        let mc_handle = self.receiver.load_block_handle(self.master.id()).unwrap().unwrap();
-        assert!(mc_handle.is_applied());
-        assert_eq!(
-            self.receiver.load_state(self.master.id()).await.unwrap().root_cell().repr_hash(),
-            &self.master_state_root
-        );
-        assert_eq!(
-            self.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
-            Some(self.master.id())
-        );
+        .catch_unwind()
+        .await;
+        if let Err(panic) = result {
+            eprintln!(
+                "CLIENT_APPLY_FAILURE last_applied={:?} shard_client={:?} expected={:?}",
+                self.receiver.load_last_applied_mc_block_id(),
+                self.receiver.load_shard_client_mc_block_id(),
+                applied_through
+            );
+            self.stop_all().await;
+            let (master_result, shard_result) = tokio::join!(master, shards);
+            eprintln!("CLIENT_APPLY_CLEANUP master={master_result:?} shards={shard_result:?}");
+            std::panic::resume_unwind(panic);
+        }
         (master, shards)
     }
 }
@@ -1440,3 +1466,6 @@ mod persistent_closure_engine_tests;
 
 #[path = "bounded_pss_tests.rs"]
 mod bounded_pss_tests;
+
+#[path = "native_gc_fixture.rs"]
+mod native_gc_fixture;

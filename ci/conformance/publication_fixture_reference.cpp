@@ -123,6 +123,25 @@ static int run(int argc, char **argv) {
             td::Bits256{update.prefetch_ref(0)->get_hash(0).bits()} !=
                 td::Bits256{state.ok()->get_hash().bits()})
           return 23;
+        const tos::BlockIdExt current{
+            tos::BlockId{shard, static_cast<unsigned>(info.seq_no)},
+            root.ok()->get_hash().bits(), td::sha256_bits256(block_raw)};
+        std::vector<tos::BlockIdExt> previous;
+        tos::BlockIdExt master_id;
+        bool after_split = false;
+        if (!block::unpack_block_prev_blk(root.ok(), current, previous,
+                                          master_id, after_split) ||
+            previous.size() != 1)
+          return 24;
+        auto history_config = block::ConfigInfo::extract_config(
+            state.ok(), previous[0], block::ConfigInfo::needPrevBlocks);
+        if (history_config.is_error())
+          return 25;
+        tos::BlockIdExt last_key;
+        if (!history_config.ok()->get_prev_key_block(previous[0].seqno(),
+                                                     last_key) ||
+            last_key.seqno() != info.prev_key_block_seqno)
+          return 26;
       }
       auto nodes = config.ok()->compute_validator_set(shard, info.gen_utime,
                                                       info.gen_catchain_seqno);
