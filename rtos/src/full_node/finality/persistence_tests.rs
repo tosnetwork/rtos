@@ -14,13 +14,21 @@ async fn open_engine(dir: &std::path::Path) -> Arc<Engine> {
         TonNodeConfig::from_file(dir.to_str().unwrap(), "config.json", None, "config.json", None)
             .await
             .unwrap();
+    let adnl_config = config.adnl_node().unwrap();
+    let adnl_address = adnl_config.ip_address();
+    let quic_address = config.quic_address();
     Engine::new(
         config,
         EngineFlags { initial_sync_disabled: true, force_check_db: false, truncate_db: None },
         Arc::new(Stopper::new()),
     )
     .await
-    .unwrap()
+    .unwrap_or_else(|error| {
+        panic!(
+            "Recovery Engine {} ADNL {adnl_address} QUIC {quic_address:?}: {error:#}",
+            dir.display()
+        )
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -369,13 +377,62 @@ async fn run_engine_recovery(network_repair: bool) {
     reopened_receiver.wait_stop().await.unwrap();
 }
 
+// Match the real wildcard UDP/TCP bindings, rather than probing loopback UDP
+// alone. Keep both guards through configuration writing so QUIC stays distinct.
+fn reserve_recovery_adnl_bindings(
+    port: u16,
+) -> std::io::Result<(std::net::UdpSocket, std::net::TcpListener)> {
+    let udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))?;
+    let tcp = std::net::TcpListener::bind(udp.local_addr()?)?;
+    Ok((udp, tcp))
+}
+
+#[test]
+fn recovery_fixture_adnl_port_requires_wildcard_udp_and_tcp() {
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    let occupied_tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let port = occupied_tcp.local_addr().unwrap().port();
+    let udp_only_probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    drop(udp_only_probe);
+    assert_eq!(
+        reserve_recovery_adnl_bindings(port).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+
+    let other_ip = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    let port = other_ip.local_addr().unwrap().port();
+    let loopback_only_probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    drop(loopback_only_probe);
+    assert_eq!(
+        reserve_recovery_adnl_bindings(port).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+
+    let (udp, tcp) = reserve_recovery_adnl_bindings(0).unwrap();
+    let port = udp.local_addr().unwrap().port();
+    assert_eq!(tcp.local_addr().unwrap().port(), port);
+    assert!(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_err());
+    assert!(TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_err());
+    drop(udp);
+    drop(tcp);
+    let _udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
+    let _tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap();
+}
+
 fn write_recovery_config(dir: &std::path::Path, mc_id: &BlockIdExt, network: bool) {
     std::fs::create_dir_all(dir).unwrap();
-    let address = if network {
-        // Select a local ephemeral port instead of reserving shared fixed ports.
-        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string()
-    } else {
-        "127.0.0.1:0".to_owned()
+    let adnl_bindings = network.then(|| {
+        (0..32)
+            .find_map(|_| match reserve_recovery_adnl_bindings(0) {
+                Ok(bindings) => Some(bindings),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(error) => panic!("Cannot reserve recovery ADNL bindings: {error}"),
+            })
+            .expect("Cannot reserve both recovery ADNL transports after 32 candidates")
+    });
+    let address = match &adnl_bindings {
+        Some((udp, _)) => format!("127.0.0.1:{}", udp.local_addr().unwrap().port()),
+        None => "127.0.0.1:0".to_owned(),
     };
     // QUIC otherwise derives ADNL + offset, which may already belong to another
     // socket. Ask the OS for a separate available port for each fixture.
