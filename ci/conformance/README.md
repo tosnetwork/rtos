@@ -1040,3 +1040,36 @@ historical chain or qualify a native full-block replay. Original trace files sta
 unchanged. This conversion preserves the proof-coverage assertions. The separate
 proof-selection profile above derives the historical root count from native
 per-account decisions; the size-limit conversion does not supply that evidence.
+
+
+### Workchain local-role fixture context
+
+The local-role validator test creates MC1 anew. Its two frozen negative WC
+candidates refer to historical MC1 hashes, so the test explicitly rebinds only
+`BlockInfo.master_ref` to the generated MC1 and recomputes the candidate ID.
+The original fixture files and WC body references remain unchanged. Unknown
+engine and nonzero TVM mode still require their specific rejection; a freshly
+collated TVM candidate must validate successfully in the same test.
+
+Export the test context from the node test directory and verify it independently:
+
+```sh
+cd rtos
+RTOS_EXECUTION_CONTEXT_EXPORT=/absolute/path/context \
+  cargo test -j32 --release -p rtos --features ci_run --bin rtos \
+  collator_test_bundle::workchain_execution_callers::execution_validator_local_role -- --exact
+cd ..
+python3 ci/conformance/workchain_context_reference.py \
+  --cpp-build /absolute/path/native-build \
+  --export /absolute/path/context --out /absolute/path/new-verification-directory
+```
+
+Leave `RTOS_EXECUTION_EXPORT` unset for this validation run. The native probe
+uses the clean source revision pinned by `REFERENCE`, rebuilds its libraries,
+reconstructs the migrated WC root independently, checks the MC state-update
+hash, and requires the native registry's exact unknown-engine/nonzero-mode
+errors. A TVM descriptor control must resolve. Each of the eight input files is
+limited to 4 MiB; two native processes each have a 60-second deadline. This is
+an offline context and registry control, not native validation of the complete
+historical WC block or proof of chain authenticity. Raw exports and build logs
+stay outside Git; `receipt.json` records their hashes and the commands.
