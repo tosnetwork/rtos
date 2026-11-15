@@ -77,7 +77,16 @@ async fn broadcast_outside_the_date_window_is_neither_delivered_nor_relayed() {
     let adnl = node(71).await;
     let sender = node(72).await;
     let overlay_node = OverlayNode::with_params(adnl.clone(), &[7; 32], 0).unwrap();
-    let rldp = RldpNode::with_params(adnl.clone(), vec![overlay_node.clone()], None).unwrap();
+    let rldp = RldpNode::with_params(
+        adnl.clone(),
+        vec![overlay_node.clone()],
+        None,
+        #[cfg(feature = "debug")]
+        None,
+        #[cfg(feature = "debug")]
+        None,
+    )
+    .unwrap();
     overlay_node.set_rldp(rldp).unwrap();
     let id = KeyId::from_data([73; 32]);
     let local = adnl.key_by_tag(0).unwrap();
