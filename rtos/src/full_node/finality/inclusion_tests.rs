@@ -120,6 +120,16 @@ async fn refresh_fixture_public_advertisements(
     }
 }
 
+async fn wait_for_fixture_advertisement_version(previous: i32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while adnl::common::Version::get() <= previous {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("public advertisement version must advance after Plumtree activation");
+}
+
 // Engine::new restores storage/transport but does not execute Engine::run's
 // overlay startup. Reopen fixtures must restore real reachability before the
 // autonomous recovery owner starts; no runtime, record or history is supplied.
@@ -619,13 +629,7 @@ impl Pair {
         // The creation-time advertisements said Plumtree was disabled. Admit
         // fresh signed capabilities after activation, as public discovery does.
         // A same-second advertisement cannot supersede the cached version.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while adnl::common::Version::get() <= previous_advertisement_version {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("public advertisement version must advance after Plumtree activation");
+        wait_for_fixture_advertisement_version(previous_advertisement_version).await;
         self.refresh_public_advertisements().await;
         let prefix = rtos_api::serialize_boxed(
             &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*id.data()) }
@@ -1031,130 +1035,155 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
     use std::sync::atomic::Ordering;
     let pair = Pair::new("included", false).await;
     let relays = Pair::new("included", false).await;
-    let engines = [&pair.provider, &pair.receiver, &relays.receiver, &relays.provider];
-    let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
-    let overlay = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
-    let keys: Vec<_> = engines
-        .iter()
-        .map(|engine| {
-            engine.network().context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap()
-        })
-        .collect();
-    let mut addresses = vec![];
-    for (engine, key) in engines.iter().zip(&keys) {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let address = socket.local_addr().unwrap();
-        drop(socket);
-        let private = key.pvt_key().unwrap().lock().unwrap();
-        engine
-            .network()
-            .context()
-            .stack
-            .quic
-            .as_ref()
-            .unwrap()
-            .add_key(private.as_ref().try_into().unwrap(), key.id(), address)
-            .unwrap();
-        addresses.push(address);
-    }
-    for (index, engine) in engines.iter().enumerate() {
-        let stack = &engine.network().context().stack;
-        for (remote_index, remote) in engines.iter().enumerate() {
-            if index == remote_index {
-                continue;
-            }
-            let remote_stack = &remote.network().context().stack;
-            let peer = stack
-                .adnl
-                .add_peer(
-                    keys[index].id(),
-                    remote_stack.adnl.ip_address_adnl(),
-                    None,
-                    &keys[remote_index],
-                )
-                .unwrap()
-                .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let engines = [&pair.provider, &pair.receiver, &relays.receiver, &relays.provider];
+        let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
+        let overlay = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+        let keys: Vec<_> = engines
+            .iter()
+            .map(|engine| {
+                engine
+                    .network()
+                    .context()
+                    .stack
+                    .adnl
+                    .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+                    .unwrap()
+            })
+            .collect();
+        let mut addresses = vec![];
+        for (engine, key) in engines.iter().zip(&keys) {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            drop(socket);
+            let private = key.pvt_key().unwrap().lock().unwrap();
             engine
-                .overlay_client(pair.shard.id().shard())
-                .await
-                .unwrap()
-                .overlay_client()
-                .neighbours()
-                .add(peer)
-                .unwrap();
-            let advertisement = remote_stack.overlay.get_signed_node(&overlay, false).unwrap();
-            stack
-                .overlay
-                .add_public_peer(remote_stack.adnl.ip_address_adnl(), &advertisement, &overlay)
-                .unwrap()
-                .unwrap();
-            stack
+                .network()
+                .context()
+                .stack
                 .quic
                 .as_ref()
                 .unwrap()
-                .add_peer_key(keys[remote_index].id().clone(), addresses[remote_index])
+                .add_key(private.as_ref().try_into().unwrap(), key.id(), address)
+                .unwrap();
+            addresses.push(address);
+        }
+        let previous_advertisement_version = adnl::common::Version::get();
+        for (index, engine) in engines.iter().enumerate() {
+            let stack = &engine.network().context().stack;
+            for (remote_index, remote) in engines.iter().enumerate() {
+                if index == remote_index {
+                    continue;
+                }
+                let remote_stack = &remote.network().context().stack;
+                let peer = stack
+                    .adnl
+                    .add_peer(
+                        keys[index].id(),
+                        remote_stack.adnl.ip_address_adnl(),
+                        None,
+                        &keys[remote_index],
+                    )
+                    .unwrap()
+                    .unwrap();
+                engine
+                    .overlay_client(pair.shard.id().shard())
+                    .await
+                    .unwrap()
+                    .overlay_client()
+                    .neighbours()
+                    .add(peer)
+                    .unwrap();
+                let advertisement = remote_stack.overlay.get_signed_node(&overlay, false).unwrap();
+                stack
+                    .overlay
+                    .add_public_peer(remote_stack.adnl.ip_address_adnl(), &advertisement, &overlay)
+                    .unwrap()
+                    .unwrap();
+                stack
+                    .quic
+                    .as_ref()
+                    .unwrap()
+                    .add_peer_key(keys[remote_index].id().clone(), addresses[remote_index])
+                    .unwrap();
+            }
+            stack
+                .overlay
+                .configure_plumtree(
+                    &overlay,
+                    adnl::PlumtreeConfig {
+                        authorized_keys: std::collections::BTreeMap::from([(
+                            *keys[0].id().data(),
+                            2 << 20,
+                        )]),
+                        max_untrusted_size: 0,
+                        untrusted_flags: 0,
+                        fixed_members: true,
+                        original_sender: index == 0,
+                        eager_limit: 4,
+                        max_retained_bytes: 64 << 20,
+                        max_broadcasts: 64,
+                    },
+                    &tokio::runtime::Handle::current(),
+                )
                 .unwrap();
         }
-        stack
-            .overlay
-            .configure_plumtree(
-                &overlay,
-                adnl::PlumtreeConfig {
-                    authorized_keys: std::collections::BTreeMap::from([(
-                        *keys[0].id().data(),
-                        2 << 20,
-                    )]),
-                    max_untrusted_size: 0,
-                    untrusted_flags: 0,
-                    fixed_members: true,
-                    original_sender: index == 0,
-                    eager_limit: 4,
-                    max_retained_bytes: 64 << 20,
-                    max_broadcasts: 64,
-                },
-                &tokio::runtime::Handle::current(),
-            )
-            .unwrap();
-    }
-    let prefix = rtos_api::serialize_boxed(
-        &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
-            .into_boxed(),
-    )
-    .unwrap();
-    let faults = &pair.receiver.network().test_broadcast_faults;
-    faults.configure(*keys[0].id().data(), prefix, 1);
-    faults.drop_one_ihave();
-    let replies = Arc::new(RepairReceipts::default());
-    for relay in [&relays.receiver, &relays.provider] {
-        relay
-            .network()
-            .test_broadcast_faults
-            .suppress_first_repair_reply(*keys[1].id().data(), replies.clone());
-    }
-    let (wire, id) = pair.finality_wire();
-    pair.publish(&overlay, id, &wire).await;
-    pair.wait_preapplied().await;
-    assert_eq!(
-        faults.receipts().iter().filter(|receipt| receipt.dropped).count(),
-        1,
-        "the real publisher IHAVE must be lost"
-    );
-    assert_eq!(
-        replies.dropped.load(Ordering::Acquire),
-        1,
-        "the first real relay reply must be lost after authentication"
-    );
-    assert!(
-        replies.delivered.load(Ordering::Acquire) >= 1,
-        "another real relay must answer the production fallback query"
-    );
-    assert_eq!(pair.receiver.test_finality_notifications.load(Ordering::Acquire), 1);
-    assert!(pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none());
-    let (master, shards) = pair.apply_by_normal_clients().await;
-    assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
-    pair.finish(master, shards).await;
-    relays.receiver.clone().wait_stop().await.unwrap();
-    relays.provider.clone().wait_stop().await.unwrap();
+        // All four nodes advertised before manual Plumtree activation. Publish
+        // the actual new capabilities through normal signed peer admission.
+        wait_for_fixture_advertisement_version(previous_advertisement_version).await;
+        refresh_fixture_public_advertisements(&engines, &[pair.shard.id().shard()]).await;
+        let prefix = rtos_api::serialize_boxed(
+            &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
+                .into_boxed(),
+        )
+        .unwrap();
+        let faults = &pair.receiver.network().test_broadcast_faults;
+        faults.configure(*keys[0].id().data(), prefix, 1);
+        faults.drop_one_ihave();
+        let replies = Arc::new(RepairReceipts::default());
+        for relay in [&relays.receiver, &relays.provider] {
+            relay
+                .network()
+                .test_broadcast_faults
+                .suppress_first_repair_reply(*keys[1].id().data(), replies.clone());
+        }
+        let (wire, id) = pair.finality_wire();
+        pair.publish(&overlay, id, &wire).await;
+        pair.wait_preapplied().await;
+        assert_eq!(
+            faults.receipts().iter().filter(|receipt| receipt.dropped).count(),
+            1,
+            "the real publisher IHAVE must be lost"
+        );
+        assert_eq!(
+            replies.dropped.load(Ordering::Acquire),
+            1,
+            "the first real relay reply must be lost after authentication"
+        );
+        assert!(
+            replies.delivered.load(Ordering::Acquire) >= 1,
+            "another real relay must answer the production fallback query"
+        );
+        assert_eq!(pair.receiver.test_finality_notifications.load(Ordering::Acquire), 1);
+        assert!(pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none());
+        let (master, shards) = pair.apply_by_normal_clients().await;
+        assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
+        (master, shards)
+    })
+    .catch_unwind()
+    .await;
+    // Keep all four Engines and their directories alive until every owner
+    // drains, including when setup or an assertion above panics.
+    stop_fixture_engines(vec![
+        pair.receiver.clone(),
+        pair.provider.clone(),
+        relays.receiver.clone(),
+        relays.provider.clone(),
+    ])
+    .await;
+    let (master, shards) = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    master.await.unwrap();
+    shards.await.unwrap();
 }
 
 // Separate from Pair: this fixture never installs the old network block or MC
