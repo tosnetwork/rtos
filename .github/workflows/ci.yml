@@ -140,6 +140,26 @@ jobs:
           workspaces: . -> target
           shared-key: tests
 
+      - name: Reserve swap for memory-intensive tests
+        run: |
+          set -euo pipefail
+          # The full-size message pool test alone needs about 21 GiB RSS.
+          # Keep 20 GiB of disk headroom after allocating 32 GiB of swap.
+          task_swap_file=/rtos-ci.swap
+          test ! -e "$task_swap_file"
+          task_free_kib=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if (( task_free_kib < 52 * 1024 * 1024 )); then
+            echo "Insufficient disk space for test swap and build headroom" >&2
+            exit 1
+          fi
+          sudo install -m 600 /dev/null "$task_swap_file"
+          sudo fallocate -l 32G "$task_swap_file"
+          sudo mkswap "$task_swap_file"
+          sudo swapon "$task_swap_file"
+          swapon --show
+          free -m
+          df -h /
+
       - name: Build workspace binary tests
         run: bash ci/run_with_resources.sh build-bins cargo test --release --bins --features ci_run --no-run
 
