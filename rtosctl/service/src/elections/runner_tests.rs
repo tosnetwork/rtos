@@ -3270,8 +3270,8 @@ async fn test_toncore_pending_withdraws_send_failure_probes_pending_and_proceeds
 // =====================================================
 
 fn make_vset(utime_since: u32, utime_until: u32) -> ValidatorSet {
-    ValidatorSet::new(utime_since, utime_until, 1, vec![ValidatorDescr::default()])
-        .expect("validator set")
+    let validator = ValidatorDescr::with_params(SigPubKey::with_bytes([1; 32]), 1, None);
+    ValidatorSet::new(utime_since, utime_until, 1, vec![validator]).expect("validator set")
 }
 
 #[test]
