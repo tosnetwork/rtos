@@ -34,9 +34,6 @@ def check_restart_partition(name, receipt, recovery):
             "member": member,
             "phase": "recovered",
             "mode": "partition_during_original_database_restart",
-            "settle_after_interruption_seconds": 12,
-            "hold_after_restart_seconds": 12,
-            "recovery_limit_seconds": 180,
             "interruption_returncode": -9,
             "isolated_rpc_timeout_observed": True,
             "manual_database_repair": False,
@@ -54,6 +51,16 @@ def check_restart_partition(name, receipt, recovery):
             "workchain_states_match": True,
         },
     )
+    # argparse emits floating-point seconds; JSON integers are equivalent.
+    # Keep identity/weight/boolean fields strictly typed in require_fields.
+    for field, expected in (
+        ("settle_after_interruption_seconds", 12),
+        ("hold_after_restart_seconds", 12),
+        ("recovery_limit_seconds", 180),
+    ):
+        value = receipt.get(field)
+        if type(value) not in (int, float) or value != expected:
+            raise ValueError(f"Restart duration differs at {field}")
     elapsed = receipt.get("elapsed_seconds")
     if type(elapsed) not in (int, float) or not 24 <= elapsed <= 180:
         raise ValueError("Partition restart exceeded or omitted the original budget")
@@ -186,6 +193,10 @@ def check_restart_cleanup(runtime, receipt):
     ):
         raise ValueError("Restart partition used the parent namespace")
     statistics = json.loads((directory / "statistics.json").read_text())
+    # statistics.json contains the latest tc sample, not the sampling history.
     for key in ("kernel_before_restart_hold", "kernel_after_restart_hold"):
-        if receipt[key] not in statistics:
+        sampled = json.loads((directory.parent / f"{key}.json").read_text())
+        if receipt[key] != sampled:
             raise ValueError("Restart partition counter differs from native output")
+    if receipt["kernel_after_restart_hold"] not in statistics:
+        raise ValueError("Final restart partition counter differs from native output")

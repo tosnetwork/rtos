@@ -126,6 +126,40 @@ class RestartTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check_result(name, result)
 
+    def test_real_driver_duration_numbers(self):
+        for name, member in (
+            ("partition-restart-member2", 2),
+            ("partition-restart-member5", 5),
+            ("below-quorum-restart", 2),
+        ):
+            receipt, recovery = fixture(member, name == "below-quorum-restart")
+            for field in (
+                "settle_after_interruption_seconds",
+                "hold_after_restart_seconds",
+                "recovery_limit_seconds",
+            ):
+                receipt[field] = float(receipt[field])
+            check_restart_partition(name, receipt, recovery)
+            for field, expected in (
+                ("settle_after_interruption_seconds", 12),
+                ("hold_after_restart_seconds", 12),
+                ("recovery_limit_seconds", 180),
+            ):
+                for invalid in (
+                    True,
+                    str(expected),
+                    None,
+                    expected + 0.5,
+                    float("nan"),
+                    float("inf"),
+                ):
+                    altered = copy.deepcopy(receipt)
+                    altered[field] = invalid
+                    with self.assertRaises(
+                        ValueError, msg=f"{name}: {field}={invalid}"
+                    ):
+                        check_restart_partition(name, altered, recovery)
+
     def test_fixed_modes_and_necessary_member(self):
         for name, member in (
             ("partition-restart-member2", 2),
@@ -197,10 +231,9 @@ class RestartTests(unittest.TestCase):
             root = Path(directory)
             target = root / "recovery-partition/injection"
             target.mkdir(parents=True)
-            stats = [
-                receipt["kernel_before_restart_hold"],
-                receipt["kernel_after_restart_hold"],
-            ]
+            stats = [receipt["kernel_after_restart_hold"]]
+            for key in ("kernel_before_restart_hold", "kernel_after_restart_hold"):
+                (target.parent / f"{key}.json").write_text(json.dumps(receipt[key]))
             (target / "statistics.json").write_text(json.dumps(stats))
             (target / "injection.json").write_text(json.dumps(injection))
             check_restart_cleanup(root, receipt)
@@ -215,7 +248,17 @@ class RestartTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     check_restart_cleanup(root, receipt)
             (target / "injection.json").write_text(json.dumps(injection))
-            (target / "statistics.json").write_text(json.dumps(stats[:1]))
+            for key in ("kernel_before_restart_hold", "kernel_after_restart_hold"):
+                sample = target.parent / f"{key}.json"
+                original = sample.read_bytes()
+                sample.write_text(json.dumps({"drops": -1}))
+                with self.assertRaises(ValueError):
+                    check_restart_cleanup(root, receipt)
+                sample.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    check_restart_cleanup(root, receipt)
+                sample.write_bytes(original)
+            (target / "statistics.json").write_text(json.dumps([]))
             with self.assertRaises(ValueError):
                 check_restart_cleanup(root, receipt)
 
