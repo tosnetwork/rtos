@@ -107,6 +107,12 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    # Upstream uses the ton-large runner group for this workload. Budget the
+    # standard hosted runner without removing any tests from make test.
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "1"
+      TOKIO_WORKER_THREADS: "4"
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
@@ -116,15 +122,37 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config clang libssl-dev libzstd-dev libgoogle-perftools-dev build-essential
+          sudo apt-get install -y pkg-config clang libssl-dev libzstd-dev libgoogle-perftools-dev build-essential time
+
+      - name: Reclaim unused runner SDK space
+        run: |
+          df -h .
+          for task_ci_sdk in /usr/local/lib/android /usr/share/dotnet; do
+            if [ -d "$task_ci_sdk" ]; then
+              sudo du -sh -- "$task_ci_sdk"
+              sudo rm -rf -- "$task_ci_sdk"
+            fi
+          done
+          df -h .
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
           shared-key: tests
 
+      - name: Build workspace binary tests
+        run: bash ci/run_with_resources.sh build-bins cargo test --release --bins --features ci_run --no-run
+
       - name: Run cargo tests
-        run: NODE_SKIP_TEST_LOGS=yes make test
+        run: bash ci/run_with_resources.sh full-tests env NODE_SKIP_TEST_LOGS=yes make test
+
+      - name: Retain test resource evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-tests-resources-${{ github.sha }}
+          path: ${{ runner.temp }}/rtos-ci-resources
+          if-no-files-found: warn
 
   tests-net:
     runs-on: ubuntu-latest
