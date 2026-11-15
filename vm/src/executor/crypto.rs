@@ -145,10 +145,13 @@ fn check_signature(engine: &mut Engine, name: &'static str, hash: bool) -> Statu
         }
         slice.get_bytestring(0).into_vec()
     };
-    let signature = engine.cmd.var(1).as_slice()?.get_bytestring(0);
-    if signature.len() < ED25519_SIGNATURE_LENGTH {
+    let signature_slice = engine.cmd.var(1).as_slice()?;
+    // get_bytestring rounds a partial final byte up; the reference requires
+    // all 512 signature bits before public-key export and signature gas.
+    if signature_slice.remaining_bits() < ED25519_SIGNATURE_LENGTH * 8 {
         fail!(ExceptionCode::CellUnderflow)
     }
+    let signature = signature_slice.get_bytestring(0);
     let key = engine.cmd.var(0).as_integer()?.as_vec(ED25519_PUBLIC_KEY_LENGTH * 8, false, true)?;
     engine.register_signature_call()?;
     let rejected_key = engine.block_version() >= TVM_VERSION_14
