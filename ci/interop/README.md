@@ -510,3 +510,12 @@ certificate session; retired3 must be observer with no validator index, while
 retained2/new5 are validators. CPP retired members require corresponding MC
 observer startup logs. This legitimate availability/role observation does not
 replace acceptance for invalid old-group votes submitted to a new group.
+
+The `expired-member-restart` scenario naturally expires member5 before an ACK
+sync-EIO and partitioned restart of its original database. It requires recovery
+as a full node with no vote or creator role, unchanged original signing authority,
+and at least three progressing native-checked samples spanning12 seconds.
+Provide both ACK and packet library provenance arguments. Authority copies,
+pre-expiry-process refusal logs and post-expiry survivor certificates are checked
+alongside original ACK bytes and kernel partition counters. The distinct
+`signer-expiry` below-quorum combination remains unintegrated.

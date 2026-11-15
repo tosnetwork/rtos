@@ -24,8 +24,16 @@ def restart_arguments(name, library):
     return result
 
 
-def check_restart_partition(name, receipt, recovery):
+def check_restart_partition(name, receipt, recovery, *, expired_member=False):
     member = RESTARTS[name]
+    if expired_member and (
+        member != 5
+        or recovery.get("expired_full_node", {}).get("signing_authority_restored")
+        is not False
+        or recovery.get("vote")
+        or recovery.get("leaders")
+    ):
+        raise ValueError("Expired partition recovery regained signing authority")
     if not isinstance(receipt, dict) or not isinstance(recovery, dict):
         raise TypeError("Missing partitioned restart receipts")
     require_fields(
@@ -107,8 +115,13 @@ def check_restart_partition(name, receipt, recovery):
         not receipt.get("final_checkpoint")
         or receipt["final_checkpoint"] != recovery.get("last_checkpoint")
         or receipt.get("survivor_checkpoint") != recovery.get("survivor_checkpoint")
-        or not recovery.get("vote")
-        or set(recovery.get("leaders", {})) != {"masterchain", "workchain"}
+        or (
+            not expired_member
+            and (
+                not recovery.get("vote")
+                or set(recovery.get("leaders", {})) != {"masterchain", "workchain"}
+            )
+        )
     ):
         raise ValueError(
             "Restart evidence lacks matching checkpoints or fresh participation"

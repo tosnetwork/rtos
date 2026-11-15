@@ -42,16 +42,24 @@ def ack_arguments(name, library):
     ]
 
 
-def check_ack_result(name, receipt, recovery):
+def check_ack_result(name, receipt, recovery, *, expired_member=False):
     if not isinstance(receipt, dict) or not isinstance(recovery, dict):
         raise TypeError("Missing ACK or original-database recovery receipt")
     mode = ACKS[name]
+    member = 5 if expired_member else 2
+    if expired_member and (
+        recovery.get("expired_full_node", {}).get("signing_authority_restored")
+        is not False
+        or recovery.get("vote")
+        or recovery.get("leaders")
+    ):
+        raise ValueError("Expired ACK recovery regained signing authority")
     require_fields(
         receipt,
         {
             "phase": "recovered",
             "mode": mode,
-            "member": 2,
+            "member": member,
             "interruption_returncode": -9,
             "source_acknowledged_before_interruption": False,
             "pending_preserved_after_interruption": True,
@@ -64,7 +72,7 @@ def check_ack_result(name, receipt, recovery):
         recovery,
         {
             "phase": "recovered",
-            "member": 2,
+            "member": member,
             "interruption_returncode": -9,
             "manual_database_repair": False,
             "all_six_applied_states_match": True,
@@ -126,8 +134,13 @@ def check_ack_result(name, receipt, recovery):
         or not receipt.get("final_checkpoint")
         or receipt["final_checkpoint"] != recovery.get("last_checkpoint")
         or receipt.get("survivor_checkpoint") != recovery.get("survivor_checkpoint")
-        or not recovery.get("vote")
-        or set(recovery.get("leaders", {})) != {"masterchain", "workchain"}
+        or (
+            not expired_member
+            and (
+                not recovery.get("vote")
+                or set(recovery.get("leaders", {})) != {"masterchain", "workchain"}
+            )
+        )
     ):
         raise ValueError("ACK recovery lacks matching checkpoints or participation")
 
