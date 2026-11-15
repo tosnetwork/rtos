@@ -1188,8 +1188,16 @@ impl RldpNode {
                 *x ^= 0xFF
             }
             let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-            let expected_total_size = max_answer_size
-                .map(|s| (s as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD));
+            let expected_total_size = max_answer_size.map(|size| {
+                if v2 {
+                    // V2 limits the complete serialized response, including its
+                    // envelope. A zero receive limit selects the default MTU.
+                    usize::try_from(if size == 0 { rldp2::DEFAULT_MTU } else { size })
+                        .unwrap_or(usize::MAX)
+                } else {
+                    (size as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD)
+                }
+            });
             let recv_transfer = RecvTransfer::new(
                 recv_transfer_id,
                 self.allocated.recv_transfers.clone(),
@@ -1431,7 +1439,7 @@ impl RldpNode {
         let Some((recv_state, mut pong)) = recv_state else {
             return Ok(None);
         };
-        self.wait_answer(peer, &transfer_str, recv_state, &mut pong, propagate_failure).await
+        self.wait_answer(peer, &transfer_str, recv_state, &mut pong, propagate_failure, v2).await
     }
 
     async fn wait_answer(
@@ -1441,6 +1449,7 @@ impl RldpNode {
         recv_state: Arc<RecvTransferState>,
         recv_pong: &mut tokio::sync::mpsc::UnboundedReceiver<RecvTransfer>,
         propagate_failure: bool,
+        v2: bool,
     ) -> Result<Option<Vec<u8>>> {
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
@@ -1453,9 +1462,13 @@ impl RldpNode {
                 Ok(Some(reply)) => {
                     log::trace!(target: TARGET, "Got reply in {transfer_str}");
                     peer.stats.v1.update(self.min_timeout_ms);
-                    if propagate_failure {
-                        if let Some(error) = reply.failure {
+                    if let Some(error) = reply.failure {
+                        if propagate_failure {
                             return Err(error);
+                        }
+                        if v2 {
+                            // A rejected transfer has no complete answer to decode.
+                            return Ok(None);
                         }
                     }
                     return Ok(Some(reply.data));

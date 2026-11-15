@@ -364,9 +364,12 @@ fn bounded_rldp_real_malicious_wire_total_rejected_before_decode_v1_v2() {
                 let exceeded = error
                     .downcast_ref::<ResponseLimitExceeded>()
                     .unwrap_or_else(|| panic!("expected peer-declared wire bound, got {error:#}"));
-                // Current protocol allowance reserves 64 bytes for RldpAnswer TL
-                // overhead in addition to the advertised payload wire limit.
-                assert_eq!((exceeded.limit, exceeded.actual), (1024 + 64, 4096));
+                // V2 counts the complete response against the advertised limit;
+                // V1 retains its separate allowance for the answer envelope.
+                assert_eq!(
+                    (exceeded.limit, exceeded.actual),
+                    (if v2 { 1024 } else { 1024 + 64 }, 4096)
+                );
                 assert!(hostile.observed.load(Ordering::Acquire) > 0);
                 hostile.armed.store(false, Ordering::Release);
                 let (answer, _) = tokio::time::timeout(
