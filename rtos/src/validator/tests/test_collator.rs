@@ -1291,6 +1291,18 @@ fn read_dict_proof(root: Cell) -> Result<MerkleProof> {
     MerkleProof::construct_from_cell(AccountStorageDictProof::construct_from_cell(root)?.proof)
 }
 
+fn native_proof_selection_profile() -> serde_json::Value {
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../block/src/tests/data/proof-selection-native.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        profile["reference_commit"].as_str().unwrap(),
+        include_str!("../../../../ci/conformance/REFERENCE").trim()
+    );
+    profile
+}
+
 async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bool) {
     let mut bundle = CollatorTestBundle::load(bundle_path).unwrap();
     let config =
@@ -1306,6 +1318,9 @@ async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bo
         try_collate_by_bundle_reference(Arc::new(bundle), true, reference).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
+    let mut collated_root_hashes =
+        collated_data_roots.iter().map(|root| root.repr_hash().to_hex_string()).collect::<Vec<_>>();
+    collated_root_hashes.sort();
     if let Some(root) = std::env::var_os("RTOS_COLLATOR_PROOF_EXPORT") {
         let name = std::path::Path::new(bundle_path).file_name().unwrap();
         let output = std::path::PathBuf::from(root).join(name);
@@ -1334,6 +1349,36 @@ async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bo
             }
         })
         .collect::<Vec<_>>();
+
+    let profile = native_proof_selection_profile();
+    if std::path::Path::new(bundle_path).file_name().unwrap().to_str().unwrap()
+        == profile["bundle"].as_str().unwrap()
+    {
+        assert_eq!(
+            UInt256::calc_file_hash(&candidate.data).to_hex_string(),
+            profile["capture_block_sha256"].as_str().unwrap(),
+            "native profile candidate changed"
+        );
+        let expected_roots = profile["capture_collated_root_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hash| hash.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(collated_root_hashes, expected_roots, "native profile proof packing changed");
+        let mut expected = profile["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| !case["expected"]["fits"].as_bool().unwrap())
+            .map(|case| case["dict_hash"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut actual =
+            dict_proofs.iter().map(|proof| proof.hash.to_hex_string()).collect::<Vec<_>>();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected, "selected dictionary proofs must match native choices");
+    }
 
     let block = Block::construct_from_bytes(&candidate.data).unwrap();
     let extra = block.read_extra().unwrap();
@@ -1380,9 +1425,17 @@ async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bo
 async fn test_collated_data2() {
     init_test_log();
     check_bundle("src/tests/static/test_collated_data", 10, true).await;
+    let profile = native_proof_selection_profile();
+    let dictionary_proofs = profile["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| !case["expected"]["fits"].as_bool().unwrap())
+        .count();
+    assert_eq!(profile["metadata_roots"].as_u64().unwrap(), 1);
     check_bundle(
         "src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle",
-        10,
+        profile["non_dictionary_proof_roots"].as_u64().unwrap() as usize + dictionary_proofs,
         true,
     )
     .await;

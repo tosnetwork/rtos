@@ -979,3 +979,32 @@ For offline inspection of `test_collated_data2`, set
 exact node test. The helper writes regenerated `block.boc` and `collated.boc`
 under each fixture basename before checking the original proof-count assertion.
 These are public synthetic test outputs, not an authenticated historical replay.
+
+Replay the real eight-account proof-selection profile with native TOS:
+
+```sh
+python3 ci/conformance/proof_selection_reference.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --out /datax/rtos-conformance/proof-selection-reference
+```
+
+The JSON fixture and its SHA-bound generated TSV view retain decision prefixes
+from the historical `56703839` collator fixture, captured on Rust `d83c410d`.
+The native probe rebuilds each complete storage dictionary from the existing
+original state, verifies its root, recreates the frozen `ProofStorageStat`, checks
+every captured membership and budget against native primitives, then runs the
+native preorder decision. All eight cases agree: seven dictionary proofs and
+one state-proof branch. The collator regression derives its expected count from
+these choices and checks the exact dictionary hashes, candidate bytes and proof
+root multiset. Neighbor proof order is unspecified; their content hashes are
+unchanged when tracing is enabled or disabled.
+
+Only cells beyond the stopping prefix are pruned in the compact inputs. The
+Rust unit test replays the same frozen prefixes and checks refusal atomicity;
+the native verifier checks the JSON/TSV correspondence. The capture is a Rust
+usage snapshot, not native full-block collation. An additional full native
+validation attempt stopped with `pruned_input` in the historical served context;
+it is not an acceptance or whole-history replay result. Capture instrumentation
+and raw input hashes are retained under
+`/datax/rtos-conformance/2026-11-15-collated-proof-selection`, rather than adding
+tracing paths to production code.
