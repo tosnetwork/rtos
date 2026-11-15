@@ -1100,9 +1100,6 @@ impl EngineOperations for Engine {
             #[cfg(feature = "telemetry")]
             self.full_node_telemetry().new_pre_applied_block(handle.got_by_broadcast());
         }
-        self.shard_states_awaiters()
-            .do_or_wait(state.block_id(), None, async { Ok(state.clone()) })
-            .await?;
         Ok(state)
     }
 
@@ -1134,9 +1131,6 @@ impl EngineOperations for Engine {
         let (state, _) = self
             .shard_states_keeper()
             .store_state(&handle, state, Some(state_bytes), false)
-            .await?;
-        self.shard_states_awaiters()
-            .do_or_wait(state.block_id(), None, async { Ok(state.clone()) })
             .await?;
         Ok((state, handle))
     }

@@ -163,7 +163,6 @@ pub struct Engine {
         Option<Arc<crate::validator::retired_session_service::RetiredSessionService>>,
     >,
 
-    shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
     next_block_applying_awaiters: AwaitersPool<BlockIdExt, BlockIdExt>,
     download_block_awaiters: AwaitersPool<BlockDownloadKey, (BlockStuff, BlockProofStuff)>,
@@ -972,12 +971,6 @@ impl Engine {
                     pq_custody,
                     db,
                     candidate_db,
-                    shard_states_awaiters: AwaitersPool::new(
-                        "shard_states_awaiters",
-                        #[cfg(feature = "telemetry")]
-                        engine_telemetry.clone(),
-                        engine_allocated.clone(),
-                    ),
                     block_applying_awaiters: AwaitersPool::new(
                         "block_applying_awaiters",
                         #[cfg(feature = "telemetry")]
@@ -1563,7 +1556,7 @@ impl Engine {
     }
 
     pub fn shard_states_awaiters(&self) -> &AwaitersPool<BlockIdExt, Arc<ShardStateStuff>> {
-        &self.shard_states_awaiters
+        self.shard_states_keeper.state_awaiters()
     }
 
     pub fn block_applying_awaiters(&self) -> &AwaitersPool<BlockIdExt, ()> {

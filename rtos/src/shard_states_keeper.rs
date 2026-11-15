@@ -21,6 +21,7 @@ use crate::{
         InternalDb, LAST_APPLIED_MC_BLOCK,
     },
     shard_state::ShardStateStuff,
+    types::awaiters_pool::AwaitersPool,
 };
 use adnl::common::add_unbound_object_to_map_with_update;
 use rtos_block::{
@@ -115,6 +116,7 @@ pub struct ShardStatesKeeper {
     gc_resolver: Arc<AllowStateGcSmartResolver>,
     cache_resolver: Arc<AllowStateGcSmartResolver>,
     states: lockfree::map::Map<BlockIdExt, (Arc<ShardStateStuff>, Arc<BlockHandle>)>,
+    state_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     enable_persistent_gc: bool,
     stopper: Arc<Stopper>,
     max_catch_up_depth: u32,
@@ -213,6 +215,12 @@ impl ShardStatesKeeper {
             cache_resolver,
             enable_persistent_gc: enable_shard_state_persistent_gc,
             states: lockfree::map::Map::new(),
+            state_awaiters: AwaitersPool::new(
+                "shard_states_awaiters",
+                #[cfg(feature = "telemetry")]
+                telemetry.clone(),
+                allocated.clone(),
+            ),
             stopper,
             max_catch_up_depth,
             skip_saving_pss,
@@ -232,6 +240,17 @@ impl ShardStatesKeeper {
             telemetry,
             allocated,
         }))
+    }
+
+    pub(crate) fn state_awaiters(&self) -> &AwaitersPool<BlockIdExt, Arc<ShardStateStuff>> {
+        &self.state_awaiters
+    }
+
+    /// Publish availability, not a new durability guarantee. Normal writes and
+    /// recursive recovery share this notification; authenticated repair calls
+    /// it after its separate physical installation and metadata barriers.
+    pub(crate) fn notify_state_ready(&self, state: Arc<ShardStateStuff>) -> Result<()> {
+        self.state_awaiters.shunt(state.block_id(), || Ok(state.clone()))
     }
 
     /// Pins `id` through a physical read coordinated with state deletion: the
@@ -837,6 +856,7 @@ impl ShardStatesKeeper {
                 }
             })?;
 
+        self.notify_state_ready(state.clone())?;
         Ok((state, saved))
     }
 

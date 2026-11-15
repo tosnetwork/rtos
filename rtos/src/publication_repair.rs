@@ -450,6 +450,9 @@ async fn repair_owned(
     handle.set_state_saved();
     engine.db().repair_candidate_links(&handle, &candidate)?;
     engine.db().sync_publication_metadata(&handle).await?;
+    // Repair bypasses the ordinary keeper store. The verified physical state
+    // is available even if a later request-domain check refuses the receipt.
+    engine.shard_states_keeper().notify_state_ready(target.state_arc())?;
     drop(target_reservation); // transfer to the verified target's existing pin
     drop(existing_target);
     check_domain(engine.as_ref(), &request)?;
