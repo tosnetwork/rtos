@@ -295,6 +295,46 @@ fn rldp(adnl: &Arc<crate::adnl::node::AdnlNode>) -> Arc<super::super::RldpNode> 
 }
 
 #[tokio::test]
+async fn rldp_owned_query_deadline_includes_peer_admission_wait() {
+    use super::super::RldpQueryTimeout;
+    use crate::adnl::common::{AdnlPeers, TaggedByteSlice};
+    let adnl = node().await;
+    let rldp = rldp(&adnl);
+    let local = adnl.key_by_tag(0).unwrap();
+    let peers = AdnlPeers::with_keys(local.id().clone(), local.id().clone());
+    let peer = rldp.get_peer(local.id()).unwrap();
+    let capacity = peer.outbound_semaphore.available_permits();
+    let occupied = peer.outbound_semaphore.clone().try_acquire_many_owned(capacity as u32).unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let data = TaggedByteSlice {
+            object: &[0; 4],
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(12),
+            rldp.query(&data, Some(1024), &peers, true, None),
+        )
+        .await
+        .expect("query deadline must bound waiting for the peer slot")
+        .unwrap_err();
+        assert!(error.downcast_ref::<RldpQueryTimeout>().is_some(), "{error:#}");
+        assert!(started.elapsed() >= Duration::from_millis(9500));
+        assert_eq!(rldp.allocated.send_transfers.load(Ordering::Acquire), 0);
+        assert_eq!(rldp.allocated.recv_transfers.load(Ordering::Acquire), 0);
+    })
+    .catch_unwind()
+    .await;
+    drop(occupied);
+    bounded(adnl.stop_checked()).await.unwrap();
+    assert_eq!(peer.outbound_semaphore.available_permits(), capacity);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn rldp_owned_idle_peer_does_not_retain_own_sender() {
     let adnl = node().await;
     let rldp = rldp(&adnl);

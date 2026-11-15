@@ -1167,6 +1167,16 @@ impl RldpNode {
         let permit = tokio::select! {
             _ = control.cancelled() => { control.check()?; unreachable!() },
             _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+            _ = async {
+                if let Some(deadline) = query_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                control.cancel(SendCancelled::Deadline);
+                return Err(RldpQueryTimeout.into());
+            },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
         #[cfg(feature = "telemetry")]
