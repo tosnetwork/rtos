@@ -326,8 +326,69 @@ impl<'a> NodeTestNetwork<'a> {
 
 impl<'a> Drop for NodeTestNetwork<'a> {
     fn drop(&mut self) {
-        if self.auto_shutdown {
+        if self.auto_shutdown || std::thread::panicking() {
             self.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
+mod unwind_tests {
+    use super::*;
+
+    #[test]
+    fn manual_network_unwind_releases_workers_and_ports() {
+        const CHILD: &str = "RTOS_TEST_NETWORK_UNWIND_CHILD";
+        const CHILD_COMPLETED: i32 = 42;
+        if std::env::var(CHILD).is_ok_and(|value| value == "1") {
+            let result = std::panic::catch_unwind(|| {
+                let _network = NodeTestNetwork::create_with_options(
+                    "unwind_regression",
+                    1,
+                    2,
+                    false,
+                    true,
+                    false,
+                );
+                panic!("controlled test-network unwind");
+            });
+            assert!(result.is_err());
+            let network =
+                NodeTestNetwork::create_with_options("unwind_regression", 1, 2, true, true, false);
+            network.shutdown();
+            drop(network);
+            std::process::exit(CHILD_COMPLETED);
+        }
+
+        // The child has its own mutex; reserve the fixed test ports against
+        // other fixtures in this process until it has exited.
+        let _ports = NODE_NETWORK_TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node_test_network::unwind_tests::manual_network_unwind_releases_workers_and_ports",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(
+                    status.code(),
+                    Some(CHILD_COMPLETED),
+                    "test-network unwind child: {status}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("test-network unwind retained workers or its port exclusion");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
