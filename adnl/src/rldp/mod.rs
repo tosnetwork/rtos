@@ -1351,6 +1351,19 @@ impl RldpNode {
                     if answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
+                        // Native RLDP2 checks the original payload limit even
+                        // when a zero transport limit selected the default MTU.
+                        if v2 {
+                            if let Some(limit) = max_answer_size {
+                                if answer.data.len() as u64 > limit {
+                                    return Err(ResponseLimitExceeded {
+                                        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                                        actual: answer.data.len(),
+                                    }
+                                    .into());
+                                }
+                            }
+                        }
                         let decompressed = match response_limits {
                             Some(limits) => DataCompression::decompress_raw_bounded(
                                 &answer.data,

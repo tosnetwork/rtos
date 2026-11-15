@@ -220,6 +220,7 @@ struct OversizeWirePeer {
     armed: std::sync::atomic::AtomicBool,
     observed: std::sync::atomic::AtomicUsize,
     v2: bool,
+    zero_limit_payload: bool,
 }
 #[async_trait::async_trait]
 impl Subscriber for OversizeWirePeer {
@@ -271,8 +272,34 @@ impl Subscriber for OversizeWirePeer {
         for byte in &mut response_id {
             *byte ^= 0xff;
         }
+        if self.zero_limit_payload {
+            let rtos_api::ton::fec::Type::Fec_RaptorQ(params) = &chunk.fec_type else {
+                anyhow::bail!("unexpected FEC type");
+            };
+            let mut decoder = adnl::RaptorqDecoder::with_params(params.clone())?;
+            let Some(bytes) = decoder.decode(chunk.seqno as u32, &chunk.data) else {
+                return Ok(true);
+            };
+            let rldp::Message::Rldp_Query(query) = deserialize_boxed(&bytes)?
+                .downcast::<rldp::Message>()
+                .map_err(|_| anyhow::anyhow!("expected query"))?
+            else {
+                anyhow::bail!("expected query");
+            };
+            let answer = serialize_boxed(
+                &rldp::message::Answer { query_id: query.query_id, data: vec![42; 64] }
+                    .into_boxed(),
+            )?;
+            let mut encoder = adnl::RaptorqEncoder::with_data(&answer, None);
+            chunk.fec_type = encoder.params().clone().into_boxed();
+            chunk.total_size = answer.len() as i64;
+            let mut seqno = 0;
+            chunk.data = encoder.encode(&mut seqno)?;
+            chunk.seqno = seqno as i32;
+        } else {
+            chunk.total_size = 4096;
+        }
         chunk.transfer_id = UInt256::from(response_id);
-        chunk.total_size = 4096;
         chunk.part = 0;
         chunk.seqno = 0;
         let malicious = if self.v2 {
@@ -331,6 +358,7 @@ fn bounded_rldp_real_malicious_wire_total_rejected_before_decode_v1_v2() {
                         armed: true.into(),
                         observed: 0.into(),
                         v2,
+                        zero_limit_payload: false,
                     });
                     subscribers.push(hostile.clone());
                     remote = Some(hostile);
@@ -370,6 +398,101 @@ fn bounded_rldp_real_malicious_wire_total_rejected_before_decode_v1_v2() {
                     (exceeded.limit, exceeded.actual),
                     (if v2 { 1024 } else { 1024 + 64 }, 4096)
                 );
+                assert!(hostile.observed.load(Ordering::Acquire) > 0);
+                hostile.armed.store(false, Ordering::Release);
+                let (answer, _) = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    rldps[0].query_bounded(&data, limits, &peers, v2, None),
+                )
+                .await
+                .expect("ordinary response must recover on the same connection")
+                .unwrap();
+                assert_eq!(answer.unwrap(), vec![42; 4096]);
+            })
+            .catch_unwind()
+            .await;
+            hostile.armed.store(false, Ordering::Release);
+            // Collect both real joins before propagating any test failure.
+            let stopped =
+                futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+            for stop in stopped {
+                stop.unwrap();
+            }
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+}
+
+#[test]
+fn rldp2_zero_limit_rejects_hostile_nonempty_answer() {
+    use std::{sync::atomic::Ordering, time::Duration};
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    runtime.block_on(async {
+        for v2 in [true] {
+            let mut nodes = Vec::new();
+            let mut rldps = Vec::new();
+            let mut remote = None;
+            for index in 0..2 {
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                let address = socket.local_addr().unwrap().to_string();
+                let config = test_utils::generate_adnl_configs(&address, vec![0], None).unwrap().1;
+                drop(socket);
+                let node = AdnlNode::with_config(config).await.unwrap();
+                let rldp = RldpNode::with_params(
+                    node.clone(),
+                    vec![Arc::new(Reply { gate: None })],
+                    None,
+                    #[cfg(feature = "debug")]
+                    None,
+                    #[cfg(feature = "debug")]
+                    None,
+                )
+                .unwrap();
+                let mut subscribers: Vec<Arc<dyn Subscriber>> = Vec::new();
+                if index == 1 {
+                    let hostile = Arc::new(OversizeWirePeer {
+                        node: Arc::downgrade(&node),
+                        armed: true.into(),
+                        observed: 0.into(),
+                        v2,
+                        zero_limit_payload: true,
+                    });
+                    subscribers.push(hostile.clone());
+                    remote = Some(hostile);
+                }
+                subscribers.push(rldp.clone());
+                node.start_over_udp(subscribers).await.unwrap();
+                nodes.push(node);
+                rldps.push(rldp);
+            }
+            let key0 = nodes[0].key_by_tag(0).unwrap();
+            let key1 = nodes[1].key_by_tag(0).unwrap();
+            nodes[0].add_peer(key0.id(), nodes[1].ip_address_adnl(), None, &key1).unwrap();
+            nodes[1].add_peer(key1.id(), nodes[0].ip_address_adnl(), None, &key0).unwrap();
+            let hostile = remote.unwrap();
+            let result = std::panic::AssertUnwindSafe(async {
+                let peers = AdnlPeers::with_keys(key0.id().clone(), key1.id().clone());
+                let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+                let data = TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                };
+                let limits = QueryResponseLimits { wire_bytes: 8192, decoded_bytes: 4096 };
+                let error = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    rldps[0].query(&data, Some(0), &peers, v2, None),
+                )
+                .await
+                .expect("actual malicious response must complete, not time out")
+                .unwrap_err();
+                let exceeded = error
+                    .downcast_ref::<ResponseLimitExceeded>()
+                    .unwrap_or_else(|| panic!("expected peer-declared wire bound, got {error:#}"));
+                assert_eq!((exceeded.limit, exceeded.actual), (0, 64));
                 assert!(hostile.observed.load(Ordering::Acquire) > 0);
                 hostile.armed.store(false, Ordering::Release);
                 let (answer, _) = tokio::time::timeout(
