@@ -828,22 +828,25 @@ async fn publication_durable_sink_wal_receipt_reopens_and_accepts_creator_bound_
     assert_eq!(stable_ids[1], stable_ids[3]);
 }
 
-fn remove_spool_transport(dir: &std::path::Path) -> serde_json::Value {
+fn remove_spool_authority(dir: &std::path::Path) -> serde_json::Value {
     let path = dir.join("config.json");
     let original: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let mut retired = original.clone();
     retired["consensus_transport_bindings"] = serde_json::json!([]);
     retired["validator_key_ring"] = serde_json::json!({});
+    retired.as_object_mut().unwrap().remove(crate::pq_consensus_config::CONFIG_FIELD);
     std::fs::write(path, serde_json::to_vec(&retired).unwrap()).unwrap();
     original
 }
-fn restore_spool_transport(dir: &std::path::Path, original: &serde_json::Value) {
+fn restore_spool_authority(dir: &std::path::Path, original: &serde_json::Value) {
     let path = dir.join("config.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config["consensus_transport_bindings"] = original["consensus_transport_bindings"].clone();
     config["validator_key_ring"] = original["validator_key_ring"].clone();
+    config[crate::pq_consensus_config::CONFIG_FIELD] =
+        original[crate::pq_consensus_config::CONFIG_FIELD].clone();
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
 }
 fn spool_domain(
@@ -911,10 +914,11 @@ async fn publication_retired_transport_accepts_and_restored_authority_resumes_fr
             engine.clone().wait_stop().await.unwrap();
             drop(engine);
             let id = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let original = remove_spool_transport(dir.path());
+            let original = remove_spool_authority(dir.path());
             let retired = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {
                 assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                assert!(retired.pq_consensus_custody().is_none());
                 assert!(retired.consensus_transport_bindings().unwrap().is_empty());
                 initialize_spool_router(&retired).await;
                 assert_spool_acceptance(&retired, &id, &block, &state_root, final_role).await;
@@ -937,10 +941,11 @@ async fn publication_retired_transport_accepts_and_restored_authority_resumes_fr
             drop(retired);
             let blocked = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 
-            restore_spool_transport(dir.path(), &original);
+            restore_spool_authority(dir.path(), &original);
             let restored = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {
                 assert!(restored.adnl_key_by_id(runtime.local_adnl()).is_some());
+                assert!(restored.pq_consensus_custody().is_some());
                 assert_eq!(
                     inspect_spool(&restored, &domain, &id),
                     blocked,
@@ -982,10 +987,11 @@ async fn publication_retired_transport_accepts_and_restored_authority_resumes_fr
 
             // Revoke authority again after destinations have been frozen. The
             // next normal router has no fast identity, but cannot rewrite them.
-            remove_spool_transport(dir.path());
+            remove_spool_authority(dir.path());
             let retired = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {
                 assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                assert!(retired.pq_consensus_custody().is_none());
                 let frozen = inspect_spool(&retired, &domain, &id);
                 assert_eq!(frozen.stage, PublicationStage::Ready);
                 assert!(!frozen.pending.is_empty());
@@ -1154,7 +1160,7 @@ async fn publication_source_only_crash_recovers_without_retired_key_and_rejects_
                 std::path::PathBuf::from(engine.db_root_dir().unwrap()).join("catchains");
             engine.clone().wait_stop().await.unwrap();
             drop(engine);
-            let original = remove_spool_transport(dir.path());
+            let original = remove_spool_authority(dir.path());
             let output=std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","full_node::finality::persistence_tests::inclusion_tests::propagation_tests::publication_source_only_crash_child","--nocapture"])
                 .env("RTOS_SPOOL_CRASH_ROOT",&source_root)
@@ -1178,6 +1184,7 @@ async fn publication_source_only_crash_recovers_without_retired_key_and_rejects_
             let retired = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {
                 assert!(retired.adnl_key_by_id(runtime.local_adnl()).is_none());
+                assert!(retired.pq_consensus_custody().is_none());
                 assert!(retired.consensus_transport_bindings().unwrap().is_empty());
                 assert!(
                     crate::propagation_outbox::inspect_delivery(
@@ -1255,7 +1262,7 @@ async fn publication_source_only_crash_recovers_without_retired_key_and_rejects_
             // An additional real DB reopen preserves the accepted but unresolved
             // evidence. Key restoration cannot turn corrupt history into valid input.
             if !negatives.is_empty() {
-                restore_spool_transport(dir.path(), &original);
+                restore_spool_authority(dir.path(), &original);
             }
             let reopened = open_engine(dir.path()).await;
             let result = std::panic::AssertUnwindSafe(async {

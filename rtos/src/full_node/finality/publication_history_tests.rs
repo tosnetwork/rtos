@@ -12,7 +12,11 @@ use simplex::finality_delivery::{
 use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
 
 async fn history_fixture() -> (SpoolFixture, BlockIdExt) {
-    let mut fixture = SpoolFixture::new(0).await;
+    // This signed history chain is rooted in the original public zerostate.
+    // Historical authentication deliberately needs no retired consensus key.
+    let anchor =
+        serde_json::from_str(include_str!("testdata/v2-publication-history-anchor.json")).unwrap();
+    let mut fixture = SpoolFixture::from_transport_fixture(anchor, 0, 0x61).await;
     let input: serde_json::Value =
         serde_json::from_str(include_str!("testdata/v2-publication-history.json")).unwrap();
     let setup = std::panic::AssertUnwindSafe(async {

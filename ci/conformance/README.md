@@ -917,3 +917,33 @@ SETRAND can extend the inner c7 tuple to index 6; LDSLICE preserves an already
 consumed reference offset even when its result has no references. The old
 maximum stack index of 255 applies before version 4 only. These checks cover
 historical profiles as well as active-version behavior and are not a release gate.
+
+### Publication custody fixture
+
+`generate_publication_fixture.py --cpp-build <pinned-TOS-Ninja-build> --out <empty-directory>`
+rebuilds the synthetic `v2-publication-spool.json` fixture. The native build must
+use the clean commit in `REFERENCE`. Set `CARGO_TARGET_DIR` when sharing an existing
+Rust build. The command writes a separate `fixture.json`; copy it into the testdata
+directory only after the generation receipt and node tests have been checked.
+Native ML-DSA signatures use randomized signing, so repeated runs need not produce
+identical bytes. Retain the exact output and generation receipts together.
+
+The native helper derives three explicitly public test seeds from
+`SHA256("rtos/publication-custody-fixture/v1/<index>")`, where index is 0, 1 or 2.
+It reads no operational keys. The Rust preparer replaces committee keys and all
+dependent masterchain references, validator hashes, session identities and
+candidate preimages. The native helper independently checks both original and
+replacement governing states, block identities and three signing preimages per
+candidate. Native verification checks 18 signatures and rejects 36 modified-message
+or signature-domain controls; mismatched governing states and candidate block IDs
+also fail. The Rust verifier checks final, approval and candidate signatures.
+These receipts qualify fixture construction; node acceptance, persistence and
+restart tests remain separate requirements.
+
+The Engine fixture loads the matching public seed through the normal protected
+key-file loader, with a private directory and mode-0600 file. Historical transport
+fixtures continue to hold no consensus key. `v2-publication-history-anchor.json`
+preserves the original spool fixture byte for byte because the separately signed
+`v2-publication-history.json` chain commits to that zerostate. The historical test
+uses this anchor without a retired consensus key; do not mix that signed chain
+with the regenerated custody fixture's zerostate.

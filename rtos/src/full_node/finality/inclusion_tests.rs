@@ -1170,7 +1170,9 @@ struct SpoolFixture {
 
 impl SpoolFixture {
     async fn new(row_index: usize) -> Self {
-        Self::new_for_transport(row_index, 0x61).await
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/v2-publication-spool.json")).unwrap();
+        Self::from_transport_fixture_with_custody(fixture, row_index, 0x61, true).await
     }
 
     async fn new_for_transport(row_index: usize, transport_seed: u8) -> Self {
@@ -1183,6 +1185,15 @@ impl SpoolFixture {
         fixture: serde_json::Value,
         row_index: usize,
         transport_seed: u8,
+    ) -> Self {
+        Self::from_transport_fixture_with_custody(fixture, row_index, transport_seed, false).await
+    }
+
+    async fn from_transport_fixture_with_custody(
+        fixture: serde_json::Value,
+        row_index: usize,
+        transport_seed: u8,
+        with_custody: bool,
     ) -> Self {
         use consensus_common::session_runtime::{AuthenticatedSessionRuntime, SessionNetworkPin};
         let row = fixture["rows"][row_index].clone();
@@ -1207,15 +1218,15 @@ impl SpoolFixture {
             read_single_root_boc(&decode(&fixture["config_boc"])).unwrap(),
         )
         .unwrap();
-        let validator = governing
+        let member = governing
             .validator_set()
             .unwrap()
             .list()
             .iter()
             .find(|member| member.adnl_addr().is_ok_and(|id| id == *key.id()))
             .expect("fixture transport must bind to its real governing identity")
-            .validator_id()
-            .unwrap();
+            .clone();
+        let validator = member.validator_id().unwrap();
         config["ip_address_quic"] = "127.0.0.1:0".into();
         config["validator_key_ring"][base64_encode(key.id().data())] =
             serde_json::to_value(key_json).unwrap();
@@ -1223,6 +1234,48 @@ impl SpoolFixture {
             "validator_id":base64_encode(validator.as_slice()),
             "adnl_key_id":base64_encode(key.id().data()),
         }]);
+        if with_custody {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            // Public synthetic seeds only. Loading an unrelated key under the
+            // same stable identity would not exercise real committee custody.
+            let entry = fixture["public_custody"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["validator_id"] == hex::encode(validator.as_slice()))
+                .expect("native fixture must provide its member's public test seed");
+            let seed = decode(&entry["seed"]);
+            let store = rtos_pq_consensus::ConsensusKeyStore::from_seed(&seed, 0).unwrap();
+            assert_eq!(Some(store.consensus_key()), member.pq_key());
+            drop(store);
+            let path = dir.path().join("public-test-consensus-seed");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            let mut seed_file = options.open(&path).unwrap();
+            seed_file.write_all(&seed).unwrap();
+            seed_file.sync_all().unwrap();
+            config[crate::pq_consensus_config::CONFIG_FIELD] =
+                crate::pq_consensus_config::PqConsensusConfig {
+                    validator_id: validator.clone(),
+                    keys: vec![rtos_pq_consensus::ConfiguredKey {
+                        key_file: path,
+                        valid_from: 0,
+                        expire_at: 0,
+                    }],
+                }
+                .to_json();
+        }
         std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
         let engine = open_engine(dir.path()).await;
         let setup = std::panic::AssertUnwindSafe(async {
@@ -1287,7 +1340,29 @@ impl SpoolFixture {
                 consensus_common::session_runtime::LocalRole::Validator(expected_index)
             );
             assert_eq!(runtime.session_id(), &UInt256::from_slice(&decode(&row["session"])));
-            Arc::new(runtime)
+            let runtime = Arc::new(runtime);
+            if with_custody {
+                let custody = engine.pq_consensus_custody().expect("real configured custody");
+                assert_eq!(custody.validator_id(), &validator);
+                assert!(custody
+                    .usable_key_ids(crate::pq_consensus_config::pq_custody_now())
+                    .contains(member.pq_key().unwrap().key_id.as_array()));
+            } else {
+                assert!(engine.pq_consensus_custody().is_none());
+                let error = engine
+                    .clone()
+                    .durable_finality_sink(runtime.clone())
+                    .await
+                    .err()
+                    .expect("validator sink must require actual local custody");
+                assert!(
+                    error.to_string().contains(
+                        "Finality sink validator is not the one this node custodies keys for"
+                    ),
+                    "unexpected sink refusal: {error:#}"
+                );
+            }
+            runtime
         })
         .catch_unwind()
         .await;
