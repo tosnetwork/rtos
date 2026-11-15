@@ -1,8 +1,8 @@
 {
   "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
   "input_sha256": "7233551b204cf6c46351804904605ba88283a374dc116c839a844b223f4ec121",
-  "probe_source_sha256": "99aafd56d5207a6f57961878c8e507c7844483c91f7dc3d17061781e56ccb3fb",
-  "scope": "Native runtime caller completion and payload; packet/timing/resource effects not captured",
+  "probe_source_sha256": "058fb4f446fc2d79da63111d5bfd369047c99b4f6b10bb7cd101438638c676db",
+  "scope": "Native runtime caller completion, complete payload and minimum timeout duration; packet/resource effects not captured",
   "effects": [
     {
       "id": "empty",

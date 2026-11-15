@@ -71,6 +71,7 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
+          python3 ci/conformance/test_rldp2_runtime_checker.py
           task_runtime_out="$RUNNER_TEMP/conformance/rldp2-runtime"
           mkdir -p "$task_runtime_out"
           git rev-parse HEAD > "$task_runtime_out/head.txt"

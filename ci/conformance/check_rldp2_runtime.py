@@ -35,6 +35,12 @@ def read_frozen(path, cases, ids):
         raise ValueError("frozen reference is not the current pinned commit")
     if document["input_sha256"] != hashlib.sha256(cases.read_bytes()).hexdigest():
         raise ValueError("frozen reference does not match the input corpus")
+    probe = Path(__file__).with_name("rldp2_runtime_reference.cpp")
+    if (
+        document["probe_source_sha256"]
+        != hashlib.sha256(probe.read_bytes()).hexdigest()
+    ):
+        raise ValueError("frozen reference does not match the native probe source")
     rows = document["effects"]
     if [row["id"] for row in rows] != ids:
         raise ValueError("frozen reference has missing, reordered, or extra cases")
