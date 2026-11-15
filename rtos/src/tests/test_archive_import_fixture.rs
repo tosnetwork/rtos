@@ -264,6 +264,27 @@ impl Fixture {
             for wc in self.chains() {
                 let id = self.id(seq, wc);
                 let block = check_imported_block(db, &id).await?;
+                if seq == 0 {
+                    let handle = db.load_block_handle(&id)?.expect("imported zero-state handle");
+                    assert!(
+                        handle.has_persistent_state(),
+                        "original zero BOC must be acknowledged"
+                    );
+                    let part = storage::types::PersistentStatePartId::WholeState(id.clone());
+                    let expected = self.bytes(0, wc, true);
+                    assert_eq!(
+                        db.load_shard_state_persistent_size(&part).await?,
+                        expected.len() as u64
+                    );
+                    let raw = db
+                        .load_shard_state_persistent_slice(&part, 0, expected.len() as u64)
+                        .await?;
+                    assert_eq!(
+                        raw, expected,
+                        "preserve original zero BOC bytes, not a re-encoding"
+                    );
+                    assert_eq!(UInt256::calc_file_hash(&raw), id.file_hash);
+                }
                 let loaded = db.load_shard_state_dynamic(&id)?;
                 assert_eq!(
                     loaded.root_cell().repr_hash(),

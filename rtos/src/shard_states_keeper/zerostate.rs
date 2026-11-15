@@ -15,7 +15,10 @@ pub(super) fn read(
     keeper.check_stop()?;
     let mut input = keeper
         .db
-        .load_shard_state_persistent_obj(&PersistentStatePartId::WholeState(id.clone()))?;
+        .load_shard_state_persistent_obj(&PersistentStatePartId::WholeState(id.clone()))
+        .map_err(|error| {
+            error.context(format!("Persistent zero-state file unavailable for {id}"))
+        })?;
     read_input(keeper, id, budget, &mut input).map_err(|error| {
         if budget.is_some() && !crate::history_read_budget::stops_fallback(&error) {
             error.context(storage::bounded_cell::InvalidBoundedState("persistent zero-state file"))

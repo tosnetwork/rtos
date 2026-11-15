@@ -1096,3 +1096,41 @@ This follows the native `TlParser::fetch_string` payload-length check before
 returning a string. It changes test expectations, with no decoder or downloader
 behavior change. The direct TL control isolates its allocation budget from the
 transport's separate whole-response cap.
+
+### Zero-state cells and permanent BOC files
+
+State GC follows the native stored-state order and admits MC sequence zero
+when it is below the durable floor. The immutable MC and WC zero-state BOCs
+remain separate from those dynamic entries and survive persistent-snapshot
+expiry. Reading them verifies the pinned file hash, cell root and header
+identity, without recreating a collected dynamic index.
+
+Archive import publishes the original verified BOC before marking its handle
+applied/file-backed. A boot with a supplied static directory can fill files
+missing from older imports or older WC snapshot expiry. Existing acknowledged corrupt
+files are rejected; re-encoding cells is not a substitute for the pinned
+original file bytes. The ordinary reader authenticates the file in fixed-size
+chunks before allocating its complete buffer. Historical reads instead retain
+the caller's cumulative byte, cell and depth limits and stop fallback on
+integrity or budget refusal.
+
+The library process tests exercise two real starts with SIGKILL in between,
+checking the canonical packages and progress cursors after reopening. They also
+exercise older imports with missing files and older WC expiry with a retained
+metadata marker. Build and verify the node's commit with `--version` first:
+
+```sh
+cargo build -j32 --release -p rtos --features ci_run --bin rtos
+RTOS_NODE_RECOVERY_BINARY=/absolute/path/to/rtos \
+  cargo test -j32 --release -p rtos --features ci_run --lib \
+  archive_import::tests::node_process_recovery::actual_node_restarts_with_legacy_zero_state_files \
+  -- --ignored --exact --nocapture
+```
+
+`actual_node_restarts_with_nonzero_authenticated_history` covers a fresh import;
+`actual_node_restarts_with_expired_legacy_zero_state_files` covers missing WC
+files whose old metadata still claims they were persisted. The ordinary
+`persistent_gc_keeps_mc_and_wc_zero_files_but_expires_regular_snapshots` control
+keeps both zero BOCs while requiring a nonzero expired snapshot to disappear.
+These fixture checks do not establish power-loss, long-run or full historical
+chain qualification.

@@ -68,6 +68,18 @@ async fn actual_node_restarts_with_nonzero_authenticated_history() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_restarts_with_legacy_zero_state_files() -> Result<()> {
+    exercise_nonzero_recovery_with_genesis_files(false, None, None, false, 0, Some(false)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RTOS_NODE_RECOVERY_BINARY built from this revision"]
+async fn actual_node_restarts_with_expired_legacy_zero_state_files() -> Result<()> {
+    exercise_nonzero_recovery_with_genesis_files(false, None, None, false, 0, Some(true)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires gdb and RTOS_NODE_RECOVERY_BINARY with current debug symbols"]
 async fn actual_node_resumes_after_interrupting_recovery() -> Result<()> {
     exercise_nonzero_recovery(true, None).await
@@ -527,6 +539,25 @@ async fn exercise_nonzero_recovery_with_finality(
     sparse: bool,
     retained_finality: u8,
 ) -> Result<()> {
+    exercise_nonzero_recovery_with_genesis_files(
+        interrupt_recovery,
+        building,
+        truncation,
+        sparse,
+        retained_finality,
+        None,
+    )
+    .await
+}
+
+async fn exercise_nonzero_recovery_with_genesis_files(
+    interrupt_recovery: bool,
+    building: Option<&str>,
+    truncation: Option<(u32, Option<&str>)>,
+    sparse: bool,
+    retained_finality: u8,
+    legacy_zero_files: Option<bool>,
+) -> Result<()> {
     let binary = fs::canonicalize(std::env::var("RTOS_NODE_RECOVERY_BINARY")?)?;
     let dir = match std::env::var_os("RTOS_NODE_RECOVERY_FIXTURE_DIR") {
         Some(parent) => tempfile::tempdir_in(parent)?,
@@ -562,6 +593,15 @@ async fn exercise_nonzero_recovery_with_finality(
     }
     let db = open_db(root).await?;
     fixture.assert_imported(&db, 4).await?;
+    if let Some(keep_marker) = legacy_zero_files {
+        for wc in fixture.chains() {
+            if keep_marker && !wc {
+                // The old PSS cleaner protected MC zero, but could expire WC zero.
+                continue;
+            }
+            db.test_forget_zero_file_commit(&fixture.id(0, wc), keep_marker).await?;
+        }
+    }
     let lease = if let Some((retained, cut)) = truncation {
         Some(
             truncation_recovery::prepare(
@@ -651,6 +691,8 @@ async fn exercise_nonzero_recovery_with_finality(
         }
         return result;
     }
+    prepare_node_config(&binary, root, &zero).await?;
+    assert_eq!(package_inventory(root)?, before, "config initialization must not recover archives");
     if let Some(lease) = lease {
         return truncation_recovery::run(
             &binary,
@@ -832,12 +874,14 @@ async fn exercise_nonzero_recovery_with_finality(
         loop {
             let output = fs::read_to_string(&path)?;
             if let Some(status) = node.0.try_wait()? {
+                keep_evidence(root, &path)?;
                 rtos_block::fail!("Node attempt {attempt} exited {status}: {output}");
             }
             if output.contains("Node services started.") {
                 break;
             }
             if Instant::now() >= deadline {
+                keep_evidence(root, &path)?;
                 rtos_block::fail!("Node attempt {attempt} startup timeout: {output}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -871,6 +915,49 @@ async fn exercise_nonzero_recovery_with_finality(
     db.stop_states_db().await?;
     eprintln!("All MC/WC blocks, proofs, state roots, indexes and four progress cursors remain consistent through height 4");
     Ok(())
+}
+
+// First invocation intentionally creates config.json and exits before opening
+// the database. That setup operation is separate from either recovery attempt.
+async fn prepare_node_config(binary: &Path, root: &Path, zero: &Path) -> Result<()> {
+    if root.join("config.json").exists() {
+        return Ok(());
+    }
+    let path = root.join("config-init.log");
+    let log = fs::File::create(&path)?;
+    let mut node = Process(
+        Command::new(binary)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .arg("--configs")
+            .arg(root)
+            .arg("--zerostate")
+            .arg(zero)
+            .arg("--initial-sync-disabled")
+            .current_dir(root)
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = node.0.try_wait()? {
+            keep_evidence(root, &path)?;
+            let output = fs::read_to_string(&path)?;
+            if !status.success()
+                || !root.join("config.json").exists()
+                || !output.contains("created config file")
+                || output.contains("Node services started.")
+            {
+                rtos_block::fail!("Node config initialization failed {status}: {output}");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            keep_evidence(root, &path)?;
+            rtos_block::fail!("Node config initialization timeout");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[path = "test_node_recovery_root_fixture.rs"]

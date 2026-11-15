@@ -3028,13 +3028,68 @@ fn establish_gc_floor(engine: &Arc<Engine>, head: &BlockIdExt, cold: bool) -> Re
     Ok(())
 }
 
+// Older archive imports kept zero states in the cell archive without the
+// original BOC. A supplied static directory can complete that missing file
+// publication. Old WC zero files may also have expired with their marker set.
+// Missing files can be filled; corrupt existing files are never replaced here.
+async fn load_boot_zerostate(
+    engine: &Arc<Engine>,
+    path: &str,
+    handle: &Arc<BlockHandle>,
+) -> Result<Arc<ShardStateStuff>> {
+    let id = handle.id();
+    if handle.has_persistent_state() {
+        match engine.load_state(id).await {
+            Ok(state) => {
+                state.verify_zerostate(id)?;
+                return Ok(state);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    {
+        let file = format!("{}/{:x}.boc", path, id.file_hash());
+        let bytes = tokio::fs::read(&file)
+            .await
+            .map_err(|error| error!("Cannot read static zero state {file}: {error}"))?;
+        ShardStateStuff::deserialize_zerostate(
+            id.clone(),
+            &bytes,
+            #[cfg(feature = "telemetry")]
+            engine.engine_telemetry(),
+            engine.engine_allocated(),
+        )?;
+        engine.db().store_shard_state_persistent_raw(handle, &bytes, None).await?;
+    }
+    let state = engine.load_state(id).await?;
+    state.verify_zerostate(id)?;
+    Ok(state)
+}
+
 pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<bool> {
     let zero_id = engine.zerostate_id();
     log::trace!("loading mc static zero state {} from path {}", zero_id, path);
 
     if let Some(handle) = engine.load_block_handle(zero_id)? {
         if handle.is_applied() {
-            engine.load_state(zero_id).await?.verify_zerostate(zero_id)?;
+            let state = load_boot_zerostate(engine, path, &handle).await?;
+            for (wc_id, wc_info) in state.workchains()? {
+                let id = BlockIdExt {
+                    shard_id: ShardIdent::with_tagged_prefix(wc_id, SHARD_FULL)?,
+                    seq_no: 0,
+                    root_hash: wc_info.zerostate_root_hash,
+                    file_hash: wc_info.zerostate_file_hash,
+                };
+                if let Some(handle) = engine.load_block_handle(&id)? {
+                    if handle.is_applied() {
+                        load_boot_zerostate(engine, path, &handle).await?;
+                    }
+                }
+            }
             log::trace!("zero state already applied");
             return Ok(false);
         }
@@ -3067,6 +3122,7 @@ pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<
         };
         if let Some(handle) = engine.load_block_handle(&id)? {
             if handle.is_applied() {
+                load_boot_zerostate(engine, path, &handle).await?;
                 continue;
             }
         }

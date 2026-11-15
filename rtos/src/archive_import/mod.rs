@@ -18,7 +18,7 @@ use crate::{
     engine_traits::EngineAlloc,
     internal_db::{
         ARCHIVE_CELLS_CF_NAME, ARCHIVE_SHARDSTATE_CF_NAME, CURRENT_DB_VERSION, DB_VERSION,
-        SHARD_CLIENT_MC_BLOCK,
+        SHARD_CLIENT_MC_BLOCK, SHARD_STATE_PERSISTENT_DB_NAME,
     },
     shard_state::ShardStateStuff,
 };
@@ -50,6 +50,7 @@ use storage::{
         PREV2_BLOCK_DB_NAME,
     },
     db::{
+        filedb::FileDb,
         node::open_node_db,
         rocksdb::{AccessType, RocksDb},
     },
@@ -150,7 +151,7 @@ async fn build_initial_group_state(
     Ok(LastGroupState { mc_block_id: block_id, shard_tops })
 }
 
-fn process_zerostates(
+async fn process_zerostates(
     config: &ImportConfig,
     global_config: &TonNodeGlobalConfig,
     archive_state_db: &ArchiveShardStateDb,
@@ -162,6 +163,7 @@ fn process_zerostates(
     let zerostate_bytes = std::fs::read(&config.mc_zerostate_path).map_err(|e| {
         error!("Cannot read MC zerostate file {}: {}", config.mc_zerostate_path.display(), e)
     })?;
+    let persistent = FileDb::with_path(config.node_db_path.join(SHARD_STATE_PERSISTENT_DB_NAME));
     let expected_mc_zerostate_id = global_config.zero_state()?;
     let mc_zerostate = ShardStateStuff::deserialize_zerostate(
         expected_mc_zerostate_id.clone(),
@@ -198,6 +200,9 @@ fn process_zerostates(
             &engine_telemetry,
             &engine_allocated,
         )?;
+        // Persist the original, authenticated bytes before advertising the
+        // state as applied. Re-encoding the same root need not retain file_hash.
+        persistent.write_whole_file(&id, &zerostate_bytes).await?;
         wc_zerostates.push((id, state.root_cell().clone()));
     }
 
@@ -206,6 +211,7 @@ fn process_zerostates(
         return Err(error!("Missing workchain zerostates: {:?}", missing,));
     }
 
+    persistent.write_whole_file(&expected_mc_zerostate_id, &zerostate_bytes).await?;
     let save_handle = |id: &BlockIdExt| -> Result<()> {
         let handle = if let Some(handle) =
             block_handle_storage.create_handle(id.clone(), BlockMeta::default(), None)?
@@ -216,7 +222,11 @@ fn process_zerostates(
                 .load_handle_by_id(&id)?
                 .ok_or_else(|| error!("Failed to create or load block handle for MC zerostate"))?
         };
-        if handle.set_state() | handle.set_state_saved() | handle.set_block_applied() {
+        if handle.set_state()
+            | handle.set_state_saved()
+            | handle.set_persistent_state()
+            | handle.set_block_applied()
+        {
             block_handle_storage.save_handle(&handle, None)?;
         }
         Ok(())
@@ -352,7 +362,8 @@ pub async fn run_import(config: ImportConfig) -> Result<Arc<RocksDb>> {
         #[cfg(feature = "telemetry")]
         engine_telemetry.clone(),
         engine_allocated.clone(),
-    )?;
+    )
+    .await?;
 
     log::info!(target: TARGET, "Scanning packages in {}", config.archives_path.display());
     let packages = scanner::scan_packages(&config.archives_path)?;
