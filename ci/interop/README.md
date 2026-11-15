@@ -47,7 +47,12 @@ then recover its ACK after reopening the original database without injection.
 Acceptance binds the retained source bytes, recovered ACK/reference, native error
 marker, process identities and fresh vote/MC/WC participation, within the original
 180-second recovery budget. These are syscall interposition tests, not physical
-media failures. The combined ACK-plus-partition cases remain unintegrated.
+media failures. Combined cases `source-ack-partition-sync-eio` and
+`source-ack-partition-write-enospc` additionally require both packet-library
+arguments. They bind the ACK refusal and partition to the same original
+180-second budget, process and checkpoints, and retain both native counter
+samples. The source IO fault is removed before restart while packet isolation
+continues through the restarted-process hold.
 
 Packet completion additionally requires native netem counters demonstrating
 traffic effects (drops for partition/loss, traffic with zero drops for reorder),

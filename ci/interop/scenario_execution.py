@@ -15,6 +15,11 @@ from scenario_ack import (
     check_ack_evidence,
     check_ack_result,
 )
+from scenario_ack_partition import (
+    ACK_PARTITIONS,
+    ack_partition_arguments,
+    check_ack_partition_result,
+)
 from scenario_matrix import (
     MATRICES,
     check_matrix_result,
@@ -51,6 +56,7 @@ ROTATIONS = (
     | set(PACKETS)
     | set(RESTARTS)
     | set(ACKS)
+    | set(ACK_PARTITIONS)
 )
 
 
@@ -177,7 +183,15 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name in ACKS:
+    if name in ACK_PARTITIONS:
+        check_ack_partition_result(
+            name,
+            result.get("source_ack_partition_restart"),
+            result.get("source_ack_fault"),
+            result.get("partition_restart"),
+            recovery,
+        )
+    elif name in ACKS:
         check_ack_result(name, result.get("source_ack_fault"), recovery)
     elif name in RESTARTS:
         check_restart_partition(name, result.get("partition_restart"), recovery)
@@ -203,10 +217,23 @@ def check_result(name, result):
             raise ValueError("Restarted member lacks its vote or creators")
     elif recovery is not None:
         raise ValueError("Unexpected restart receipt")
-    if name not in RESTARTS and result.get("partition_restart") is not None:
+    if (
+        name not in RESTARTS
+        and name not in ACK_PARTITIONS
+        and result.get("partition_restart") is not None
+    ):
         raise ValueError("Unexpected restart partition receipt")
-    if name not in ACKS and result.get("source_ack_fault") is not None:
+    if (
+        name not in ACKS
+        and name not in ACK_PARTITIONS
+        and result.get("source_ack_fault") is not None
+    ):
         raise ValueError("Unexpected source ACK fault receipt")
+    if (
+        name not in ACK_PARTITIONS
+        and result.get("source_ack_partition_restart") is not None
+    ):
+        raise ValueError("Unexpected combined ACK partition receipt")
 
 
 def execute(args, names, catalog):
@@ -244,9 +271,11 @@ def execute(args, names, catalog):
         catalog,
         *source.glob("*.py"),
     ]
-    if any(name in PACKETS or name in RESTARTS for name in names):
+    if any(
+        name in PACKETS or name in RESTARTS or name in ACK_PARTITIONS for name in names
+    ):
         inputs.extend(packet_artifacts(args, source))
-    if any(name in ACKS for name in names):
+    if any(name in ACKS or name in ACK_PARTITIONS for name in names):
         inputs.extend(ack_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
@@ -318,6 +347,10 @@ def execute(args, names, catalog):
                 run += restart_arguments(name, args.socket_mark_library)
             if name in ACKS:
                 run += ack_arguments(name, args.source_ack_fault_library)
+            if name in ACK_PARTITIONS:
+                run += ack_partition_arguments(
+                    name, args.source_ack_fault_library, args.socket_mark_library
+                )
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -342,9 +375,9 @@ def execute(args, names, catalog):
                 check_result(name, result)
                 if name in PACKETS:
                     check_packet_cleanup(case / "runtime", result["network_fault"])
-                if name in RESTARTS:
+                if name in RESTARTS or name in ACK_PARTITIONS:
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
-                if name in ACKS:
+                if name in ACKS or name in ACK_PARTITIONS:
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
