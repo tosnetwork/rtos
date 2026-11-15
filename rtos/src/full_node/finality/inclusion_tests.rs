@@ -304,10 +304,11 @@ impl Pair {
                         entry["data"] = serde_json::to_value(&key).unwrap();
                     }
                 }
-                if source_transport && seed != 0x70 {
-                    // The normal source factory requires an explicit stable
-                    // validator -> transport binding. Derive it from the actual
-                    // governing state and persist it for the cold-open phase.
+                if seed != 0x70 {
+                    // Register the held validator transport through normal
+                    // configuration, as the native full node requires for
+                    // signing a shard-source certificate. The public observer
+                    // stays unregistered. This grants no PQ voting custody.
                     let governing = ShardStateUnsplit::construct_from_cell(mc_root.clone())
                         .unwrap()
                         .read_custom()
@@ -325,6 +326,13 @@ impl Pair {
                         .unwrap();
                     config["validator_key_ring"][base64_encode(transport.id().data())] =
                         serde_json::to_value(&key).unwrap();
+                    config["validator_keys"] = serde_json::json!([{
+                        // Election IDs are also ADNL tags; avoid DHT/overlay 1/2.
+                        "election_id": 1000 + i32::from(seed),
+                        "expire_at": i32::MAX,
+                        "validator_key_id": base64_encode(transport.id().data()),
+                        "validator_adnl_key_id": base64_encode(transport.id().data()),
+                    }]);
                     config["consensus_transport_bindings"] = serde_json::json!([{
                         "validator_id": base64_encode(validator.as_slice()),
                         "adnl_key_id": base64_encode(transport.id().data()),
