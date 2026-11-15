@@ -584,6 +584,7 @@ impl Pair {
             .unwrap();
         let client = self.receiver.overlay_client(self.shard.id().shard()).await.unwrap();
         let id = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+        let previous_advertisement_version = adnl::common::Version::get();
         for (index, engine, remote_key) in
             [(0, &self.receiver, &provider_key), (1, &self.provider, &receiver_key)]
         {
@@ -615,6 +616,17 @@ impl Pair {
                 )
                 .unwrap();
         }
+        // The creation-time advertisements said Plumtree was disabled. Admit
+        // fresh signed capabilities after activation, as public discovery does.
+        // A same-second advertisement cannot supersede the cached version.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adnl::common::Version::get() <= previous_advertisement_version {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("public advertisement version must advance after Plumtree activation");
+        self.refresh_public_advertisements().await;
         let prefix = rtos_api::serialize_boxed(
             &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*id.data()) }
                 .into_boxed(),
