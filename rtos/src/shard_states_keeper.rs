@@ -45,6 +45,8 @@ use storage::{
     shardstate_db_async::{AllowStateGcResolver, SsNotificationCallback},
     types::PersistentStatePartId,
 };
+mod zerostate;
+
 pub(crate) struct StateReadLease {
     id: BlockIdExt,
     resolver: Arc<AllowStateGcSmartResolver>,
@@ -62,7 +64,9 @@ impl Drop for StateReadLease {
 
 pub struct PinnedShardStateGuard {
     state: Arc<ShardStateStuff>,
-    gc_resolver: Arc<AllowStateGcSmartResolver>,
+    // None only for fully owned cells decoded from an authenticated zero BOC.
+    // Such cells do not depend on the lifetime of a dynamic database record.
+    gc_resolver: Option<Arc<AllowStateGcSmartResolver>>,
 }
 impl PinnedShardStateGuard {
     pub fn new(
@@ -74,7 +78,7 @@ impl PinnedShardStateGuard {
         if !gc_resolver.pin_state(state.block_id(), state.state()?.gen_time() as u64, now)? {
             fail!(StorageError::StateIsAllowedToGc(state.block_id().clone()))
         }
-        Ok(Self { state, gc_resolver })
+        Ok(Self { state, gc_resolver: Some(gc_resolver) })
     }
     pub(crate) fn state_arc(&self) -> Arc<ShardStateStuff> {
         self.state.clone()
@@ -85,16 +89,20 @@ impl PinnedShardStateGuard {
 }
 impl Clone for PinnedShardStateGuard {
     fn clone(&self) -> Self {
-        if let Err(e) = self.gc_resolver.add_pin_for_state(self.state.block_id()) {
-            log::error!("INTERNAL ERROR: {}", e);
+        if let Some(resolver) = &self.gc_resolver {
+            if let Err(e) = resolver.add_pin_for_state(self.state.block_id()) {
+                log::error!("INTERNAL ERROR: {}", e);
+            }
         }
         Self { state: self.state.clone(), gc_resolver: self.gc_resolver.clone() }
     }
 }
 impl Drop for PinnedShardStateGuard {
     fn drop(&mut self) {
-        if let Err(e) = self.gc_resolver.unpin_state(self.state.block_id()) {
-            log::error!("INTERNAL ERROR: {}", e);
+        if let Some(resolver) = &self.gc_resolver {
+            if let Err(e) = resolver.unpin_state(self.state.block_id()) {
+                log::error!("INTERNAL ERROR: {}", e);
+            }
         }
     }
 }
@@ -270,7 +278,7 @@ impl ShardStatesKeeper {
                     Ok(StateReadLease { id: id.clone(), resolver: resolver.clone(), active: true })
                 })?;
             lease.active = false;
-            Ok(PinnedShardStateGuard { state, gc_resolver: resolver.clone() })
+            Ok(PinnedShardStateGuard { state, gc_resolver: Some(resolver.clone()) })
         })
     }
 
@@ -714,6 +722,13 @@ impl ShardStatesKeeper {
         block_id: &BlockIdExt,
     ) -> Result<Arc<ShardStateStuff>> {
         log::trace!("load_state {}", block_id);
+        if block_id.seq_no() == 0 {
+            let keeper = self.clone();
+            let id = block_id.clone();
+            return tokio::task::spawn_blocking(move || zerostate::read(&keeper, &id, None))
+                .await
+                .map_err(|error| error!("Zero-state reader failed: {error}"))?;
+        }
         if let Some(state) = self.states.get(block_id) {
             log::trace!("load_state {} FROM CACHE", block_id);
             return Ok(state.val().0.clone());
@@ -750,6 +765,9 @@ impl ShardStatesKeeper {
     ) -> Result<PinnedShardStateGuard> {
         log::trace!("load_and_pin_state {}", block_id);
         let state = self.load_state(block_id).await?;
+        if block_id.seq_no() == 0 {
+            return Ok(PinnedShardStateGuard { state, gc_resolver: None });
+        }
         PinnedShardStateGuard::new(state, self.gc_resolver.clone())
     }
 
@@ -774,21 +792,26 @@ impl ShardStatesKeeper {
     pub(crate) fn load_and_pin_bounded_state(
         &self,
         id: &BlockIdExt,
-        budget: &crate::history_read_budget::HistoryReadBudget,
+        budget: &Arc<crate::history_read_budget::HistoryReadBudget>,
     ) -> Result<PinnedShardStateGuard> {
+        if id.seq_no() == 0 {
+            let state = zerostate::read(self, id, Some(budget))?;
+            return Ok(PinnedShardStateGuard { state, gc_resolver: None });
+        }
         budget.detached_read(|| {
-            let (state, mut lease) = self.db.load_shard_state_bounded(id, budget, |saved_at| {
-                if !self.gc_resolver.pin_state(id, saved_at, UnixTime::now())? {
-                    fail!(StorageError::StateIsAllowedToGc(id.clone()));
-                }
-                Ok(StateReadLease {
-                    id: id.clone(),
-                    resolver: self.gc_resolver.clone(),
-                    active: true,
-                })
-            })?;
+            let (state, mut lease) =
+                self.db.load_shard_state_bounded(id, budget.as_ref(), |saved_at| {
+                    if !self.gc_resolver.pin_state(id, saved_at, UnixTime::now())? {
+                        fail!(StorageError::StateIsAllowedToGc(id.clone()));
+                    }
+                    Ok(StateReadLease {
+                        id: id.clone(),
+                        resolver: self.gc_resolver.clone(),
+                        active: true,
+                    })
+                })?;
             lease.active = false;
-            Ok(PinnedShardStateGuard { state, gc_resolver: self.gc_resolver.clone() })
+            Ok(PinnedShardStateGuard { state, gc_resolver: Some(self.gc_resolver.clone()) })
         })
     }
 
@@ -796,6 +819,10 @@ impl ShardStatesKeeper {
         &self,
         block_id: &BlockIdExt,
     ) -> Result<PinnedShardStateGuard> {
+        if block_id.seq_no() == 0 {
+            let state = zerostate::read(self, block_id, None)?;
+            return Ok(PinnedShardStateGuard { state, gc_resolver: None });
+        }
         let state = self.db.load_shard_state_dynamic(block_id)?;
         PinnedShardStateGuard::new(state, self.gc_resolver.clone())
     }

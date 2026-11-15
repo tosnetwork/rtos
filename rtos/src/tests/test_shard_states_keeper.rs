@@ -1071,6 +1071,170 @@ async fn test_state_gc_follows_the_floor_in_store_order() -> Result<()> {
     Ok(())
 }
 
+/// The native collector starts at the oldest stored state. Its MC rule
+/// admits every sequence below the floor, including sequence zero. A kept
+/// zero must not accidentally stop collection of every subsequent old state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_state_gc_collects_zero_before_floor_in_store_order() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    engine.db.adjust_states_gc_interval(1);
+    let bytes = include_bytes!("static/zerostate.boc");
+    let root = rtos_block::read_single_root_boc(bytes)?;
+    let zero = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(bytes),
+    );
+    let state = ShardStateStuff::deserialize_zerostate(
+        zero.clone(),
+        bytes,
+        #[cfg(feature = "telemetry")]
+        &keeper.telemetry,
+        &keeper.allocated,
+    )?;
+    let handle = engine.db.create_test_block_handle(&zero)?;
+    keeper.store_state(&handle, state, Some(bytes), true).await?;
+    wait_pin(&keeper, &zero).await?;
+    let (old, floor) = (driver_mc(50, 2), driver_mc(100, 3));
+    for id in [&old, &floor] {
+        store_driver_state(&keeper, &engine.db, id, None, 1, 0).await?;
+        wait_pin(&keeper, id).await?;
+    }
+    keeper.seed_cleanup_floor(&floor, keeper.cleanup_floor_epoch())?;
+    assert_eq!(keeper.cleanup_floor().map(|(id, _)| id), Some(floor.clone()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (engine.db.test_contains_dynamic_state_record(&zero)?
+        || engine.db.test_contains_dynamic_state_record(&old)?)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let zero_remains = engine.db.test_contains_dynamic_state_record(&zero)?;
+    let old_remains = engine.db.test_contains_dynamic_state_record(&old)?;
+    let floor_remains = engine.db.test_contains_dynamic_state_record(&floor)?;
+    // Ignore the old dynamic cache and read the hash-pinned persistent BOC.
+    // Finish storage teardown even when a read fails.
+    let reads: Result<PinnedShardStateGuard> = async {
+        let state = keeper.load_state(&zero).await?;
+        state.verify_zerostate(&zero)?;
+        let detached = keeper.load_and_pin_state(&zero).await?;
+        let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+        let bounded = keeper.load_and_pin_bounded_state(&zero, &budget)?;
+        bounded.state().verify_zerostate(&zero)?;
+        if engine.db.test_contains_dynamic_state_record(&zero)? {
+            fail!("read must not resurrect GC entries");
+        }
+        Ok(detached.clone())
+    }
+    .await;
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    assert!(floor_remains, "the pinned floor must remain");
+    assert!(
+        !zero_remains,
+        "native MC rule admits zero below a durable floor; old remains={old_remains}"
+    );
+    assert!(!old_remains, "the old state behind zero must also be collected");
+    let detached_clone = reads?;
+    drop(keeper);
+    drop(engine);
+    // A cloned file-owned guard remains fully usable after the database closes.
+    rtos_block::write_boc(detached_clone.state().root_cell())?;
+    drop(detached_clone);
+
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    let result = keeper.load_state(&zero).await;
+    let restored = keeper.cleanup_floor().map(|(id, _)| id);
+    let reinserted = engine.db.test_contains_dynamic_state_record(&zero)?;
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    result?.verify_zerostate(&zero)?;
+    assert_eq!(restored, Some(floor));
+    assert!(!reinserted, "cold read must not recreate the old index");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_zero_file_reader_rejects_identity_and_budget_mismatches() -> Result<()> {
+    use crate::history_read_budget::{HistoryBudgetExceeded, HistoryReadBudget, HistoryReadLimits};
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let engine = TestEngine::new_db_dir(dir.path().to_str().unwrap(), None).await?;
+    let stopper = Arc::new(Stopper::new());
+    let keeper = floor_keeper(engine.db.clone(), stopper.clone())?;
+    let bytes = include_bytes!("static/zerostate.boc");
+    let root = rtos_block::read_single_root_boc(bytes)?;
+    let zero = BlockIdExt::with_params(
+        ShardIdent::masterchain(),
+        0,
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(bytes),
+    );
+    let write = |id: &BlockIdExt, data: &[u8]| -> Result<()> {
+        let part = PersistentStatePartId::WholeState(id.clone());
+        let mut output = engine.db.shard_state_persistent_write_obj(&part)?;
+        output.write_all(data)?;
+        engine.db.finalize_shard_state_persistent(&part, output)
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        write(&zero, bytes)?;
+        zerostate::read(&keeper, &zero, None)?.verify_zerostate(&zero)?;
+        for limits in [
+            HistoryReadLimits { state_boc_bytes: bytes.len() - 1, ..Default::default() },
+            HistoryReadLimits { cells: 0, ..Default::default() },
+            HistoryReadLimits { depth: 0, ..Default::default() },
+        ] {
+            let budget = HistoryReadBudget::new(limits);
+            let error = zerostate::read(&keeper, &zero, Some(&budget))
+                .err()
+                .expect("bounded zero read must refuse");
+            assert!(error.downcast_ref::<HistoryBudgetExceeded>().is_some(), "{error:#}");
+        }
+        let mut changed = bytes.to_vec();
+        changed[0] ^= 1;
+        write(&zero, &changed)?;
+        for bounded in [false, true] {
+            let budget = HistoryReadBudget::new(Default::default());
+            let error = zerostate::read(&keeper, &zero, bounded.then_some(&budget))
+                .err()
+                .expect("corrupt persistent file must refuse");
+            assert!(format!("{error:#}").contains("file hash differs"), "{error:#}");
+            if bounded {
+                assert!(crate::history_read_budget::stops_fallback(&error));
+            }
+        }
+        write(&zero, bytes)?;
+        let mut wrong_root = zero.clone();
+        wrong_root.root_hash = UInt256::from([0x95; 32]);
+        write(&wrong_root, bytes)?;
+        let error =
+            zerostate::read(&keeper, &wrong_root, None).err().expect("wrong root must refuse");
+        assert!(error.to_string().contains("root differs"), "{error:#}");
+        let mut wrong_file = zero.clone();
+        wrong_file.file_hash = UInt256::from([0x96; 32]);
+        let error = zerostate::read(&keeper, &wrong_file, None)
+            .err()
+            .expect("wrong pinned file hash must refuse");
+        assert!(format!("{error:#}").contains("file hash differs"), "{error:#}");
+        let mut wrong_shard = zero.clone();
+        wrong_shard.shard_id = ShardIdent::with_workchain_id(0)?;
+        let error =
+            zerostate::read(&keeper, &wrong_shard, None).err().expect("wrong shard must refuse");
+        assert!(error.to_string().contains("shard block_id"), "{error:#}");
+        zerostate::read(&keeper, &zero, None)?.verify_zerostate(&zero)?;
+        Ok(())
+    }));
+    stopper.set_stop();
+    engine.db.stop_states_db().await.unwrap();
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// A floor write that committed but did not report success, followed by a
 /// crash: the next start restores the committed floor and publishes it to
 /// state GC; a crash before the write keeps the previous floor.
