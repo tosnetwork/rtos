@@ -1850,6 +1850,13 @@ def main():
         help="Trace finality dependencies on the interrupted Rust node",
     )
     parser.add_argument(
+        "--diagnostic-rust-member",
+        type=int,
+        choices=(2, 3, 5),
+        action="append",
+        help="Trace finality and tracked tasks on an additional Rust member (repeatable)",
+    )
+    parser.add_argument(
         "--followup-intent-frontier",
         action="store_true",
         help="After original ACK recovery, capture new intents and require their completion and fresh states within a separate 180 seconds",

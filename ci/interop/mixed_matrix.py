@@ -347,7 +347,10 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
         "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
         "root:\n  level: info\n  appenders: [console]\n"
     )
-    if getattr(args, "finality_diagnostics", False) and i == args.interrupt_rust_member:
+    diagnostic_members = getattr(args, "diagnostic_rust_member", None) or []
+    if (
+        getattr(args, "finality_diagnostics", False) and i == args.interrupt_rust_member
+    ) or i in diagnostic_members:
         with (directory / "node-log.yml").open("a") as stream:
             stream.write(
                 "loggers:\n  simplex::consensus_controller:\n    level: trace\n"
