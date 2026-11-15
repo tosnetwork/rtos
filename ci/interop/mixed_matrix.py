@@ -360,6 +360,8 @@ async def prepare_rust(args, directory, i, network, global_config, tcp_used, udp
                 "  rtos::network::overlay_client:\n    level: debug\n"
                 "  overlay:\n    level: debug\n"
                 "  dht:\n    level: debug\n"
+                "  validator:\n    level: debug\n"
+                "  rtos::full_node::apply_block:\n    level: debug\n"
             )
     command = [
         args.validator_preparer,
