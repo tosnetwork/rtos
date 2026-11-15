@@ -8,6 +8,13 @@ from pathlib import Path
 
 from binary_identity import require_rust_revision
 from cpp_baseline import require_cpp_baseline
+from scenario_ack import (
+    ACKS,
+    ack_arguments,
+    ack_artifacts,
+    check_ack_evidence,
+    check_ack_result,
+)
 from scenario_matrix import (
     MATRICES,
     check_matrix_result,
@@ -43,6 +50,7 @@ ROTATIONS = (
     | {"restart-member2", "restart-member5"}
     | set(PACKETS)
     | set(RESTARTS)
+    | set(ACKS)
 )
 
 
@@ -169,7 +177,9 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name in RESTARTS:
+    if name in ACKS:
+        check_ack_result(name, result.get("source_ack_fault"), recovery)
+    elif name in RESTARTS:
         check_restart_partition(name, result.get("partition_restart"), recovery)
     elif name.startswith("restart-member"):
         member = int(name[-1])
@@ -195,6 +205,8 @@ def check_result(name, result):
         raise ValueError("Unexpected restart receipt")
     if name not in RESTARTS and result.get("partition_restart") is not None:
         raise ValueError("Unexpected restart partition receipt")
+    if name not in ACKS and result.get("source_ack_fault") is not None:
+        raise ValueError("Unexpected source ACK fault receipt")
 
 
 def execute(args, names, catalog):
@@ -234,6 +246,8 @@ def execute(args, names, catalog):
     ]
     if any(name in PACKETS or name in RESTARTS for name in names):
         inputs.extend(packet_artifacts(args, source))
+    if any(name in ACKS for name in names):
+        inputs.extend(ack_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -302,6 +316,8 @@ def execute(args, names, catalog):
                 run += packet_arguments(name, args.socket_mark_library)
             if name in RESTARTS:
                 run += restart_arguments(name, args.socket_mark_library)
+            if name in ACKS:
+                run += ack_arguments(name, args.source_ack_fault_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -328,6 +344,8 @@ def execute(args, names, catalog):
                     check_packet_cleanup(case / "runtime", result["network_fault"])
                 if name in RESTARTS:
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
+                if name in ACKS:
+                    check_ack_evidence(case / "runtime", result["source_ack_fault"])
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

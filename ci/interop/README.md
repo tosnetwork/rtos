@@ -38,6 +38,17 @@ then recovery without changing the original committee. A historical certificate
 is not counted as new finality during the stall. Generic rotation dependencies
 remain controls for rotation, not native controls for each injected restart.
 
+Source ACK cases `source-ack-sync-eio` and `source-ack-write-enospc` target one
+owned authenticated current-masterchain source store. Supply
+`--source-ack-fault-library` and `--source-ack-fault-build-record`; the build record
+uses the same source/library path, size and SHA256 checks described above.
+The native syscall refusal must leave the original source pending across SIGKILL,
+then recover its ACK after reopening the original database without injection.
+Acceptance binds the retained source bytes, recovered ACK/reference, native error
+marker, process identities and fresh vote/MC/WC participation, within the original
+180-second recovery budget. These are syscall interposition tests, not physical
+media failures. The combined ACK-plus-partition cases remain unintegrated.
+
 Packet completion additionally requires native netem counters demonstrating
 traffic effects (drops for partition/loss, traffic with zero drops for reorder),
 a fresh surviving quorum, restored own vote and both chain creators, unchanged
