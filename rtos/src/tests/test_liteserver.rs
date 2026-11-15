@@ -3290,10 +3290,16 @@ async fn run_smc_method_uses_node_context_and_pinned_identifier() -> Result<()> 
                     14
                 } else if version < 11 {
                     17
-                } else {
+                } else if version < 16 {
                     18
-                }
+                } else {
+                    19
+                },
+                "getter context v{version}: full={full}"
             );
+            if version >= 16 {
+                assert!(context[18].is_null(), "getter has no authenticated external import");
+            }
             if version >= 4 {
                 let root = context[13].as_tuple()?[0].as_tuple()?[0].as_tuple()?[3].as_integer()?;
                 assert_eq!(
