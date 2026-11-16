@@ -1,0 +1,29 @@
+{
+  "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+  "input_sha256": "0c408c83a59997ed924a07a627f5300e809988ec43ee723c53a1b76631b1fd00",
+  "probe_source_sha256": "058fb4f446fc2d79da63111d5bfd369047c99b4f6b10bb7cd101438638c676db",
+  "scope": "Actual two-part native query completion and complete application payload; does not impose tail-first arrival or qualify three-part live transfer.",
+  "effects": [
+    {
+      "id": "two_part_forward",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 2000769,
+      "payload_sha256": "a46151ecb069b40fea7259bda7e9156b55d7ec01871a762cc7a27c362246bff7"
+    },
+    {
+      "id": "two_part_reverse",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 2000769,
+      "payload_sha256": "a46151ecb069b40fea7259bda7e9156b55d7ec01871a762cc7a27c362246bff7"
+    },
+    {
+      "id": "after_multipart",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 64,
+      "payload_sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    }
+  ]
+}

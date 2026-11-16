@@ -996,3 +996,121 @@ mod existing_part_fec_tests {
         assert_eq!(actual, expected, "native existing-part FEC mutation effects");
     }
 }
+
+#[cfg(test)]
+mod multipart_assembly_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    fn send(
+        receiver: &mut RecvTransfer,
+        encoder: &mut crate::RaptorqEncoder,
+        part: usize,
+        total: usize,
+        sequence: u32,
+        transcript: &mut Vec<u8>,
+    ) -> usize {
+        let mut seq = sequence;
+        let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+            transfer_id: UInt256::default(),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: part as i32,
+            total_size: total as i64,
+            data: encoder.encode(&mut seq).unwrap(),
+            seqno: sequence as i32,
+        }));
+        let Chunk::V2(ref wire) = chunk else { unreachable!() };
+        transcript.extend(rtos_api::serialize_boxed(&wire.clone().into_boxed()).unwrap());
+        usize::from(receiver.process_chunk(chunk).unwrap().is_some())
+    }
+
+    #[test]
+    fn rldp2_multipart_assembly_matches_native_completion_order() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_metadata.json"),
+        );
+        assert_eq!(native.len(), 24);
+        let mut checked = 0;
+        for line in
+            include_str!("../../../ci/conformance/rldp2_multipart_assembly_context.tsv").lines()
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let count: usize = fields[1].parse().unwrap();
+            let total = (count - 1) * 2_000_000 + 769;
+            let mut encoders: Vec<_> = (0..count)
+                .map(|part| {
+                    let data: Vec<_> = (0..if part + 1 == count { 769 } else { 2_000_000 })
+                        .map(|i| ((i * 17 + part * 29) % 251) as u8)
+                        .collect();
+                    crate::RaptorqEncoder::with_data(&data, Some(768))
+                })
+                .collect();
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(total),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut completes = 0;
+            let mut transcript = Vec::new();
+            for row in native.iter().filter(|row| row["id"] == fields[0]) {
+                let part = row["part"].as_u64().unwrap() as usize;
+                match row["phase"].as_str().unwrap() {
+                    "admitted" => {
+                        for (index, encoder) in encoders.iter_mut().enumerate() {
+                            completes +=
+                                send(&mut receiver, encoder, index, total, 0, &mut transcript);
+                        }
+                    }
+                    "decoded" => {
+                        let size: usize = if part + 1 == count { 769 } else { 2_000_000 };
+                        for seq in 1..size.div_ceil(768) {
+                            completes += send(
+                                &mut receiver,
+                                &mut encoders[part],
+                                part,
+                                total,
+                                seq as u32,
+                                &mut transcript,
+                            );
+                        }
+                    }
+                    "replay" => {
+                        // Rust source symbols are consumed in order. A fresh
+                        // encoder regenerates the original seq0 for replay.
+                        let data: Vec<_> = (0..if part + 1 == count { 769 } else { 2_000_000 })
+                            .map(|i| ((i * 17 + part * 29) % 251) as u8)
+                            .collect();
+                        let mut replay = crate::RaptorqEncoder::with_data(&data, Some(768));
+                        completes +=
+                            send(&mut receiver, &mut replay, part, total, 0, &mut transcript)
+                    }
+                    _ => panic!("unknown native phase"),
+                }
+                // This checks processor assembly and reply effects. Native owner
+                // removal and application delivery counts require an entry test.
+                assert_eq!(
+                    hex::encode(rtos_block::sha256_digest(&transcript)),
+                    row["input_sha256"].as_str().unwrap(),
+                    "input packets: {row}"
+                );
+                assert_eq!(row["errors"], 0);
+                assert_eq!(completes as u64, row["complete_packets"].as_u64().unwrap(), "{row}");
+                assert_eq!(receiver.data.len() as u64, row["size"].as_u64().unwrap(), "{row}");
+                let digest = if receiver.data.is_empty() {
+                    String::new()
+                } else {
+                    hex::encode(rtos_block::sha256_digest(&receiver.data))
+                };
+                assert_eq!(digest, row["sha256"].as_str().unwrap(), "{row}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, native.len());
+    }
+}

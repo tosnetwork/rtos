@@ -99,6 +99,18 @@ jobs:
             --actual "$task_runtime_out/boundaries.jsonl" \
             > "$task_runtime_out/boundaries-comparison.json"
 
+          target/release/examples/rldp2_runtime \
+            < ci/conformance/rldp2_multipart_live_context.tsv \
+            > "$task_runtime_out/multipart.jsonl" 2> "$task_runtime_out/multipart.log"
+          sha256sum ci/conformance/rldp2_multipart_live_context.tsv \
+            ci/conformance/rldp2_multipart_live_expected.json \
+            >> "$task_runtime_out/sha256.txt"
+          python3 ci/conformance/check_rldp2_runtime.py \
+            --cases ci/conformance/rldp2_multipart_live_context.tsv \
+            --frozen-reference ci/conformance/rldp2_multipart_live_expected.json \
+            --actual "$task_runtime_out/multipart.jsonl" \
+            > "$task_runtime_out/multipart-comparison.json"
+
       - name: Check RLDP response lifetime and ownership
         timeout-minutes: 15
         run: |
