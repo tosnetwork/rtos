@@ -294,6 +294,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        inbound_active: std::sync::Mutex<HashSet<TransferId>>,
         inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
@@ -670,6 +671,11 @@ impl RldpNode {
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        // A solicited receive registration is only a promise of future input.
+        // Charge concurrency when the first actual part arrives, in either path.
+        if v2 && !peer.admit_inbound(*transfer_id)? {
+            return Ok(());
+        }
         loop {
             let result = if let Some(transfer) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(queue_sender) = transfer.val() {
