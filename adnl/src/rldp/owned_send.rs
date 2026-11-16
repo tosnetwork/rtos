@@ -6,7 +6,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 //! RLDP sender owners. Cancellation requests drain; they never detach active work.
-use super::TARGET;
+use super::{query_admission::QueryAdmission, TARGET};
 use crate::adnl::tasks::AdnlTasks;
 use futures::FutureExt;
 use rtos_block::{error, Result};
@@ -374,11 +374,6 @@ where
         log::error!(target: TARGET, "RLDP FEC worker failed: {e}");
         error!("RLDP FEC task failed").context(FecTaskFailed(e))
     })?
-}
-
-pub(super) struct QueryAdmission {
-    pub _global: tokio::sync::OwnedSemaphorePermit,
-    pub _connection: tokio::sync::OwnedSemaphorePermit,
 }
 
 pub(super) struct SendRegistration {

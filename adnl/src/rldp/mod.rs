@@ -71,6 +71,7 @@ use send::{
 
 mod owned_send;
 mod peers;
+mod query_admission;
 use owned_send::{SendCancelled, SendControl, SendWorkerPool};
 
 pub mod rldp2;
@@ -293,7 +294,6 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
-        query_slots: Arc<tokio::sync::Semaphore>,
         inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
@@ -365,7 +365,7 @@ struct BoundedReceive {
 
 /// Rldp Node
 pub struct RldpNode {
-    query_slots: Arc<tokio::sync::Semaphore>,
+    query_budget: Arc<query_admission::QueryBudget>,
     adnl: Arc<AdnlNode>,
     local_id: Option<Arc<KeyId>>,
     min_timeout_ms: u64,
@@ -439,7 +439,10 @@ impl RldpNode {
             min_timeout_ms,
         )?;
         let ret = Self {
-            query_slots: Arc::new(tokio::sync::Semaphore::new(Self::MAX_PENDING_QUERIES)),
+            query_budget: query_admission::QueryBudget::new(
+                Self::MAX_PENDING_QUERIES,
+                Self::MAX_PENDING_QUERIES_PER_CONNECTION,
+            ),
             adnl,
             local_id,
             min_timeout_ms,
@@ -1302,16 +1305,8 @@ impl RldpNode {
         let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
         // This counts queries waiting for answers, including those queued for
         // a sender. Native RldpIn refuses these independently of transfer capacity.
-        let global_query_admission = if v2 && query_id.is_some() {
-            Some(
-                self.query_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| error!("too many RLDP queries are already awaiting an answer"))?,
-            )
-        } else {
-            None
-        };
+        let query_admission =
+            if v2 && query_id.is_some() { Some(self.query_budget.acquire(peers)?) } else { None };
         // Native send_message also supplies a ten-second transfer deadline;
         // connection retention is that deadline plus the 120-second idle span.
         let connection_deadline = v2.then(|| {
@@ -1331,14 +1326,6 @@ impl RldpNode {
             Ok(peer) => peer?,
             Err(_) if query_deadline.is_some() => return Err(RldpQueryTimeout.into()),
             Err(_) => return Err(SendCancelled::Deadline.into()),
-        };
-        let query_admission = if let Some(global) = global_query_admission {
-            let connection = peer.query_slots.clone().try_acquire_owned().map_err(|_| {
-                error!("too many RLDP queries are already awaiting an answer from this peer")
-            })?;
-            Some(Arc::new(owned_send::QueryAdmission { _global: global, _connection: connection }))
-        } else {
-            None
         };
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?

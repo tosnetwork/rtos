@@ -1693,20 +1693,19 @@ async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
         assert_eq!(expected["refused"], 1);
         assert_eq!(expected["other"], 0);
         assert!(pending.next().now_or_never().is_none());
-        let peer = rldps[0].peers.find_v2(peers.local(), peers.other()).unwrap();
-        assert_eq!(peer.query_slots.available_permits(), 0);
-        assert_eq!(rldps[0].query_slots.available_permits(), 8192 - 256,
-            "failed connection admission must return its partial global permit");
+        assert_eq!(rldps[0].query_budget.remaining(&peers).1, 0);
+        assert_eq!(rldps[0].query_budget.remaining(&peers).0, 8192 - 256,
+            "refused connection admission must not consume global capacity");
         drop(pending);
         reply.hold.store(false, Ordering::Release);
         reply.release.notify_waiters();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while rldps[0].query_slots.available_permits() != 8192 {
+            while rldps[0].query_budget.remaining(&peers) != (8192, 256) {
                 reply.release.notify_waiters();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("cancelled query owners must release pending-query admission");
-        assert_eq!(peer.query_slots.available_permits(), 256);
+        assert_eq!(rldps[0].query_budget.remaining(&peers).1, 256);
         let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42;64]);
     }).catch_unwind().await;
@@ -1761,12 +1760,12 @@ async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
         assert_eq!(expected["global_refused"], 1);
         assert_eq!(expected["global_other"], 0);
         assert!(pending.next().now_or_never().is_none());
-        assert_eq!(rldps[1].query_slots.available_permits(), 0);
+        assert_eq!(rldps[1].query_budget.remaining(&routes[0]).0, 0);
         drop(pending);
         reply.hold.store(false, Ordering::Release);
         reply.release.notify_waiters();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while rldps[1].query_slots.available_permits() != 8192 {
+            while rldps[1].query_budget.remaining(&routes[0]).0 != 8192 {
                 reply.release.notify_waiters();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1803,6 +1802,86 @@ fn query_admission_native_effects() -> serde_json::Value {
         (
             "probe_source_sha256",
             include_bytes!("../../../ci/conformance/rldp2_query_admission_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_refused_query_does_not_extend_connection_expiry() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_query_refusal_expiry_context.tsv").trim(),
+        "256 10 1 130.5"
+    );
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for _ in 0..256 {
+            pending.push(rldps[0].query(&query, Some(1024), &peers, true, None));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.next()).await.is_err(),
+            "all256 admitted queries must still await replies"
+        );
+        assert_eq!(rldps[0].query_budget.remaining(&peers).0, 8192 - 256);
+        // Every admitted query already captured its10s deadline. This cutoff
+        // includes its120s connection retention, but precedes the refused call's.
+        let original_expiry = tokio::time::Instant::now() + Duration::from_millis(130500);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let rejected = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap_err();
+        assert!(rejected.to_string().contains("from this peer"));
+        rldps[0].peers.expire(original_expiry);
+        let live = usize::from(rldps[0].peers.find_v2(peers.local(), peers.other()).is_some());
+        let actual = serde_json::json!({"refused":1,"live_after_original_expiry":live});
+        assert_eq!(
+            actual,
+            query_refusal_expiry_native_effects(),
+            "refused query must not extend the connection beyond admitted-query retention"
+        );
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn query_refusal_expiry_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_query_refusal_expiry_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_reference.cpp")
                 .as_slice(),
         ),
         (
