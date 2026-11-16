@@ -438,6 +438,9 @@ impl RecvTransfer {
                 decoder.params().symbol_size
             )
         }
+        if v2 {
+            Constraints::check_seqno(chunk_seqno_u32)?;
+        }
         if let Some(mut data) = decoder.decode(chunk_seqno_u32, &chunk.data) {
             match &mut self.parts {
                 RecvParts::V1(part) => {

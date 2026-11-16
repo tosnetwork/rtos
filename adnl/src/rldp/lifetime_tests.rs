@@ -2954,3 +2954,208 @@ async fn rldp2_ack_retries_without_new_symbols_match_native() {
         std::panic::resume_unwind(panic);
     }
 }
+
+fn sequence_error_native_effects() -> serde_json::Value {
+    let context =
+        include_bytes!("../../../ci/conformance/rldp2_sequence_error_lifetime_context.tsv");
+    let effects =
+        include_bytes!("../../../ci/conformance/rldp2_sequence_error_lifetime_effects.jsonl");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_sequence_error_lifetime_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["exit"], 0);
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_sequence_error_lifetime_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_sequence_error_lifetime_matches_native() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let expected = sequence_error_native_effects();
+    let mut actual = Vec::new();
+    for line in
+        include_str!("../../../ci/conformance/rldp2_sequence_error_lifetime_context.tsv").lines()
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let name = fields[0];
+        let seqno: i32 = fields[2].parse().unwrap();
+        let expected_row = expected.as_array().unwrap().iter().find(|r| r["id"] == name).unwrap();
+        let (_, packets, nodes, rldps, peers) = pair().await;
+        *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+            let encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+            let chunk = RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: 2048,
+                seqno,
+                data: vec![42; 768],
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+            nodes[1]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while packets.processed_parts.load(Ordering::Acquire) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("authenticated packet must finish the actual handler");
+            if expected_row["completed"] == 1 {
+                // Record all four actual states before comparing; the old
+                // implementation drops the large IDs without a completion.
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while !peer
+                        .inbound_transfers
+                        .get(&[0; 32])
+                        .is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done))
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+            }
+            let inbound = peer
+                .inbound_transfers
+                .iter()
+                .filter(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+                .count();
+            let completed = peer
+                .inbound_transfers
+                .iter()
+                .filter(|e| matches!(e.val(), super::RldpTransfer::Done))
+                .count();
+            serde_json::json!({"id":name,"inbound":inbound,"completed":completed})
+        })
+        .catch_unwind()
+        .await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        match outcome {
+            Ok(value) => actual.push(value),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    let expected: Vec<_> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(
+            |r| serde_json::json!({"id":r["id"],"inbound":r["inbound"],"completed":r["completed"]}),
+        )
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "sequence syntax rejection and decoder failure must preserve native lifetimes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_sequence_decoder_error_reaches_query_caller() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    // Native RldpIn::receive_message forwards the transport error to the
+    // matching query promise; it must not become a successful empty reply.
+    let native = sequence_error_native_effects();
+    assert_eq!(
+        native.as_array().unwrap().iter().find(|r| r["id"] == "first_invalid_seqno").unwrap()
+            ["errors"],
+        1
+    );
+    let (reply, _, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        reply.hold.store(true, Ordering::Release);
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let request = rldps[0].query(&query, Some(4096), &peers, true, None);
+        let inject = async {
+            tokio::time::timeout(Duration::from_secs(2), reply.entered.notified())
+                .await
+                .expect("real query must reach held subscriber");
+            let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+            let id = *peer
+                .inbound_transfers
+                .iter()
+                .find(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+                .expect("query must register its answer transfer")
+                .key();
+            let encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+            let chunk = RldpChunk {
+                transfer_id: id.into(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: 2048,
+                seqno: 1 << 24,
+                data: vec![42; 768],
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+            nodes[1]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(request, inject) })
+                .await
+                .expect("decoder error must resolve query before its deadline");
+        let error = result.expect_err("native decoder errors must propagate to the query caller");
+        assert!(
+            error.to_string().contains("24 bits"),
+            "expected the actual decoder sequence error, got {error}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

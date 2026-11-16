@@ -709,7 +709,10 @@ impl RldpNode {
         let valid_packet = match &chunk {
             Chunk::V1(_) => true,
             Chunk::V2(Rldp2MessagePart(part)) => {
-                Self::check_message(Some(&part.fec_type), part.seqno).is_ok()
+                const CONSTRAINTS: Constraints = Constraints { data_size: Constraints::SLICE };
+                // Native rejects negative wire integers here, but a nonnegative
+                // ID beyond the decoder's 24-bit range terminates the transfer.
+                part.seqno >= 0 && CONSTRAINTS.check_fec_type(&part.fec_type).is_ok()
             }
         };
         // Explicit bounded queries report a declared wire-limit violation
@@ -1844,12 +1847,10 @@ impl RldpNode {
                     log::trace!(target: TARGET, "Got reply in {transfer_str}");
                     peer.stats.v1.update(self.min_timeout_ms);
                     if let Some(error) = reply.failure {
-                        if propagate_failure {
+                        // Native RLDP2 forwards a decoder failure to the query
+                        // promise; it is not a successful empty answer.
+                        if propagate_failure || v2 {
                             return Err(error);
-                        }
-                        if v2 {
-                            // A rejected transfer has no complete answer to decode.
-                            return Ok(None);
                         }
                     }
                     return Ok(Some(reply.data));
