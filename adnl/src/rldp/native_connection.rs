@@ -34,6 +34,8 @@ struct WaiterRegistration {
     waiters: Arc<Mutex<Waiters>>,
     send: TransferId,
     receive: Option<TransferId>,
+    #[cfg(test)]
+    finished: Arc<AtomicU64>,
 }
 impl Drop for WaiterRegistration {
     fn drop(&mut self) {
@@ -43,6 +45,11 @@ impl Drop for WaiterRegistration {
             if let Some(query) = waiters.received.remove(&id) {
                 query.admission.release();
             }
+        }
+        #[cfg(test)]
+        {
+            drop(waiters);
+            self.finished.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -76,8 +83,15 @@ pub(super) struct NativeConnection {
     pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
     #[cfg(test)]
     pub(super) query_send_results: Mutex<Vec<(TransferId, bool)>>,
+    #[cfg(test)]
+    pub(super) retired_registrations: Arc<AtomicU64>,
 }
 impl NativeConnection {
+    #[cfg(test)]
+    pub(super) fn waiter_counts(&self) -> (usize, usize) {
+        let waiters = self.waiters.lock().unwrap();
+        (waiters.sent.len(), waiters.received.len())
+    }
     pub(super) fn start(
         node: Weak<RldpNode>,
         adnl: Arc<AdnlNode>,
@@ -116,6 +130,8 @@ impl NativeConnection {
             completed_send_ids: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             query_send_results: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            retired_registrations: Arc::new(AtomicU64::new(0)),
         });
         #[cfg(test)]
         let completed_sends = ret.completed_sends.clone();
@@ -302,7 +318,11 @@ impl NativeConnection {
                     });
                 }
             }
-            let _registration = WaiterRegistration { waiters: this.waiters.clone(), send, receive };
+            let _registration = WaiterRegistration {
+                waiters: this.waiters.clone(), send, receive,
+                #[cfg(test)]
+                finished: this.retired_registrations.clone(),
+            };
             let mut sent_result = Some(sent_result);
             let mut accepted = false;
             let work = async {

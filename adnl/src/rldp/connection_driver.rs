@@ -21,6 +21,8 @@ pub(super) enum Command {
     Receive(Vec<u8>),
     #[cfg(test)]
     Inspect(oneshot::Sender<(usize, usize, usize)>),
+    #[cfg(test)]
+    InspectCompleted(oneshot::Sender<Vec<TransferId>>),
     Packet {
         data: Vec<u8>,
         mtu: u64,
@@ -64,6 +66,11 @@ impl Command {
                     connection.outbound_transfer_count(),
                     connection.completed_transfer_count(),
                 ));
+                Ok(true)
+            }
+            #[cfg(test)]
+            Self::InspectCompleted(reply) => {
+                let _ = reply.send(connection.completed_ids());
                 Ok(true)
             }
             Self::Packet { data, mtu } => {

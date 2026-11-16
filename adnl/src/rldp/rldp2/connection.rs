@@ -242,6 +242,10 @@ impl Connection {
         }
         Ok(true)
     }
+    #[cfg(test)]
+    pub(crate) fn completed_ids(&self) -> Vec<TransferId> {
+        self.completed.iter().copied().collect()
+    }
     pub fn completed_transfer_count(&self) -> usize {
         self.completed.len()
     }

@@ -96,3 +96,85 @@ async fn native_completed_retention_and_replay_match_native_under_churn() {
     // ordering marker from the frozen vector's application delivery count.
     assert_eq!(reply.messages.load(Ordering::Acquire) - 1, 2050);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_query_churn_bounds_completed_cache_and_retires_sender_ids() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_outbound_retirement_context.tsv").trim(),
+        "2049\t64\t60"
+    );
+    let expected = outbound_retirement_native_effects();
+    let (reply, _, nodes, rldps, route) = topology_configured(2, None, false, true).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome=std::panic::AssertUnwindSafe(async {
+        let peers=[
+            rldps[0].get_peer(route.local(),route.other(),true,None).await.unwrap(),
+            rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap(),
+        ];
+        let natives=peers.iter().map(|p|p.native.get().expect("both actual query endpoints must use native Connection")).collect::<Vec<_>>();
+        let quota=rldps[0].query_budget.remaining(&route);
+        let bytes=serialize_boxed(&Query {overlay:UInt256::default()}).unwrap();
+        let request=TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0};
+        let started=tokio::time::Instant::now();
+        for index in 0..2049 {
+            let (answer,_)=rldps[0].query(&request,Some(1024),&route,true,None).await.unwrap_or_else(|error|panic!("native query {index} failed: {error}"));
+            assert_eq!(answer,Some(vec![42;64]));
+            if [0,127,128,2047,2048].contains(&index) {
+                for native in &natives {assert_eq!(inspect(native).await.2,(index+1).min(2048));}
+            }
+        }
+        assert!(started.elapsed()<Duration::from_secs(10),"cache bound must be observed before TTL pruning");
+        assert_eq!(reply.calls.load(Ordering::Acquire),2049);
+        let submissions=natives[0].query_send_results.lock().unwrap().clone();
+        assert_eq!(submissions.len(),2049);
+        assert!(submissions.iter().all(|(_,accepted)|*accepted));
+        let requests=submissions.iter().map(|(id,_)|*id).collect::<std::collections::BTreeSet<_>>();
+        let responses=requests.iter().map(|id|id.map(|b|b^0xff)).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(requests.len(),2049);
+        assert!(requests.is_disjoint(&responses));
+        for (side,native) in natives.iter().enumerate() {
+            // Answer delivery precedes final ACK and waiter cleanup. Observe
+            // the actual send completions and waiters, not just API returns.
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while native.completed_sends.load(Ordering::Acquire)!=2049 || native.waiter_counts()!=(0,0)
+                    || native.retired_registrations.load(Ordering::Acquire)!=if side==0 {2049} else {0} {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap_or_else(|error|panic!("{error}: side={side} sent={} retired={} waiters={:?}",native.completed_sends.load(Ordering::Acquire),native.retired_registrations.load(Ordering::Acquire),native.waiter_counts()));
+            let (_,outbound,completed)=inspect(native).await;
+            assert_eq!((outbound,completed),(0,2048));
+            let sent=native.completed_send_ids.lock().unwrap().clone();
+            let sent_ids=sent.iter().copied().collect::<std::collections::BTreeSet<_>>();
+            let (expected_sent,expected_received)=if side==0 {(&requests,&responses)} else {(&responses,&requests)};
+            assert_eq!(&sent_ids,expected_sent);
+            assert_eq!(sent.len(),2049,"each actual sender completes exactly once");
+            let (done,receipt)=tokio::sync::oneshot::channel();
+            native.driver.submit(super::super::connection_driver::Command::InspectCompleted(done)).await.unwrap();
+            let remembered=receipt.await.unwrap().into_iter().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(remembered.len(),2048);
+            assert!(remembered.is_subset(expected_received),"completed cache must contain received IDs only");
+            let sender_ids_in_receive_cache=remembered.intersection(expected_sent).count();
+            // Native's one-way vector has no received data on the sender.
+            // Real queries have incoming answers/requests: report that cache
+            // separately instead of calling its actual 2048 entries zero.
+            assert_eq!(sent.len(),expected["completed"].as_u64().unwrap() as usize);
+            assert_eq!(outbound,expected["outbound_retained"].as_u64().unwrap() as usize);
+            assert_eq!(sender_ids_in_receive_cache,0,"sender IDs must not enter the receive cache");
+            let actual=serde_json::json!({"completed":sent.len(),"outbound_retained":outbound,"sender_ids_in_receive_cache":sender_ids_in_receive_cache,"completed_inbound":completed});
+            assert_eq!(rldps[side].allocated.send_transfers.load(Ordering::Acquire),0);
+            assert_eq!(rldps[side].allocated.recv_transfers.load(Ordering::Acquire),0);
+            eprintln!("NATIVE_QUERY_RETIREMENT side={side}: {actual} actual_inbound_cache={completed}");
+        }
+        assert_eq!(rldps[0].query_budget.remaining(&route),quota);
+        eprintln!("NATIVE_QUERY_CHURN elapsed_ms={}",started.elapsed().as_millis());
+    }).catch_unwind().await;
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
