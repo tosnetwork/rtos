@@ -3159,3 +3159,90 @@ async fn rldp2_sequence_decoder_error_reaches_query_caller() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_overdue_ack_progresses_with_ready_receive_queue() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_ack_ready_queue_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_ready_queue_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_ready_queue_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_ready_queue_metadata.json"),
+    );
+    for row in native {
+        let (_, packets, nodes, _, peers) = pair().await;
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let queued = row["queued"].as_u64().unwrap() as usize;
+            let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+            let mut seqno = 0;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: 2048,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: 0,
+            };
+            let mut receiver = super::recv::RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(2048),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            assert!(receiver
+                .process_chunk(super::Chunk::V2(rldp2::messagepart::MessagePart(chunk.clone())))
+                .unwrap()
+                .is_none());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for _ in 0..queued {
+                tx.send(super::Chunk::V2(rldp2::messagepart::MessagePart(chunk.clone()))).unwrap();
+            }
+            let mut context = super::recv::RecvContext {
+                adnl: nodes[1].clone(),
+                peers: AdnlPeers::with_keys(peers.other().clone(), peers.local().clone()),
+                queue_reader: rx,
+                recv_transfer: receiver,
+                transfer_id: [0; 32],
+                #[cfg(feature = "debug")]
+                loss_fn: None,
+            };
+            let mut confirms = 0;
+            for remaining in (0..queued).rev() {
+                // The production poll must service its timer even though recv()
+                // is immediately ready. Keep the producer alive: no close or
+                // idle timeout is used to trigger the confirmation.
+                let next = RldpNode::receive_chunk(&mut context, true, &mut confirms)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.queue_reader.len(), remaining);
+                assert!(context.recv_transfer.process_chunk(next).unwrap().is_none());
+            }
+            assert_eq!(confirms > 0, row["ack_progress"].as_bool().unwrap());
+            assert_eq!(
+                u64::from(!context.recv_transfer.data.is_empty()),
+                row["deliveries"].as_u64().unwrap()
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while packets.confirm_packets.load(Ordering::Acquire) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the confirmation must reach the real ADNL peer");
+            drop(tx);
+        })
+        .catch_unwind()
+        .await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}

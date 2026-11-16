@@ -1919,6 +1919,23 @@ impl RldpNode {
     #[cfg(feature = "telemetry")]
     fn print_stats(&self) {}
 
+    async fn receive_chunk(
+        context: &mut RecvContext,
+        v2: bool,
+        confirmations_sent: &mut u32,
+    ) -> std::result::Result<Option<Chunk>, tokio::time::error::Elapsed> {
+        let spin = Duration::from_millis(Self::ACK_DELAY_MS);
+        // Like the native connection turn, service due ACKs even when the
+        // receive queue is immediately ready; traffic must not starve timers.
+        if v2 {
+            match context.send_confirmations().await {
+                Ok(sent) => *confirmations_sent = confirmations_sent.saturating_add(sent),
+                Err(e) => log::warn!(target: TARGET, "RLDPv2 confirmation error: {e}"),
+            }
+        }
+        tokio::time::timeout(spin, context.queue_reader.recv()).await
+    }
+
     async fn receive_loop(context: &mut RecvContext, v2: bool) {
         Self::receive_loop_controlled(context, v2, None, false).await;
     }
@@ -1931,7 +1948,6 @@ impl RldpNode {
     ) {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let spin = Duration::from_millis(Self::ACK_DELAY_MS);
         let start = std::time::Instant::now();
         let mut last_diag = start;
         let mut packets_received: u32 = 0;
@@ -1953,20 +1969,10 @@ impl RldpNode {
                 );
                 last_diag = std::time::Instant::now();
             }
-            let job = match tokio::time::timeout(spin, context.queue_reader.recv()).await {
+            let job = match Self::receive_chunk(context, v2, &mut confirmations_sent).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
-                Err(_) => {
-                    if v2 {
-                        match context.send_confirmations().await {
-                            Ok(sent) => {
-                                confirmations_sent = confirmations_sent.saturating_add(sent)
-                            }
-                            Err(e) => log::warn!(target: TARGET, "{rldp} confirmation error: {e}"),
-                        }
-                    }
-                    continue;
-                }
+                Err(_) => continue,
             };
             packets_received = packets_received.saturating_add(1);
             let (chunk_v2, chunk_part, chunk_seqno, chunk_data_len) = match &job {
