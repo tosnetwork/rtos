@@ -149,8 +149,30 @@ type TransferId = [u8; 32];
 
 enum RldpTransfer {
     Recv(tokio::sync::mpsc::UnboundedSender<Chunk>),
-    Send(SendTransferState),
+    Send(std::sync::Mutex<Option<SendTransferState>>),
     Done,
+}
+
+impl RldpTransfer {
+    fn sender(state: SendTransferState) -> Self {
+        Self::Send(std::sync::Mutex::new(Some(state)))
+    }
+    fn sender_state(&self) -> Option<SendTransferState> {
+        match self {
+            Self::Send(state) => state.lock().unwrap().clone(),
+            _ => None,
+        }
+    }
+    fn release_v2_sender(&self) {
+        if let Self::Send(state) = self {
+            let mut state = state.lock().unwrap();
+            if matches!(*state, Some(SendTransferState::V2(_))) {
+                // A lock-free map reader may defer entry reclamation. Release
+                // payload ownership at actual sender drain, independently of that entry.
+                state.take();
+            }
+        }
+    }
 }
 
 // The expiry is an update, never a new registration. A delayed timer must not
@@ -271,6 +293,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
         transfer_slots: Arc<tokio::sync::Semaphore>,
         closed: tokio_util::sync::CancellationToken,
@@ -637,8 +660,9 @@ impl RldpNode {
             Chunk::V1(RldpMessagePart(chunk)) => (false, chunk.part, chunk.seqno),
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
+        let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
         loop {
-            let result = if let Some(transfer) = self.transfers.get(transfer_id) {
+            let result = if let Some(transfer) = peer.transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(queue_sender) = transfer.val() {
                     queue_sender.send(chunk)
                 } else {
@@ -674,7 +698,9 @@ impl RldpNode {
                     );
                     break;
                 }
-            } else if let Some(queue_sender) = self.inbound(transfer_id, peers, v2).await? {
+            } else if let Some(queue_sender) =
+                self.inbound(transfer_id, peers, v2, peer.clone()).await?
+            {
                 queue_sender.send(chunk)
             } else {
                 continue;
@@ -730,7 +756,9 @@ impl RldpNode {
                 }
             }
             MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_Complete(msg)) => {
-                if let Some(state) = self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32) {
+                if let Some(state) =
+                    self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32, peers)
+                {
                     state.set_finished(true)
                 }
             }
@@ -740,7 +768,9 @@ impl RldpNode {
                 }
             }
             MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_Confirm(msg)) => {
-                if let Some(state) = self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32) {
+                if let Some(state) =
+                    self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32, peers)
+                {
                     state.set_recv_info(
                         msg.max_seqno as u32,
                         msg.received_count as u32,
@@ -780,8 +810,9 @@ impl RldpNode {
             .get(transfer_id)
             .ok_or_else(|| error!("No state for transfer {}", base64_encode(transfer_id)))?
             .val()
+            .sender_state()
         {
-            RldpTransfer::Send(SendTransferState::V2(state)) => Ok(state.clone()),
+            Some(SendTransferState::V2(state)) => Ok(state.clone()),
             _ => fail!("Wrong state for transfer {}", base64_encode(transfer_id)),
         }
     }
@@ -803,13 +834,13 @@ impl RldpNode {
     fn get_v1_state(&self, transfer_id: &TransferId, part: u32) -> Option<Arc<SendPartStateV1>> {
         let mut ret = None;
         if let Some(transfer) = self.transfers.get(transfer_id) {
-            match transfer.val() {
-                RldpTransfer::Send(SendTransferState::V1(state)) => {
+            match transfer.val().sender_state() {
+                Some(SendTransferState::V1(state)) => {
                     if state.part() == part {
                         ret.replace(state.clone());
                     }
                 }
-                RldpTransfer::Send(SendTransferState::V2(_)) => log::warn!(
+                Some(SendTransferState::V2(_)) => log::warn!(
                     target: TARGET,
                     "Received V1 message in V2 transfer {}",
                     base64_encode(transfer.key())
@@ -820,16 +851,22 @@ impl RldpNode {
         ret
     }
 
-    fn get_v2_state(&self, transfer_id: &TransferId, part: u32) -> Option<Arc<SendPartStateV2>> {
+    fn get_v2_state(
+        &self,
+        transfer_id: &TransferId,
+        part: u32,
+        peers: &AdnlPeers,
+    ) -> Option<Arc<SendPartStateV2>> {
+        let peer = self.peers.find_v2(peers.local(), peers.other())?;
         let mut ret = None;
-        if let Some(transfer) = self.transfers.get(transfer_id) {
-            match transfer.val() {
-                RldpTransfer::Send(SendTransferState::V1(_)) => log::warn!(
+        if let Some(transfer) = peer.transfers.get(transfer_id) {
+            match transfer.val().sender_state() {
+                Some(SendTransferState::V1(_)) => log::warn!(
                     target: TARGET,
                     "Received V2 message in V1 transfer {}",
                     base64_encode(transfer.key())
                 ),
-                RldpTransfer::Send(SendTransferState::V2(states)) => {
+                Some(SendTransferState::V2(states)) => {
                     if (part as usize) < states.len() {
                         ret.replace(states[part as usize].clone());
                     }
@@ -845,16 +882,17 @@ impl RldpNode {
         transfer_id: &TransferId,
         peers: &AdnlPeers,
         v2: bool,
+        peer: Arc<RldpPeer>,
     ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Chunk>>> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        let transfer_map = peer.transfers.clone();
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
         let inserted = {
             let mut ids = peer.registrations.lock().unwrap();
             if peer.closed.is_cancelled() {
                 return Err(SendCancelled::PeerEvicted.into());
             }
-            let inserted = add_unbound_object_to_map(&self.transfers, *transfer_id, || {
+            let inserted = add_unbound_object_to_map(&transfer_map, *transfer_id, || {
                 Ok(RldpTransfer::Recv(queue_sender.clone()))
             })?;
             if inserted {
@@ -869,7 +907,7 @@ impl RldpNode {
             v2,
             inbound: v2.then(|| (*transfer_id, tokio_util::sync::CancellationToken::new())),
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
-            transfers: self.transfers.clone(),
+            transfers: transfer_map.clone(),
             send: *transfer_id,
             receive: None,
             owner: self.adnl.tasks().clone(),
@@ -908,7 +946,7 @@ impl RldpNode {
         #[cfg(test)]
         let response_lifecycle = self.allocated.response_lifecycle.clone();
         let subscribers = self.subscribers.clone();
-        let transfers = self.transfers.clone();
+        let transfers = transfer_map.clone();
         let owner = self.adnl.tasks().clone();
         let token = owner.enter()?;
         let lifetime = owner.clone();
@@ -933,7 +971,6 @@ impl RldpNode {
             let send_transfer_id = Self::inbound_loop(
                 &mut context,
                 subscribers,
-                transfers.clone(),
                 v2,
                 &peer_table,
                 #[cfg(feature = "telemetry")]
@@ -982,7 +1019,7 @@ impl RldpNode {
                 ids.remove(&context.transfer_id);
             }
         });
-        let transfers = self.transfers.clone();
+        let transfers = transfer_map.clone();
         let transfer_id = *transfer_id;
         let lifetime = owner.clone();
         owner.spawn("RLDP inbound expiry", async move {
@@ -1003,7 +1040,6 @@ impl RldpNode {
     async fn inbound_loop(
         context: &mut RecvContext,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
-        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         v2: bool,
         peer_table: &Arc<peers::PeerTable>,
         #[cfg(feature = "telemetry")] send_metric: Arc<Metric>,
@@ -1095,6 +1131,7 @@ impl RldpNode {
                 response_deadline.map(tokio::time::Instant::from_std),
             )
             .await?;
+        let transfers = peer.transfers.clone();
         if response_deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return Ok(None);
         }
@@ -1137,7 +1174,7 @@ impl RldpNode {
         let send_transfer = peer.insert_transfer_with(&transfers, send_transfer_id, || {
             let (transfer, state) =
                 SendTransfer::new(data, send_transfer_id, send_counter.clone(), ping, v2)?;
-            Ok((RldpTransfer::Send(state), transfer))
+            Ok((RldpTransfer::sender(state), transfer))
         })?;
         #[cfg(feature = "telemetry")]
         send_metric.update(send_counter.load(Ordering::Relaxed));
@@ -1332,9 +1369,9 @@ impl RldpNode {
         #[cfg(feature = "telemetry")]
         self.telemetry.send_transfers.update(self.allocated.send_transfers.load(Ordering::Relaxed));
         peer.insert_transfer(
-            &self.transfers,
+            &peer.transfers,
             send_transfer_id,
-            RldpTransfer::Send(send_transfer_state),
+            RldpTransfer::sender(send_transfer_state),
         )?;
         let (recv_context, recv_transfer_id) = if query_id.is_some() {
             let mut recv_transfer_id = send_transfer_id;
@@ -1365,7 +1402,7 @@ impl RldpNode {
                 .recv_transfers
                 .update(self.allocated.recv_transfers.load(Ordering::Relaxed));
             peer.insert_transfer(
-                &self.transfers,
+                &peer.transfers,
                 recv_transfer_id,
                 RldpTransfer::Recv(queue_sender),
             )?;
@@ -1401,7 +1438,7 @@ impl RldpNode {
                 None
             },
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
-            transfers: self.transfers.clone(),
+            transfers: peer.transfers.clone(),
             send: send_transfer_id,
             receive: recv_transfer_id,
             owner: self.adnl.tasks().clone(),
@@ -1625,7 +1662,7 @@ impl RldpNode {
         } else {
             "Outbound sent"
         });
-        peer.insert_transfer(&self.transfers, *send_transfer_id, RldpTransfer::Done)?;
+        peer.insert_transfer(&peer.transfers, *send_transfer_id, RldpTransfer::Done)?;
         let outbound_str = if recv_state.is_some() { "outbound query" } else { "outbound message" };
         if ok {
             log::trace!(target: TARGET, "RLDP {outbound_str} sent in transfer {transfer_str}");

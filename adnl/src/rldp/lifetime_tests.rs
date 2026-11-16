@@ -381,7 +381,17 @@ async fn silent_rldp2_peer_does_not_starve_a_healthy_peer() {
         for id in packets.transfers.lock().unwrap().iter() {
             let id: [u8; 32] = id.as_slice().try_into().unwrap();
             assert!(
-                matches!(rldps[1].transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
+                matches!(
+                    rldps[1]
+                        .peers
+                        .find_v2(attacker_peers.other(), attacker_peers.local())
+                        .unwrap()
+                        .transfers
+                        .get(&id)
+                        .unwrap()
+                        .val(),
+                    super::RldpTransfer::Send(_)
+                ),
                 "healthy progress must not evict the silent peer's valid responses"
             );
         }
@@ -483,7 +493,7 @@ async fn sixteen_large_silent_responses_retain_initialized_encoders() {
         for id in packets.transfers.lock().unwrap().iter() {
             let id: [u8; 32] = id.as_slice().try_into().unwrap();
             assert!(
-                matches!(rldps[1].transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
+                matches!(rldps[1].peers.find_v2(attacker_peers.other(), attacker_peers.local()).unwrap().transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
                 "healthy progress must not evict the silent peer's valid responses"
             );
         }
@@ -698,7 +708,7 @@ async fn outbound_count_boundary(mode: OutboundBoundary) {
                 .try_into()
                 .unwrap();
             completed_id = Some(id);
-            let completed_state = rldps[1].get_v2_state(&id, 0).unwrap();
+            let completed_state = rldps[1].get_v2_state(&id, 0, &AdnlPeers::with_keys(server.id().clone(), client.id().clone())).unwrap();
             let ack = serialize_boxed(
                 &rldp2::messagepart::Complete { transfer_id: UInt256::from(id), part: 0 }
                     .into_boxed(),
@@ -737,7 +747,7 @@ async fn outbound_count_boundary(mode: OutboundBoundary) {
             })
             .await
             .expect("actual completion must release one sender and admission slot");
-            assert!(rldps[1].transfers.get(&id).is_none(), "completed sender must retire");
+            assert!(rldps[1].peers.find_v2(attacker_peers.other(), attacker_peers.local()).unwrap().transfers.get(&id).is_none(), "completed sender must retire");
             let after_ack = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
 
             let request = serialize_boxed(
@@ -884,8 +894,14 @@ async fn outbound_count_boundary(mode: OutboundBoundary) {
             if completed_id == Some(id) {
                 continue;
             }
+            let still_sending = (0..=u8::from(second_local)).any(|tag| {
+                let local = nodes[1].key_by_tag(tag as usize).unwrap();
+                rldps[1].peers.find_v2(local.id(), attacker_peers.local()).is_some_and(|peer| {
+                    peer.transfers.get(&id).is_some_and(|entry| matches!(entry.val(), super::RldpTransfer::Send(_)))
+                })
+            });
             assert!(
-                matches!(rldps[1].transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
+                still_sending,
                 "healthy progress must not evict the silent peer's valid responses"
             );
         }
@@ -1108,7 +1124,7 @@ async fn rldp2_completed_retention_matches_native_under_churn() {
         assert!(started.elapsed() < Duration::from_secs(10), "churn must precede20s expiry");
         let unique_delivered = reply.messages.load(Ordering::Acquire);
         assert_eq!(unique_delivered, 2049);
-        let remembered = rldps[1].transfers.iter().filter(|entry| matches!(entry.val(), super::RldpTransfer::Done)).count();
+        let remembered = rldps[1].peers.find_v2(peers.other(), peers.local()).unwrap().transfers.iter().filter(|entry| matches!(entry.val(), super::RldpTransfer::Done)).count();
         assert_eq!(remembered, 2048, "native bounds completed IDs independently of time");
         let oldest = wire(0);
         nodes[0].send_custom(&TaggedByteSlice { object: &oldest, #[cfg(feature = "telemetry")] tag: 0 }, &peers).await.unwrap();
@@ -1309,6 +1325,107 @@ fn outbound_retirement_native_effects() -> serde_json::Value {
         (
             "probe_source_sha256",
             include_bytes!("../../../ci/conformance/rldp2_outbound_retirement_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_same_transfer_id_isolated_by_connection() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_transfer_identity_context.tsv").trim(),
+        "3"
+    );
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    let (reply, _packets, nodes, rldps, peers) = topology(3).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let local = nodes[1].key_by_tag(1).unwrap();
+        let remote = nodes[0].key_by_tag(0).unwrap();
+        nodes[0].add_peer(remote.id(), nodes[1].ip_address_adnl(), None, &local).unwrap();
+        nodes[1].add_peer(local.id(), nodes[0].ip_address_adnl(), None, &remote).unwrap();
+        let routes = [
+            (0, peers.clone()),
+            (2, AdnlPeers::with_keys(nodes[2].key_by_tag(0).unwrap().id().clone(), peers.other().clone())),
+            (0, AdnlPeers::with_keys(remote.id().clone(), local.id().clone())),
+        ];
+        let message = serialize_boxed(&rldp::message::Message { id: UInt256::default(), data: b"churn".to_vec() }.into_boxed()).unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&message, None);
+        let mut seqno = 0;
+        let chunk = RldpChunk { transfer_id: UInt256::default(), fec_type: encoder.params().clone().into_boxed(), part: 0, total_size: message.len() as i64, data: encoder.encode(&mut seqno).unwrap(), seqno: seqno as i32 };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        for (index, (sender, route)) in routes.iter().enumerate() {
+            nodes[*sender].send_custom(&TaggedByteSlice { object: &wire, #[cfg(feature = "telemetry")] tag: 0 }, route).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while reply.messages.load(Ordering::Acquire) < index + 1 { reply.message_received.notified().await; }
+            }).await.expect("same transfer ID on another authenticated connection must deliver independently");
+        }
+        let mut remembered = Vec::new();
+        for (_, route) in &routes {
+            let reverse = AdnlPeers::with_keys(route.other().clone(), route.local().clone());
+            assert!(rldps[1].try_consume_custom(&wire, &reverse).await.unwrap());
+            let peer = rldps[1].get_peer(reverse.local(), reverse.other(), true, None).await.unwrap();
+            remembered.push(peer.completed.lock().unwrap().len());
+        }
+        // Same outgoing ID on all three connections: one connection's ACK
+        // must finish only its own part. Real UDP above validates route identity;
+        // this phase drives the normal authenticated handler synchronously.
+        let mut senders = Vec::new();
+        let mut states = Vec::new();
+        for (_, route) in &routes {
+            let peer = rldps[1].get_peer(route.other(), route.local(), true, None).await.unwrap();
+            let (ping, _pong) = tokio::sync::mpsc::unbounded_channel();
+            let (sender, state) = super::SendTransfer::new(vec![42u8; 64].into(), [7; 32], rldps[1].allocated.send_transfers.clone(), ping, true).unwrap();
+            let super::SendTransferState::V2(parts) = &state else { unreachable!() };
+            states.push(parts[0].clone());
+            peer.insert_transfer(&peer.transfers, [7; 32], super::RldpTransfer::sender(state)).unwrap();
+            senders.push(sender);
+        }
+        let ack = serialize_boxed(&rldp2::messagepart::Complete { transfer_id: UInt256::from([7; 32]), part: 0 }.into_boxed()).unwrap();
+        let mut ack_pending = Vec::new();
+        for (index, (_, route)) in routes.iter().enumerate() {
+            let reverse = AdnlPeers::with_keys(route.other().clone(), route.local().clone());
+            for _ in 0..2 {
+                assert!(rldps[1].try_consume_custom(&ack, &reverse).await.unwrap());
+                let finished: Vec<_> = states.iter().map(|state| state.is_finished()).collect();
+                let expected: Vec<_> = (0..3).map(|other| if other <= index { Some(true) } else { None }).collect();
+                assert_eq!(finished, expected, "ACK must affect only its own connection");
+            }
+            ack_pending.push(states.iter().map(|state| usize::from(state.is_finished() != Some(true))).collect::<Vec<_>>());
+        }
+        let actual = serde_json::json!({"delivered":reply.messages.load(Ordering::Acquire),"remembered":remembered,"duplicates_suppressed":reply.messages.load(Ordering::Acquire)==3,"ack_pending":ack_pending});
+        eprintln!("TRANSFER_IDENTITY: {actual}");
+        assert_eq!(actual, transfer_identity_native_effects());
+    }).catch_unwind().await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire), 0);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn transfer_identity_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_transfer_identity_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_transfer_identity_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_transfer_identity_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_transfer_identity_reference.cpp")
                 .as_slice(),
         ),
         (

@@ -433,7 +433,7 @@ async fn rldp_owned_public_v1_v2_cancellation_retains_real_sender() {
                         peer.outbound_semaphore.available_permits(),
                         RldpNode::MAX_OUTBOUNDS_PER_PEER as usize - 1
                     );
-                    assert!(rldp.transfers.iter().next().is_some());
+                    assert!(peer.transfers.iter().next().is_some());
                     assert!(tokio::time::timeout(Duration::from_millis(20), adnl.stop_checked())
                         .await
                         .is_err());
@@ -450,7 +450,7 @@ async fn rldp_owned_public_v1_v2_cancellation_retains_real_sender() {
                     peer.outbound_semaphore.available_permits(),
                     RldpNode::MAX_OUTBOUNDS_PER_PEER as usize
                 );
-                assert!(rldp.transfers.iter().next().is_none());
+                assert!(peer.transfers.iter().next().is_none());
                 if stop == 0 {
                     assert!(returned.unwrap_err().is_cancelled());
                 } else {
@@ -504,12 +504,12 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         }));
         let (transfer, states) = send::owned_test_transfer(2).unwrap();
         let id = [7; 32];
-        rldp.transfers.insert(id, RldpTransfer::Send(SendTransferState::V2(states)));
+        peer.transfers.insert(id, RldpTransfer::sender(SendTransferState::V2(states)));
         let registration = Arc::new(SendRegistration {
             v2: true,
             inbound: None,
             peer: None,
-            transfers: rldp.transfers.clone(),
+            transfers: peer.transfers.clone(),
             send: id,
             receive: None,
             owner: adnl.tasks().clone(),
@@ -540,7 +540,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             },
         };
         let work_peer = peer.clone();
-        let transfers = rldp.transfers.clone();
+        let transfers = peer.transfers.clone();
         adnl.tasks().spawn_admitted(
             "test real send job",
             adnl.tasks().enter().unwrap(),
@@ -553,7 +553,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             assert!(matches!(receipt.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
             assert_eq!(peer.outbound_semaphore.available_permits(), 2);
             assert_eq!(peer.transfer_slots.available_permits(), 255);
-            assert!(rldp.transfers.get(&id).is_some());
+            assert!(peer.transfers.get(&id).is_some());
             assert!(tokio::time::timeout(Duration::from_millis(20), adnl.stop_checked())
                 .await
                 .is_err());
@@ -586,7 +586,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         }
         assert_eq!(peer.outbound_semaphore.available_permits(), 3);
         assert_eq!(peer.transfer_slots.available_permits(), 256);
-        assert!(rldp.transfers.get(&id).is_none());
+        assert!(peer.transfers.get(&id).is_none());
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
@@ -867,12 +867,12 @@ async fn retirement_joins_before_reuse(fill_table: bool) {
             admission = None;
             panic!("retirement must not reuse a slot while its actual FEC still runs");
         }
-        assert!(rldp.transfers.iter().next().is_some(), "retain registration until real join");
+        assert!(peer.transfers.iter().next().is_some(), "retain registration until real join");
         gate.release();
         let replacement = bounded(admission.as_mut().unwrap()).await.unwrap().unwrap();
         admission = None;
         assert!(!replacement.closed.is_cancelled());
-        assert!(rldp.transfers.iter().next().is_none());
+        assert!(peer.transfers.iter().next().is_none());
     })
     .catch_unwind()
     .await;
@@ -931,16 +931,16 @@ async fn rldp_old_inbound_expiry_preserves_reopened_registration() {
     let old = rldp.get_peer(local.id(), local.id(), true, Some(now)).await.unwrap();
     let id = [94; 32];
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    old.insert_transfer(&rldp.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    old.insert_transfer(&old.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
     rldp.peers.expire(now + Duration::from_secs(120));
     let fresh = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
     assert!(old.drained.is_cancelled());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    fresh.insert_transfer(&rldp.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    fresh.insert_transfer(&fresh.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
     // The old timer's completion can already be in flight on another worker.
     // Its final mutation must be serialized with close and generation cleanup.
     super::super::expire_inbound_transfer(
-        rldp.transfers.clone(),
+        old.transfers.clone(),
         id,
         adnl.tasks().clone(),
         async {},
@@ -949,7 +949,7 @@ async fn rldp_old_inbound_expiry_preserves_reopened_registration() {
     )
     .await;
     let preserved =
-        matches!(rldp.transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Recv(_));
+        matches!(fresh.transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Recv(_));
     bounded(adnl.stop_checked()).await.unwrap();
     assert!(preserved, "old inbound expiry overwrote the reopened connection's registration");
 }
@@ -966,7 +966,7 @@ async fn rldp_completed_id_reuse_is_safe_from_old_expiry_and_drop() {
         v2: true,
         inbound: Some((id, finished.clone())),
         peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
-        transfers: rldp.transfers.clone(),
+        transfers: peer.transfers.clone(),
         send: id,
         receive: None,
         owner: adnl.tasks().clone(),
@@ -977,13 +977,13 @@ async fn rldp_completed_id_reuse_is_safe_from_old_expiry_and_drop() {
     for value in 0..2048u32 {
         let mut other = [0; 32];
         other[..4].copy_from_slice(&value.to_le_bytes());
-        peer.finish_inbound(&rldp.transfers, other, &CancellationToken::new(), now);
+        peer.finish_inbound(&peer.transfers, other, &CancellationToken::new(), now);
     }
-    assert!(rldp.transfers.get(&id).is_none());
+    assert!(peer.transfers.get(&id).is_none());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    peer.insert_transfer(&rldp.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    peer.insert_transfer(&peer.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
     super::super::expire_inbound_transfer(
-        rldp.transfers.clone(),
+        peer.transfers.clone(),
         id,
         adnl.tasks().clone(),
         async {},
@@ -993,7 +993,7 @@ async fn rldp_completed_id_reuse_is_safe_from_old_expiry_and_drop() {
     .await;
     drop(registration);
     let preserved =
-        matches!(rldp.transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Recv(_));
+        matches!(peer.transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Recv(_));
     bounded(adnl.stop_checked()).await.unwrap();
     assert!(preserved, "old completed registration overwrote a reused inbound ID");
     assert!(peer.registrations.lock().unwrap().is_empty());
@@ -1013,33 +1013,69 @@ async fn rldp_completed_id_expiration_preserves_native_floor() {
         id
     };
     for value in 0..129 {
-        peer.finish_inbound(&rldp.transfers, key(value), &CancellationToken::new(), now);
+        peer.finish_inbound(&peer.transfers, key(value), &CancellationToken::new(), now);
     }
     peer.finish_inbound(
-        &rldp.transfers,
+        &peer.transfers,
         key(129),
         &CancellationToken::new(),
         now + Duration::from_secs(20) - Duration::from_nanos(1),
     );
     assert_eq!(peer.completed.lock().unwrap().len(), 130);
     peer.finish_inbound(
-        &rldp.transfers,
+        &peer.transfers,
         key(130),
         &CancellationToken::new(),
         now + Duration::from_secs(20),
     );
     assert_eq!(peer.completed.lock().unwrap().len(), 128);
     for value in 0..3 {
-        assert!(rldp.transfers.get(&key(value)).is_none());
+        assert!(peer.transfers.get(&key(value)).is_none());
     }
-    assert!(rldp.transfers.get(&key(3)).is_some());
+    assert!(peer.transfers.get(&key(3)).is_some());
     peer.finish_inbound(
-        &rldp.transfers,
+        &peer.transfers,
         key(131),
         &CancellationToken::new(),
         now + Duration::from_secs(100),
     );
     assert_eq!(peer.completed.lock().unwrap().len(), 128);
-    assert!(rldp.transfers.get(&key(3)).is_none());
+    assert!(peer.transfers.get(&key(3)).is_none());
     bounded(adnl.stop_checked()).await.unwrap();
+}
+
+#[tokio::test]
+async fn rldp_retired_sender_releases_state_with_pinned_map_reader() {
+    use super::super::{RldpTransfer, SendTransfer};
+    let owner = AdnlTasks::new();
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let transfers = Arc::new(lockfree::map::Map::new());
+    let id = [91; 32];
+    let (ping, _pong) = tokio::sync::mpsc::unbounded_channel();
+    let (transfer, state) =
+        SendTransfer::new(vec![42u8; 64].into(), id, counter.clone(), ping, true).unwrap();
+    transfers.insert(id, RldpTransfer::sender(state));
+    let registration = SendRegistration {
+        v2: true,
+        inbound: None,
+        peer: None,
+        transfers: transfers.clone(),
+        send: id,
+        receive: None,
+        owner: owner.clone(),
+        bounded_permit: None,
+    };
+    let reader = transfers.get(&id).unwrap();
+    assert_eq!(counter.load(Ordering::Acquire), 1);
+    drop(transfer);
+    drop(registration);
+    assert!(transfers.get(&id).is_none());
+    assert_eq!(
+        counter.load(Ordering::Acquire),
+        0,
+        "retired map entry must not retain sender state after actual owners drain"
+    );
+    drop(reader);
+    owner.close();
+    owner.wait().await.unwrap();
 }

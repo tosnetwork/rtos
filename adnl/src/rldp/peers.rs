@@ -231,9 +231,26 @@ impl PeerTable {
         self.wake.notify_one();
         Ok(peer)
     }
+    pub(super) fn find_v2(&self, local: &Arc<KeyId>, remote: &Arc<KeyId>) -> Option<Arc<RldpPeer>> {
+        self.state
+            .lock()
+            .unwrap()
+            .v2
+            .get(&(local.clone(), remote.clone()))
+            .filter(|entry| !entry.peer.closed.is_cancelled())
+            .map(|entry| entry.peer.clone())
+    }
     fn create(&self, permit: Option<OwnedSemaphorePermit>) -> Result<Arc<RldpPeer>> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let transfers = if permit.is_some() {
+            // Keep the existing node-wide reclamation domain while isolating keys.
+            // Independent idle collectors can retain retired sender state in worker TLS.
+            Arc::new(lockfree::map::Map::with_incin(self.transfers.incin()))
+        } else {
+            self.transfers.clone()
+        };
         let peer = Arc::new(RldpPeer {
+            transfers: transfers.clone(),
             outbound_semaphore: Arc::new(Semaphore::new(RldpNode::MAX_OUTBOUNDS_PER_PEER as usize)),
             transfer_slots: Arc::new(Semaphore::new(256)),
             tx,
@@ -253,7 +270,6 @@ impl PeerTable {
         let registrations = peer.registrations.clone();
         #[cfg(test)]
         let idle = peer.idle.clone();
-        let transfers = self.transfers.clone();
         let pool = self.pool.clone();
         let min_timeout_ms = self.min_timeout_ms;
         let owner = self.adnl.tasks().clone();
@@ -291,6 +307,9 @@ impl PeerTable {
             while tasks.next().await.is_some() {}
             let mut ids = registrations.lock().unwrap();
             for id in ids.drain() {
+                if let Some(entry) = transfers.get(&id) {
+                    entry.val().release_v2_sender();
+                }
                 transfers.remove(&id);
             }
             if let Some(peer) = weak.upgrade() {
@@ -366,6 +385,11 @@ impl RldpPeer {
             return Err(SendCancelled::PeerEvicted.into());
         }
         let (value, result) = create()?;
+        if matches!(value, RldpTransfer::Done) {
+            if let Some(entry) = transfers.get(&id) {
+                entry.val().release_v2_sender();
+            }
+        }
         transfers.insert(id, value);
         ids.insert(id);
         Ok(result)

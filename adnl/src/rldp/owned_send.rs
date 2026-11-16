@@ -425,6 +425,9 @@ impl Drop for SendRegistration {
         // participate in replay suppression; no sender tombstone or timer is needed.
         if self.v2 {
             with_live_peer(&self.peer, |ids| {
+                if let Some(entry) = self.transfers.get(&self.send) {
+                    entry.val().release_v2_sender();
+                }
                 self.transfers.remove(&self.send);
                 if let Some(ids) = ids {
                     ids.remove(&self.send);
