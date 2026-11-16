@@ -66,14 +66,18 @@ struct ResponsePackets {
     part_one_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
+    handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
+    processed_parts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
 impl Subscriber for ResponsePackets {
-    async fn try_consume_custom(&self, bytes: &[u8], _: &AdnlPeers) -> Result<bool> {
+    async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
+        let mut is_data_part = false;
         if let Ok(message) = deserialize_boxed(bytes) {
             if let Ok(part) = message.downcast::<rldp2::MessagePart>() {
                 match part {
                     rldp2::MessagePart::Rldp2_MessagePart(part) => {
+                        is_data_part = true;
                         self.transfers
                             .lock()
                             .unwrap()
@@ -91,6 +95,17 @@ impl Subscriber for ResponsePackets {
                     _ => {}
                 }
             }
+        }
+        // In tests requiring a negative state assertion, acknowledge processing only
+        // after the real handler returns. Consume here to prevent double dispatch.
+        let handler = self.handler.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
+        if let Some(handler) = handler {
+            let consumed = handler.try_consume_custom(bytes, peers).await?;
+            if is_data_part {
+                assert!(consumed, "real RLDP handler must consume the test packet");
+                self.processed_parts.fetch_add(1, Ordering::Release);
+            }
+            return Ok(consumed);
         }
         Ok(false) // Observe authenticated packets, then let the real receiver handle them.
     }
@@ -2234,6 +2249,7 @@ async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
         let total: i64 = fields[2].parse().unwrap();
         let bytes: usize = fields[3].parse().unwrap();
         let (reply, packets, nodes, rldps, peers) = pair().await;
+        *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
         let outcome = std::panic::AssertUnwindSafe(async {
             let replay = name == "completed_replay";
             let (sender, receiver, route) = if replay { (0,1,peers.clone()) }
@@ -2245,19 +2261,16 @@ async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
                 tokio::time::timeout(Duration::from_secs(2), async {
                     while reply.messages.load(Ordering::Acquire) != 1 { reply.message_received.notified().await; }
                 }).await.expect("warm message must actually deliver");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                eprintln!("GEOMETRY_WARM_COMPLETE_PACKETS {}", packets.complete_packets.load(Ordering::Acquire));
             }
             send(&nodes[sender], &route, part, total, &vec![42;bytes]).await;
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let observed = if replay { packets.part_one_completions.load(Ordering::Acquire)>0 }
-                        else { !packets.transfers.lock().unwrap().is_empty() };
+                        else { packets.processed_parts.load(Ordering::Acquire)>0 };
                     if observed { break; }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }).await.expect("input or completed-ID replay acknowledgement must reach the authenticated receiver");
-            tokio::time::sleep(Duration::from_millis(100)).await;
             let inbound = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Recv(_))).count();
             let completed = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Done)).count();
             serde_json::json!({"id":name,"inbound":inbound,"completed":completed,"replay_complete_packets":packets.part_one_completions.load(Ordering::Acquire)})
