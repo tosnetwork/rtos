@@ -348,6 +348,7 @@ impl RldpPeer {
         id: TransferId,
         valid_geometry: bool,
         first_part: bool,
+        within_default_mtu: bool,
     ) -> Result<bool> {
         let _ids = self.registrations.lock().unwrap();
         if self.closed.is_cancelled() {
@@ -362,6 +363,11 @@ impl RldpPeer {
             return Ok(true);
         }
         if !valid_geometry {
+            return Ok(false);
+        }
+        // A local query registration has its own receive limit. Otherwise
+        // native rejects over-MTU packets before creating transport state.
+        if !within_default_mtu && self.inbound_transfers.get(&id).is_none() {
             return Ok(false);
         }
         let mut active = self.inbound_active.lock().unwrap();
