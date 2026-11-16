@@ -3146,6 +3146,13 @@ async fn rldp2_sequence_error_lifetime_matches_native() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_sequence_decoder_error_reaches_query_caller() {
+    check_sequence_decoder_error_reaches_query_caller(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_connection_sequence_decoder_error_reaches_query_caller() {
+    check_sequence_decoder_error_reaches_query_caller(true).await;
+}
+async fn check_sequence_decoder_error_reaches_query_caller(use_native: bool) {
     use rtos_api::{IntoBoxed, RldpChunk};
     // Native RldpIn::receive_message forwards the transport error to the
     // matching query promise; it must not become a successful empty reply.
@@ -3155,7 +3162,14 @@ async fn rldp2_sequence_decoder_error_reaches_query_caller() {
             ["errors"],
         1
     );
-    let (reply, _, nodes, rldps, peers) = pair().await;
+    let remote = Arc::new(ResponsePackets::default());
+    let (reply, _packets, nodes, rldps, peers) =
+        topology_with_remote_observer(2, Some(remote.clone())).await;
+    if use_native {
+        for node in &rldps {
+            node.peers.enable_native_for_tests();
+        }
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         reply.hold.store(true, Ordering::Release);
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
@@ -3170,12 +3184,22 @@ async fn rldp2_sequence_decoder_error_reaches_query_caller() {
                 .await
                 .expect("real query must reach held subscriber");
             let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
-            let id = *peer
-                .inbound_transfers
-                .iter()
-                .find(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
-                .expect("query must register its answer transfer")
-                .key();
+            assert_eq!(peer.native.get().is_some(), use_native);
+            // Observe the actual authenticated outgoing request instead of
+            // reading the old implementation's private receive map.
+            let id = {
+                let transfers = remote.transfers.lock().unwrap();
+                assert_eq!(transfers.len(), 1);
+                let request: [u8; 32] =
+                    transfers.iter().next().unwrap().as_slice().try_into().unwrap();
+                request.map(|byte| byte ^ 0xff)
+            };
+            if !use_native {
+                assert!(peer
+                    .inbound_transfers
+                    .get(&id)
+                    .is_some_and(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_))));
+            }
             let encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
             let chunk = RldpChunk {
                 transfer_id: id.into(),
@@ -3205,10 +3229,21 @@ async fn rldp2_sequence_decoder_error_reaches_query_caller() {
                 .await
                 .expect("decoder error must resolve query before its deadline");
         let error = result.expect_err("native decoder errors must propagate to the query caller");
-        assert!(
-            error.to_string().contains("24 bits"),
-            "expected the actual decoder sequence error, got {error}"
-        );
+        if use_native {
+            // TOS/TON Decoder::add_symbol rejects id >= 2^24 ("Too big
+            // symbol id"). The Connection preserves our typed equivalent;
+            // the legacy decoder below uses a different diagnostic string.
+            assert_eq!(
+                error.downcast_ref::<crate::fec::Refusal>().map(|reason| reason.0),
+                Some("symbol_id_range"),
+                "expected the actual decoder sequence error, got {error}"
+            );
+        } else {
+            assert!(
+                error.to_string().contains("24 bits"),
+                "expected the actual decoder sequence error, got {error}"
+            );
+        }
     })
     .catch_unwind()
     .await;
@@ -4112,6 +4147,13 @@ async fn native_application_is_joined_by_node_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_answer_envelope_id_does_not_override_authenticated_transfer() {
+    check_answer_envelope_id_does_not_override_authenticated_transfer(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_connection_answer_envelope_id_does_not_override_authenticated_transfer() {
+    check_answer_envelope_id_does_not_override_authenticated_transfer(true).await;
+}
+async fn check_answer_envelope_id_does_not_override_authenticated_transfer(use_native: bool) {
     use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_answer_envelope_context.tsv").trim(),
@@ -4123,7 +4165,14 @@ async fn rldp2_answer_envelope_id_does_not_override_authenticated_transfer() {
         include_bytes!("../../../ci/conformance/rldp2_answer_envelope_reference.cpp"),
         include_bytes!("../../../ci/conformance/rldp2_answer_envelope_metadata.json"),
     );
-    let (reply, packets, nodes, rldps, peers) = pair().await;
+    let remote = Arc::new(ResponsePackets::default());
+    let (reply, packets, nodes, rldps, peers) =
+        topology_with_remote_observer(2, Some(remote.clone())).await;
+    if use_native {
+        for node in &rldps {
+            node.peers.enable_native_for_tests();
+        }
+    }
     *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
     reply.hold.store(true, Ordering::Release);
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -4138,9 +4187,18 @@ async fn rldp2_answer_envelope_id_does_not_override_authenticated_transfer() {
         let inject = async {
             tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
             let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
-            let id = *peer.inbound_transfers.iter()
-                .find(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_)))
-                .expect("query response must be registered").key();
+            assert_eq!(peer.native.get().is_some(), use_native);
+            // Observe the actual authenticated outgoing request instead of
+            // reading the old implementation's private receive map.
+            let id = {
+                let transfers = remote.transfers.lock().unwrap();
+                assert_eq!(transfers.len(), 1);
+                let request: [u8; 32] = transfers.iter().next().unwrap().as_slice().try_into().unwrap();
+                request.map(|byte| byte ^ 0xff)
+            };
+            if !use_native {
+                assert!(peer.inbound_transfers.get(&id).is_some_and(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_))));
+            }
             let answer = serialize_boxed(&rldp::message::Answer {
                 query_id: UInt256::default(), data: vec![42; 64],
             }.into_boxed()).unwrap();
