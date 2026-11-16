@@ -119,8 +119,32 @@ async fn native_query_churn_bounds_completed_cache_and_retires_sender_ids() {
         let request=TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0};
         let started=tokio::time::Instant::now();
         for index in 0..2049 {
-            let (answer,_)=rldps[0].query(&request,Some(1024),&route,true,None).await.unwrap_or_else(|error|panic!("native query {index} failed: {error}"));
+            let (answer,_)=match rldps[0].query(&request,Some(1024),&route,true,None).await {
+                Ok(answer)=>answer,
+                Err(error)=>{
+                    eprintln!("NATIVE_QUERY_FAILURE index={index} elapsed_ms={} calls={} response_started={} response_handlers={}",started.elapsed().as_millis(),reply.calls.load(Ordering::Acquire),rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire),rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire));
+                    for (side,native) in natives.iter().enumerate() {
+                        let state=tokio::time::timeout(Duration::from_secs(5),inspect(native)).await;
+                        let submissions=native.query_send_results.lock().unwrap().clone();
+                        eprintln!("NATIVE_QUERY_FAILURE side={side} state={state:?} completed={} failed={} waiters={:?} retired={} submitted={} refused={} last={:?}",native.completed_sends.load(Ordering::Acquire),native.failed_send_ids.lock().unwrap().len(),native.waiter_counts(),native.retired_registrations.load(Ordering::Acquire),submissions.len(),submissions.iter().filter(|(_,ok)|!*ok).count(),submissions.last());
+                    }
+                    panic!("native query {index} failed: {error}");
+                }
+            };
             assert_eq!(answer,Some(vec![42;64]));
+            // The native retirement vector waits for on_sent and outbound=0
+            // before its next transfer. API answer delivery is earlier than
+            // request ACK/registration retirement; pacing by answers alone
+            // can fill the legitimate 256 outbound slots on a slower runner.
+            for (side,native) in natives.iter().enumerate() {
+                tokio::time::timeout(Duration::from_secs(5),async {
+                    while native.completed_sends.load(Ordering::Acquire)!=index as u64+1
+                        || (side==0 && native.retired_registrations.load(Ordering::Acquire)!=index as u64+1) {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("each iteration must retire actual senders before the next native-vector transfer");
+                assert_eq!(inspect(native).await.1,0);
+            }
             if [0,127,128,2047,2048].contains(&index) {
                 for native in &natives {assert_eq!(inspect(native).await.2,(index+1).min(2048));}
             }
