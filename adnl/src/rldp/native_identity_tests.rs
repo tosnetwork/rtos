@@ -313,10 +313,10 @@ fn native_global_decoder_budget_preserves_solicited_capacity() {
     if std::env::var_os(CHILD).is_none() {
         // The production budget is process-global. A fresh process excludes
         // other parallel fixtures without replacing it with a smaller budget.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_process::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "rldp::lifetime_tests::native_identity_tests::native_global_decoder_budget_preserves_solicited_capacity", "--nocapture"])
             .env(CHILD, "1")
-            .output().unwrap();
+            ).unwrap();
         print!("{}", String::from_utf8_lossy(&output.stdout));
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(

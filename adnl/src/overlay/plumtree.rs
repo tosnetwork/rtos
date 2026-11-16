@@ -1709,6 +1709,7 @@ mod transport_tests {
         endpoint_with_profile(seed, rtos_api::WireProfile::Legacy).await
     }
     async fn endpoint_with_profile(seed: u8, profile: rtos_api::WireProfile) -> Endpoint {
+        let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
@@ -2864,7 +2865,10 @@ mod reference_interop {
         fs::write(dir.join("rust-trailing.tl"), trailing).unwrap();
         manifest.push_str(&format!("rust-trailing.tl {} 0 0 0\n", hex::encode(simple_key.id)));
         fs::write(dir.join("rust-cases.txt"), manifest).unwrap();
-        let output = Command::new(runner).env("RTOS_PLUMTREE_INTEROP_DIR", &dir).output().unwrap();
+        let output = crate::test_process::output(
+            Command::new(runner).env("RTOS_PLUMTREE_INTEROP_DIR", &dir),
+        )
+        .unwrap();
         fs::write(dir.join("reference.stdout"), &output.stdout).unwrap();
         fs::write(dir.join("reference.stderr"), &output.stderr).unwrap();
         assert!(

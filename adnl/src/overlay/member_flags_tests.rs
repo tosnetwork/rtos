@@ -29,6 +29,7 @@ fn reference() -> HashMap<String, (u32, u32)> {
 }
 
 async fn node(seed: u8) -> (Arc<AdnlNode>, Arc<OverlayNode>) {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);

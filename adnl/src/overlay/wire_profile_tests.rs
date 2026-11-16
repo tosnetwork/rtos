@@ -89,6 +89,7 @@ fn free_address() -> SocketAddr {
     UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
 }
 async fn endpoint(seed: u8, profile: WireProfile) -> Endpoint {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let udp = free_address();
     let quic_addr = free_address();
     let (_, config) =

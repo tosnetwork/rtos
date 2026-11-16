@@ -5,9 +5,9 @@ use super::{native_identity_tests::inspect, *};
 fn native_byte_limits_and_solver_recovery() {
     const CHILD: &str = "RTOS_BYTE_BUDGET_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_process::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "rldp::lifetime_tests::native_byte_budget_tests::native_byte_limits_and_solver_recovery", "--nocapture"])
-            .env(CHILD, "1").output().unwrap();
+            .env(CHILD, "1")).unwrap();
         print!("{}", String::from_utf8_lossy(&output.stdout));
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(

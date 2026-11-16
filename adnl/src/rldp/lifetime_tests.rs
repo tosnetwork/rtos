@@ -274,6 +274,7 @@ async fn topology_configured(
     for index in 0..count {
         let mut attempts = 0;
         let (node, rldp) = loop {
+            let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys(
                 &socket.local_addr().unwrap().to_string(),

@@ -9,9 +9,9 @@ use super::{
 fn native_multipart_retention_assembly_and_retirement() {
     const CHILD: &str = "RTOS_MULTIPART_BUDGET_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let output=std::process::Command::new(std::env::current_exe().unwrap())
+        let output= crate::test_process::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","rldp::lifetime_tests::native_multipart_budget_tests::native_multipart_retention_assembly_and_retirement","--nocapture"])
-            .env(CHILD,"1").output().unwrap();
+            .env(CHILD,"1")).unwrap();
         print!("{}", String::from_utf8_lossy(&output.stdout));
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(

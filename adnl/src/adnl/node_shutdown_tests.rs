@@ -104,6 +104,7 @@ async fn started_tcp_node_with(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let mut held_tcp = None;
     let mut first_port = 0;
     let mut first_owner = None;
@@ -141,6 +142,7 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_tcp_fixture_does_not_retry_non_bind_startup_failure() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     for close_owner in [true, false] {
         let mut attempts = 0;
         let mut owner = None;
@@ -265,6 +267,7 @@ fn tcp_released(port: u16) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_udp_stop_releases_socket_and_node() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(41).await;
     node.start_over_udp(Vec::new()).await.unwrap_or_else(|error| {
         udp_port_diagnostic(port, "startup");
@@ -295,6 +298,7 @@ impl Subscriber for HeldPoll {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_udp_stop_waiter_cancel_and_concurrent_drain() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(42).await;
     let poll = Arc::new(HeldPoll {
         entered: Notify::new(),
@@ -341,6 +345,7 @@ impl Subscriber for PanicPoll {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_async_panic_closes_transport_and_is_sticky() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(43).await;
     let poll = Arc::new(PanicPoll { release: Notify::new() });
     node.start_over_udp(vec![poll.clone()]).await.unwrap_or_else(|error| {
@@ -368,6 +373,7 @@ impl AdnlReceiver for PanicReceiver {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_receiver_thread_panic_is_joined() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(44).await;
     let started = node
         .start(
@@ -391,6 +397,7 @@ async fn adnl_owned_receiver_thread_panic_is_joined() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_tcp_accept_and_udp_are_joined() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = started_tcp_node(45).await.unwrap();
     let peer = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     bounded(node.stop_checked()).await.unwrap();
@@ -435,6 +442,7 @@ impl Subscriber for PendingSubscriber {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_real_udp_pending_child_after_close_drains() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, port) = node(46).await;
     let (client, _) = node(47).await;
     let pending = Arc::new(PendingSubscriber {
@@ -485,6 +493,7 @@ async fn adnl_owned_real_udp_pending_child_after_close_drains() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_thread_join_survives_all_waiters_cancelled() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let owner = AdnlTasks::new();
     let (release, hold) = std::sync::mpsc::channel();
     let (entered, ready) = oneshot::channel();
@@ -543,6 +552,7 @@ impl AdnlSender for PanicSender {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(48).await;
     node.start(
         |node| {
@@ -568,6 +578,7 @@ async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let mut previous_owner: Option<std::sync::Weak<AdnlNode>> = None;
     for attempt in 0..8 {
         if let Some(previous) = &previous_owner {
@@ -625,6 +636,7 @@ async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, server_port) = started_tcp_node(50).await.unwrap();
     let (client, client_port) = started_tcp_node(51).await.unwrap();
     let local = client.key_by_tag(0).unwrap();
@@ -669,6 +681,7 @@ async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
 
 #[tokio::test]
 async fn adnl_owned_pipeline_stop_between_reservation_and_admission() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, _) = node(52).await;
     let pipeline = Arc::new(RecvPipeline::with_params(node.clone(), Arc::new(Vec::new())));
     let reservation = pipeline.reserve_worker().unwrap();
@@ -692,6 +705,7 @@ impl Subscriber for PanicCustom {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_pipeline_panic_returns_worker_and_processing_counts() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, port) = node(53).await;
     let (client, _) = node(54).await;
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
