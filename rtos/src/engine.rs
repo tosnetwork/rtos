@@ -1119,7 +1119,7 @@ impl Engine {
                     }
                 }
                 if let Some(db) = opened_db.take() {
-                    if let Err(error) = db.stop_states_db().await {
+                    if let Err(error) = db.stop_storage().await {
                         rollback_stopper
                             .report_service_failure(0, format!("DB rollback drain: {error}"));
                     }
@@ -1438,6 +1438,9 @@ impl Engine {
         // writes before releasing the Engine/database owner.
         if let Err(error) = self.persistence_tasks.wait().await {
             self.stopper.report_service_failure(0, format!("top shard persistence: {error}"));
+        }
+        if let Err(error) = self.db.stop_handle_writer().await {
+            self.stopper.report_service_failure(0, format!("DB handle writer drain: {error}"));
         }
         if let Err(error) = self.network.stop_adnl().await {
             self.stopper.report_service_failure(0, format!("node network shutdown: {error}"));
