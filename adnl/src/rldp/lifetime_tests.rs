@@ -1437,3 +1437,105 @@ fn transfer_identity_native_effects() -> serde_json::Value {
     }
     serde_json::from_slice(effects).unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_replayed_query_does_not_replace_active_response() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_outbound_id_reuse_context.tsv").trim(),
+        "64\t65\t60"
+    );
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    fn wire(data: &[u8], id: [u8; 32]) -> Vec<u8> {
+        let mut encoder = crate::RaptorqEncoder::with_data(data, None);
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from(id),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: data.len() as i64,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: seqno as i32,
+        };
+        serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap()
+    }
+    let (reply, packets, nodes, rldps, peers) = pair().await;
+    packets.drop_parts.store(true, Ordering::Release);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let request = serialize_boxed(&rldp::message::Query { query_id: UInt256::from([9;32]), max_answer_size: 1024, timeout: super::Version::get()+60, data: serialize_boxed(&Query { overlay: UInt256::default() }).unwrap() }.into_boxed()).unwrap();
+        let request = wire(&request, [248;32]);
+        fn tagged(bytes: &[u8]) -> TaggedByteSlice<'_> { TaggedByteSlice { object: bytes, #[cfg(feature = "telemetry")] tag: 0 } }
+        nodes[0].send_custom(&tagged(&request), &peers).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) != 1 || packets.transfers.lock().unwrap().len() != 1 { tokio::task::yield_now().await; }
+        }).await.expect("original response must reach the wire and remain unacknowledged");
+        let reverse = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let peer = rldps[1].get_peer(reverse.local(), reverse.other(), true, None).await.unwrap();
+        let original = rldps[1].get_v2_state(&[7;32], 0, &reverse).unwrap();
+        assert_eq!(original.is_finished(), None);
+        let before = rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire);
+        let churn = serialize_boxed(&rldp::message::Message { id: UInt256::default(), data: b"churn".to_vec() }.into_boxed()).unwrap();
+        for value in 0..2048u32 {
+            let mut id = [0;32]; id[..4].copy_from_slice(&value.to_le_bytes());
+            let chunk = wire(&churn, id);
+            nodes[0].send_custom(&tagged(&chunk), &peers).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while reply.messages.load(Ordering::Acquire) != value as usize + 1 { reply.message_received.notified().await; }
+            }).await.unwrap();
+        }
+        assert!(!peer.completed.lock().unwrap().iter().any(|(id,_)| *id == [248;32]));
+        assert_eq!(original.is_finished(), None, "original response must still be active before replay");
+        reply.response_bytes.store(65, Ordering::Release);
+        nodes[0].send_custom(&tagged(&request), &peers).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reply.calls.load(Ordering::Acquire) != 2 ||
+                (rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) == 1 && rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) < 2049) { tokio::task::yield_now().await; }
+        }).await.expect("replayed query must attempt a response or finish refusing it");
+        let after = rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire);
+        eprintln!("OUTBOUND_ID_REUSE: started_before={before} started_after_replay={after}");
+        assert_eq!(after, 1, "native refuses duplicate active outbound ID before creating a replacement");
+        assert!(Arc::ptr_eq(&original, &rldps[1].get_v2_state(&[7;32],0,&reverse).unwrap()));
+        let ack = serialize_boxed(&rldp2::messagepart::Complete { transfer_id: UInt256::from([7;32]), part: 0 }.into_boxed()).unwrap();
+        assert!(rldps[1].try_consume_custom(&ack,&reverse).await.unwrap());
+        assert_eq!(original.is_finished(),Some(true));
+        let completed = u64::from(original.is_finished()==Some(true));
+        drop(original);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].allocated.send_transfers.load(Ordering::Acquire) != 0 || peer.transfer_slots.available_permits()!=256 { tokio::task::yield_now().await; }
+        }).await.expect("original response must still ACK and drain");
+        let actual=serde_json::json!({"started_before":before,"started_after_replay":after,"completed":completed,"retained":rldps[1].allocated.send_transfers.load(Ordering::Acquire)});
+        eprintln!("OUTBOUND_ID_REUSE_EFFECTS: {actual}");
+        assert_eq!(actual,outbound_id_reuse_native_effects());
+    }).catch_unwind().await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn outbound_id_reuse_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_outbound_id_reuse_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_outbound_id_reuse_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_outbound_id_reuse_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_outbound_id_reuse_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}

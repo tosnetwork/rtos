@@ -1171,11 +1171,19 @@ impl RldpNode {
         if response_deadline.is_some_and(|at| std::time::Instant::now() >= at) {
             return Ok(None);
         }
-        let send_transfer = peer.insert_transfer_with(&transfers, send_transfer_id, || {
+        let create = || {
             let (transfer, state) =
                 SendTransfer::new(data, send_transfer_id, send_counter.clone(), ping, v2)?;
             Ok((RldpTransfer::sender(state), transfer))
-        })?;
+        };
+        let send_transfer = if v2 {
+            let Some(transfer) = peer.try_insert_outbound_with(send_transfer_id, create)? else {
+                return Ok(None);
+            };
+            transfer
+        } else {
+            peer.insert_transfer_with(&transfers, send_transfer_id, create)?
+        };
         #[cfg(feature = "telemetry")]
         send_metric.update(send_counter.load(Ordering::Relaxed));
         #[cfg(test)]
@@ -1337,14 +1345,7 @@ impl RldpNode {
                 Err(_) => {
                     // Native silently drops a send at capacity. A query still
                     // completes at its original deadline, without a retry.
-                    if let Some(deadline) = query_deadline {
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(deadline) => return Err(RldpQueryTimeout.into()),
-                            _ = control.cancelled() => { control.check()?; unreachable!() },
-                            _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
-                        }
-                    }
-                    return Ok((None, peer.stats.v1.roundtrip()));
+                    return self.refused_outbound(query_deadline, &control, &peer).await;
                 }
             }
         } else {
@@ -1359,20 +1360,27 @@ impl RldpNode {
         let (ping, pong) = tokio::sync::mpsc::unbounded_channel();
         let total_to_send = data.len();
         let send_transfer_id: TransferId = rand::thread_rng().gen();
-        let (send_transfer, send_transfer_state) = SendTransfer::new(
-            data,
-            send_transfer_id.clone(),
-            self.allocated.send_transfers.clone(),
-            ping,
-            v2,
-        )?;
+        let create = || {
+            let (transfer, state) = SendTransfer::new(
+                data,
+                send_transfer_id,
+                self.allocated.send_transfers.clone(),
+                ping,
+                v2,
+            )?;
+            Ok((RldpTransfer::sender(state), transfer))
+        };
+        let send_transfer = if v2 {
+            let Some(transfer) = peer.try_insert_outbound_with(send_transfer_id, create)? else {
+                drop(admission);
+                return self.refused_outbound(query_deadline, &control, &peer).await;
+            };
+            transfer
+        } else {
+            peer.insert_transfer_with(&peer.transfers, send_transfer_id, create)?
+        };
         #[cfg(feature = "telemetry")]
         self.telemetry.send_transfers.update(self.allocated.send_transfers.load(Ordering::Relaxed));
-        peer.insert_transfer(
-            &peer.transfers,
-            send_transfer_id,
-            RldpTransfer::sender(send_transfer_state),
-        )?;
         let (recv_context, recv_transfer_id) = if query_id.is_some() {
             let mut recv_transfer_id = send_transfer_id;
             for x in &mut recv_transfer_id {
@@ -1603,6 +1611,22 @@ impl RldpNode {
         } else {
             Ok((None, peer.stats.v1.roundtrip()))
         }
+    }
+
+    async fn refused_outbound(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        control: &SendControl,
+        peer: &RldpPeer,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return Err(RldpQueryTimeout.into()),
+                _ = control.cancelled() => { control.check()?; unreachable!() },
+                _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+            }
+        }
+        Ok((None, peer.stats.v1.roundtrip()))
     }
 
     async fn outbound_loop(

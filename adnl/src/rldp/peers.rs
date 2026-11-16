@@ -374,6 +374,25 @@ impl RldpPeer {
     ) -> Result<()> {
         self.insert_transfer_with(transfers, id, || Ok((value, ())))
     }
+    pub(super) fn try_insert_outbound_with<T>(
+        &self,
+        id: TransferId,
+        create: impl FnOnce() -> Result<(RldpTransfer, T)>,
+    ) -> Result<Option<T>> {
+        let mut ids = self.registrations.lock().unwrap();
+        if self.closed.is_cancelled() {
+            return Err(SendCancelled::PeerEvicted.into());
+        }
+        // Native send() ignores an already active outbound ID before creating
+        // its replacement's encoder or timeout registration.
+        if self.transfers.get(&id).is_some_and(|entry| entry.val().sender_state().is_some()) {
+            return Ok(None);
+        }
+        let (value, result) = create()?;
+        self.transfers.insert(id, value);
+        ids.insert(id);
+        Ok(Some(result))
+    }
     pub(super) fn insert_transfer_with<T>(
         &self,
         transfers: &lockfree::map::Map<TransferId, RldpTransfer>,
