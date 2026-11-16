@@ -23,6 +23,7 @@ use std::{
 
 #[derive(Default)]
 struct HeldReply {
+    runtime_pattern: AtomicBool,
     concurrent_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     messages: std::sync::atomic::AtomicUsize,
     message_received: tokio::sync::Notify,
@@ -47,7 +48,7 @@ impl Subscriber for HeldReply {
     }
     async fn try_consume_query(&self, object: TLObject, _: &AdnlPeers) -> Result<QueryResult> {
         match object.downcast::<Query>() {
-            Ok(_) => {
+            Ok(query) => {
                 self.calls.fetch_add(1, Ordering::Release);
                 let concurrent_gate = self.concurrent_gate.lock().unwrap().clone();
                 if let Some(gate) = concurrent_gate {
@@ -58,7 +59,17 @@ impl Subscriber for HeldReply {
                     self.release.notified().await;
                 }
                 Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Raw(TaggedByteVec {
-                    object: vec![42; self.response_bytes.load(Ordering::Acquire).max(64)],
+                    object: if self.runtime_pattern.load(Ordering::Acquire) {
+                        let size =
+                            u32::from_le_bytes(query.overlay.as_slice()[..4].try_into()?) as usize;
+                        anyhow::ensure!(
+                            size <= 2 * 1024 * 1024,
+                            "runtime reply exceeds input bound"
+                        );
+                        (0..size).map(|i| (i % 251) as u8).collect()
+                    } else {
+                        vec![42; self.response_bytes.load(Ordering::Acquire).max(64)]
+                    },
                     #[cfg(feature = "telemetry")]
                     tag: 0,
                 })))))
@@ -4603,3 +4614,6 @@ async fn rldp2_completed_receive_preserves_queued_replay_ack() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[path = "native_runtime_tests.rs"]
+mod native_runtime_tests;
