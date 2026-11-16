@@ -36,6 +36,37 @@ use storage::{
 const TARGET: &str = "sync";
 const SHARD_RETRIES: u8 = 10;
 
+// A registered archive operation owns its IO through shutdown. This carries
+// drain ownership for one database, not block/source authentication authority.
+tokio::task_local! {
+    static ARCHIVE_READ_OWNER: Option<Arc<crate::internal_db::InternalDb>>;
+}
+
+pub(crate) struct ArchiveReadPermit {
+    db: Arc<crate::internal_db::InternalDb>,
+}
+impl ArchiveReadPermit {
+    pub(crate) fn permits(&self, db: &Arc<crate::internal_db::InternalDb>) -> bool {
+        Arc::ptr_eq(&self.db, db)
+    }
+}
+
+pub(crate) fn archive_read_permit() -> Option<ArchiveReadPermit> {
+    ARCHIVE_READ_OWNER
+        .try_with(|db| db.as_ref().map(|db| ArchiveReadPermit { db: db.clone() }))
+        .ok()
+        .flatten()
+}
+
+// Parent apply uses joined child tasks to bound the native stack. Transfer
+// only the originating archive read capability across that task boundary.
+pub(crate) async fn scope_archive_read<T>(
+    permit: Option<ArchiveReadPermit>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    ARCHIVE_READ_OWNER.scope(permit.map(|permit| permit.db), future).await
+}
+
 #[async_trait::async_trait]
 pub trait StopSyncChecker: Send + Sync {
     async fn check(&self, engine: &Arc<dyn EngineOperations>) -> bool;
@@ -1008,6 +1039,7 @@ fn spawn_archive_task<T: Send + 'static>(
     let (sent, received) = tokio::sync::oneshot::channel();
     let (acknowledge, observed) = tokio::sync::oneshot::channel();
     let worker_engine = engine.clone();
+    let read_owner = engine.archive_read_database();
     #[cfg(test)]
     let observer_engine = engine.clone();
     let completion = engine.register_service_task(
@@ -1015,7 +1047,9 @@ fn spawn_archive_task<T: Send + 'static>(
         0,
         Box::new(move || {
             tokio::spawn(async move {
-                let result = future.await;
+                // The registration factory runs only after service admission.
+                // Capture the matching permit before any blocking-read hop.
+                let result = ARCHIVE_READ_OWNER.scope(read_owner, future).await;
                 let failure = result.as_ref().err().map(|error| format!("{error:#}"));
                 let _ = sent.send(result);
                 if observed.await.is_err() {

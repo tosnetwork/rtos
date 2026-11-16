@@ -42,7 +42,31 @@ fn install_config_account(state: &mut ShardStateUnsplit, config: &ConfigParams) 
 }
 
 fn main() {
+    use std::io::Read;
     let args: Vec<_> = std::env::args().collect();
+    let gc_keys: Option<Vec<String>> =
+        args.windows(2).find(|a| a[0] == "--gc-history-keys").map(|a| {
+            let mut bytes = Vec::new();
+            std::fs::File::open(&a[1])
+                .unwrap()
+                .take((16 << 10) + 1)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 16 << 10, "GC public-key file exceeds 16KiB");
+            serde_json::from_slice(&bytes).unwrap()
+        });
+    assert!(
+        !args.iter().any(|a| a == "--gc-history-keys") || gc_keys.is_some(),
+        "--gc-history-keys requires a public-key file"
+    );
+    if let Some(keys) = &gc_keys {
+        assert_eq!(keys.len(), 3);
+        assert!(
+            keys.iter().all(|key| key.len() == 2 * 1312),
+            "ML-DSA-44 public keys must be 1312 bytes"
+        );
+    }
+    let gc_history = gc_keys.is_some();
     let network_keys: Option<Vec<String>> = args
         .windows(2)
         .find(|a| a[0] == "--active-network-keys")
@@ -51,14 +75,17 @@ fn main() {
         assert_eq!(keys.len(), 4, "network fixture requires four independent validators");
     }
     let active = network_keys.is_some() || args.iter().any(|arg| arg == "--active-validator");
+    assert!(!gc_history || !active, "GC history is a separate public fixture mode");
     let history_cc = if network_keys.is_some() { 6 } else { 7 };
-    let finality = active || std::env::args().any(|arg| arg == "--retained-finality");
+    let finality = gc_history || active || std::env::args().any(|arg| arg == "--retained-finality");
     let genesis_time = if active {
         u32::try_from(
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         )
         .unwrap()
             - 4
+    } else if gc_history {
+        1_000
     } else {
         1_700_000_000
     };
@@ -72,6 +99,47 @@ fn main() {
     let wcboc = write_boc(&wcroot).unwrap();
     let mut wcprevious = wczero.clone();
     let mut config = fixture::config();
+    if let Some(keys) = &gc_keys {
+        let members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, public)| {
+                let public_key = hex::decode(public).unwrap();
+                let mut stable = [0; 32];
+                stable[..4].copy_from_slice(&((index + 1) as u32).to_le_bytes());
+                let transport =
+                    Ed25519KeyOption::<ZeroizingBytes>::from_private_key(&[0x60 + index as u8; 32])
+                        .unwrap();
+                ValidatorDescr::with_pq_params(
+                    UInt256::from(stable),
+                    PqConsensusKey {
+                        algorithm_id: 1,
+                        key_id: derive_consensus_key_id(1, &public_key),
+                        public_key,
+                    },
+                    1,
+                    UInt256::from(*transport.id().data()),
+                )
+            })
+            .collect();
+        config
+            .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
+                cur_validators: ValidatorSet::new(0, u32::MAX, 3, members).unwrap(),
+            }))
+            .unwrap();
+        // The native schema requires positive lifetimes; factory zero defaults
+        // are for missing configuration, not a serialized Param28 record.
+        config
+            .set_config(ConfigParamEnum::ConfigParam28(CatchainConfig {
+                mc_catchain_lifetime: 86_400,
+                shard_catchain_lifetime: 600,
+                shard_validators_lifetime: 3_600,
+                shard_validators_num: 3,
+                shuffle_mc_validators: false,
+                ..Default::default()
+            }))
+            .unwrap();
+    }
     if finality {
         let simplex = SimplexConfig { protocol_version: 2, ..Default::default() };
         config
@@ -147,7 +215,7 @@ fn main() {
     config
         .set_config(ConfigParamEnum::ConfigParam34(ConfigParam34 {
             cur_validators: ValidatorSet::new(
-                1_600_000_000,
+                if gc_history { 0 } else { 1_600_000_000 },
                 u32::MAX,
                 validators.len() as u16,
                 validators,
@@ -181,7 +249,7 @@ fn main() {
     let mut custom = McStateExtra::default();
     custom.config = config.clone();
     custom.after_key_block = true;
-    if active {
+    if active || gc_history {
         custom.validator_info.catchain_seqno = history_cc;
         custom.validator_info.validator_list_hash_short =
             ValidatorSet::calc_subset_hash_short(config.validator_set().unwrap().list(), 0)
@@ -195,6 +263,7 @@ fn main() {
     let zero = id(&state_root, 0, ShardIdent::masterchain());
     let zero_boc = write_boc(&state_root).unwrap();
     let mut previous = zero.clone();
+    let mut previous_key = true;
     let mut epoch = 0;
     let mut last_key = None;
     let mut rows = vec![];
@@ -214,6 +283,22 @@ fn main() {
         wcinfo.set_end_lt(wc_end_lt);
         wcinfo.set_shard(shard.clone());
         wcinfo.set_gen_utime(genesis_time + seq);
+        let mut wc_extra = BlockExtra::default();
+        if gc_history {
+            wcinfo.set_prev_key_block_seqno(epoch);
+            wcinfo.set_gen_catchain_seqno(history_cc);
+            wcinfo.set_gen_validator_list_hash_short(
+                config
+                    .validator_set()
+                    .unwrap()
+                    .calc_subset(&config.catchain_config().unwrap(), SHARD_FULL, 0, history_cc)
+                    .unwrap()
+                    .1,
+            );
+            let mut creator = [0; 32];
+            creator[..4].copy_from_slice(&1u32.to_le_bytes());
+            *wc_extra.created_by_mut() = UInt256::from(creator);
+        }
         wcinfo.set_prev_stuff(false, &BlkPrevInfo::Block { prev: reference(&wcprevious) }).unwrap();
         wcinfo.write_master_ref(Some(&BlkMasterInfo { master: reference(&previous) })).unwrap();
         let wcblock = Block::with_params(
@@ -221,13 +306,13 @@ fn main() {
             wcinfo,
             ValueFlow::default(),
             MerkleUpdate::create(&wcroot, &nextwc).unwrap(),
-            BlockExtra::default(),
+            wc_extra,
         )
         .unwrap();
         let wcblockroot = wcblock.serialize().unwrap();
         let wcid = id(&wcblockroot, seq, shard.clone());
         let governing = config.clone();
-        let key = seq % 2 == 1;
+        let key = if gc_history { seq == 3 } else { seq % 2 == 1 };
         if key {
             let mut opts = config.consensus_config().unwrap();
             opts.next_candidate_delay_ms += 1;
@@ -254,14 +339,8 @@ fn main() {
             .prev_blocks
             .set(
                 &previous.seq_no,
-                &KeyExtBlkRef {
-                    key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
-                    blk_ref: reference(&previous),
-                },
-                &KeyMaxLt {
-                    key: previous.seq_no == 0 || previous.seq_no % 2 == 1,
-                    max_end_lt: reference(&previous).end_lt,
-                },
+                &KeyExtBlkRef { key: previous_key, blk_ref: reference(&previous) },
+                &KeyMaxLt { key: previous_key, max_end_lt: reference(&previous).end_lt },
             )
             .unwrap();
         custom.shards = shards.clone();
@@ -288,7 +367,7 @@ fn main() {
         info.set_key_block(key);
         info.set_gen_utime(genesis_time + seq);
         info.set_prev_key_block_seqno(epoch);
-        info.set_vertical_stuff(0, if active { 0 } else { 1 }, None).unwrap();
+        info.set_vertical_stuff(0, if active || gc_history { 0 } else { 1 }, None).unwrap();
         if finality {
             info.set_gen_catchain_seqno(history_cc);
             let (_, hash) = governing
@@ -308,7 +387,13 @@ fn main() {
             } else {
                 1
             };
-            *extra.created_by_mut() = UInt256::from([creator; 32]);
+            *extra.created_by_mut() = if gc_history {
+                let mut stable = [0; 32];
+                stable[..4].copy_from_slice(&u32::from(creator).to_le_bytes());
+                UInt256::from(stable)
+            } else {
+                UInt256::from([creator; 32])
+            };
         }
         let mut mc = McBlockExtra::default();
         *mc.shards_mut() = shards;
@@ -330,7 +415,7 @@ fn main() {
             -239,
             &governing,
             blockid.clone(),
-            if active { 0 } else { 1 },
+            if active || gc_history { 0 } else { 1 },
             epoch,
             history_cc,
         )
@@ -365,7 +450,40 @@ fn main() {
             signatures: vec![],
         };
         rows.push(serde_json::json!({"block_boc":hex::encode(write_boc(&root).unwrap()),"state_boc":hex::encode(write_boc(&next_state).unwrap()),"wc_block_boc":hex::encode(write_boc(&wcblockroot).unwrap()),"wc_state_boc":hex::encode(write_boc(&nextwc).unwrap()),"candidate":hex::encode(candidate),"session":hex::encode(carrier.session_id.as_slice()),"subset_hash":ctx.subset_hash(),"slot":99,"preimage":hex::encode(final_vote_preimage(&blockid,&carrier).unwrap())}));
-        if network_keys.is_some() {
+        if gc_history {
+            let wc_ctx = PqVerificationContext::from_governing_config(
+                -239,
+                &governing,
+                wcid.clone(),
+                0,
+                epoch,
+                history_cc,
+            )
+            .unwrap();
+            let mut candidate = 0x3f6431f8u32.to_le_bytes().to_vec();
+            candidate.extend(0i32.to_le_bytes());
+            candidate.extend(SHARD_FULL.to_le_bytes());
+            candidate.extend(seq.to_le_bytes());
+            candidate.extend(wcid.root_hash.as_slice());
+            candidate.extend(wcid.file_hash.as_slice());
+            candidate.extend(UInt256::calc_file_hash(&[]).as_slice());
+            candidate.extend(rtos_api::WireProfile::T0.serialize(&rtos_api::ton::consensus::CandidateParent::Consensus_CandidateWithoutParents).unwrap());
+            let carrier = BlockSignaturesSimplexPq {
+                validator_info: ValidatorBaseInfo::with_params(wc_ctx.subset_hash(), history_cc),
+                session_id: wc_ctx.expected_session_id().clone(),
+                slot: 99,
+                candidate_data: BlockSignaturesSimplex::bytes_to_cell_tree(&candidate).unwrap(),
+                sig_count: 0,
+                sig_weight: 0,
+                signatures: vec![],
+            };
+            let row = rows.last_mut().unwrap();
+            row["wc_candidate"] = hex::encode(candidate).into();
+            row["wc_session"] = hex::encode(carrier.session_id.as_slice()).into();
+            row["wc_subset_hash"] = wc_ctx.subset_hash().into();
+            row["wc_preimage"] = hex::encode(final_vote_preimage(&wcid, &carrier).unwrap()).into();
+        }
+        if network_keys.is_some() || gc_history {
             rows.last_mut().unwrap()["catchain_seqno"] = history_cc.into();
         }
         if key {
@@ -373,6 +491,7 @@ fn main() {
             last_key = Some(reference(&blockid));
         }
         previous = blockid;
+        previous_key = key;
         state_root = next_state;
         wcprevious = wcid;
         wcroot = nextwc;

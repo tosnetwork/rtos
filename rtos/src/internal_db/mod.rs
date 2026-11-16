@@ -83,7 +83,7 @@ pub const DB_VERSION_8: u32 = 8; // with merge operator in counters CF
 pub const CURRENT_DB_VERSION: u32 = DB_VERSION_8;
 
 pub const SHARDSTATE_DB_NAME: &str = "shardstate_db";
-const SHARD_STATE_PERSISTENT_DB_NAME: &str = "shard_state_persistent_db";
+pub(crate) const SHARD_STATE_PERSISTENT_DB_NAME: &str = "shard_state_persistent_db";
 pub const ARCHIVE_STATES_DB_NAME: &str = "archive_states";
 pub const ARCHIVE_CELLS_CF_NAME: &str = "archive_cells_db";
 pub const ARCHIVE_SHARDSTATE_CF_NAME: &str = "archive_shardstate_db";
@@ -814,6 +814,29 @@ impl InternalDb {
     #[cfg(test)]
     pub(crate) async fn test_join_archive_tasks(&self) -> Result<()> {
         self.archive_tasks.wait().await
+    }
+
+    // Reconstruct version-8 import/expiry: applied metadata, missing zero BOC.
+    #[cfg(test)]
+    pub(crate) async fn test_forget_zero_file_commit(
+        &self,
+        id: &BlockIdExt,
+        keep_marker: bool,
+    ) -> Result<()> {
+        if id.seq_no() != 0 {
+            fail!("Legacy zero fixture requires sequence zero");
+        }
+        let handle = self.load_block_handle(id)?.ok_or_else(|| error!("Missing zero handle"))?;
+        if !handle.is_applied() || !handle.has_persistent_state() {
+            fail!("Legacy zero fixture requires an applied, file-backed zero state");
+        }
+        self.shard_state_persistent_db.delete_file(id).await?;
+        if !keep_marker {
+            // Persistent-state bit in the fixed version-8 stored metadata format.
+            handle.meta().reset(0x0000_0020, false);
+        }
+        assert_eq!(handle.has_persistent_state(), keep_marker);
+        self.block_handle_storage.save_handle_durable(&handle).await
     }
 
     fn store_block_handle(
@@ -1913,7 +1936,24 @@ impl InternalDb {
             || format!("store_shard_state_persistent_raw {}", handle.id()),
             state_data.len() as u64 / 1000 + 10
         );
-        if !handle.has_persistent_state() {
+        let missing_zero_file = handle.id().seq_no() == 0
+            && !self.shard_state_persistent_db.contains(handle.id()).await?;
+        if !handle.has_persistent_state() || missing_zero_file {
+            if handle.id().seq_no() == 0 {
+                // A zero file may be missing after an older workchain PSS
+                // expiry. Only its original, pinned bytes may fill that gap.
+                if UInt256::calc_file_hash(state_data) != *handle.id().file_hash() {
+                    fail!("Zero-state file differs from pinned file hash");
+                }
+                let root = rtos_block::read_single_root_boc(state_data)?;
+                if root.repr_hash() != handle.id().root_hash() {
+                    fail!("Zero-state file differs from pinned root");
+                }
+                let header = <rtos_block::ShardStateUnsplit as rtos_block::Deserializable>::construct_from_cell(root)?;
+                if header.seq_no() != 0 || header.shard() != handle.id().shard() {
+                    fail!("Zero-state file header differs from pinned identity");
+                }
+            }
             self.shard_state_persistent_db.write_whole_file(handle.id(), state_data).await?;
             if handle.set_persistent_state() {
                 self.store_block_handle(handle, callback)?;
@@ -2004,6 +2044,10 @@ impl InternalDb {
                     log::warn!("shard_state_persistent_gc: can't load handle for {:x}", root_hash)
                 }
                 Some(handle) => {
+                    // Native ZeroState files are permanent for every workchain.
+                    if handle.id().seq_no() == 0 {
+                        return Ok(true);
+                    }
                     let gen_utime = handle.gen_utime();
                     let (ttl, expired) = calc_ttl(gen_utime);
                     log::info!(

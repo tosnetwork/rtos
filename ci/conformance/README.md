@@ -947,3 +947,242 @@ preserves the original spool fixture byte for byte because the separately signed
 `v2-publication-history.json` chain commits to that zerostate. The historical test
 uses this anchor without a retired consensus key; do not mix that signed chain
 with the regenerated custody fixture's zerostate.
+
+Reproduce the collator proof-budget traversal controls:
+
+```sh
+python3 ci/conformance/proof_budget_reference.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --out /datax/rtos-conformance/proof-budget-reference
+```
+
+This focused probe uses native `vm::ProofStorageStat` with the preorder budget
+walk from pinned TOS `validator/impl/collator.cpp:3075-3122` (also present in
+TON `857b8a57`). Its fixed graphs model cells that all belong to the original
+storage dictionary; it does not execute native full-block collation. Ten
+controls cover a pruned parent's refund before an absent child, refusal before
+a later refund, and a cumulative budget across roots. The prefix peak, rather
+than only the final size delta, determines acceptance. Rust regression
+`proof_storage_stat_native_preorder_budget_boundaries` also checks that rejected
+walks leave the original statistic intact. Build commands and native
+source/binary hashes are retained in the output receipt.
+
+Four additional native controls exercise `ProofStorageStat::add_loaded_cells`:
+a dictionary proof selected for an earlier account contributes its loaded cells
+and pruned boundaries to later accounts' budgets, without downgrading full cells.
+The Rust regression `proof_storage_stat_merge_selected_dictionary_proof` checks
+the same merge and budget boundaries. The collator now includes selected
+dictionary proofs in its running statistic, as pinned TOS does at line 3130.
+
+For offline inspection of `test_collated_data2`, set
+`RTOS_COLLATOR_PROOF_EXPORT=/datax/rtos-conformance/<run>/export` when running the
+exact node test. The helper writes regenerated `block.boc` and `collated.boc`
+under each fixture basename before checking the original proof-count assertion.
+These are public synthetic test outputs, not an authenticated historical replay.
+
+Replay the real eight-account proof-selection profile with native TOS:
+
+```sh
+python3 ci/conformance/proof_selection_reference.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --out /datax/rtos-conformance/proof-selection-reference
+```
+
+The JSON fixture and its SHA-bound generated TSV view retain decision prefixes
+from the historical `56703839` collator fixture, captured on Rust `d83c410d`.
+The native probe rebuilds each complete storage dictionary from the existing
+original state, verifies its root, recreates the frozen `ProofStorageStat`, checks
+every captured membership and budget against native primitives, then runs the
+native preorder decision. All eight cases agree: seven dictionary proofs and
+one state-proof branch. The collator regression derives its expected count from
+these choices and checks the exact dictionary hashes, candidate bytes and proof
+root multiset. Neighbor proof order is unspecified; their content hashes are
+unchanged when tracing is enabled or disabled.
+
+Only cells beyond the stopping prefix are pruned in the compact inputs. The
+Rust unit test replays the same frozen prefixes and checks refusal atomicity;
+the native verifier checks the JSON/TSV correspondence. The capture is a Rust
+usage snapshot, not native full-block collation. An additional full native
+validation attempt stopped with `pruned_input` in the historical served context;
+it is not an acceptance or whole-history replay result. Capture instrumentation
+and raw input hashes are retained under
+`/datax/rtos-conformance/2026-11-15-collated-proof-selection`, rather than adding
+tracing paths to production code.
+
+### Legacy collator size-limit fixtures
+
+`collator_size_limits_reference.py --cpp-build <pinned-TOS-Ninja-build> --out <empty-directory>`
+reads the three public collator bundles named in the script. It virtualizes their
+actual masterchain-state Merkle proofs and requires native TOS to reject the old
+configuration43. TON857b8a57's version2 includes a trailing optional library-load
+limit; TOS5af405d carries that field in version3. These are different reference
+schemas, not evidence that the original TON inputs are corrupt.
+
+The native helper validates the version2 common prefix, preserves every remaining
+optional-limit bit, switches to version3 and appends the four new fields from
+native `SizeLimitsConfig` defaults. Native decoding must accept the result and
+recover the same optional library limit. Output contains the old/new cells and
+hashes, source-file hashes and a pinned build receipt. Input files are capped at
+64MiB before allocation and must not grow during the exact-length read. Each input
+is released before the next; no operational key or network is used.
+
+After checking the receipt, install the separate `migrations.json` output as
+`rtos/src/tests/data/collator-size-limits-migrations.json`. The test-only
+`CollatorTestBundle::use_native_size_limits_fixture` explicitly applies this
+small hash-indexed table to the trusted masterchain test context, verifies every
+legacy field including the optional limit, and reproduces the native replacement
+cell exactly. Unknown invalid configurations still fail. Ordinary bundle loading
+and production decoders do not perform this conversion.
+
+This is a synthetic trusted-context migration for the existing pruned-subtree,
+message-queue and storage-stat regressions. It does not authenticate a rewritten
+historical chain or qualify a native full-block replay. Original trace files stay
+unchanged. This conversion preserves the proof-coverage assertions. The separate
+proof-selection profile above derives the historical root count from native
+per-account decisions; the size-limit conversion does not supply that evidence.
+
+
+### Workchain local-role fixture context
+
+The local-role validator test creates MC1 anew. Its two frozen negative WC
+candidates refer to historical MC1 hashes, so the test explicitly rebinds only
+`BlockInfo.master_ref` to the generated MC1 and recomputes the candidate ID.
+The original fixture files and WC body references remain unchanged. Unknown
+engine and nonzero TVM mode still require their specific rejection; a freshly
+collated TVM candidate must validate successfully in the same test.
+
+Export the test context from the node test directory and verify it independently:
+
+```sh
+cd rtos
+RTOS_EXECUTION_CONTEXT_EXPORT=/absolute/path/context \
+  cargo test -j32 --release -p rtos --features ci_run --bin rtos \
+  collator_test_bundle::workchain_execution_callers::execution_validator_local_role -- --exact
+cd ..
+python3 ci/conformance/workchain_context_reference.py \
+  --cpp-build /absolute/path/native-build \
+  --export /absolute/path/context --out /absolute/path/new-verification-directory
+```
+
+Leave `RTOS_EXECUTION_EXPORT` unset for this validation run. The native probe
+uses the clean source revision pinned by `REFERENCE`, rebuilds its libraries,
+reconstructs the migrated WC root independently, checks the MC state-update
+hash, and requires the native registry's exact unknown-engine/nonzero-mode
+errors. A TVM descriptor control must resolve. Each of the eight input files is
+limited to 4 MiB; two native processes each have a 60-second deadline. This is
+an offline context and registry control, not native validation of the complete
+historical WC block or proof of chain authenticity. Raw exports and build logs
+stay outside Git; `receipt.json` records their hashes and the commands.
+
+
+### Truncated TL payloads and download limits
+
+The bounded download test separates malformed input from complete over-budget
+input. A declared 0x7fffff-byte proof with no payload must return the slice
+parser's `UnexpectedEof` before allocation-budget checks. A complete real
+`DataFull` reply is also decoded with a TL budget one byte below its proof
+length and must return the exact `DecodeLimitExceeded` limit/actual values.
+The peer download then repeats the complete reply with its proof BOC limit
+one byte too small and must refuse after exactly one query. Cell-count and
+depth refusals and a successful complete-reply control remain in the same test.
+
+```sh
+cd rtos
+NODE_SKIP_TEST_LOGS=yes cargo test -j32 --release -p rtos --features ci_run \
+  --bin rtos bounded_download_e2e_ -- --test-threads=1
+```
+
+This follows the native `TlParser::fetch_string` payload-length check before
+returning a string. It changes test expectations, with no decoder or downloader
+behavior change. The direct TL control isolates its allocation budget from the
+transport's separate whole-response cap.
+
+### Native public history for GC fixture migration
+
+Generate a bounded four-height MC/WC history with three native public test keys:
+
+```sh
+python3 ci/conformance/generate_gc_history_fixture.py \
+  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --target-dir /tos/worktrees/rtos/cpp-alignment/target \
+  --out /datax/rtos-conformance/native-gc-history
+```
+
+The output directory must be empty. `node_recovery_fixture --gc-history-keys`
+accepts exactly three ML-DSA-44 public keys from a file capped at 16 KiB, including
+concurrent growth. It creates MC/WC 1–4, a key block at MC 3 and a nonzero parent
+for target MC 2. The frozen output is
+`rtos/src/full_node/finality/testdata/native-gc-history.json`.
+
+The pinned C++ helper's separate `--check-history` mode binds each MC transition
+input to its old state, and each WC master reference to the actual governing MC
+block and resulting state. It recomputes subsets, sessions and vote preimages;
+24 native final signatures are checked independently. The native previous-key
+lookup also checks the history dictionary against the next block's declared
+epoch. Its parent key flags must come from the actual parent header, not an
+assumed alternating schedule. Wrong state, governing
+block and candidate controls refuse. The 16 KiB key boundary, wrong key length,
+2 MiB native token cap and the original two publication contexts are exercised.
+Native signing is randomized: retain the generated bytes and receipt.
+
+The history GC test applies this synthetic history through normal MC/WC clients,
+then models a persisted floor at MC3 below the applied head MC4. It checks actual
+dynamic-state deletion, authenticated history reads and two cold reopens. This
+controlled boundary does not qualify whole-block transaction execution, actual
+cold boot or soak. Four heights do not satisfy the production floor
+advancement lag of 1024 blocks. Tests must establish a valid persisted/startup floor
+or provide sufficient authenticated history; the floor policy must not be
+relaxed. Original source/repair failures remain failures until those tests run.
+
+Repair fixtures use the same authenticated successors and cold Engine setup.
+A controlled MC2 floor keeps target MC2 while its nonzero parent MC1 is
+collected; an MC3 floor makes both eligible for custody and crash tests. The
+session in this history is governed by original zero, not non-key MC1. A
+missing-parent refusal first validates that source identity. The two WAL crash
+windows retain an unleased WC-zero control and require its actual GC batch to
+finish before authenticating the recovered MC dependencies.
+
+The bounded writer test distinguishes pin ownership from stored-state order.
+It observes the real target pin at the paused WAL boundary, its transfer to
+custody and its release. Reconstructed MC2 is appended after retained MC3 and
+therefore stays readable without a pin. A released older parent is actually
+collected in a completed batch as the positive GC control. The earlier guard
+test separately requires actual target deletion when its index precedes MC3.
+
+### Zero-state cells and permanent BOC files
+
+State GC follows the native stored-state order and admits MC sequence zero
+when it is below the durable floor. The immutable MC and WC zero-state BOCs
+remain separate from those dynamic entries and survive persistent-snapshot
+expiry. Reading them verifies the pinned file hash, cell root and header
+identity, without recreating a collected dynamic index.
+
+Archive import publishes the original verified BOC before marking its handle
+applied/file-backed. A boot with a supplied static directory can fill files
+missing from older imports or older WC snapshot expiry. Existing acknowledged corrupt
+files are rejected; re-encoding cells is not a substitute for the pinned
+original file bytes. The ordinary reader authenticates the file in fixed-size
+chunks before allocating its complete buffer. Historical reads instead retain
+the caller's cumulative byte, cell and depth limits and stop fallback on
+integrity or budget refusal.
+
+The library process tests exercise two real starts with SIGKILL in between,
+checking the canonical packages and progress cursors after reopening. They also
+exercise older imports with missing files and older WC expiry with a retained
+metadata marker. Build and verify the node's commit with `--version` first:
+
+```sh
+cargo build -j32 --release -p rtos --features ci_run --bin rtos
+RTOS_NODE_RECOVERY_BINARY=/absolute/path/to/rtos \
+  cargo test -j32 --release -p rtos --features ci_run --lib \
+  archive_import::tests::node_process_recovery::actual_node_restarts_with_legacy_zero_state_files \
+  -- --ignored --exact --nocapture
+```
+
+`actual_node_restarts_with_nonzero_authenticated_history` covers a fresh import;
+`actual_node_restarts_with_expired_legacy_zero_state_files` covers missing WC
+files whose old metadata still claims they were persisted. The ordinary
+`persistent_gc_keeps_mc_and_wc_zero_files_but_expires_regular_snapshots` control
+keeps both zero BOCs while requiring a nonzero expired snapshot to disappear.
+These fixture checks do not establish power-loss, long-run or full historical
+chain qualification.

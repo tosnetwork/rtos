@@ -63,6 +63,57 @@ fn full_proof(block: &BlockStuff, carrier: BlockSignaturesSimplexPq) -> BlockPro
     .unwrap()
 }
 
+fn configure_fixture_transport(dir: &std::path::Path, seed: u8, root: &Cell) {
+    let file = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let (key, transport) =
+        Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32]).unwrap();
+    for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
+        if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
+            entry["data"] = serde_json::to_value(&key).unwrap();
+        }
+    }
+    if seed != 0x70 {
+        // Register the held validator transport through normal
+        // configuration, as the native full node requires for
+        // signing a shard-source certificate. The public observer
+        // stays unregistered. This grants no PQ voting custody.
+        let governing = ShardStateUnsplit::construct_from_cell(root.clone())
+            .unwrap()
+            .read_custom()
+            .unwrap()
+            .unwrap()
+            .config;
+        let validator = governing
+            .validator_set()
+            .unwrap()
+            .list()
+            .iter()
+            .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
+            .expect("source circulation key must belong to the governing committee")
+            .validator_id()
+            .unwrap();
+        config["validator_key_ring"][base64_encode(transport.id().data())] =
+            serde_json::to_value(&key).unwrap();
+        config["validator_keys"] = serde_json::json!([{
+            // Election IDs are also ADNL tags; avoid DHT/overlay 1/2.
+            "election_id": 1000 + i32::from(seed),
+            "expire_at": i32::MAX,
+            "validator_key_id": base64_encode(transport.id().data()),
+            "validator_adnl_key_id": base64_encode(transport.id().data()),
+        }]);
+        config["consensus_transport_bindings"] = serde_json::json!([{
+            "validator_id": base64_encode(validator.as_slice()),
+            "adnl_key_id": base64_encode(transport.id().data()),
+        }]);
+    }
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
+    drop(socket);
+    std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+}
+
 struct Pair {
     _dir: tempfile::TempDir,
     receiver: Arc<Engine>,
@@ -75,6 +126,7 @@ struct Pair {
     shard_state_root: UInt256,
     master: BlockStuff,
     master_state_root: UInt256,
+    applied_through: Option<BlockIdExt>,
 }
 
 async fn stop_fixture_engines(engines: Vec<Arc<Engine>>) {
@@ -118,6 +170,16 @@ async fn refresh_fixture_public_advertisements(
             }
         }
     }
+}
+
+async fn wait_for_fixture_advertisement_version(previous: i32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while adnl::common::Version::get() <= previous {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("public advertisement version must advance after Plumtree activation");
 }
 
 // Engine::new restores storage/transport but does not execute Engine::run's
@@ -206,7 +268,11 @@ impl Pair {
         v2: bool,
         history_gc: bool,
     ) -> Self {
-        Self::with_source_options(variant, corrupt_signature, v2, history_gc, false).await
+        if history_gc {
+            assert!(v2 && variant == "included" && !corrupt_signature);
+            return native_gc_fixture::pair().await;
+        }
+        Self::with_source_options(variant, corrupt_signature, v2, false, false).await
     }
 
     async fn with_source_transport(variant: &str) -> Self {
@@ -283,47 +349,7 @@ impl Pair {
                 configurations.push((path, 0x70));
             }
             for (dir, seed) in configurations {
-                let file = dir.join("config.json");
-                let mut config: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-                let (key, transport) =
-                    Ed25519KeyOption::<ZeroizingBytes>::from_private_key_with_json(&[seed; 32])
-                        .unwrap();
-                for entry in config["adnl_node"]["keys"].as_array_mut().unwrap() {
-                    if entry["tag"] == NodeNetwork::TAG_OVERLAY_KEY {
-                        entry["data"] = serde_json::to_value(&key).unwrap();
-                    }
-                }
-                if source_transport && seed != 0x70 {
-                    // The normal source factory requires an explicit stable
-                    // validator -> transport binding. Derive it from the actual
-                    // governing state and persist it for the cold-open phase.
-                    let governing = ShardStateUnsplit::construct_from_cell(mc_root.clone())
-                        .unwrap()
-                        .read_custom()
-                        .unwrap()
-                        .unwrap()
-                        .config;
-                    let validator = governing
-                        .validator_set()
-                        .unwrap()
-                        .list()
-                        .iter()
-                        .find(|member| member.adnl_addr().is_ok_and(|id| id == *transport.id()))
-                        .expect("source circulation key must belong to the governing committee")
-                        .validator_id()
-                        .unwrap();
-                    config["validator_key_ring"][base64_encode(transport.id().data())] =
-                        serde_json::to_value(&key).unwrap();
-                    config["consensus_transport_bindings"] = serde_json::json!([{
-                        "validator_id": base64_encode(validator.as_slice()),
-                        "adnl_key_id": base64_encode(transport.id().data()),
-                    }]);
-                }
-                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-                config["ip_address_quic"] = socket.local_addr().unwrap().to_string().into();
-                drop(socket);
-                std::fs::write(file, serde_json::to_vec(&config).unwrap()).unwrap();
+                configure_fixture_transport(dir, seed, &mc_root);
             }
         }
         if history_gc {
@@ -487,6 +513,7 @@ impl Pair {
                 .clone(),
             master,
             master_state_root,
+            applied_through: None,
         }
     }
 
@@ -494,6 +521,7 @@ impl Pair {
         &self,
     ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
         assert!(self.receiver.load_block_handle(self.master.id()).unwrap().is_none());
+        let applied_through = self.applied_through.as_ref().unwrap_or(self.master.id());
         let ops: Arc<dyn EngineOperations> = self.receiver.clone();
         let master = crate::full_node::shard_client::start_masterchain_client(
             ops.clone(),
@@ -502,28 +530,44 @@ impl Pair {
         .unwrap();
         let shards =
             crate::full_node::shard_client::start_shards_client(ops, self.anchor.clone()).unwrap();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if self.receiver.load_shard_client_mc_block_id().unwrap().as_deref()
-                    == Some(self.master.id())
-                {
-                    break;
+        let result = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if self.receiver.load_shard_client_mc_block_id().unwrap().as_deref()
+                        == Some(applied_through)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            })
+            .await
+            .expect("normal authenticated masterchain and shard clients must advance");
+            let mc_handle = self.receiver.load_block_handle(self.master.id()).unwrap().unwrap();
+            assert!(mc_handle.is_applied());
+            assert_eq!(
+                self.receiver.load_state(self.master.id()).await.unwrap().root_cell().repr_hash(),
+                &self.master_state_root
+            );
+            assert_eq!(
+                self.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
+                Some(applied_through)
+            );
         })
-        .await
-        .expect("normal authenticated masterchain and shard clients must advance");
-        let mc_handle = self.receiver.load_block_handle(self.master.id()).unwrap().unwrap();
-        assert!(mc_handle.is_applied());
-        assert_eq!(
-            self.receiver.load_state(self.master.id()).await.unwrap().root_cell().repr_hash(),
-            &self.master_state_root
-        );
-        assert_eq!(
-            self.receiver.load_last_applied_mc_block_id().unwrap().as_deref(),
-            Some(self.master.id())
-        );
+        .catch_unwind()
+        .await;
+        if let Err(panic) = result {
+            eprintln!(
+                "CLIENT_APPLY_FAILURE last_applied={:?} shard_client={:?} expected={:?}",
+                self.receiver.load_last_applied_mc_block_id(),
+                self.receiver.load_shard_client_mc_block_id(),
+                applied_through
+            );
+            self.stop_all().await;
+            let (master_result, shard_result) = tokio::join!(master, shards);
+            eprintln!("CLIENT_APPLY_CLEANUP master={master_result:?} shards={shard_result:?}");
+            std::panic::resume_unwind(panic);
+        }
         (master, shards)
     }
 }
@@ -619,13 +663,7 @@ impl Pair {
         // The creation-time advertisements said Plumtree was disabled. Admit
         // fresh signed capabilities after activation, as public discovery does.
         // A same-second advertisement cannot supersede the cached version.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while adnl::common::Version::get() <= previous_advertisement_version {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("public advertisement version must advance after Plumtree activation");
+        wait_for_fixture_advertisement_version(previous_advertisement_version).await;
         self.refresh_public_advertisements().await;
         let prefix = rtos_api::serialize_boxed(
             &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*id.data()) }
@@ -1031,130 +1069,159 @@ async fn real_multinode_plumtree_repairs_lost_ihave_and_first_repair_response() 
     use std::sync::atomic::Ordering;
     let pair = Pair::new("included", false).await;
     let relays = Pair::new("included", false).await;
-    let engines = [&pair.provider, &pair.receiver, &relays.receiver, &relays.provider];
-    let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
-    let overlay = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
-    let keys: Vec<_> = engines
-        .iter()
-        .map(|engine| {
-            engine.network().context().stack.adnl.key_by_tag(NodeNetwork::TAG_OVERLAY_KEY).unwrap()
-        })
-        .collect();
-    let mut addresses = vec![];
-    for (engine, key) in engines.iter().zip(&keys) {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let address = socket.local_addr().unwrap();
-        drop(socket);
-        let private = key.pvt_key().unwrap().lock().unwrap();
-        engine
-            .network()
-            .context()
-            .stack
-            .quic
-            .as_ref()
-            .unwrap()
-            .add_key(private.as_ref().try_into().unwrap(), key.id(), address)
-            .unwrap();
-        addresses.push(address);
-    }
-    for (index, engine) in engines.iter().enumerate() {
-        let stack = &engine.network().context().stack;
-        for (remote_index, remote) in engines.iter().enumerate() {
-            if index == remote_index {
-                continue;
-            }
-            let remote_stack = &remote.network().context().stack;
-            let peer = stack
-                .adnl
-                .add_peer(
-                    keys[index].id(),
-                    remote_stack.adnl.ip_address_adnl(),
-                    None,
-                    &keys[remote_index],
-                )
-                .unwrap()
-                .unwrap();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let engines = [&pair.provider, &pair.receiver, &relays.receiver, &relays.provider];
+        let client = pair.receiver.overlay_client(pair.shard.id().shard()).await.unwrap();
+        let overlay = adnl::OverlayShortId::from_data(*client.overlay_client().id().data());
+        let keys: Vec<_> = engines
+            .iter()
+            .map(|engine| {
+                engine
+                    .network()
+                    .context()
+                    .stack
+                    .adnl
+                    .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
+                    .unwrap()
+            })
+            .collect();
+        let mut addresses = vec![];
+        for (engine, key) in engines.iter().zip(&keys) {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let address = socket.local_addr().unwrap();
+            drop(socket);
+            let private = key.pvt_key().unwrap().lock().unwrap();
             engine
-                .overlay_client(pair.shard.id().shard())
-                .await
-                .unwrap()
-                .overlay_client()
-                .neighbours()
-                .add(peer)
-                .unwrap();
-            let advertisement = remote_stack.overlay.get_signed_node(&overlay, false).unwrap();
-            stack
-                .overlay
-                .add_public_peer(remote_stack.adnl.ip_address_adnl(), &advertisement, &overlay)
-                .unwrap()
-                .unwrap();
-            stack
+                .network()
+                .context()
+                .stack
                 .quic
                 .as_ref()
                 .unwrap()
-                .add_peer_key(keys[remote_index].id().clone(), addresses[remote_index])
+                .add_key(private.as_ref().try_into().unwrap(), key.id(), address)
+                .unwrap();
+            addresses.push(address);
+        }
+        for (index, engine) in engines.iter().enumerate() {
+            let stack = &engine.network().context().stack;
+            for (remote_index, remote) in engines.iter().enumerate() {
+                if index == remote_index {
+                    continue;
+                }
+                let remote_stack = &remote.network().context().stack;
+                let peer = stack
+                    .adnl
+                    .add_peer(
+                        keys[index].id(),
+                        remote_stack.adnl.ip_address_adnl(),
+                        None,
+                        &keys[remote_index],
+                    )
+                    .unwrap()
+                    .unwrap();
+                engine
+                    .overlay_client(pair.shard.id().shard())
+                    .await
+                    .unwrap()
+                    .overlay_client()
+                    .neighbours()
+                    .add(peer)
+                    .unwrap();
+                let advertisement = remote_stack.overlay.get_signed_node(&overlay, false).unwrap();
+                stack
+                    .overlay
+                    .add_public_peer(remote_stack.adnl.ip_address_adnl(), &advertisement, &overlay)
+                    .unwrap()
+                    .unwrap();
+                stack
+                    .quic
+                    .as_ref()
+                    .unwrap()
+                    .add_peer_key(keys[remote_index].id().clone(), addresses[remote_index])
+                    .unwrap();
+            }
+            stack
+                .overlay
+                .configure_plumtree(
+                    &overlay,
+                    adnl::PlumtreeConfig {
+                        authorized_keys: std::collections::BTreeMap::from([(
+                            *keys[0].id().data(),
+                            2 << 20,
+                        )]),
+                        max_untrusted_size: 0,
+                        untrusted_flags: 0,
+                        fixed_members: true,
+                        original_sender: index == 0,
+                        eager_limit: 4,
+                        max_retained_bytes: 64 << 20,
+                        max_broadcasts: 64,
+                    },
+                    &tokio::runtime::Handle::current(),
+                )
                 .unwrap();
         }
-        stack
-            .overlay
-            .configure_plumtree(
-                &overlay,
-                adnl::PlumtreeConfig {
-                    authorized_keys: std::collections::BTreeMap::from([(
-                        *keys[0].id().data(),
-                        2 << 20,
-                    )]),
-                    max_untrusted_size: 0,
-                    untrusted_flags: 0,
-                    fixed_members: true,
-                    original_sender: index == 0,
-                    eager_limit: 4,
-                    max_retained_bytes: 64 << 20,
-                    max_broadcasts: 64,
-                },
-                &tokio::runtime::Handle::current(),
-            )
-            .unwrap();
-    }
-    let prefix = rtos_api::serialize_boxed(
-        &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
-            .into_boxed(),
+        // Capture after all initial advertisements: setup itself may cross a
+        // second boundary. Every refreshed record must supersede all of them.
+        let previous_advertisement_version = adnl::common::Version::get();
+        wait_for_fixture_advertisement_version(previous_advertisement_version).await;
+        refresh_fixture_public_advertisements(&engines, &[pair.shard.id().shard()]).await;
+        let prefix = rtos_api::serialize_boxed(
+            &rtos_api::ton::overlay::message::Message { overlay: UInt256::from(*overlay.data()) }
+                .into_boxed(),
+        )
+        .unwrap();
+        let faults = &pair.receiver.network().test_broadcast_faults;
+        faults.configure(*keys[0].id().data(), prefix, 1);
+        faults.drop_one_ihave();
+        let replies = Arc::new(RepairReceipts::default());
+        for relay in [&relays.receiver, &relays.provider] {
+            relay
+                .network()
+                .test_broadcast_faults
+                .suppress_first_repair_reply(*keys[1].id().data(), replies.clone());
+        }
+        let (wire, id) = pair.finality_wire();
+        pair.publish(&overlay, id, &wire).await;
+        pair.wait_preapplied().await;
+        assert_eq!(
+            faults.receipts().iter().filter(|receipt| receipt.dropped).count(),
+            1,
+            "the real publisher IHAVE must be lost"
+        );
+        assert_eq!(
+            replies.dropped.load(Ordering::Acquire),
+            1,
+            "the first real relay reply must be lost after authentication"
+        );
+        assert!(
+            replies.delivered.load(Ordering::Acquire) >= 1,
+            "another real relay must answer the production fallback query"
+        );
+        assert_eq!(pair.receiver.test_finality_notifications.load(Ordering::Acquire), 1);
+        assert!(pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none());
+        let (master, shards) = pair.apply_by_normal_clients().await;
+        assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
+        (master, shards)
+    })
+    .catch_unwind()
+    .await;
+    // Keep all four Engines and their directories alive until every owner
+    // drains, including when setup or an assertion above panics.
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stop_fixture_engines(vec![
+            pair.receiver.clone(),
+            pair.provider.clone(),
+            relays.receiver.clone(),
+            relays.provider.clone(),
+        ]),
     )
-    .unwrap();
-    let faults = &pair.receiver.network().test_broadcast_faults;
-    faults.configure(*keys[0].id().data(), prefix, 1);
-    faults.drop_one_ihave();
-    let replies = Arc::new(RepairReceipts::default());
-    for relay in [&relays.receiver, &relays.provider] {
-        relay
-            .network()
-            .test_broadcast_faults
-            .suppress_first_repair_reply(*keys[1].id().data(), replies.clone());
-    }
-    let (wire, id) = pair.finality_wire();
-    pair.publish(&overlay, id, &wire).await;
-    pair.wait_preapplied().await;
-    assert_eq!(
-        faults.receipts().iter().filter(|receipt| receipt.dropped).count(),
-        1,
-        "the real publisher IHAVE must be lost"
-    );
-    assert_eq!(
-        replies.dropped.load(Ordering::Acquire),
-        1,
-        "the first real relay reply must be lost after authentication"
-    );
-    assert!(
-        replies.delivered.load(Ordering::Acquire) >= 1,
-        "another real relay must answer the production fallback query"
-    );
-    assert_eq!(pair.receiver.test_finality_notifications.load(Ordering::Acquire), 1);
-    assert!(pair.receiver.try_get_cached_block_candidate(pair.shard.id()).is_none());
-    let (master, shards) = pair.apply_by_normal_clients().await;
-    assert!(pair.receiver.load_block_handle(pair.shard.id()).unwrap().unwrap().is_applied());
-    pair.finish(master, shards).await;
-    relays.receiver.clone().wait_stop().await.unwrap();
-    relays.provider.clone().wait_stop().await.unwrap();
+    .await
+    .expect("all four real Engine services must drain");
+    let (master, shards) = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    master.await.unwrap();
+    shards.await.unwrap();
 }
 
 // Separate from Pair: this fixture never installs the old network block or MC
@@ -1399,3 +1466,6 @@ mod persistent_closure_engine_tests;
 
 #[path = "bounded_pss_tests.rs"]
 mod bounded_pss_tests;
+
+#[path = "native_gc_fixture.rs"]
+mod native_gc_fixture;

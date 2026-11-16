@@ -57,6 +57,33 @@ fn binding(fixture: &Fixture) -> RepairLeaseBinding {
     }
 }
 
+// The native GC chain's MC1 is not a key block. Its target2 session is
+// governed by original zero, unlike the legacy key-parent fixture above.
+fn gc_binding(fixture: &Fixture) -> RepairLeaseBinding {
+    let mut exact = binding(fixture);
+    assert_eq!(exact.domain.source_recovery_coordinates.last_key_block_seqno, 0);
+    exact.domain.source_recovery_anchor = exact.domain.zerostate.clone();
+    exact
+}
+
+async fn validate_gc_source_binding(engine: &Arc<Engine>, exact: &RepairLeaseBinding) {
+    let budget = crate::history_read_budget::HistoryReadBudget::new(Default::default());
+    let source = crate::retired_history::authenticate_state_with_budget(
+        engine.as_ref(),
+        &exact.domain.source_recovery_anchor,
+        Some(&budget),
+    )
+    .await
+    .unwrap();
+    crate::validator::retired_session_auth::validate_close_recovery_binding_with_budget(
+        engine.as_ref(),
+        exact,
+        &source,
+        &budget,
+    )
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_repair_custody_actual_engine_cache_cold_gc_and_exact_binding() {
     let fixture = fixture(true).await;
@@ -113,11 +140,15 @@ async fn persistent_repair_custody_actual_engine_cache_cold_gc_and_exact_binding
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_repair_custody_missing_parent_refuses_durable_lease() {
-    let fixture = fixture(false).await;
-    let exact = binding(&fixture);
+    let fixture = gc_fixture_in(None).await;
+    let exact = gc_binding(&fixture);
     let Fixture { dir, engine, parent, target: _, request } = fixture;
-    engine.shard_states_keeper().test_retire_history_state(parent.id());
     let run = std::panic::AssertUnwindSafe(async {
+        // Prove the exact source identity is valid before removing a distinct
+        // repair dependency; an invalid binding must not satisfy this test.
+        validate_gc_source_binding(&engine, &exact).await;
+        super::super::super::native_gc_fixture::establish_floor_at(&engine, 2);
+        engine.shard_states_keeper().test_retire_history_state(parent.id());
         tokio::time::timeout(Duration::from_secs(15), async {
             while engine.db().test_contains_dynamic_state_record(parent.id()).unwrap() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -125,7 +156,9 @@ async fn persistent_repair_custody_missing_parent_refuses_durable_lease() {
         })
         .await
         .unwrap();
-        assert!(obtain_durable_mc_custody(engine.clone(), request, exact).await.is_err());
+        let refused = obtain_durable_mc_custody(engine.clone(), request, exact).await;
+        assert!(refused.is_err(), "missing nonzero parent must refuse durable custody");
+        assert!(!engine.db().test_contains_dynamic_state_record(parent.id()).unwrap());
     })
     .catch_unwind()
     .await;

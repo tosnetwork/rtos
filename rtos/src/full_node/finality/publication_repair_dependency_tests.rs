@@ -8,8 +8,19 @@ use std::{
 };
 use storage::db::rocksdb::{AccessType, RocksDb, NODE_DB_NAME};
 
+struct FixtureDir {
+    _owner: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl FixtureDir {
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
 struct Fixture {
-    dir: tempfile::TempDir,
+    dir: FixtureDir,
     engine: Arc<Engine>,
     parent: BlockStuff,
     target: BlockStuff,
@@ -118,12 +129,43 @@ async fn fixture_backend_in(key_parent: bool, archive: bool, parent_dir: Option<
     .catch_unwind()
     .await;
     match setup {
-        Ok((parent, target, request)) => Fixture { dir, engine, parent, target, request },
+        Ok((parent, target, request)) => Fixture {
+            dir: FixtureDir { root: dir.path().to_owned(), _owner: dir },
+            engine,
+            parent,
+            target,
+            request,
+        },
         Err(panic) => {
             engine.wait_stop().await.unwrap();
             std::panic::resume_unwind(panic)
         }
     }
+}
+
+// Keep the old key-history and archive profiles unchanged. GC-specific
+// fixtures require authenticated successors beyond the parent/target pair.
+async fn gc_fixture_in(parent_dir: Option<&Path>) -> Fixture {
+    let pair = super::super::native_gc_fixture::pair_in(parent_dir).await;
+    let (master, shards) = pair.apply_by_normal_clients().await;
+    let request = super::request(&pair).await;
+    let parent_id = pair.master.construct_prev_id().unwrap().0;
+    assert!(parent_id.seq_no() > 0);
+    let parent = pair
+        .receiver
+        .load_block(&pair.receiver.load_block_handle(&parent_id).unwrap().unwrap())
+        .await
+        .unwrap();
+    pair.receiver.clone().wait_stop().await.unwrap();
+    master.await.unwrap();
+    shards.await.unwrap();
+    pair.provider.clone().wait_stop().await.unwrap();
+    let Pair { _dir: owner, receiver, provider, master: target, .. } = pair;
+    close(receiver).await;
+    close(provider).await;
+    let dir = FixtureDir { root: owner.path().join("receiver"), _owner: owner };
+    let engine = open_engine(dir.path()).await;
+    Fixture { dir, engine, parent, target, request }
 }
 
 async fn close(engine: Arc<Engine>) {
@@ -138,10 +180,13 @@ async fn close(engine: Arc<Engine>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_dependency_missing_parent_state_defers_with_history_intact() {
-    let Fixture { dir, engine, parent, target, request } = fixture(false).await;
+    let Fixture { dir, engine, parent, target, request } = gc_fixture_in(None).await;
     close(engine).await;
     let engine = open_engine(dir.path()).await;
     let result = std::panic::AssertUnwindSafe(async {
+        // The actual target is the durable floor; only its nonzero parent
+        // lies below it. This remains true across the following cold open.
+        super::super::native_gc_fixture::establish_floor_at(&engine, 2);
         engine.shard_states_keeper().test_retire_history_state(parent.id());
         tokio::time::timeout(Duration::from_secs(15), async {
             while engine.db().test_contains_dynamic_state_record(parent.id()).unwrap() {
@@ -465,7 +510,7 @@ async fn bounded_state_actual_engine_cold_warm_and_budget_rejection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody() {
-    let Fixture { dir: _dir, engine, parent, target, request } = fixture(false).await;
+    let Fixture { dir: _dir, engine, parent, target, request } = gc_fixture_in(None).await;
     struct ReleaseGate(Option<std::sync::mpsc::Sender<()>>);
     impl Drop for ReleaseGate {
         fn drop(&mut self) {
@@ -478,6 +523,9 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
     let mut repair = None;
     let result = std::panic::AssertUnwindSafe(async {
         let parent_pin = engine.load_and_pin_state(parent.id()).await.unwrap();
+        let keeper = engine.shard_states_keeper();
+        assert_eq!(keeper.test_state_gc_pin_count(target.id()), 0);
+        super::super::native_gc_fixture::establish_floor(&engine);
         engine.shard_states_keeper().test_retire_history_state(target.id());
         tokio::time::timeout(Duration::from_secs(15), async {
             while engine.db().test_contains_dynamic_state_record(target.id()).unwrap() {
@@ -505,9 +553,11 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         repair = Some(tokio::spawn(async move { repair_mc_final(owner, request).await }));
         tokio::time::timeout(Duration::from_secs(15), entered_rx).await.unwrap().unwrap();
         // The bounded writer has committed its atomic index/cells batch and is
-        // paused at the real WAL boundary. Check the actual GC decision too:
-        // queue serialization alone would postpone deletion while WAL is paused.
-        assert!(!engine.shard_states_keeper().allow_state_gc(target.id()).unwrap());
+        // paused at the real WAL boundary. Inspect the actual pin, separately
+        // from store-order retention: reconstructed target2 was appended after
+        // retained MC3, so a GC refusal alone would not prove pin ownership.
+        assert!(keeper.test_state_gc_pin_count(target.id()) > 0);
+        assert!(!keeper.allow_state_gc(target.id()).unwrap());
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
@@ -520,16 +570,36 @@ async fn mc_live_repair_bounded_writer_pin_survives_gc_and_transfers_to_custody(
         );
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
+        assert!(keeper.test_state_gc_pin_count(target.id()) > 0);
         drop(custody);
-        assert!(engine.shard_states_keeper().allow_state_gc(target.id()).unwrap());
+        assert_eq!(
+            keeper.test_state_gc_pin_count(target.id()),
+            0,
+            "custody Drop must release the transferred writer pin"
+        );
+        assert!(keeper.test_state_gc_pin_count(parent.id()) > 0);
+        // Native GC stops at the older retained MC3. Unlike the original
+        // target index, its reconstructed index is behind that boundary and
+        // remains readable even after every repair/read pin has been released.
+        assert!(!keeper.allow_state_gc(target.id()).unwrap());
+        engine.db().test_watch_state_gc_batch(parent.id());
+        drop(parent_pin);
+        assert_eq!(keeper.test_state_gc_pin_count(parent.id()), 0);
         tokio::time::timeout(Duration::from_secs(15), async {
-            while engine.db().test_contains_dynamic_state_record(target.id()).unwrap() {
+            while engine.db().test_contains_dynamic_state_record(parent.id()).unwrap()
+                || !engine.db().test_watched_state_gc_batch_completed()
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("dropping custody must release the transferred repair pin");
-        drop(parent_pin);
+        .expect("real GC must collect the released older parent and finish its batch");
+        assert!(engine.db().test_contains_dynamic_state_record(target.id()).unwrap());
+        assert!(!keeper.allow_state_gc(target.id()).unwrap());
+        assert_eq!(
+            engine.db().load_shard_state_dynamic(target.id()).unwrap().root_cell().repr_hash(),
+            &target.block().unwrap().read_state_update().unwrap().new_hash
+        );
     })
     .catch_unwind()
     .await;

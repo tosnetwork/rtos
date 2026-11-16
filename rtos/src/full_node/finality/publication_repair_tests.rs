@@ -5,18 +5,19 @@ use consensus_common::session_runtime::SessionNetworkPin;
 use storage::archives::package_entry_id::{GetFileName, PackageEntryId};
 
 async fn request(pair: &Pair) -> McFinalRepairRequest {
-    let context = pair
-        .receiver
-        .historical_pq_publication_context(pair.master.id(), pair.master.block().unwrap())
-        .await
-        .unwrap();
+    request_for(&pair.receiver, &pair.master).await
+}
+
+async fn request_for(engine: &Arc<Engine>, block: &BlockStuff) -> McFinalRepairRequest {
+    let context =
+        engine.historical_pq_publication_context(block.id(), block.block().unwrap()).await.unwrap();
     McFinalRepairRequest {
         pin: SessionNetworkPin {
             zerostate: context.zerostate().clone(),
             global_id: context.global_id(),
         },
         history_init: context.history_init().clone(),
-        block_id: pair.master.id().clone(),
+        block_id: block.id().clone(),
         session_id: context.verifier().expected_session_id().clone(),
         profile: context.profile().clone(),
         protocol: context.protocol(),
@@ -298,19 +299,49 @@ async fn mc_live_repair_canceled_waiter_remains_owned_until_real_barrier_finishe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_guard_excludes_actual_state_gc_until_drop() {
-    let pair = Pair::with_propagation_profile("included", false, true).await;
+    let mut pair = Pair::with_gc_options("included", false, true, true).await;
     let result = std::panic::AssertUnwindSafe(async {
         let (master, shards) = pair.apply_by_normal_clients().await;
-        let custody = repair_mc_final(pair.receiver.clone(), request(&pair).await).await.unwrap();
-        let keeper = pair.receiver.shard_states_keeper();
-        keeper.test_retire_history_state(pair.master.id());
-        let parent_protected = !keeper.allow_state_gc(&pair.anchor).unwrap();
-        let target_protected = !keeper.allow_state_gc(pair.master.id()).unwrap();
-        drop(custody);
-        let target_released = keeper.allow_state_gc(pair.master.id()).unwrap();
         pair.receiver.clone().wait_stop().await.unwrap();
         master.await.unwrap();
         shards.await.unwrap();
+        // Cold open excludes normal clients' predecessor/cache pins from the
+        // repair guard's release control.
+        drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
+        pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
+        let custody = repair_mc_final(pair.receiver.clone(), request(&pair).await).await.unwrap();
+        let keeper = pair.receiver.shard_states_keeper();
+        assert!(pair.receiver.db().test_contains_dynamic_state_record(&pair.anchor).unwrap());
+        pair.receiver.db().test_watch_state_gc_batch(&pair.anchor);
+        super::native_gc_fixture::establish_floor(&pair.receiver);
+        keeper.test_retire_history_state(pair.master.id());
+        // Native store order is published by a real collection pass. Observe
+        // its unpinned zero-state control being deleted before testing release;
+        // an immediate query before that pass only sees the old prefix.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !pair.receiver.db().test_watched_state_gc_batch_completed() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("real GC must finish the unpinned control's batch");
+        let parent = pair.master.construct_prev_id().unwrap().0;
+        assert!(parent.seq_no() > 0);
+        let parent_protected = !keeper.allow_state_gc(&parent).unwrap();
+        let target_protected = !keeper.allow_state_gc(pair.master.id()).unwrap();
+        for id in [&parent, pair.master.id()] {
+            assert!(pair.receiver.db().test_contains_dynamic_state_record(id).unwrap());
+        }
+        drop(custody);
+        let target_released = keeper.allow_state_gc(pair.master.id()).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dropping repair custody must permit actual target deletion");
+        pair.receiver.clone().wait_stop().await.unwrap();
         assert!(parent_protected && target_protected, "actual resolver must honor live state pins");
         assert!(target_released, "guard Drop must release target GC pin");
     })
@@ -325,7 +356,7 @@ async fn mc_live_repair_guard_excludes_actual_state_gc_until_drop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable_state() {
-    let mut pair = Pair::with_propagation_profile("included", false, true).await;
+    let mut pair = Pair::with_gc_options("included", false, true, true).await;
     let result = std::panic::AssertUnwindSafe(async {
         let (master, shards) = pair.apply_by_normal_clients().await;
         let expected = request(&pair).await;
@@ -343,7 +374,8 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
         std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
         pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
-        // Real GC removes the target dynamic state; the zerostate parent remains.
+        // A controlled established floor at MC3 admits real GC of MC1/MC2.
+        super::native_gc_fixture::establish_floor(&pair.receiver);
         pair.receiver.shard_states_keeper().test_retire_history_state(pair.master.id());
         tokio::time::timeout(Duration::from_secs(15), async {
             while pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap() {
@@ -357,6 +389,20 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
         pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;
         // Local body/fullproof still exist, so no network setup is needed here.
         assert!(!pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap());
+        // Restore the nonzero parent through the actual bounded repair path,
+        // rooted at the retained original zero. Hold its real custody through
+        // the target's budget refusal and successful reconstruction.
+        let parent_id = pair.master.construct_prev_id().unwrap().0;
+        assert!(parent_id.seq_no() > 0);
+        let parent = pair
+            .receiver
+            .load_block(&pair.receiver.load_block_handle(&parent_id).unwrap().unwrap())
+            .await
+            .unwrap();
+        let parent_custody =
+            repair_mc_final(pair.receiver.clone(), request_for(&pair.receiver, &parent).await)
+                .await
+                .unwrap();
         let _bounded_only = crate::publication_repair::require_bounded_durability(&pair.receiver);
         crate::publication_repair::limit_next_candidate_for_test(&pair.receiver, 0);
         let failure = repair_mc_final(pair.receiver.clone(), expected.clone()).await;
@@ -371,6 +417,7 @@ async fn mc_live_repair_missing_root_preflights_budget_before_rebuilding_durable
         assert_eq!(custody.state_root(), &pair.master_state_root);
         assert!(pair.receiver.db().test_contains_dynamic_state_record(pair.master.id()).unwrap());
         drop(custody);
+        drop(parent_custody);
         pair.receiver.clone().wait_stop().await.unwrap();
         drop(std::mem::replace(&mut pair.receiver, pair.provider.clone()));
         pair.receiver = open_engine(&pair._dir.path().join("receiver")).await;

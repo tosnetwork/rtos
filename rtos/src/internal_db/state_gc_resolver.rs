@@ -57,8 +57,8 @@ impl FloorBoundary {
         self.seqno
     }
 
-    /// The reference rule: a masterchain state below the floor goes (the
-    /// zerostate stays: boot re-verifies it from these cells); a shard state
+    /// The reference rule: every masterchain state below the floor goes,
+    /// including zero (its authenticated BOC is stored separately); a shard state
     /// goes when its workchain is active in the floor state and it is below
     /// the top of the same shard, or else of the first intersecting shard.
     /// A shard state that intersects no top is kept; the reference treats
@@ -66,7 +66,7 @@ impl FloorBoundary {
     pub(crate) fn allows(&self, block_id: &BlockIdExt) -> bool {
         let shard = block_id.shard();
         if shard.is_masterchain() {
-            return block_id.seq_no() != 0 && block_id.seq_no() < self.seqno;
+            return block_id.seq_no() < self.seqno;
         }
         if !self.workchains.contains(&shard.workchain_id()) {
             return false;
@@ -111,6 +111,13 @@ struct GcProgress {
 }
 
 impl AllowStateGcSmartResolver {
+    /// Observe real read/write pin ownership without conflating it with the
+    /// native store-order prefix, which can independently retain a state.
+    #[cfg(test)]
+    pub(crate) fn test_pin_count(&self, id: &BlockIdExt) -> u32 {
+        self.pinned_roots.read().get(id).copied().unwrap_or(0)
+    }
+
     /// Moves the masterchain boundary as if that progress had been committed
     /// after a durability barrier.
     #[cfg(test)]
@@ -528,11 +535,11 @@ mod floor_boundary_tests {
             vec![id(0, RIGHT, 70), id(0, LEFT_RIGHT, 40), id(0, LEFT_LEFT, 30)],
         );
         assert_eq!(floor.seqno(), 100);
-        // Masterchain: strictly below the floor; the zerostate is kept.
+        // Masterchain: every sequence strictly below the floor, including zero.
         assert!(floor.allows(&mc(99)));
         assert!(!floor.allows(&mc(100)));
         assert!(!floor.allows(&mc(101)));
-        assert!(!floor.allows(&mc(0)));
+        assert!(floor.allows(&mc(0)));
         // An exact shard is decided by its own top, strictly.
         assert!(floor.allows(&id(0, RIGHT, 69)));
         assert!(!floor.allows(&id(0, RIGHT, 70)));

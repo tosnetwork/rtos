@@ -266,3 +266,31 @@ async fn test_import_rejects_skip_validation() -> Result<()> {
 
 #[path = "test_node_nonzero_recovery.rs"]
 mod node_process_recovery;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_gc_keeps_mc_and_wc_zero_files_but_expires_regular_snapshots() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = Fixture::node_recovery();
+    let archives = dir.path().join("archives");
+    fixture.prepare(dir.path(), &archives).await?;
+    let physical = run_import(fixture.config(dir.path(), archives)).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), wait_for_db_release(physical)).await?;
+    let db = open_db(dir.path()).await?;
+    fixture.assert_imported(&db, 4).await?;
+    let old = fixture.id(1, false);
+    let handle = db.load_block_handle(&old)?.expect("imported MC1");
+    let bytes = rtos_block::write_boc(db.load_shard_state_dynamic(&old)?.root_cell())?;
+    db.store_shard_state_persistent_raw(&handle, &bytes, None).await?;
+    let files = storage::db::filedb::FileDb::with_path(
+        dir.path().join("node_db").join(crate::internal_db::SHARD_STATE_PERSISTENT_DB_NAME),
+    );
+    assert!(files.contains(&old).await?);
+    let result = db.shard_state_persistent_gc(|_| (0, true), &fixture.id(0, false)).await;
+    let checked = fixture.assert_imported(&db, 4).await;
+    let expired = !files.contains(&old).await?;
+    db.stop_states_db().await?;
+    result?;
+    checked?;
+    assert!(expired, "ordinary expired snapshots must still be collected");
+    Ok(())
+}

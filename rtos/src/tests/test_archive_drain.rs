@@ -10,6 +10,7 @@ use crate::{
     },
     shard_state::ShardStateStuff,
 };
+use futures::FutureExt;
 use rtos_block::*;
 use std::{
     path::{Path, PathBuf},
@@ -241,6 +242,37 @@ async fn archive_drain_cancel_before_admission_has_no_block_writes() {
     let reopened = open(dir.path()).await;
     assert!(reopened.load_block_handle(&id).unwrap().is_none());
     stop(reopened.clone()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_drain_read_permit_cannot_authorize_a_foreign_stopped_database() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let owner = prepare(owner_dir.path(), &fixture, false).await;
+    let foreign = prepare(foreign_dir.path(), &fixture, false).await;
+    let foreign_keeper = foreign.shard_states_keeper().clone();
+    let zero = fixture.id(0, false);
+    stop(foreign.clone()).await;
+    let ops: Arc<dyn EngineOperations> = owner.clone();
+    let result = std::panic::AssertUnwindSafe(async {
+        let task = spawn_archive_task(&ops, "archive foreign read boundary", async move {
+            let error =
+                foreign_keeper.load_state(&zero).await.err().ok_or_else(|| {
+                    error!("Archive admission authorized another stopped database")
+                })?;
+            if error.to_string() != "Stopped" {
+                fail!("Foreign zero-state read refused for the wrong reason: {error:#}");
+            }
+            Ok(())
+        })
+        .unwrap();
+        task.await.unwrap().observe().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    stop(owner.clone()).await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

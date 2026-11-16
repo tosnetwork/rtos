@@ -1,7 +1,7 @@
 // Copyright 2026 TOS Blockchain Teams. SPDX-License-Identifier: GPL-3.0-only
 use super::*;
 use rtos_block::{
-    BinTreeType, BuilderData, ConfigParam12, IBitstring, WorkchainFormat, WorkchainFormat1,
+    BinTreeType, Block, BuilderData, ConfigParam12, IBitstring, WorkchainFormat, WorkchainFormat1,
 };
 
 async fn execution_bundle(kind: &str, transition: bool) -> Result<CollatorTestBundle> {
@@ -215,6 +215,74 @@ fn read_execution_candidate(name: &str) -> Result<BlockCandidate> {
     })
 }
 
+// These two negative fixtures deliberately keep their historical WC body. Bind
+// only their MC reference to the actual MC1 constructed by this test run.
+async fn local_role_candidate(bundle: &CollatorTestBundle, name: &str) -> Result<BlockCandidate> {
+    let mut candidate = read_execution_candidate(name)?;
+    let expected = match name {
+        "local-unknown" => "9314aae84e256f2dc80864b6bbeabbcc25cbc8ae08b52abaee3cdb48ab8d3a10",
+        "local-mode" => "e32643fc3bbbe46818cb8beb63c12342620404f522d7dc48be95f2b8139fbabc",
+        _ => panic!("unknown local execution fixture {name}"),
+    };
+    assert_eq!(candidate.block_id.root_hash().to_hex_string(), expected);
+    let original_data = candidate.data.clone();
+    let original = read_single_root_boc(&original_data)?;
+    let mut block = Block::construct_from_cell(original.clone())?;
+    let mut info = block.read_info()?;
+    assert!(!info.shard().is_masterchain());
+    let old_reference = info.read_master_ref()?.expect("local fixture MC reference");
+    let master =
+        bundle.prev_blocks.get(&bundle.index.last_mc_state).expect("generated masterchain anchor");
+    assert!(master.id().shard().is_masterchain());
+    assert_eq!(master.id().seq_no(), 1);
+    assert_eq!(old_reference.master.seq_no, 1);
+    let reference = rtos_block::BlkMasterInfo {
+        master: rtos_block::ExtBlkRef {
+            end_lt: master.block()?.read_info()?.end_lt(),
+            seq_no: master.id().seq_no(),
+            root_hash: master.id().root_hash().clone(),
+            file_hash: master.id().file_hash().clone(),
+        },
+    };
+    info.write_master_ref(Some(&reference))?;
+    block.write_info(&info)?;
+    let root = block.serialize()?;
+    assert_eq!(original.data(), root.data());
+    assert_eq!(original.references_count(), root.references_count());
+    for index in 1..original.references_count() {
+        assert_eq!(
+            original.reference_repr_hash(index)?,
+            root.reference_repr_hash(index)?,
+            "local role migration changes only the info reference"
+        );
+    }
+    let data = rtos_block::write_boc(&root)?;
+    candidate.block_id = BlockIdExt::with_params(
+        info.shard().clone(),
+        info.seq_no(),
+        root.repr_hash().clone(),
+        UInt256::calc_file_hash(&data),
+    );
+    candidate.data = data;
+    assert_eq!(
+        Block::construct_from_cell(root)?.read_info()?.read_master_ref()?.unwrap(),
+        reference
+    );
+    if let Some(path) = std::env::var_os("RTOS_EXECUTION_CONTEXT_EXPORT") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join(format!("{name}-original.boc")), original_data)?;
+        std::fs::write(path.join(format!("{name}-migrated.boc")), &candidate.data)?;
+        std::fs::write(path.join(format!("{name}-mc1.boc")), master.data())?;
+        let state = bundle.load_state(master.id()).await?;
+        std::fs::write(
+            path.join(format!("{name}-mc1-state.boc")),
+            rtos_block::write_boc(&state.state()?.serialize()?)?,
+        )?;
+    }
+    Ok(candidate)
+}
+
 async fn validate_execution_candidate(
     bundle: Arc<CollatorTestBundle>,
     candidate: BlockCandidate,
@@ -277,18 +345,25 @@ async fn execution_validator_config_account_transition() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn execution_validator_local_role() -> Result<()> {
     crate::test_helper::fixture_clock(async {
-        for kind in ["unknown", "mode"] {
+        for kind in ["tvm", "unknown", "mode"] {
             let (bundle, prev) = execution_shard_bundle(kind).await?;
             let name = format!("local-{kind}");
+            if kind == "tvm" {
+                let (candidate, _) = collate_execution(
+                    bundle.clone(),
+                    ShardIdent::with_workchain_id(0)?,
+                    prev.clone(),
+                    false,
+                )
+                .await?;
+                validate_execution_candidate(bundle, candidate, prev).await?;
+                continue;
+            }
+            let candidate = local_role_candidate(&bundle, &name).await?;
             if std::env::var_os("RTOS_EXECUTION_EXPORT").is_some() {
-                let (candidate, _) =
-                    collate_execution(bundle, ShardIdent::with_workchain_id(0)?, prev, false)
-                        .await?;
                 write_execution_candidate(&candidate, &name)?;
             } else {
-                let result =
-                    validate_execution_candidate(bundle, read_execution_candidate(&name)?, prev)
-                        .await;
+                let result = validate_execution_candidate(bundle, candidate, prev).await;
                 let error = result
                     .err()
                     .expect("unsupported local engine must fail validation")

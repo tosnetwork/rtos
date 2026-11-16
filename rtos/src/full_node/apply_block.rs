@@ -64,12 +64,13 @@ async fn check_prev_blocks(
     for (index, id) in std::iter::once(&prev_ids.0).chain(prev_ids.1.iter()).enumerate() {
         let engine = engine.clone();
         let id = id.clone();
-        tasks.spawn(async move {
+        let read_permit = crate::sync::archive_read_permit();
+        tasks.spawn(crate::sync::scope_archive_read(read_permit, async move {
             let result = engine
                 .download_and_apply_block_internal(&id, mc_seq_no, pre_apply, recursion_depth + 1)
                 .await;
             (index, result)
-        });
+        }));
     }
     let mut results = [None, None];
     while let Some(result) = tasks.join_next().await {

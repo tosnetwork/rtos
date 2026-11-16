@@ -2370,3 +2370,190 @@ fn test_proof_storage_stat() {
         assert_eq!(a.is_loaded(h), b.is_loaded(h), "order-independent load");
     }
 }
+
+#[test]
+fn proof_storage_stat_native_preorder_budget_boundaries() {
+    fn big(tag: u32, child: Option<Cell>) -> Cell {
+        let mut builder = BuilderData::new();
+        for _ in 0..20 {
+            builder.append_u32(tag).unwrap();
+        }
+        if let Some(child) = child {
+            builder.checked_append_reference(child).unwrap();
+        }
+        builder.into_cell().unwrap()
+    }
+    fn small(child: Option<Cell>) -> Cell {
+        let mut builder = BuilderData::new();
+        builder.append_bit_one().unwrap();
+        if let Some(child) = child {
+            builder.checked_append_reference(child).unwrap();
+        }
+        builder.into_cell().unwrap()
+    }
+    let all = |_: &UInt256| true;
+    // TOS5af native ProofStorageStat + collator preorder DFS: parent replaces a
+    // 41-byte pruned boundary (-32), then its absent child costs 85: prefix max 53.
+    let leaf = big(0x12345678, None);
+    let parent = small(Some(leaf.clone()));
+    let mut owner = BuilderData::new();
+    owner.checked_append_reference(parent.clone()).unwrap();
+    let owner = owner.into_cell().unwrap();
+    for (budget, accepted) in [(52, false), (53, true), (60, true), (85, true)] {
+        let mut stat = ProofStorageStat::default();
+        stat.add_loaded_cell(&owner).unwrap();
+        assert_eq!(
+            stat.try_load_branches(&[parent.clone()], &all, budget).unwrap(),
+            accepted,
+            "native small-parent budget {budget}"
+        );
+        assert_eq!(stat.is_loaded(parent.repr_hash()), accepted);
+        assert_eq!(stat.is_loaded(leaf.repr_hash()), accepted);
+        if !accepted {
+            // A failed measurement must leave both the boundary refund and child cost intact.
+            assert!(stat.try_load_branches(&[parent.clone()], &all, 53).unwrap());
+        }
+    }
+    // The reverse order must refuse before a later negative delta can refund it.
+    let tiny = small(None);
+    let parent = big(0x87654321, Some(tiny.clone()));
+    let mut owner = BuilderData::new();
+    owner.checked_append_reference(tiny).unwrap();
+    let owner = owner.into_cell().unwrap();
+    for (budget, accepted) in [(53, false), (60, false), (88, true)] {
+        let mut stat = ProofStorageStat::default();
+        stat.add_loaded_cell(&owner).unwrap();
+        assert_eq!(
+            stat.try_load_branches(&[parent.clone()], &all, budget).unwrap(),
+            accepted,
+            "native big-parent budget {budget}"
+        );
+        assert_eq!(stat.is_loaded(parent.repr_hash()), accepted);
+    }
+
+    // One shared budget spans roots: the first leaf costs 85, then this parent
+    // costs 88 before its pruned child refunds 35. Final total 138, prefix max 173.
+    for (budget, accepted) in [(138, false), (172, false), (173, true)] {
+        let mut stat = ProofStorageStat::default();
+        stat.add_loaded_cell(&owner).unwrap();
+        assert_eq!(
+            stat.try_load_branches(&[leaf.clone(), parent.clone()], &all, budget).unwrap(),
+            accepted,
+            "native multiple-root budget {budget}"
+        );
+        assert_eq!(stat.is_loaded(leaf.repr_hash()), accepted);
+        assert_eq!(stat.is_loaded(parent.repr_hash()), accepted);
+    }
+}
+
+#[test]
+fn proof_storage_stat_merge_selected_dictionary_proof() {
+    let mut builder = BuilderData::new();
+    for _ in 0..20 {
+        builder.append_u32(0x12345678).unwrap();
+    }
+    let leaf = builder.into_cell().unwrap();
+    let mut builder = BuilderData::new();
+    builder.checked_append_reference(leaf.clone()).unwrap();
+    let owner = builder.into_cell().unwrap();
+    let all = |_: &UInt256| true;
+    let mut dictionary_proof = ProofStorageStat::default();
+    dictionary_proof.add_loaded_cell(&owner).unwrap();
+    let mut stat = ProofStorageStat::default();
+    assert!(!stat.try_load_branches(&[leaf.clone()], &all, 44).unwrap());
+    stat.add_loaded_cells(&dictionary_proof);
+    assert!(stat.is_loaded(owner.repr_hash()));
+    assert!(!stat.is_loaded(leaf.repr_hash()));
+    // Native full leaf costs 85; the selected proof already carries its 41-byte boundary.
+    assert!(!stat.try_load_branches(&[leaf.clone()], &all, 43).unwrap());
+    assert!(stat.try_load_branches(&[leaf.clone()], &all, 44).unwrap());
+    stat.add_loaded_cells(&dictionary_proof);
+    assert!(stat.is_loaded(leaf.repr_hash()), "merging a boundary must not downgrade full data");
+    assert!(stat.try_load_branches(&[owner], &all, 0).unwrap());
+}
+
+#[test]
+fn proof_storage_stat_captured_native_selection_prefixes() {
+    use crate::Deserializable;
+    // The generated TSV view avoids adding a JSON dependency to this crate's tests.
+    let mut lines = include_str!("../../tests/data/proof-selection-native.tsv").lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!(
+            "FIXTURE_SHA256 {}",
+            UInt256::calc_file_hash(include_bytes!("../../tests/data/proof-selection-native.json"))
+                .to_hex_string()
+        )
+    );
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("REFERENCE {}", include_str!("../../../../ci/conformance/REFERENCE").trim())
+    );
+    let mut cases = 0;
+    let mut selected_dictionaries = 0;
+    while let Some(line) = lines.next() {
+        let header = line.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(header.len(), 6);
+        assert_eq!(header[0], "CASE");
+        let budget = header[2].parse::<usize>().unwrap();
+        let expected = match header[3] {
+            "0" => false,
+            "1" => true,
+            _ => panic!("invalid native fit"),
+        };
+        let roots = crate::read_boc(&crate::base64_decode(header[4]).unwrap())
+            .unwrap()
+            .roots
+            .into_iter()
+            .map(|root| crate::MerkleProof::construct_from_cell(root).unwrap().proof.virtualize(1))
+            .collect::<Vec<_>>();
+        let hashes = lines.next().unwrap().split_whitespace().collect::<Vec<_>>();
+        assert_eq!(hashes[0], "ROOTS");
+        assert_eq!(
+            roots.iter().map(|cell| cell.repr_hash().to_hex_string()).collect::<Vec<_>>(),
+            hashes[1..]
+        );
+        let mut stat = ProofStorageStat::default();
+        let mut included = ahash::AHashSet::default();
+        let mut visited = ahash::AHashSet::default();
+        loop {
+            let line = lines.next().unwrap();
+            if line == "END" {
+                break;
+            }
+            let row = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(row.len(), 4);
+            assert_eq!(row[0], "STATUS");
+            let hash: UInt256 = row[1].parse().unwrap();
+            assert!(visited.insert(hash.clone()));
+            match row[2] {
+                "0" => (),
+                "1" => {
+                    stat.cells.insert(hash.clone(), super::CellStatus::Pruned);
+                }
+                "2" => {
+                    stat.cells.insert(hash.clone(), super::CellStatus::Loaded);
+                }
+                _ => panic!("invalid frozen status"),
+            }
+            match row[3] {
+                "0" => (),
+                "1" => {
+                    included.insert(hash);
+                }
+                _ => panic!("invalid membership"),
+            }
+        }
+        assert_eq!(visited.len(), header[5].parse::<usize>().unwrap());
+        let before = stat.cells.clone();
+        let fits = stat.try_load_branches(&roots, &|hash| included.contains(hash), budget).unwrap();
+        assert_eq!(fits, expected, "native account {}", header[1]);
+        if !fits {
+            selected_dictionaries += 1;
+            assert_eq!(stat.cells, before, "refused prefix must leave the statistic untouched");
+        }
+        cases += 1;
+    }
+    assert_eq!(cases, 8);
+    assert_eq!(selected_dictionaries, 7);
+}

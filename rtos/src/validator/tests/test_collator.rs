@@ -1205,7 +1205,9 @@ fn collated_fixture_v2_reference(block: &Block) -> Result<Block> {
     Ok(migrated)
 }
 
-async fn try_validate_historical_bundle(bundle: Arc<CollatorTestBundle>) {
+async fn try_validate_historical_bundle(mut bundle: CollatorTestBundle) {
+    bundle.use_native_size_limits_fixture().unwrap();
+    let bundle = Arc::new(bundle);
     let error =
         try_validate_by_bundle(bundle.clone()).await.err().expect("legacy hash is rejected");
     assert!(error.to_string().contains("validator set hash"), "{error}");
@@ -1291,8 +1293,20 @@ fn read_dict_proof(root: Cell) -> Result<MerkleProof> {
     MerkleProof::construct_from_cell(AccountStorageDictProof::construct_from_cell(root)?.proof)
 }
 
-async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
-    let mut bundle = CollatorTestBundle::load(bundle).unwrap();
+fn native_proof_selection_profile() -> serde_json::Value {
+    let profile: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../block/src/tests/data/proof-selection-native.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        profile["reference_commit"].as_str().unwrap(),
+        include_str!("../../../../ci/conformance/REFERENCE").trim()
+    );
+    profile
+}
+
+async fn check_bundle(bundle_path: &str, collated_roots: usize, migrate_hash: bool) {
+    let mut bundle = CollatorTestBundle::load(bundle_path).unwrap();
     let config =
         bundle.load_last_applied_mc_state().await.unwrap().config_params().unwrap().clone();
     let capabilities = config.capabilities();
@@ -1306,7 +1320,17 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
         try_collate_by_bundle_reference(Arc::new(bundle), true, reference).await.unwrap();
 
     let mut collated_data_roots = read_boc(&candidate.collated_data).unwrap().roots;
-    assert_eq!(collated_data_roots.len(), collated_roots + 1);
+    let mut collated_root_hashes =
+        collated_data_roots.iter().map(|root| root.repr_hash().to_hex_string()).collect::<Vec<_>>();
+    collated_root_hashes.sort();
+    if let Some(root) = std::env::var_os("RTOS_COLLATOR_PROOF_EXPORT") {
+        let name = std::path::Path::new(bundle_path).file_name().unwrap();
+        let output = std::path::PathBuf::from(root).join(name);
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("block.boc"), &candidate.data).unwrap();
+        std::fs::write(output.join("collated.boc"), &candidate.collated_data).unwrap();
+    }
+    assert_eq!(collated_data_roots.len(), collated_roots + 1, "{bundle_path}");
     let state_proof = MerkleProof::construct_from_cell(collated_data_roots.pop().unwrap()).unwrap();
     let state: ShardStateUnsplit = state_proof.virtualize().unwrap();
     let accounts = state.read_accounts().unwrap();
@@ -1327,6 +1351,36 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
             }
         })
         .collect::<Vec<_>>();
+
+    let profile = native_proof_selection_profile();
+    if std::path::Path::new(bundle_path).file_name().unwrap().to_str().unwrap()
+        == profile["bundle"].as_str().unwrap()
+    {
+        assert_eq!(
+            UInt256::calc_file_hash(&candidate.data).to_hex_string(),
+            profile["capture_block_sha256"].as_str().unwrap(),
+            "native profile candidate changed"
+        );
+        let expected_roots = profile["capture_collated_root_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hash| hash.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(collated_root_hashes, expected_roots, "native profile proof packing changed");
+        let mut expected = profile["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| !case["expected"]["fits"].as_bool().unwrap())
+            .map(|case| case["dict_hash"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut actual =
+            dict_proofs.iter().map(|proof| proof.hash.to_hex_string()).collect::<Vec<_>>();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected, "selected dictionary proofs must match native choices");
+    }
 
     let block = Block::construct_from_bytes(&candidate.data).unwrap();
     let extra = block.read_extra().unwrap();
@@ -1373,9 +1427,17 @@ async fn check_bundle(bundle: &str, collated_roots: usize, migrate_hash: bool) {
 async fn test_collated_data2() {
     init_test_log();
     check_bundle("src/tests/static/test_collated_data", 10, true).await;
+    let profile = native_proof_selection_profile();
+    let dictionary_proofs = profile["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| !case["expected"]["fits"].as_bool().unwrap())
+        .count();
+    assert_eq!(profile["metadata_roots"].as_u64().unwrap(), 1);
     check_bundle(
         "src/tests/static/0.8000000000000000_56703839_5b25cdef_collator_test_bundle",
-        10,
+        profile["non_dictionary_proof_roots"].as_u64().unwrap() as usize + dictionary_proofs,
         true,
     )
     .await;
@@ -1386,12 +1448,10 @@ async fn test_collated_data2() {
     )
     .await;
 
-    let bundle = Arc::new(
-        CollatorTestBundle::load(
-            "src/tests/static/0.6000000000000000_439_d27493e2_collator_test_bundle",
-        )
-        .unwrap(),
-    );
+    let bundle = CollatorTestBundle::load(
+        "src/tests/static/0.6000000000000000_439_d27493e2_collator_test_bundle",
+    )
+    .unwrap();
     try_validate_historical_bundle(bundle).await;
 }
 
@@ -1417,7 +1477,7 @@ async fn test_collated_data_validate_unchanged_account() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_66163599_2bc2034d_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 // full-collated-data validation where a subtree shared with the new state is pruned in
@@ -1429,7 +1489,7 @@ async fn test_validate_pruned_shared_subtree_storage_stat() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76189835_5ca9034e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1438,7 +1498,7 @@ async fn test_validate_pruned_dispatch_queue() {
     init_test_log();
     let path = "src/tests/static/0.8000000000000000_76770988_db9fc78e_collator_test_bundle";
     let bundle = CollatorTestBundle::load(path).unwrap();
-    try_validate_historical_bundle(Arc::new(bundle)).await;
+    try_validate_historical_bundle(bundle).await;
 }
 
 #[cfg(not(feature = "xp25"))]
@@ -1446,7 +1506,9 @@ async fn test_validate_pruned_dispatch_queue() {
 async fn test_collated_data_add_removed_cells_to_proof() {
     init_test_log();
     let path = "src/tests/static/0.e000000000000000_67704975_6cea4ad1_collator_test_bundle";
-    let bundle = CollatorTestBundle::load(path).unwrap();
+    let mut bundle = CollatorTestBundle::load(path).unwrap();
+    assert!(bundle.use_native_size_limits_fixture().unwrap());
+    assert!(!bundle.use_native_size_limits_fixture().unwrap(), "migration must be idempotent");
     try_collate_by_bundle(Arc::new(bundle), false).await.unwrap();
 }
 

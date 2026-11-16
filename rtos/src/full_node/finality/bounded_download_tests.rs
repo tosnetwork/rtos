@@ -163,9 +163,41 @@ async fn bounded_download_e2e_declared_wire_and_graph_rejection() {
             .await
             .err()
             .unwrap();
-        let error = error.downcast_ref::<adnl::ResponseLimitExceeded>().unwrap();
-        assert_eq!(error.actual, 0x7fffff);
+        // A slice-backed TL parser checks the declared payload is present
+        // before applying allocation budgets, matching the native parser.
+        let error = error.downcast_ref::<std::io::Error>().expect("truncated TL payload");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "truncated TL field");
         assert_eq!(count(&pair), before + 1);
+
+        // A complete field must still hit the preallocation byte budget.
+        // Exercise the same decoder directly so the transport envelope cap
+        // cannot reject the complete response before it reaches this check.
+        let byte_budget = proof.len() - 1;
+        let error = WireProfile::T0
+            .deserialize_value_bounded::<rtos_api::ton::ton_node::DataFull>(&valid, byte_budget)
+            .err()
+            .expect("complete proof must exceed the TL allocation budget");
+        let error = error.downcast_ref::<adnl::ResponseLimitExceeded>().unwrap();
+        assert_eq!(error.actual, proof.len());
+        assert_eq!(error.limit, byte_budget);
+
+        // Also retain an end-to-end complete proof-size refusal and ensure
+        // one reply is sufficient: malformed/oversized replies are not retried.
+        inject(&pair, valid.clone());
+        let before_proof = count(&pair);
+        let mut proof_cap = limits(proof.len(), block.len());
+        proof_cap.proof_bytes = byte_budget;
+        let error = client
+            .download_block_full_bounded(pair.master.id(), false, proof_cap)
+            .await
+            .err()
+            .expect("complete proof must exceed its BOC byte limit");
+        let error = error.downcast_ref::<adnl::ResponseLimitExceeded>().unwrap();
+        assert_eq!(error.actual, proof.len());
+        assert_eq!(error.limit, byte_budget);
+        assert_eq!(count(&pair), before_proof + 1);
+
         inject(&pair, valid.clone());
         let (header, _) = BocReader::new().read_header(&mut std::io::Cursor::new(&block)).unwrap();
         assert!(header.cells_count > 1);

@@ -700,6 +700,7 @@ struct BootstrapTestEngine {
     validator_network: Arc<BootstrapValidatorNetwork>,
     transport_config: Option<Arc<crate::config::NodeConfigHandler>>,
     fail_finality_sink_once: AtomicBool,
+    failed_finality_sink_session: std::sync::Mutex<Option<UInt256>>,
     fail_current_history_busy_once: AtomicBool,
     fail_current_history_auth: AtomicBool,
     fail_future_history_once: AtomicBool,
@@ -783,6 +784,7 @@ impl BootstrapTestEngine {
             validator_network: Arc::new(BootstrapValidatorNetwork::new(local_keys)),
             transport_config: None,
             fail_finality_sink_once: AtomicBool::new(false),
+            failed_finality_sink_session: std::sync::Mutex::new(None),
             fail_current_history_busy_once: AtomicBool::new(false),
             fail_current_history_auth: AtomicBool::new(false),
             fail_future_history_once: AtomicBool::new(false),
@@ -1011,9 +1013,10 @@ impl EngineOperations for BootstrapTestEngine {
 
     async fn durable_finality_sink(
         self: Arc<Self>,
-        _runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
+        runtime: Arc<consensus_common::session_runtime::AuthenticatedSessionRuntime>,
     ) -> Result<consensus_common::finality_delivery::DurableFinalitySinkPtr> {
         if self.fail_finality_sink_once.swap(false, Ordering::SeqCst) {
+            *self.failed_finality_sink_session.lock().unwrap() = Some(runtime.session_id().clone());
             fail!("Injected transient finality sink initialization failure");
         }
         Ok(Arc::new(BootstrapUnavailableFinalitySink))

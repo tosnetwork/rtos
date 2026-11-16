@@ -62,6 +62,7 @@ async fn retired_history_real_gc_and_cold_reopen_preserve_authenticated_state() 
     let engine = open_engine(&directory.path().join("receiver")).await;
     let result = std::panic::AssertUnwindSafe(async {
         assert!(engine.db().test_contains_dynamic_state_record(master.id()).unwrap());
+        native_gc_fixture::establish_floor(&engine);
         engine.shard_states_keeper().test_retire_history_state(master.id());
         tokio::time::timeout(Duration::from_secs(20), async {
             while engine.db().test_contains_dynamic_state_record(master.id()).unwrap() {

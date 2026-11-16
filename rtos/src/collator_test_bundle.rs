@@ -553,6 +553,74 @@ impl CollatorTestBundle {
     pub fn set_capabilities(&mut self, capabilities: u64) {
         self.capabilities = Some(capabilities);
     }
+
+    /// Converts only known TON fixture cells to native-generated TOS records.
+    /// This changes a trusted test context, not an authenticated chain replay.
+    #[cfg(test)]
+    pub(crate) fn use_native_size_limits_fixture(&mut self) -> Result<bool> {
+        use rtos_block::SizeLimitsConfig;
+        #[derive(serde::Deserialize)]
+        struct Replacement {
+            old_hash: String,
+            new_hash: String,
+            old_boc: String,
+            new_boc: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Migrations {
+            reference_commit: String,
+            cells: Vec<Replacement>,
+        }
+        let table: Migrations =
+            serde_json::from_str(include_str!("tests/data/collator-size-limits-migrations.json"))?;
+        if table.reference_commit != include_str!("../../ci/conformance/REFERENCE").trim() {
+            fail!("size-limit fixture reference differs from the active native pin");
+        }
+        let id = self.index.last_mc_state.clone();
+        let state = self.states.get(&id).ok_or_else(|| error!("missing fixture MC state"))?;
+        let mut modified = state.state()?.clone();
+        let mut extra = modified.read_custom()?.ok_or_else(|| error!("missing MC extra"))?;
+        if !extra.config.config_present(43)? {
+            return Ok(false);
+        }
+        let original = extra.config.config_cell_slice(43)?.into_cell()?;
+        let hash = original.repr_hash().to_hex_string();
+        let Some(row) = table.cells.iter().find(|row| row.old_hash == hash) else {
+            // Unrecognized invalid configurations remain errors.
+            extra.config.size_limits_config()?;
+            return Ok(false);
+        };
+        let before = read_single_root_boc(&hex::decode(&row.old_boc)?)?;
+        if before != original {
+            fail!("native migration source differs from the supplied fixture cell");
+        }
+        let replacement = read_single_root_boc(&hex::decode(&row.new_boc)?)?;
+        if replacement.repr_hash().to_hex_string() != row.new_hash {
+            fail!("native migration replacement hash mismatch");
+        }
+        let limits = SizeLimitsConfig::construct_from_full_cell(replacement.clone())?;
+        let mut old = rtos_block::SliceData::load_cell(original)?;
+        let mut expected = SizeLimitsConfig::construct_from(&mut old)?;
+        expected.max_transaction_library_loads =
+            if old.get_next_bit()? { Some(u32::construct_from(&mut old)?) } else { None };
+        if old.remaining_bits() != 0 || old.remaining_references() != 0 || expected != limits {
+            fail!("native migration changed legacy size-limit semantics");
+        }
+        extra.config.set_config(ConfigParamEnum::ConfigParam43(limits))?;
+        if extra.config.config_cell_slice(43)?.into_cell()? != replacement {
+            fail!("Rust did not reproduce the native size-limit cell");
+        }
+        modified.write_custom(Some(&extra))?;
+        let updated = ShardStateStuff::from_state(
+            id.clone(),
+            modified,
+            #[cfg(feature = "telemetry")]
+            &self.telemetry,
+            &self.allocated,
+        )?;
+        self.states.insert(id, updated);
+        Ok(true)
+    }
 }
 
 impl CollatorTestBundle {
