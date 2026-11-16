@@ -1728,6 +1728,10 @@ async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
         let query = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
         let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42;64]);
+        assert_eq!(query_admission_native_effects()["warm_pending"], 0);
+        let admission_started = std::time::Instant::now();
+        let before_admission = rldps[0].query_budget.remaining(&peers);
+        assert_eq!(before_admission, (8192, 256), "completed warm query must return its admission before caller resumes");
         reply.hold.store(true, Ordering::Release);
         let mut pending = futures::stream::FuturesUnordered::new();
         for _ in 0..257 { pending.push(rldps[0].query(&query, Some(1024), &peers, true, None)); }
@@ -1739,7 +1743,8 @@ async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
         assert_eq!(pending.len(), expected["pending"].as_u64().unwrap() as usize);
         assert_eq!(expected["refused"], 1);
         assert_eq!(expected["other"], 0);
-        assert!(pending.next().now_or_never().is_none());
+        let additional = pending.next().now_or_never();
+        assert!(additional.is_none(), "additional={additional:?}, warm_remaining={before_admission:?}, elapsed={:?}", admission_started.elapsed());
         assert_eq!(rldps[0].query_budget.remaining(&peers).1, 0);
         assert_eq!(rldps[0].query_budget.remaining(&peers).0, 8192 - 256,
             "refused connection admission must not consume global capacity");
@@ -1789,6 +1794,14 @@ async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
             .collect();
         let (answer, _) = rldps[1].query(&query, Some(1024), &routes[0], true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42; 64]);
+        assert_eq!(query_admission_native_effects()["warm_pending"], 0);
+        let admission_started = std::time::Instant::now();
+        let before_admission = rldps[1].query_budget.remaining(&routes[0]);
+        assert_eq!(
+            before_admission,
+            (8192, 256),
+            "completed warm query must return both admission levels"
+        );
         reply.hold.store(true, Ordering::Release);
         let mut pending = futures::stream::FuturesUnordered::new();
         for (index, route) in routes.iter().enumerate() {
@@ -1806,7 +1819,12 @@ async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
         assert_eq!(pending.len(), expected["global_pending"].as_u64().unwrap() as usize);
         assert_eq!(expected["global_refused"], 1);
         assert_eq!(expected["global_other"], 0);
-        assert!(pending.next().now_or_never().is_none());
+        let additional = pending.next().now_or_never();
+        assert!(
+            additional.is_none(),
+            "additional={additional:?}, warm_remaining={before_admission:?}, elapsed={:?}",
+            admission_started.elapsed()
+        );
         assert_eq!(rldps[1].query_budget.remaining(&routes[0]).0, 0);
         drop(pending);
         reply.hold.store(false, Ordering::Release);

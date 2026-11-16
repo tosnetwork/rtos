@@ -4,8 +4,8 @@
   "native_source": "/tos/worktrees/tos/rtos-conformance-latest-5af405d",
   "native_build": "/tos/build/rtos-conformance-latest-5af405d",
   "runner_source_sha256": "2855676a32f30eb9d308cff1af6b5a7f10b3dc985a8a31bacd9ca6447fb171a9",
-  "probe_source_sha256": "8ebb869ffc13a55ec6749a8e39989284696663a94c441786718cafd373007038",
-  "probe_binary_sha256": "6ae39310901a926ee94a054907d789852ed7e941f1fc80dd6516da3fa36897e9",
+  "probe_source_sha256": "7c4f57b2cb70a421162615b42ead44109b9eb6101049fbeb724d23f19c332418",
+  "probe_binary_sha256": "0fcd7beee091016c5239cd9b252e59ac6ac4034af1c9613e7e6fbecde509b729",
   "exit": 0,
   "compile_command": [
     "/usr/bin/clang++-21",
@@ -50,15 +50,15 @@
     "-std=c++20",
     "-O1",
     "-c",
-    "/tos/worktrees/rtos/rldp2-query-admission/ci/conformance/rldp2_query_admission_reference.cpp",
+    "/tos/worktrees/rtos/query-admission-ci-observation/ci/conformance/rldp2_query_admission_reference.cpp",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-rldp2-query-admission/native-final/probe.o"
+    "/datax/rtos-conformance/2026-11-16-query-admission-ci-observation/native/probe.o"
   ],
   "link_command": [
     "/usr/bin/clang++-21",
-    "/datax/rtos-conformance/2026-11-16-rldp2-query-admission/native-final/probe.o",
+    "/datax/rtos-conformance/2026-11-16-query-admission-ci-observation/native/probe.o",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-rldp2-query-admission/native-final/probe",
+    "/datax/rtos-conformance/2026-11-16-query-admission-ci-observation/native/probe",
     "-Wl,--start-group",
     "adnl/libadnl.a",
     "adnl/libadnltest.a",
@@ -150,5 +150,5 @@
     "-lpthread",
     "-ldl"
   ],
-  "effects_sha256": "c0e3af03432926c8800fc200bde13b9d0b80c718790b990cf4db7db357b15891"
+  "effects_sha256": "bebced75ff7bce8355b01c50f14b76f4dc7e965f2577fc9fdbe3794469dde491"
 }

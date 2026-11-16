@@ -377,7 +377,8 @@ where
 }
 
 pub(super) struct SendRegistration {
-    // Keep pending-query capacity until actual send/receive owners have drained.
+    // Retain cancellation fallback; completed queries release logical admission
+    // before returning, independently of these transport resource owners.
     pub _query_admission: Option<Arc<QueryAdmission>>,
     pub v2: bool,
     pub inbound: Option<(super::TransferId, CancellationToken)>,

@@ -164,6 +164,21 @@ int main(int argc, char **argv) {
     fail("one connection did not carry a burst of queries to their answers");
   }
 
+  size_t warm_pending = 1;
+  bool warm_stats_done = false;
+  scheduler.run_in_context([&] {
+    td::actor::send_closure(
+        rldp, &tos::rldp2::Rldp::get_connection_stats,
+        td::PromiseCreator::lambda(
+            [&](td::Result<tos::rldp2::Rldp::ConnectionStats> r) {
+              r.ensure();
+              warm_pending = r.ok().pending_queries;
+              warm_stats_done = true;
+            }));
+  });
+  run_for(scheduler, 1.0, [&] { return warm_stats_done; });
+  CHECK(warm_stats_done && warm_pending == 0);
+
   // Nothing is delivered from here on, so the query below can never complete
   // by itself.
   scheduler.run_in_context([&] {
@@ -242,7 +257,8 @@ int main(int argc, char **argv) {
   run_for(scheduler, 1.0, [&] { return stats_done; });
   CHECK(stats_done && global_pending == 8192 && global->refused == 1 &&
         global->other == 0);
-  std::cout << "{\"pending\":" << pending << ",\"refused\":" << result->refused
+  std::cout << "{\"warm_pending\":" << warm_pending
+            << ",\"pending\":" << pending << ",\"refused\":" << result->refused
             << ",\"other\":" << result->other
             << ",\"global_pending\":" << global_pending
             << ",\"global_refused\":" << global->refused

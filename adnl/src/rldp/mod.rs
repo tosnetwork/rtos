@@ -1565,7 +1565,7 @@ impl RldpNode {
             (None, None)
         };
         let registration = Arc::new(owned_send::SendRegistration {
-            _query_admission: query_admission,
+            _query_admission: query_admission.clone(),
             v2,
             inbound: if v2 {
                 recv_transfer_id.map(|id| (id, tokio_util::sync::CancellationToken::new()))
@@ -1649,8 +1649,13 @@ impl RldpNode {
             outbound_started_at.elapsed().as_millis(),
             res.is_ok(),
         );
-        // Actual sender/receiver descendants retain their registration. A caller
-        // timeout only cancels them; it cannot release their IDs or permits.
+        // Native removes the pending query when its result is delivered. Its
+        // logical admission must not wait for transport descendants to drop.
+        if let Some(admission) = &query_admission {
+            admission.release();
+        }
+        // Actual sender/receiver descendants still retain their registration,
+        // transport IDs and resource permits until they have drained.
         drop(registration);
         #[cfg(feature = "telemetry")]
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
