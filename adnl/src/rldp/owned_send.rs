@@ -23,6 +23,7 @@ pub(super) enum SendCancelled {
     CallerDropped,
     Deadline,
     OwnerClosed,
+    PeerEvicted,
     SiblingFailed,
 }
 impl std::fmt::Display for SendCancelled {
@@ -376,39 +377,76 @@ where
 }
 
 pub(super) struct SendRegistration {
+    pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
     pub transfers: Arc<lockfree::map::Map<super::TransferId, super::RldpTransfer>>,
     pub send: super::TransferId,
     pub receive: Option<super::TransferId>,
     pub owner: Arc<AdnlTasks>,
     pub bounded_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
+fn with_live_peer(
+    peer: &Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
+    action: impl FnOnce(Option<&mut std::collections::HashSet<super::TransferId>>),
+) {
+    if let Some((weak, closed)) = peer {
+        if let Some(peer) = weak.upgrade() {
+            let mut ids = peer.registrations.lock().unwrap();
+            if !closed.is_cancelled() {
+                action(Some(&mut ids));
+            }
+        }
+    } else {
+        action(None);
+    }
+}
 impl Drop for SendRegistration {
     fn drop(&mut self) {
-        self.transfers.insert(self.send, super::RldpTransfer::Done);
-        if let Some(id) = self.receive {
-            self.transfers.insert(id, super::RldpTransfer::Done);
-        }
+        with_live_peer(&self.peer, |_| {
+            self.transfers.insert(self.send, super::RldpTransfer::Done);
+            if let Some(id) = self.receive {
+                self.transfers.insert(id, super::RldpTransfer::Done);
+            }
+        });
         let transfers = self.transfers.clone();
         let send = self.send;
         let receive = self.receive;
         let owner = self.owner.clone();
-        // The query capacity lease ends with the real transfer, not with its
-        // small tombstone's expiry timer.
+        let peer = self.peer.clone();
         let expiry = async move {
             tokio::select! {
                 _ = owner.cancelled() => {},
+                _ = async {
+                    if let Some((_, closed)) = &peer { closed.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
                 _ = tokio::time::sleep(std::time::Duration::from_millis(super::RldpNode::TIMEOUT_MAX_MS * 2)) => {},
             }
-            transfers.remove(&send);
-            if let Some(id) = receive {
-                transfers.remove(&id);
-            }
+            with_live_peer(&peer, |ids| {
+                transfers.remove(&send);
+                if let Some(id) = receive {
+                    transfers.remove(&id);
+                }
+                if let Some(ids) = ids {
+                    ids.remove(&send);
+                    if let Some(id) = receive {
+                        ids.remove(&id);
+                    }
+                }
+            });
         };
         if self.owner.spawn_or_return("RLDP transfer expiry", expiry).is_err() {
-            self.transfers.remove(&self.send);
-            if let Some(id) = self.receive {
-                self.transfers.remove(&id);
-            }
+            with_live_peer(&self.peer, |ids| {
+                self.transfers.remove(&send);
+                if let Some(id) = receive {
+                    self.transfers.remove(&id);
+                }
+                if let Some(ids) = ids {
+                    ids.remove(&send);
+                    if let Some(id) = receive {
+                        ids.remove(&id);
+                    }
+                }
+            });
         }
     }
 }

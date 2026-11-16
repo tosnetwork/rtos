@@ -687,3 +687,120 @@ async fn outbound_count_boundary(second_local: bool) {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_count_matches_native_global_cap() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_connection_count_context.tsv").trim(),
+        "4097"
+    );
+    let (_, _, nodes, rldps, _) = topology(2).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let local = nodes[0].key_by_tag(0).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for index in 0..4097u32 {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&index.to_le_bytes());
+                let route =
+                    AdnlPeers::with_keys(local.id().clone(), rtos_block::KeyId::from_data(id));
+                let result = rldps[0]
+                    .message(
+                        &TaggedByteSlice {
+                            object: b"x",
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                        &route,
+                        true,
+                        None,
+                    )
+                    .await;
+                assert!(result.is_err(), "fabricated peer must not have an ADNL route");
+            }
+        })
+        .await
+        .expect("fabricated-route probe must finish within its bound");
+        let retained = rldps[0].allocated.peers.load(Ordering::Acquire);
+        eprintln!("CONNECTION_PROBE: submitted=4097 retained={retained}");
+        assert!(
+            retained <= 4096,
+            "native retains at most4096 connections, Rust retained{retained}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_eviction_fails_query_and_recovers() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_connection_query_context.tsv").trim(),
+        "4097 10 64 1024"
+    );
+    let (reply, _, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        reply.hold.store(true, Ordering::Release);
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let data = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let request = rldps[0].query(&data, Some(1024), &peers, true, None);
+        let flood = async {
+            tokio::time::timeout(Duration::from_secs(5), reply.entered.notified()).await.unwrap();
+            let local = nodes[0].key_by_tag(0).unwrap();
+            for index in 0..4097u32 {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&index.to_le_bytes());
+                let route =
+                    AdnlPeers::with_keys(local.id().clone(), rtos_block::KeyId::from_data(id));
+                assert!(rldps[0]
+                    .message(
+                        &TaggedByteSlice {
+                            object: b"x",
+                            #[cfg(feature = "telemetry")]
+                            tag: 0
+                        },
+                        &route,
+                        true,
+                        None
+                    )
+                    .await
+                    .is_err());
+            }
+            assert_eq!(rldps[0].allocated.peers.load(Ordering::Acquire), 4096);
+            assert_eq!(rldps[0].peers.evicted.load(Ordering::Acquire), 2);
+            reply.hold.store(false, Ordering::Release);
+            reply.release.notify_one();
+        };
+        let (answer, ()) = tokio::join!(request, flood);
+        let error = answer.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<super::SendCancelled>(),
+                Some(super::SendCancelled::PeerEvicted)
+            ),
+            "{error:#}"
+        );
+        let answer = rldps[0].query(&data, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.0.unwrap(), vec![42; 64], "fresh query must recover after eviction");
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -101,6 +101,7 @@ async fn rldp_owned_running_fec_retains_permit_registration_and_join() {
         let transfers = Arc::new(lockfree::map::Map::new());
         transfers.insert([1; 32], super::super::RldpTransfer::Done);
         let registration = Arc::new(SendRegistration {
+            peer: None,
             transfers: transfers.clone(),
             send: [1; 32],
             receive: None,
@@ -248,6 +249,7 @@ async fn rldp_owned_query_capacity_is_not_tombstone_capacity() {
     for index in 0..40u8 {
         let permit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
         drop(SendRegistration {
+            peer: None,
             transfers: transfers.clone(),
             send: [index; 32],
             receive: None,
@@ -302,7 +304,7 @@ async fn rldp_owned_query_deadline_includes_peer_admission_wait() {
     let rldp = rldp(&adnl);
     let local = adnl.key_by_tag(0).unwrap();
     let peers = AdnlPeers::with_keys(local.id().clone(), local.id().clone());
-    let peer = rldp.get_peer(local.id(), local.id()).unwrap();
+    let peer = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
     let capacity = peer.outbound_semaphore.available_permits();
     let occupied = peer.outbound_semaphore.clone().try_acquire_many_owned(capacity as u32).unwrap();
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -339,7 +341,7 @@ async fn rldp_owned_idle_peer_does_not_retain_own_sender() {
     let adnl = node().await;
     let rldp = rldp(&adnl);
     let key = adnl.key_by_tag(0).unwrap();
-    let peer = rldp.get_peer(key.id(), key.id()).unwrap();
+    let peer = rldp.get_peer(key.id(), key.id(), true, None).await.unwrap();
     let weak = Arc::downgrade(&peer);
     let idle = peer.idle.clone();
     bounded(idle.notified()).await;
@@ -375,7 +377,7 @@ async fn rldp_owned_public_v1_v2_cancellation_retains_real_sender() {
                 let rldp = rldp(&adnl);
                 let local = adnl.key_by_tag(0).unwrap();
                 let peers = AdnlPeers::with_keys(local.id().clone(), local.id().clone());
-                let peer = rldp.get_peer(local.id(), local.id()).unwrap();
+                let peer = rldp.get_peer(local.id(), local.id(), v2, None).await.unwrap();
                 let control = SendControl::new();
                 *rldp.test_control.lock().unwrap() = Some(control.clone());
                 if stop == 1 {
@@ -466,7 +468,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         let adnl = node().await;
         let rldp = rldp(&adnl);
         let local = adnl.key_by_tag(0).unwrap();
-        let peer = rldp.get_peer(local.id(), local.id()).unwrap();
+        let peer = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
         let mut pool = SendWorkerPool::new(adnl.tasks().clone());
         pool.workers = 2; // Two real active siblings, still below production max8.
         let pool = Arc::new(pool);
@@ -500,6 +502,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         let id = [7; 32];
         rldp.transfers.insert(id, RldpTransfer::Send(SendTransferState::V2(states)));
         let registration = Arc::new(SendRegistration {
+            peer: None,
             transfers: rldp.transfers.clone(),
             send: id,
             receive: None,
@@ -764,4 +767,136 @@ async fn rldp_cooperative_fec_limit_survives_cancellation_until_real_join() {
         Some(SendCancelled::Deadline)
     ));
     assert_eq!(capacity.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn rldp_connection_retirement_waits_for_actual_fec_before_reusing_capacity() {
+    retirement_joins_before_reuse(true).await;
+}
+
+#[tokio::test]
+async fn rldp_connection_reopen_waits_for_old_generation_cleanup() {
+    retirement_joins_before_reuse(false).await;
+}
+
+async fn retirement_joins_before_reuse(fill_table: bool) {
+    use crate::adnl::common::{AdnlPeers, TaggedByteSlice};
+    let adnl = node().await;
+    let rldp = rldp(&adnl);
+    let local = adnl.key_by_tag(0).unwrap();
+    let peer = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
+    let control = SendControl::new();
+    *rldp.test_control.lock().unwrap() = Some(control.clone());
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let work_gate = gate.clone();
+    let (entered, started) = oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    *control.test_after_fec.lock().unwrap() = Some(Arc::new(move || {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        work_gate.wait();
+    }));
+    let sender_node = rldp.clone();
+    let local_id = local.id().clone();
+    let sender = tokio::spawn(async move {
+        sender_node
+            .message(
+                &TaggedByteSlice {
+                    object: b"x",
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &AdnlPeers::with_keys(local_id.clone(), local_id),
+                true,
+                None,
+            )
+            .await
+    });
+    let mut admission = None;
+    let result = std::panic::AssertUnwindSafe(async {
+        bounded(started).await.unwrap();
+        let deadline = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+        for value in 0..if fill_table { 4095u32 } else { 0 } {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&value.to_le_bytes());
+            rldp.get_peer(local.id(), &rtos_block::KeyId::from_data(id), true, deadline)
+                .await
+                .unwrap();
+        }
+        let other = if fill_table {
+            rtos_block::KeyId::from_data([79; 32])
+        } else {
+            rldp.peers.expire(tokio::time::Instant::now() + Duration::from_secs(131));
+            local.id().clone()
+        };
+        let admission_node = rldp.clone();
+        let local_id = local.id().clone();
+        admission = Some(tokio::spawn(async move {
+            admission_node.get_peer(&local_id, &other, true, deadline).await
+        }));
+        bounded(peer.closed.cancelled()).await;
+        bounded(control.cancelled()).await;
+        if tokio::time::timeout(Duration::from_millis(20), admission.as_mut().unwrap())
+            .await
+            .is_ok()
+        {
+            // The handle was already consumed; failure cleanup must not poll it twice.
+            admission = None;
+            panic!("retirement must not reuse a slot while its actual FEC still runs");
+        }
+        assert!(rldp.transfers.iter().next().is_some(), "retain registration until real join");
+        gate.release();
+        let replacement = bounded(admission.as_mut().unwrap()).await.unwrap().unwrap();
+        admission = None;
+        assert!(!replacement.closed.is_cancelled());
+        assert!(rldp.transfers.iter().next().is_none());
+    })
+    .catch_unwind()
+    .await;
+    gate.release();
+    bounded(adnl.stop_checked()).await.unwrap();
+    assert!(bounded(sender).await.unwrap().is_err());
+    if let Some(admission) = admission {
+        let _ = bounded(admission).await.unwrap();
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn rldp_connection_expiration_keeps_longest_deadline() {
+    let adnl = node().await;
+    let rldp = rldp(&adnl);
+    let local = adnl.key_by_tag(0).unwrap();
+    let now = tokio::time::Instant::now();
+    let short_id = rtos_block::KeyId::from_data([11; 32]);
+    let long_id = rtos_block::KeyId::from_data([12; 32]);
+    let idle_id = rtos_block::KeyId::from_data([13; 32]);
+    let short = rldp.get_peer(local.id(), &short_id, true, Some(now)).await.unwrap();
+    let refreshed = rldp
+        .get_peer(local.id(), &short_id, true, Some(now + Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&short, &refreshed));
+    let long = rldp
+        .get_peer(local.id(), &long_id, true, Some(now + Duration::from_secs(30)))
+        .await
+        .unwrap();
+    rldp.get_peer(local.id(), &long_id, true, Some(now)).await.unwrap();
+    let idle = rldp.get_peer(local.id(), &idle_id, true, Some(now)).await.unwrap();
+    rldp.peers.expire(now + Duration::from_secs(120) - Duration::from_nanos(1));
+    assert!(!idle.closed.is_cancelled());
+    rldp.peers.expire(now + Duration::from_secs(120));
+    assert!(idle.closed.is_cancelled());
+    assert!(!short.closed.is_cancelled());
+    assert!(!long.closed.is_cancelled());
+    rldp.peers.expire(now + Duration::from_secs(130));
+    assert!(short.closed.is_cancelled());
+    assert!(!long.closed.is_cancelled());
+    rldp.peers.expire(now + Duration::from_secs(150));
+    assert!(long.closed.is_cancelled());
+    bounded(adnl.stop_checked()).await.unwrap();
 }
