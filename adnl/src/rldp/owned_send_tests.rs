@@ -638,10 +638,16 @@ async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
         let map = transfers.clone();
         let lifetime = owner.clone();
         owner.spawn("test actual inbound expiry", async move {
-            super::super::expire_inbound_transfer(map, id, lifetime, async move {
-                let _ = entered_tx.send(());
-                let _ = release_rx.await;
-            })
+            super::super::expire_inbound_transfer(
+                map,
+                id,
+                lifetime,
+                async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                },
+                None,
+            )
             .await;
             let _ = done_tx.send(());
         });
@@ -665,7 +671,8 @@ async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
     let id = [92; 32];
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     transfers.insert(id, super::super::RldpTransfer::Recv(sender));
-    super::super::expire_inbound_transfer(transfers.clone(), id, owner.clone(), async {}).await;
+    super::super::expire_inbound_transfer(transfers.clone(), id, owner.clone(), async {}, None)
+        .await;
     assert!(matches!(&*transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Done));
     owner.close();
     bounded(owner.wait()).await.unwrap();
@@ -899,4 +906,35 @@ async fn rldp_connection_expiration_keeps_longest_deadline() {
     rldp.peers.expire(now + Duration::from_secs(150));
     assert!(long.closed.is_cancelled());
     bounded(adnl.stop_checked()).await.unwrap();
+}
+
+#[tokio::test]
+async fn rldp_old_inbound_expiry_preserves_reopened_registration() {
+    let adnl = node().await;
+    let rldp = rldp(&adnl);
+    let local = adnl.key_by_tag(0).unwrap();
+    let now = tokio::time::Instant::now();
+    let old = rldp.get_peer(local.id(), local.id(), true, Some(now)).await.unwrap();
+    let id = [94; 32];
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    old.insert_transfer(&rldp.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    rldp.peers.expire(now + Duration::from_secs(120));
+    let fresh = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
+    assert!(old.drained.is_cancelled());
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    fresh.insert_transfer(&rldp.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    // The old timer's completion can already be in flight on another worker.
+    // Its final mutation must be serialized with close and generation cleanup.
+    super::super::expire_inbound_transfer(
+        rldp.transfers.clone(),
+        id,
+        adnl.tasks().clone(),
+        async {},
+        Some(old),
+    )
+    .await;
+    let preserved =
+        matches!(rldp.transfers.get(&id).unwrap().val(), super::super::RldpTransfer::Recv(_));
+    bounded(adnl.stop_checked()).await.unwrap();
+    assert!(preserved, "old inbound expiry overwrote the reopened connection's registration");
 }

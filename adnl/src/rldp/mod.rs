@@ -160,11 +160,19 @@ async fn expire_inbound_transfer(
     transfer_id: TransferId,
     owner: Arc<crate::adnl::tasks::AdnlTasks>,
     timer: impl std::future::Future<Output = ()>,
+    peer: Option<Arc<RldpPeer>>,
 ) {
     tokio::select! {
         biased;
         _ = owner.cancelled() => return,
         _ = timer => {},
+    }
+    // Cancellation in the caller's select cannot stop a mutation already
+    // polling on another worker. Serialize the final write with old-generation
+    // close/cleanup, so an expired timer cannot overwrite a reopened ID.
+    let _ids = peer.as_ref().map(|peer| peer.registrations.lock().unwrap());
+    if peer.as_ref().is_some_and(|peer| peer.closed.is_cancelled()) {
+        return;
     }
     transfers.insert_with(transfer_id, |_, _, found| {
         if found.is_some() {
@@ -899,6 +907,7 @@ impl RldpNode {
         let token = owner.enter()?;
         let lifetime = owner.clone();
         let connection_closed = peer.closed.clone();
+        let expiry_peer = peer.clone();
         owner.spawn_admitted("RLDP inbound", token, async move {
             let _registration = registration;
             tokio::select! {
@@ -964,7 +973,7 @@ impl RldpNode {
                 biased;
                 _ = connection_closed.cancelled() => {},
                 _ = expire_inbound_transfer(transfers, transfer_id, lifetime,
-                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS))) => {},
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)), Some(expiry_peer)) => {},
             }
         });
         Ok(Some(queue_sender))
