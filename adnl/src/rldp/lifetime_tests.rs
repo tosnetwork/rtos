@@ -3835,3 +3835,91 @@ async fn rldp2_unsolicited_mtu_native_exact() {
 async fn rldp2_unsolicited_mtu_native_above() {
     check_unsolicited_mtu("native_above").await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_completed_receive_preserves_queued_replay_ack() {
+    use rtos_api::IntoBoxed;
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_metadata.json"),
+    )
+    .into_iter()
+    .find(|row| row["id"] == "legacy_exact")
+    .unwrap();
+    let (_, packets, nodes, _, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut payload = vec![42; 2008];
+        payload[..4].copy_from_slice(b"mtu:");
+        let message = serialize_boxed(
+            &rtos_api::ton::rldp::message::Message { id: UInt256::default(), data: payload }
+                .into_boxed(),
+        )
+        .unwrap();
+        assert_eq!(message.len(), 2048);
+        let mut encoder = crate::RaptorqEncoder::with_data(&message, Some(768));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut chunks = Vec::new();
+        let mut transcript = Vec::new();
+        for sequence in 0..message.len().div_ceil(768) {
+            let mut seqno = sequence as u32;
+            chunks.push(rldp2::messagepart::MessagePart(rtos_api::RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: message.len() as i64,
+                seqno: sequence as i32,
+                data: encoder.encode(&mut seqno).unwrap(),
+            }));
+            assert_eq!(seqno, sequence as u32);
+        }
+        for chunk in chunks.iter().chain(std::iter::once(&chunks[0])) {
+            transcript.extend(serialize_boxed(&chunk.clone().into_boxed()).unwrap());
+            tx.send(super::Chunk::V2(chunk.clone())).unwrap();
+        }
+        assert_eq!(
+            hex::encode(rtos_block::sha256_digest(&transcript)),
+            expected["input_sha256"].as_str().unwrap()
+        );
+        let mut context = super::recv::RecvContext {
+            adnl: nodes[1].clone(),
+            peers: AdnlPeers::with_keys(peers.other().clone(), peers.local().clone()),
+            queue_reader: rx,
+            recv_transfer: super::recv::RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(7680),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            ),
+            transfer_id: [0; 32],
+            #[cfg(feature = "debug")]
+            loss_fn: None,
+        };
+        RldpNode::receive_loop(&mut context, true).await;
+        assert_eq!(context.recv_transfer.data, message);
+        assert!(context.queue_reader.is_empty());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while packets.complete_packets.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("queued post-completion replay must produce native Complete ACK");
+        assert_eq!(
+            packets.complete_packets.load(Ordering::Acquire) as u64,
+            expected["complete_packets"].as_u64().unwrap()
+        );
+        drop(tx);
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
