@@ -1,0 +1,12 @@
+two_ordered 2 0 0 0 772
+two_tail_first 2 1 0 0 772
+three_ordered 3 0 0 1 772
+three_tail_first 3 1 0 1 772
+two_retire_tail 2 1 1 0 772
+three_retire_first 3 0 1 1 772
+two_min_tail 2 1 0 0 4
+two_exact_symbol_tail 2 1 0 0 768
+three_exact_two_symbols_tail 3 1 0 1 1536
+two_full_tail 2 1 0 0 2000000
+two_retire_min_tail 2 1 1 0 4
+three_retire_exact_symbol_tail 3 1 1 1 768
