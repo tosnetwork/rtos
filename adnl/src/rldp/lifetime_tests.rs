@@ -1855,13 +1855,34 @@ fn directional_identity_native_effects() -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
+    check_pending_query_admission(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
+    check_pending_query_admission(true).await;
+}
+
+async fn check_pending_query_admission(use_native: bool) {
     use futures::StreamExt;
     let (reply, _packets, nodes, rldps, peers) = pair().await;
+    if use_native {
+        for rldp in &rldps {
+            rldp.peers.enable_native_for_tests();
+        }
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         let query = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
         let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42;64]);
+        if use_native {
+            let route=&peers;
+            let peer=rldps[0].get_peer(route.local(),route.other(),true,None).await.unwrap();
+            assert!(peer.native.get().is_some(), "admission qualification must use actual Connection");
+            assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire),0,
+                "native query must not create a legacy sender");
+        }
         assert_eq!(query_admission_native_effects()["warm_pending"], 0);
         let admission_started = std::time::Instant::now();
         let before_admission = rldps[0].query_budget.remaining(&peers);
@@ -1907,8 +1928,22 @@ async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
+    check_pending_query_global_admission(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_rldp2_pending_query_global_admission_refuses_before_sender_wait() {
+    check_pending_query_global_admission(true).await;
+}
+
+async fn check_pending_query_global_admission(use_native: bool) {
     use futures::StreamExt;
     let (reply, _packets, nodes, rldps, _peers) = topology(34).await;
+    if use_native {
+        for rldp in &rldps {
+            rldp.peers.enable_native_for_tests();
+        }
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         let query = TaggedByteSlice {
@@ -1928,6 +1963,19 @@ async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
             .collect();
         let (answer, _) = rldps[1].query(&query, Some(1024), &routes[0], true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42; 64]);
+        if use_native {
+            let route = &routes[0];
+            let peer = rldps[1].get_peer(route.local(), route.other(), true, None).await.unwrap();
+            assert!(
+                peer.native.get().is_some(),
+                "admission qualification must use actual Connection"
+            );
+            assert_eq!(
+                rldps[1].allocated.send_transfers.load(Ordering::Acquire),
+                0,
+                "native query must not create a legacy sender"
+            );
+        }
         assert_eq!(query_admission_native_effects()["warm_pending"], 0);
         let admission_started = std::time::Instant::now();
         let before_admission = rldps[1].query_budget.remaining(&routes[0]);
