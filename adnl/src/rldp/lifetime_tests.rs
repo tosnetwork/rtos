@@ -248,6 +248,15 @@ async fn topology_with_observers(
     remote_observer: Option<Arc<ResponsePackets>>,
     observe_all_senders: bool,
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    topology_configured(count, remote_observer, observe_all_senders, false).await
+}
+
+async fn topology_configured(
+    count: usize,
+    remote_observer: Option<Arc<ResponsePackets>>,
+    observe_all_senders: bool,
+    unique_keys: bool,
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
     let reply = Arc::new(HeldReply::default());
     let packets = Arc::new(ResponsePackets::default());
     let mut nodes = Vec::new();
@@ -258,7 +267,9 @@ async fn topology_with_observers(
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys(
                 &socket.local_addr().unwrap().to_string(),
-                if index == 1 {
+                if unique_keys {
+                    vec![(rand::random::<[u8; 32]>(), 0)]
+                } else if index == 1 {
                     vec![([18; 32], 0), ([39; 32], 1)]
                 } else {
                     vec![([if index == 22 { 79 } else { 17 + index as u8 }; 32], 0)]
@@ -2074,8 +2085,44 @@ fn query_refusal_expiry_native_effects() -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
+    check_incomplete_inbound_transfers(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_incomplete_inbound_cap_and_budget_release() {
+    check_incomplete_inbound_transfers(true).await;
+}
+
+async fn inbound_test_count(peer: &super::RldpPeer, native: bool) -> usize {
+    if native {
+        native_identity_tests::inspect(
+            peer.native.get().expect("actual peer must own native Connection"),
+        )
+        .await
+        .0
+    } else {
+        peer.inbound_transfers
+            .iter()
+            .filter(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_)))
+            .count()
+    }
+}
+
+async fn check_incomplete_inbound_transfers(use_native: bool) {
     use rtos_api::{IntoBoxed, RldpChunk};
-    let (_reply, packets, nodes, rldps, peers) = pair().await;
+    let (_reply, packets, nodes, rldps, peers) =
+        topology_configured(2, None, false, use_native).await;
+    if use_native {
+        for node in &rldps {
+            node.peers.enable_native_for_tests();
+        }
+    }
+    *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    let budget = super::rldp2::budget::InboundBudget::process_default();
+    let identity = *peers.other().data();
+    if use_native {
+        assert_eq!(budget.identity_usage(&identity), super::rldp2::budget::Usage::default());
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
         let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
@@ -2089,6 +2136,7 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
         }
 
         for n in 0..257u32 {
+            let processed_before = packets.processed_parts.load(Ordering::Acquire);
             let mut id = [0u8; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
             let chunk = RldpChunk {
@@ -2113,7 +2161,8 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while !packets.transfers.lock().unwrap().contains(id.as_slice()) {
+                while !packets.transfers.lock().unwrap().contains(id.as_slice())
+                    || packets.processed_parts.load(Ordering::Acquire) == processed_before {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
@@ -2121,7 +2170,7 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
             .expect("every test part must reach authenticated receiver");
             if n < 256 {
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while peer.inbound_transfers.get(&id).is_none() {
+                    while if use_native { inbound_test_count(&peer, true).await != n as usize + 1 } else { peer.inbound_transfers.get(&id).is_none() } {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 })
@@ -2130,11 +2179,9 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let live = peer
-            .inbound_transfers
-            .iter()
-            .filter(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_)))
-            .count();
+        let live = inbound_test_count(&peer, use_native).await;
+        let at_cap = budget.identity_usage(&identity);
+        if use_native { assert_eq!(at_cap.decoders, live as u64); }
         assert_eq!(live, 256, "incomplete inbound transfer admission must match native cap");
         for index in 1..3u32 {
             let seqno = index;
@@ -2161,21 +2208,16 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
                 .unwrap();
         }
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !peer
-                .inbound_transfers
-                .get(&[0; 32])
-                .is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done))
+            while if use_native { inbound_test_count(&peer, true).await != 255 } else { !peer.inbound_transfers.get(&[0;32]).is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done)) }
             {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("completion must return inbound capacity before upper-layer parsing");
-        let after_completion = peer
-            .inbound_transfers
-            .iter()
-            .filter(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
-            .count();
+        let after_completion = inbound_test_count(&peer, use_native).await;
+        let budget_after_completion = budget.identity_usage(&identity);
+        if use_native { assert_eq!(budget_after_completion.decoders, after_completion as u64); }
         let mut retry_id = [0; 32];
         retry_id[..4].copy_from_slice(&256u32.to_le_bytes());
         let chunk = RldpChunk {
@@ -2199,20 +2241,19 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while peer.inbound_transfers.get(&retry_id).is_none() {
+            while if use_native { inbound_test_count(&peer, true).await != 256 } else { peer.inbound_transfers.get(&retry_id).is_none() } {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("refused transfer must be retryable when capacity returns");
-        let after_retry = peer
-            .inbound_transfers
-            .iter()
-            .filter(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
-            .count();
+        let after_retry = inbound_test_count(&peer, use_native).await;
+        let budget_after_retry = budget.identity_usage(&identity);
+        if use_native { assert_eq!(budget_after_retry.decoders, after_retry as u64); }
         // A registered query response shares the same actual inbound capacity.
         let query_bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         let query = TaggedByteSlice { object: &query_bytes, #[cfg(feature="telemetry")] tag: 0 };
+        let processed_before_query = packets.processed_parts.load(Ordering::Acquire);
         let request = rldps[0].query(&query, Some(1024), &peers, true, None);
         tokio::pin!(request);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2220,14 +2261,19 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
                 tokio::select! {
                     result = &mut request => panic!("solicited answer bypassed saturated inbound capacity: {result:?}"),
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        if packets.transfers.lock().unwrap().len() > 257 { break; }
+                        if packets.transfers.lock().unwrap().len() > 257
+                            && packets.processed_parts.load(Ordering::Acquire) > processed_before_query { break; }
                     }
                 }
             }
         }).await.expect("a solicited answer part must reach the receiver");
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut request).await.is_err(),
             "solicited answer must not bypass saturated inbound capacity");
-        assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
+        // Legacy query placeholders exist before decoder admission; only its
+        // active set corresponds to native inbound transfers at saturation.
+        let active = if use_native { inbound_test_count(&peer, true).await }
+            else { peer.inbound_active.lock().unwrap().len() };
+        assert_eq!(active, 256);
         for index in 1..3u32 {
             let seqno = index;
             let mut id = [0;32]; id[0] = 1;
@@ -2248,14 +2294,41 @@ async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
         assert_eq!(live, expected["inbound"].as_u64().unwrap() as usize);
         assert_eq!(after_completion, expected["after_completion"].as_u64().unwrap() as usize);
         assert_eq!(after_retry, expected["after_retry"].as_u64().unwrap() as usize);
+        serde_json::json!({"inbound":live,"after_completion":after_completion,"after_retry":after_retry,
+            "solicited_blocked":true,"solicited_recovered":true,"bytes_at_cap":at_cap.bytes,
+            "bytes_after_completion":budget_after_completion.bytes,"bytes_after_retry":budget_after_retry.bytes,
+            "released_decoders":0,"released_bytes":0})
     })
     .catch_unwind()
     .await;
     for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
         result.unwrap();
     }
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(actual) if use_native => {
+            let released = budget.identity_usage(&identity);
+            assert_eq!(
+                released,
+                super::rldp2::budget::Usage::default(),
+                "actual node shutdown must release identity reservations"
+            );
+            let expected = checked_ack_native_effects(
+                include_bytes!("../../../ci/conformance/rldp2_inbound_budget_runtime_context.tsv"),
+                include_bytes!(
+                    "../../../ci/conformance/rldp2_inbound_budget_runtime_effects.jsonl"
+                ),
+                include_bytes!(
+                    "../../../ci/conformance/rldp2_inbound_budget_runtime_reference.cpp"
+                ),
+                include_bytes!(
+                    "../../../ci/conformance/rldp2_inbound_budget_runtime_metadata.json"
+                ),
+            );
+            assert_eq!(vec![actual.clone()], expected);
+            eprintln!("NATIVE_INBOUND_BUDGET: {actual}");
+        }
+        Ok(_) => {}
     }
 }
 

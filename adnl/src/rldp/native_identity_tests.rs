@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
-async fn inspect(
+pub(super) async fn inspect(
     native: &super::super::native_connection::NativeConnection,
 ) -> (usize, usize, usize) {
     let (reply, receipt) = tokio::sync::oneshot::channel();
