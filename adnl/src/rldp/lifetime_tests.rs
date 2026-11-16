@@ -737,10 +737,7 @@ async fn outbound_count_boundary(mode: OutboundBoundary) {
             })
             .await
             .expect("actual completion must release one sender and admission slot");
-            assert!(matches!(
-                rldps[1].transfers.get(&id).unwrap().val(),
-                super::RldpTransfer::Done
-            ));
+            assert!(rldps[1].transfers.get(&id).is_none(), "completed sender must retire");
             let after_ack = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
 
             let request = serialize_boxed(
@@ -1207,4 +1204,110 @@ async fn rldp2_solicited_replies_share_native_completed_bound() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_outbound_completion_retires_sender_ids() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_outbound_retirement_context.tsv").trim(),
+        "2049\t64\t60"
+    );
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let started = tokio::time::Instant::now();
+        for value in 0..2049usize {
+            let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+            assert_eq!(answer.unwrap(), vec![42; 64]);
+            if [0, 127, 128, 2047, 2048].contains(&value) {
+                assert_eq!(peer.completed.lock().unwrap().len(), (value + 1).min(2048));
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must observe the count bound before TTL pruning"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[0].allocated.recv_transfers.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for node in &rldps {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.allocated.send_transfers.load(Ordering::Acquire) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let other = rldps[1].get_peer(peers.other(), peers.local(), true, None).await.unwrap();
+        let expected = outbound_retirement_native_effects();
+        assert_eq!(reply.calls.load(Ordering::Acquire), 2049);
+        for (side, peer) in [peer, other].iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while peer.transfer_slots.available_permits() != 256 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let retained =
+                peer.registrations.lock().unwrap().len() - peer.completed.lock().unwrap().len();
+            eprintln!(
+                "OUTBOUND_RETIREMENT: side={side} completed=2049 outbound_retained={retained}"
+            );
+            assert_eq!(
+                retained,
+                expected["outbound_retained"].as_u64().unwrap() as usize,
+                "completed outbound IDs must retire with actual senders"
+            );
+            assert_eq!(
+                reply.calls.load(Ordering::Acquire),
+                expected["completed"].as_u64().unwrap() as usize
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn outbound_retirement_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_outbound_retirement_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_outbound_retirement_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_outbound_retirement_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_outbound_retirement_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
 }

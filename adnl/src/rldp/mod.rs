@@ -866,6 +866,7 @@ impl RldpNode {
             return Ok(None);
         }
         let registration = Arc::new(owned_send::SendRegistration {
+            v2,
             inbound: v2.then(|| (*transfer_id, tokio_util::sync::CancellationToken::new())),
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: self.transfers.clone(),
@@ -1145,6 +1146,7 @@ impl RldpNode {
         let control = SendControl::with_protocol_deadline(response_deadline);
         let _cancel = control.guard();
         let registration = Arc::new(owned_send::SendRegistration {
+            v2,
             inbound: None,
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: transfers.clone(),
@@ -1392,6 +1394,7 @@ impl RldpNode {
             (None, None)
         };
         let registration = Arc::new(owned_send::SendRegistration {
+            v2,
             inbound: if v2 {
                 recv_transfer_id.map(|id| (id, tokio_util::sync::CancellationToken::new()))
             } else {

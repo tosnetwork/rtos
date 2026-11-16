@@ -101,6 +101,7 @@ async fn rldp_owned_running_fec_retains_permit_registration_and_join() {
         let transfers = Arc::new(lockfree::map::Map::new());
         transfers.insert([1; 32], super::super::RldpTransfer::Done);
         let registration = Arc::new(SendRegistration {
+            v2: true,
             inbound: None,
             peer: None,
             transfers: transfers.clone(),
@@ -250,6 +251,7 @@ async fn rldp_owned_query_capacity_is_not_tombstone_capacity() {
     for index in 0..40u8 {
         let permit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
         drop(SendRegistration {
+            v2: false,
             inbound: None,
             peer: None,
             transfers: transfers.clone(),
@@ -504,6 +506,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         let id = [7; 32];
         rldp.transfers.insert(id, RldpTransfer::Send(SendTransferState::V2(states)));
         let registration = Arc::new(SendRegistration {
+            v2: true,
             inbound: None,
             peer: None,
             transfers: rldp.transfers.clone(),
@@ -960,6 +963,7 @@ async fn rldp_completed_id_reuse_is_safe_from_old_expiry_and_drop() {
     let id = [99; 32];
     let finished = CancellationToken::new();
     let registration = SendRegistration {
+        v2: true,
         inbound: Some((id, finished.clone())),
         peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
         transfers: rldp.transfers.clone(),

@@ -377,6 +377,7 @@ where
 }
 
 pub(super) struct SendRegistration {
+    pub v2: bool,
     pub inbound: Option<(super::TransferId, CancellationToken)>,
     pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
     pub transfers: Arc<lockfree::map::Map<super::TransferId, super::RldpTransfer>>,
@@ -419,6 +420,17 @@ impl Drop for SendRegistration {
             if self.receive == Some(*id) {
                 self.receive = None;
             }
+        }
+        // Native RLDP2 retires outbound IDs at completion. Only inbound IDs
+        // participate in replay suppression; no sender tombstone or timer is needed.
+        if self.v2 {
+            with_live_peer(&self.peer, |ids| {
+                self.transfers.remove(&self.send);
+                if let Some(ids) = ids {
+                    ids.remove(&self.send);
+                }
+            });
+            return;
         }
         with_live_peer(&self.peer, |_| {
             self.transfers.insert(self.send, super::RldpTransfer::Done);
