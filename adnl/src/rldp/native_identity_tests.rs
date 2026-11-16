@@ -509,4 +509,9 @@ async fn native_inbound_id_does_not_alias_active_outbound() {
     for result in stopped {
         result.unwrap();
     }
+    assert_eq!(
+        reply.messages.load(Ordering::Acquire),
+        1,
+        "joined application callbacks must not add a duplicate delivery"
+    );
 }

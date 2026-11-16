@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 pub(super) enum Command {
     Receive(Vec<u8>),
     #[cfg(test)]
+    InspectOutboundStarted(oneshot::Sender<u64>),
+    #[cfg(test)]
     InspectEncoders(oneshot::Sender<Vec<(TransferId, usize, usize)>>),
     #[cfg(test)]
     Inspect(oneshot::Sender<(usize, usize, usize)>),
@@ -61,6 +63,11 @@ impl Command {
         let now = connection.now();
         let deadline = |at: Instant| now + at.saturating_duration_since(wall_now).as_secs_f64();
         match self {
+            #[cfg(test)]
+            Self::InspectOutboundStarted(reply) => {
+                let _ = reply.send(connection.outbound_started());
+                Ok(true)
+            }
             #[cfg(test)]
             Self::InspectEncoders(reply) => {
                 let _ = reply.send(connection.retained_encoders());

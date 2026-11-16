@@ -74,6 +74,8 @@ pub(super) struct NativeConnection {
     #[cfg(test)]
     pub(super) routed_receives: Arc<AtomicU64>,
     #[cfg(test)]
+    pub(super) receive_hash_probe: Arc<Mutex<Option<oneshot::Sender<(TransferId, [u8; 32])>>>>,
+    #[cfg(test)]
     pub(super) processed_data_packets: AtomicU64,
     #[cfg(test)]
     pub(super) data_receipts: Mutex<BTreeMap<(TransferId, i32, i32), u64>>,
@@ -123,6 +125,8 @@ impl NativeConnection {
             #[cfg(test)]
             routed_receives: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            receive_hash_probe: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             processed_data_packets: AtomicU64::new(0),
             #[cfg(test)]
             data_receipts: Mutex::new(BTreeMap::new()),
@@ -141,6 +145,8 @@ impl NativeConnection {
         let completed_sends = ret.completed_sends.clone();
         #[cfg(test)]
         let routed_receives = ret.routed_receives.clone();
+        #[cfg(test)]
+        let receive_hash_probe = ret.receive_hash_probe.clone();
         #[cfg(test)]
         let completed_send_ids = ret.completed_send_ids.clone();
         #[cfg(test)]
@@ -190,6 +196,12 @@ impl NativeConnection {
                     }
                 }
                 for (id, result) in event.received {
+                    #[cfg(test)]
+                    if let Ok(data) = &result {
+                        if let Some(probe) = receive_hash_probe.lock().unwrap().take() {
+                            let _ = probe.send((id, rtos_block::sha256_digest(data)));
+                        }
+                    }
                     let (data, invalid_answer) = Self::route_received(&waiters, id, result);
                     #[cfg(test)]
                     routed_receives.fetch_add(1, Ordering::Release);

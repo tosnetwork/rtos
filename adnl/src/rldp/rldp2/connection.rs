@@ -216,6 +216,10 @@ impl Connection {
     pub(crate) fn retained_encoders(&self) -> Vec<(TransferId, usize, usize)> {
         self.outbound.retained_encoders()
     }
+    #[cfg(test)]
+    pub(crate) fn outbound_started(&self) -> u64 {
+        self.outbound.started_count()
+    }
     pub fn outbound_transfer_count(&self) -> usize {
         self.outbound.transfer_count()
     }

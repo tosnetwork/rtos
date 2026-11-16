@@ -583,3 +583,69 @@ async fn native_unacknowledged_response_expires_and_recovers() {
         result.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_duplicate_outbound_id_preserves_original_payload() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_outbound_id_reuse_context.tsv").trim(),
+        "64\t65\t60"
+    );
+    let expected = outbound_id_reuse_native_effects();
+    let (_, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome=std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true,Ordering::Release);
+        let sender_peer=rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+        let receiver_peer=rldps[0].get_peer(route.local(),route.other(),true,None).await.unwrap();
+        let sender=sender_peer.native.get().expect("sender must use actual native Connection");
+        let receiver=receiver_peer.native.get().expect("receiver must use actual native Connection");
+        let (probe,decoded)=tokio::sync::oneshot::channel();
+        *receiver.receive_hash_probe.lock().unwrap()=Some(probe);
+        let id=[7u8;32];
+        let payload=vec![42;64];
+        let send=|data|super::super::connection_driver::Command::Send {id,data,deadline:Some(std::time::Instant::now()+Duration::from_secs(60)),answer:false};
+        assert!(sender.driver.submit(send(payload.clone())).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while !packets.transfers.lock().unwrap().contains(id.as_slice()) {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.expect("original transfer must emit actual UDP before duplicate submission");
+        let (done,receipt)=tokio::sync::oneshot::channel();
+        sender.driver.submit(super::super::connection_driver::Command::InspectOutboundStarted(done)).await.unwrap();
+        let before=receipt.await.unwrap();
+        assert!(!sender.driver.submit(send(vec![42;65])).await.unwrap(),"duplicate active ID must be refused");
+        let (done,receipt)=tokio::sync::oneshot::channel();
+        sender.driver.submit(super::super::connection_driver::Command::InspectOutboundStarted(done)).await.unwrap();
+        let after=receipt.await.unwrap();
+        let (done,receipt)=tokio::sync::oneshot::channel();
+        sender.driver.submit(super::super::connection_driver::Command::InspectEncoders(done)).await.unwrap();
+        assert_eq!(receipt.await.unwrap(),vec![(id,64,1)],"original wire data and initialized encoder must survive duplicate refusal");
+        packets.drop_parts.store(false,Ordering::Release);
+        let observed=tokio::time::timeout(Duration::from_secs(5),decoded).await.expect("original data must decode after loss ends").unwrap();
+        assert_eq!(observed,(id,rtos_block::sha256_digest(&payload)),"the real decoder must receive the original64 bytes, not replacement65");
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while sender.completed_sends.load(Ordering::Acquire)!=1 {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.expect("original transfer must complete through its actual UDP ACK");
+        let actual=serde_json::json!({"started_before":before,"started_after_replay":after,"completed":sender.completed_sends.load(Ordering::Acquire),"retained":inspect(sender).await.1});
+        assert_eq!(actual,expected);
+        assert!(sender.failed_send_ids.lock().unwrap().is_empty());
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0);
+        eprintln!("NATIVE_OUTBOUND_ID_REUSE: {actual}");
+        (sender.clone(),receiver.clone())
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    let (sender, receiver) = match outcome {
+        Ok(owners) => owners,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    for result in stopped {
+        result.unwrap();
+    }
+    assert_eq!(sender.completed_send_ids.lock().unwrap().as_slice(), &[[7; 32]]);
+    assert_eq!(
+        receiver.routed_receives.load(Ordering::Acquire),
+        1,
+        "joined receive events must deliver exactly once"
+    );
+}
