@@ -504,3 +504,82 @@ async fn native_query_survives_loss_until_absolute_deadline() {
         result.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_unacknowledged_response_expires_and_recovers() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_sender_deadline_context.tsv").trim(),
+        "10 64 1024 2000 13000"
+    );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_sender_deadline_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_deadline_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_deadline_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_deadline_metadata.json"),
+    );
+    let (_, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome=std::panic::AssertUnwindSafe(async {
+        let responder=rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+        let requester=rldps[0].get_peer(route.local(),route.other(),true,None).await.unwrap();
+        let native=responder.native.get().expect("response must use actual native Connection");
+        let client=requester.native.get().expect("query must use actual native Connection");
+        let quota=rldps[0].query_budget.remaining(&route);
+        packets.drop_parts.store(true,Ordering::Release);
+        let bytes=serialize_boxed(&Query {overlay:UInt256::default()}).unwrap();
+        let request=TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0};
+        let started=tokio::time::Instant::now();
+        let query=rldps[0].query(&request,Some(1024),&route,true,None);
+        let observe=async {
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire)!=1 {tokio::time::sleep(Duration::from_millis(5)).await;}
+            }).await.expect("response must be accepted before its retention window");
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            assert_eq!(packets.transfers.lock().unwrap().len(),1,"actual dropped response must have one transfer ID");
+            assert_eq!(inspect(native).await.1,1,"unacknowledged native response must retain the query deadline");
+            assert!(native.failed_send_ids.lock().unwrap().is_empty());
+            assert_eq!(native.completed_sends.load(Ordering::Acquire),0);
+        };
+        let (result,())=tokio::join!(query,observe);
+        let error=result.unwrap_err();
+        assert!(error.downcast_ref::<RldpQueryTimeout>().is_some(),"{error:#}");
+        let id: [u8;32]=packets.transfers.lock().unwrap().iter().next().unwrap().as_slice().try_into().unwrap();
+        // Native's vector checks expiry at sent+13 seconds. Wait for the
+        // actual sender error, not an already-finished application callback.
+        tokio::time::timeout_at(started+Duration::from_millis(13000),async {
+            loop {
+                let failed=native.failed_send_ids.lock().unwrap().clone();
+                if failed==vec![id] && inspect(native).await.1==0 {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("actual response sender must expire within the native vector's window");
+        let expiry_ms=started.elapsed().as_millis();
+        assert_eq!(native.completed_sends.load(Ordering::Acquire),0);
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0);
+        assert_eq!(rldps[0].query_budget.remaining(&route),quota);
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while client.waiter_counts()!=(0,0) {tokio::task::yield_now().await;}
+        }).await.expect("expired query must retire its actual waiters");
+        packets.drop_parts.store(false,Ordering::Release);
+        let (answer,_)=rldps[0].query(&request,Some(1024),&route,true,None).await.unwrap();
+        assert_eq!(answer,Some(vec![42;64]));
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while native.completed_sends.load(Ordering::Acquire)!=1 {tokio::task::yield_now().await;}
+        }).await.expect("same peer recovery response must actually finish");
+        assert_eq!(inspect(native).await.1,0);
+        assert_eq!(*native.failed_send_ids.lock().unwrap(),vec![id],"recovery must not add a failed sender");
+        let actual=serde_json::json!({"held_before_deadline":true,"live_after_deadline":0,"recovery":true});
+        assert_eq!(vec![actual.clone()],expected);
+        eprintln!("NATIVE_RESPONSE_EXPIRY: {actual} expiry_observed_ms={expiry_ms}");
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
