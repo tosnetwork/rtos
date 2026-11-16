@@ -1687,7 +1687,10 @@ impl RldpNode {
             };
             match decoded {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => {
-                    if answer.query_id.as_slice() != &query_id {
+                    // Native V2 correlates answers by the authenticated peer pair
+                    // and response transfer ID, already selected by the receiver.
+                    // The envelope query_id is not an additional acceptance gate.
+                    if !v2 && answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
                         // Native RLDP2 checks the original payload limit even
