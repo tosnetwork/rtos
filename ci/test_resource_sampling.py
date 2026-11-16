@@ -20,7 +20,21 @@ def main():
                 "control",
                 sys.executable,
                 "-c",
-                "import time; data=bytearray(16*1024*1024); print('child-marker', flush=True); time.sleep(11); raise SystemExit(37)",
+                """import json, os, time
+from pathlib import Path
+raw = Path('/proc/self/stat').read_text()
+fields = raw[raw.rindex(')') + 2:].split()
+identity = {'pid': os.getpid(), 'start_ticks': int(fields[19]),
+            'baseline_rss_kib': int(fields[21]) * os.sysconf('SC_PAGE_SIZE') // 1024}
+print('CI_CONTROL_CHILD ' + json.dumps(identity), flush=True)
+data = bytearray(16 * 1024 * 1024)
+if data is not None:
+    for offset in range(0, len(data), 4096):
+        data[offset] = 1
+print('child-marker', flush=True)
+time.sleep(11)
+raise SystemExit(37)
+""",
             ],
             check=False,
             env=env,
@@ -38,10 +52,27 @@ def main():
         ]
         assert len(rows) >= 2, rows
         assert all(row["phase"] == "control" for row in rows)
-        assert any(
-            any(child["rss_kib"] >= 16 * 1024 for child in row["top_rss"])
+        identities = [
+            json.loads(line.removeprefix("CI_CONTROL_CHILD "))
+            for line in result.stdout.splitlines()
+            if line.startswith("CI_CONTROL_CHILD ")
+        ]
+        assert len(identities) == 1, identities
+        identity = identities[0]
+        child_samples = [
+            child
             for row in rows
-        ), rows
+            for child in row["top_rss"]
+            if child["pid"] == identity["pid"]
+            and child["start_ticks"] == identity["start_ticks"]
+        ]
+        assert child_samples, (identity, rows)
+        child_peak = max(child["rss_kib"] for child in child_samples)
+        # Require growth in the identified child, never the observer's own RSS.
+        assert child_peak >= identity["baseline_rss_kib"] + 12 * 1024, (
+            identity,
+            child_samples,
+        )
         assert all(
             "CI_RESOURCE_SAMPLE " + json.dumps(row, sort_keys=True) in result.stdout
             for row in rows
@@ -96,6 +127,8 @@ def main():
                     "invalid_status": 2,
                     "samples": len(rows),
                     "cleanup": True,
+                    "child_identity": identity,
+                    "child_peak_rss_kib": child_peak,
                 }
             )
         )
