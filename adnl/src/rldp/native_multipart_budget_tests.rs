@@ -42,27 +42,36 @@ fn native_multipart_retention_assembly_and_retirement() {
                     "../../../ci/conformance/rldp2_multipart_budget_runtime_metadata.json"
                 ),
             );
-            let mut actual = Vec::new();
-            for line in std::str::from_utf8(context).unwrap().lines() {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                assert_eq!(fields.len(), 6);
-                actual.extend(
-                    check_case(
-                        fields[0],
-                        fields[1].parse().unwrap(),
-                        fields[2] == "1",
-                        fields[3] == "1",
-                        fields[4] == "1",
-                        fields[5].parse().unwrap(),
-                    )
-                    .await,
-                );
+            // Repeat within the isolated child to retain the process-global budget and allocator.
+            // Ordinary CI runs one round; the retained stress runner supplies an explicit bound.
+            let rounds = std::env::var("RTOS_MULTIPART_BUDGET_ROUNDS")
+                .map(|value| value.parse::<usize>().expect("integer round count"))
+                .unwrap_or(1);
+            assert!((1..=64).contains(&rounds), "round count must be in 1..=64");
+            for round in 0..rounds {
+                let mut actual = Vec::new();
+                for line in std::str::from_utf8(context).unwrap().lines() {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    assert_eq!(fields.len(), 6);
+                    actual.extend(
+                        check_case(
+                            fields[0],
+                            fields[1].parse().unwrap(),
+                            fields[2] == "1",
+                            fields[3] == "1",
+                            fields[4] == "1",
+                            fields[5].parse().unwrap(),
+                        )
+                        .await,
+                    );
+                }
+                assert_eq!(actual.len(), expected.len());
+                for (row, (observed, reference)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(observed, reference, "multipart budget snapshot {row}");
+                }
+                eprintln!("NATIVE_MULTIPART_BUDGET: {}", serde_json::to_string(&actual).unwrap());
+                eprintln!("NATIVE_MULTIPART_ROUND_DONE: {}", round + 1);
             }
-            assert_eq!(actual.len(), expected.len());
-            for (row, (observed, reference)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(observed, reference, "multipart budget snapshot {row}");
-            }
-            eprintln!("NATIVE_MULTIPART_BUDGET: {}", serde_json::to_string(&actual).unwrap());
         });
 }
 
