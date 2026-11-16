@@ -182,7 +182,32 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
         .expect("shutdown did not reach actual terminal state")
 }
 fn udp_released(port: u16) {
-    UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).expect("UDP socket still owned");
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap_or_else(|error| {
+        #[cfg(target_os = "linux")]
+        {
+            let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+            let suffix = format!(":{port:04X}");
+            for row in table.lines().skip(1).filter(|row| {
+                row.split_whitespace().nth(1).is_some_and(|addr| addr.ends_with(&suffix))
+            }) {
+                eprintln!("UDP_REBIND_FAILURE port={port} row={row}");
+                if let Some(inode) = row.split_whitespace().nth(9) {
+                    let target = format!("socket:[{inode}]");
+                    for fd in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+                        if std::fs::read_link(fd.path())
+                            .is_ok_and(|link| link.to_string_lossy() == target)
+                        {
+                            eprintln!(
+                                "UDP_REBIND_OWNER port={port} fd={} inode={inode}",
+                                fd.file_name().to_string_lossy()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        panic!("UDP socket still owned: port={port} error={error}")
+    });
 }
 
 fn tcp_released(port: u16) {
