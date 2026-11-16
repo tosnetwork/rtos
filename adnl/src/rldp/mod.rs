@@ -69,6 +69,7 @@ use send::{
     SendPartV2, SendTransfer, SendTransferState,
 };
 
+mod connection_driver;
 mod owned_send;
 mod peers;
 mod query_admission;
