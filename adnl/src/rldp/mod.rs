@@ -213,6 +213,7 @@ impl SendJob {
         let owner = self.ctx.adnl.tasks().clone();
         let control = self.ctx.control.clone();
         let permit = self.ctx.permit.clone();
+        let admission = self.ctx.admission.clone();
         let registration = self.ctx.registration.clone();
         let result =
             owned_send::supervise(control.clone(), owner.clone(), control.deadline(), async {
@@ -241,6 +242,7 @@ impl SendJob {
         control.drain().await;
         let result = control.take_failure().unwrap_or(result);
         drop(permit);
+        drop(admission);
         drop(registration);
         self.done.send(result).ok();
     }
@@ -249,6 +251,7 @@ impl SendJob {
 declare_counted!(
     struct RldpPeer {
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
+        transfer_slots: Arc<tokio::sync::Semaphore>,
         tx: tokio::sync::mpsc::UnboundedSender<SendJob>,
         stats: StatsV2,
         #[cfg(test)]
@@ -760,6 +763,7 @@ impl RldpNode {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 let ret = Arc::new(RldpPeer {
                     outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+                    transfer_slots: Arc::new(tokio::sync::Semaphore::new(256)),
                     tx,
                     stats: StatsV2::new(StatsConfigV2::default(), min_timeout_ms)?,
                     #[cfg(test)]
@@ -1061,6 +1065,16 @@ impl RldpNode {
         } else {
             None
         };
+        // Native RldpConnection::send refuses before retaining outbound state.
+        // This is shared by requests and responses on the same peer.
+        let admission = if v2 {
+            match peer.transfer_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            None
+        };
         if compression {
             answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
         }
@@ -1100,6 +1114,7 @@ impl RldpNode {
             bounded_permit: None,
         });
         let context_send = SendContext {
+            admission,
             registration,
             control,
             permit: None,
@@ -1218,6 +1233,25 @@ impl RldpNode {
             peers.other(),
             peer.outbound_semaphore.available_permits(),
         );
+        let admission = if v2 {
+            match peer.transfer_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(_) => {
+                    // Native silently drops a send at capacity. A query still
+                    // completes at its original deadline, without a retry.
+                    if let Some(deadline) = query_deadline {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => return Err(RldpQueryTimeout.into()),
+                            _ = control.cancelled() => { control.check()?; unreachable!() },
+                            _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+                        }
+                    }
+                    return Ok((None, peer.stats.v1.roundtrip()));
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_sent_all);
         #[cfg(feature = "telemetry")]
@@ -1298,6 +1332,7 @@ impl RldpNode {
             bounded_permit: retained_permit,
         });
         let send_context = SendContext {
+            admission,
             registration: registration.clone(),
             control: control.clone(),
             permit: Some(permit.clone()),

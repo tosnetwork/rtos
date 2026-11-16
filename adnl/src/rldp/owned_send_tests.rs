@@ -513,6 +513,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             v2: true,
             done,
             ctx: SendContext {
+                admission: None,
                 adnl: adnl.clone(),
                 peers: AdnlPeers::with_keys(local.id().clone(), local.id().clone()),
                 pong: tokio::sync::mpsc::unbounded_channel().1,

@@ -127,6 +127,7 @@ impl RaptorqEncoder {
 }
 
 pub(crate) struct SendContext {
+    pub(super) admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(super) control: Arc<super::SendControl>,
     pub(super) permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(super) registration: Arc<super::owned_send::SendRegistration>,
@@ -923,6 +924,7 @@ mod sibling_wake_tests {
         let (tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
         let peer = Arc::new(RldpPeer {
             outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            transfer_slots: Arc::new(tokio::sync::Semaphore::new(256)),
             tx,
             stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
             idle: Arc::new(tokio::sync::Notify::new()),
@@ -1067,6 +1069,7 @@ mod owned_ack_tests {
             let peer = Arc::new(RldpPeer {
                 tx,
                 outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                transfer_slots: Arc::new(tokio::sync::Semaphore::new(256)),
                 stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
                 idle: Arc::new(tokio::sync::Notify::new()),
                 counter: Arc::new(AtomicU64::new(0)).into(),
