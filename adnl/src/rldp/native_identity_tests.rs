@@ -443,3 +443,70 @@ async fn check_global_decoder_budget() {
     eprintln!("NATIVE_GLOBAL_BUDGET: {actual}");
     assert_eq!(vec![actual], expected);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_inbound_id_does_not_alias_active_outbound() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_directional_identity_context.tsv").trim(),
+        "64 60"
+    );
+    let expected = directional_identity_native_effects();
+    let (reply, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome=std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true,Ordering::Release);
+        let peer=rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+        let native=peer.native.get().expect("directional isolation must use actual native Connection");
+        let id=[7u8;32];
+        assert!(native.driver.submit(super::super::connection_driver::Command::Send {id,data:vec![42;64],deadline:Some(std::time::Instant::now()+Duration::from_secs(60)),answer:false}).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while !packets.transfers.lock().unwrap().contains(id.as_slice()) {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.expect("outbound must emit the exact ID over actual UDP before inbound reuse");
+        assert_eq!(inspect(native).await.1,1);
+        let message=serialize_boxed(&rldp::message::Message {id:UInt256::default(),data:b"churn".to_vec()}.into_boxed()).unwrap();
+        let mut encoder=crate::RaptorqEncoder::with_data(&message,Some(768));
+        let mut seqno=0;
+        let chunk=RldpChunk {transfer_id:id.into(),fec_type:encoder.params().clone().into_boxed(),part:0,total_size:message.len() as i64,data:encoder.encode(&mut seqno).unwrap(),seqno:seqno as i32};
+        let wire=serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                nodes[0].send_custom(&TaggedByteSlice {object:&wire,#[cfg(feature="telemetry")]tag:0},&route).await.unwrap();
+                if reply.messages.load(Ordering::Acquire)==1 {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("same-ID inbound must deliver through the actual application path");
+        assert_eq!(reply.message_hash.lock().unwrap().as_deref(),Some(hex::encode(rtos_block::sha256_digest(b"churn")).as_str()));
+        let pending=inspect(native).await.1==1;
+        assert!(pending,"inbound completion must preserve the same-ID outbound sender");
+        assert_eq!(native.completed_sends.load(Ordering::Acquire),0);
+        assert!(native.failed_send_ids.lock().unwrap().is_empty());
+        let ack=serialize_boxed(&rldp2::messagepart::Complete {transfer_id:id.into(),part:0}.into_boxed()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                nodes[0].send_custom(&TaggedByteSlice {object:&ack,#[cfg(feature="telemetry")]tag:0},&route).await.unwrap();
+                if native.completed_sends.load(Ordering::Acquire)==1 {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("same-ID outbound must finish only after its actual UDP ACK");
+        let (_,retained,remembered)=inspect(native).await;
+        assert_eq!(native.completed_send_ids.lock().unwrap().as_slice(),&[id]);
+        let (done,receipt)=tokio::sync::oneshot::channel();
+        native.driver.submit(super::super::connection_driver::Command::InspectCompleted(done)).await.unwrap();
+        assert_eq!(receipt.await.unwrap(),vec![id],"outbound retirement must preserve inbound completion");
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0);
+        let actual=serde_json::json!({"delivered":reply.messages.load(Ordering::Acquire),"outbound_pending_after_inbound":pending,"ack_completed":native.completed_sends.load(Ordering::Acquire),"outbound_retained":retained,"inbound_remembered":remembered});
+        assert_eq!(actual,expected);
+        eprintln!("NATIVE_DIRECTIONAL_IDENTITY: {actual}");
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
