@@ -656,3 +656,42 @@ async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
     owner.close();
     bounded(owner.wait()).await.unwrap();
 }
+
+#[tokio::test]
+async fn rldp_owned_expired_protocol_deadline_skips_queued_work() {
+    let owner = AdnlTasks::new();
+    let pool = pool(&owner);
+    let (release, wait) = oneshot::channel();
+    let (entered, started) = oneshot::channel();
+    let first = pool
+        .submit(SendControl::new(), async move {
+            entered.send(()).unwrap();
+            let _ = wait.await;
+            Ok(true)
+        })
+        .unwrap();
+    bounded(started).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+    let control = SendControl::with_protocol_deadline(Some(deadline));
+    let executed = Arc::new(AtomicBool::new(false));
+    let flag = executed.clone();
+    let second = pool
+        .submit(control.clone(), async move {
+            flag.store(true, Ordering::Release);
+            Ok(true)
+        })
+        .unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline) + Duration::from_millis(20))
+        .await;
+    release.send(()).unwrap();
+    let result = bounded(second).await.unwrap();
+    assert!(bounded(first).await.unwrap().unwrap());
+    bounded(owner.wait()).await.unwrap();
+    assert!(!executed.load(Ordering::Acquire), "queued work started after its absolute deadline");
+    assert!(result.is_err());
+    let error = control.take_failure().unwrap().unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<SendCancelled>(), Some(SendCancelled::Deadline)),
+        "{error:#}"
+    );
+}

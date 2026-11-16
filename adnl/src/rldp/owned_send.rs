@@ -33,6 +33,7 @@ impl std::fmt::Display for SendCancelled {
 impl std::error::Error for SendCancelled {}
 
 pub(super) struct SendControl {
+    pub(super) protocol_deadline: Option<std::time::Instant>,
     token: CancellationToken,
     reason: Mutex<Option<SendCancelled>>,
     parts: tokio_util::task::TaskTracker,
@@ -48,7 +49,11 @@ pub(super) struct SendControl {
 }
 impl SendControl {
     pub fn new() -> Arc<Self> {
+        Self::with_protocol_deadline(None)
+    }
+    pub fn with_protocol_deadline(protocol_deadline: Option<std::time::Instant>) -> Arc<Self> {
         Arc::new(Self {
+            protocol_deadline,
             token: CancellationToken::new(),
             reason: Mutex::new(None),
             parts: tokio_util::task::TaskTracker::new(),
@@ -64,11 +69,16 @@ impl SendControl {
         })
     }
     pub fn deadline(&self) -> std::time::Duration {
+        let remaining = self
+            .protocol_deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
         #[cfg(test)]
         if let Some(deadline) = *self.test_deadline.lock().unwrap() {
-            return deadline;
+            return remaining.map_or(deadline, |remaining| remaining.min(deadline));
         }
-        std::time::Duration::from_millis(super::RldpNode::TIMEOUT_OUTBOUND_HARD_MS)
+        remaining.unwrap_or_else(|| {
+            std::time::Duration::from_millis(super::RldpNode::TIMEOUT_OUTBOUND_HARD_MS)
+        })
     }
     pub fn cancel(&self, reason: SendCancelled) {
         let mut previous = self.reason.lock().unwrap();
@@ -81,6 +91,9 @@ impl SendControl {
         self.token.cancelled().await;
     }
     pub fn check(&self) -> Result<()> {
+        if self.protocol_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.cancel(SendCancelled::Deadline);
+        }
         if let Some(reason) = *self.reason.lock().unwrap() {
             return Err(reason.into());
         }

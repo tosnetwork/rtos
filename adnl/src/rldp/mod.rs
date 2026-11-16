@@ -1044,9 +1044,22 @@ impl RldpNode {
         let Some(mut answer) = answer.answer else { return Ok(None) };
         // Match the native response path: a subscriber may finish after the
         // wire query deadline, in which case no new transfer may be opened.
-        if v2 && Version::get() >= query.timeout {
-            return Ok(None);
-        }
+        let response_deadline = if v2 {
+            let monotonic_now = std::time::Instant::now();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+            let Some(remaining) = u64::try_from(query.timeout)
+                .ok()
+                .and_then(|seconds| Duration::from_secs(seconds).checked_sub(now))
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Ok(None);
+            };
+            // Native limits a response to the wire deadline or 60 seconds,
+            // whichever is sooner. Keep one monotonic deadline across queues.
+            Some(monotonic_now + remaining.min(Duration::from_secs(60)))
+        } else {
+            None
+        };
         if compression {
             answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
         }
@@ -1076,7 +1089,7 @@ impl RldpNode {
         #[cfg(test)]
         response_lifecycle.0.fetch_add(1, Ordering::Release);
         transfers.insert(send_transfer_id, RldpTransfer::Send(send_transfer_state));
-        let control = SendControl::new();
+        let control = SendControl::with_protocol_deadline(response_deadline);
         let _cancel = control.guard();
         let registration = Arc::new(owned_send::SendRegistration {
             transfers: transfers.clone(),
@@ -2063,7 +2076,9 @@ impl RldpNode {
                 );
                 context.peer.stats.v1.update(min_timeout_ms);
                 updates += new_received
-            } else if context.peer.stats.v1.try_timeout(start_ms) {
+            } else if control.protocol_deadline.is_none()
+                && context.peer.stats.v1.try_timeout(start_ms)
+            {
                 transfer.state().set_finished(false);
                 continue;
             }
