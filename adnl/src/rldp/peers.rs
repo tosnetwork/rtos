@@ -145,6 +145,17 @@ impl PeerTable {
         assert!(self.state.lock().unwrap().v2.is_empty());
         self.native_enabled.store(true, Ordering::Release);
     }
+    #[cfg(test)]
+    pub(super) fn evict_for_test(&self, route: &AdnlPeers) -> Arc<RldpPeer> {
+        let peer = self
+            .state
+            .lock()
+            .unwrap()
+            .remove(&(route.local().clone(), route.other().clone()))
+            .unwrap();
+        peer.close(&self.transfers);
+        peer
+    }
     pub(super) fn expire(&self, now: Instant) -> Option<Instant> {
         let mut state = self.state.lock().unwrap();
         state.retiring.retain(|_, drained| !drained.is_cancelled());

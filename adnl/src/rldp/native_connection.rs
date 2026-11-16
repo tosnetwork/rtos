@@ -1,7 +1,6 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Connection event routing owned by an authenticated PeerTable entry.
 use super::*;
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt};
 use std::sync::Weak;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio_util::sync::CancellationToken;
@@ -39,21 +38,14 @@ impl NativeConnection {
         let completed_sends = ret.completed_sends.clone();
         let lifetime = owner.clone();
         owner.spawn_admitted("RLDP2 Connection events", token, async move {
-            // Keep this entry's capacity until both transport work and application
-            // callbacks have actually ended, including after peer eviction.
+            // Keep this entry's capacity until actual transport work ends.
+            // Application callbacks are separately retained by the node owner.
             let _permit = permit;
-            let mut applications = FuturesUnordered::<BoxFuture<'static, Result<()>>>::new();
             loop {
                 let event = tokio::select! {
                     biased;
                     _ = closed.cancelled() => break,
                     _ = lifetime.cancelled() => break,
-                    result = applications.next(), if !applications.is_empty() => {
-                        if let Some(Err(error)) = result {
-                            log::warn!(target: TARGET, "RLDP2 application: {error}");
-                        }
-                        continue;
-                    },
                     event = events.recv() => match event { Some(event) => event, None => break },
                 };
                 for (_, result) in event.sent {
@@ -91,12 +83,25 @@ impl NativeConnection {
                     let Some(node) = node.upgrade() else {
                         break;
                     };
-                    let (driver, route) = (driver.clone(), route.clone());
-                    applications.push(
+                    let route = route.clone();
+                    let application_owner = lifetime.clone();
+                    let Ok(application_token) = application_owner.enter() else {
+                        continue;
+                    };
+                    let application_lifetime = application_owner.clone();
+                    application_owner.spawn_admitted(
+                        "RLDP2 application",
+                        application_token,
                         async move {
-                            RldpNode::process_message(
+                            // Refuse callbacks that have not started when the node
+                            // closes. Once entered, retain the subscriber's actual
+                            // awaiter even if its original peer actor is evicted.
+                            if application_lifetime.is_closed() {
+                                return;
+                            }
+                            let result = RldpNode::process_message(
                                 MessageContext {
-                                    driver: Some(&driver),
+                                    native: true,
                                     adnl: &node.adnl,
                                     peers: &route,
                                     data: &data,
@@ -113,22 +118,18 @@ impl NativeConnection {
                                 #[cfg(test)]
                                 &node.allocated.response_lifecycle,
                             )
-                            .await?;
-                            Ok(())
-                        }
-                        .boxed(),
+                            .await;
+                            #[cfg(test)]
+                            node.allocated.response_lifecycle.1.fetch_add(1, Ordering::Release);
+                            if let Err(error) = result {
+                                log::debug!(target: TARGET, "RLDP2 application: {error}");
+                            }
+                        },
                     );
                 }
             }
             closed.cancel();
             driver.close().await;
-            // A subscriber can own a pending answer task. Never drop its awaiter
-            // during shutdown and silently detach that application's work.
-            while let Some(result) = applications.next().await {
-                if let Err(error) = result {
-                    log::debug!(target: TARGET, "RLDP2 closing application: {error}");
-                }
-            }
             drained.cancel();
             wake.notify_one();
         });

@@ -334,7 +334,7 @@ declare_counted!(
 // Complete application input, independent of a particular transport decoder.
 // Both the legacy receive wrapper and the Connection event route can borrow it.
 struct MessageContext<'a> {
-    driver: Option<&'a connection_driver::ConnectionDriver>,
+    native: bool,
     adnl: &'a Arc<AdnlNode>,
     peers: &'a AdnlPeers,
     data: &'a [u8],
@@ -1111,7 +1111,7 @@ impl RldpNode {
             }
             let send_transfer_id = Self::process_message(
                 MessageContext {
-                    driver: None,
+                    native: false,
                     adnl: &context.adnl,
                     peers: &context.peers,
                     data: &context.recv_transfer.data,
@@ -1270,7 +1270,7 @@ impl RldpNode {
         } else {
             None
         };
-        if let Some(driver) = context.driver {
+        if context.native {
             if compression {
                 answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
             }
@@ -1282,7 +1282,21 @@ impl RldpNode {
             for byte in &mut send_transfer_id {
                 *byte ^= 0xff;
             }
-            let accepted = driver
+            // Application work belongs to the node, not the old connection.
+            // Native answer_query reacquires this authenticated pair after the
+            // application finishes, including when its former actor was evicted.
+            let peer = peer_table
+                .get(
+                    context.peers.local(),
+                    context.peers.other(),
+                    true,
+                    response_deadline.map(tokio::time::Instant::from_std),
+                )
+                .await?;
+            let native =
+                peer.native.get().ok_or_else(|| error!("Connection response mode mismatch"))?;
+            let accepted = native
+                .driver
                 .submit(connection_driver::Command::Send {
                     id: send_transfer_id,
                     data: serialize_boxed(&answer.object.into_boxed())?,

@@ -3944,3 +3944,127 @@ async fn native_peer_reopen_waits_for_actual_fec_owner() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_application_answer_reacquires_evicted_connection() {
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    rldps[0].peers.enable_native_for_tests();
+    reply.hold.store(true, Ordering::Release);
+    let remote = rldps[1].clone();
+    let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+    let mut query = tokio::spawn(async move {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        remote
+            .query(
+                &TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                Some(1024),
+                &route,
+                true,
+                None,
+            )
+            .await
+    });
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+        let retired = rldps[0].peers.evict_for_test(&peers);
+        tokio::time::timeout(Duration::from_millis(500), retired.drained.cancelled())
+            .await
+            .expect("application reply must not retain the retired Connection owner");
+        let replacement =
+            rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        assert!(!Arc::ptr_eq(&retired, &replacement));
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_one();
+        let (answer, _) = tokio::time::timeout(Duration::from_secs(2), &mut query)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while replacement.native.get().unwrap().completed_sends.load(Ordering::Acquire) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("response completed on the replacement Connection");
+        assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire), 0);
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_one();
+    if !query.is_finished() {
+        query.abort();
+        let _ = query.await;
+    }
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_application_is_joined_by_node_shutdown() {
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    rldps[0].peers.enable_native_for_tests();
+    reply.hold.store(true, Ordering::Release);
+    let remote = rldps[1].clone();
+    let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+    let query = tokio::spawn(async move {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        remote
+            .query(
+                &TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                Some(1024),
+                &route,
+                true,
+                None,
+            )
+            .await
+    });
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+        let mut stop = Box::pin(nodes[0].stop_checked());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut stop).await.is_err(),
+            "node stop must retain the entered application callback"
+        );
+        assert!(!nodes[0].tasks().drained());
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), stop).await.unwrap().unwrap();
+        assert!(nodes[0].tasks().drained());
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_one();
+    query.abort();
+    let _ = query.await;
+    if reply.calls.load(Ordering::Acquire) > 0 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rldps[0].allocated.response_lifecycle.1.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("released application must reach its actual terminal callback");
+    }
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
