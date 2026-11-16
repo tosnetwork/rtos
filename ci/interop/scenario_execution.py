@@ -35,6 +35,13 @@ from scenario_expiry import (
     check_passive_recovery_components,
     expiry_arguments,
 )
+from scenario_first_intent import (
+    FIRST_INTENTS,
+    check_first_intent_evidence,
+    check_first_intent_result,
+    first_intent_arguments,
+    first_intent_artifacts,
+)
 from scenario_matrix import (
     MATRICES,
     check_matrix_result,
@@ -82,6 +89,7 @@ ROTATIONS = (
     | set(INTENTS)
     | set(RETENTIONS)
     | EXPIRIES
+    | set(FIRST_INTENTS)
 )
 
 
@@ -207,6 +215,10 @@ def check_result(name, result):
         check_packet_result(name, result.get("network_fault"))
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
+    if name in FIRST_INTENTS:
+        check_first_intent_result(name, result)
+    elif result.get("first_intent_cut") is not None:
+        raise ValueError("Unexpected first-intent cut receipt")
     recovery = result.get("recovery")
     if name == "signer-expiry":
         check_ack_partition_result(
@@ -352,6 +364,8 @@ def execute(args, names, catalog):
         inputs.extend(ack_artifacts(args, source))
     if any(name in RETENTIONS for name in names):
         inputs.extend(retention_artifacts(args, source))
+    if any(name in FIRST_INTENTS for name in names):
+        inputs.extend(first_intent_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -436,6 +450,8 @@ def execute(args, names, catalog):
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name in FIRST_INTENTS:
+                run += first_intent_arguments(name, args.first_intent_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -474,6 +490,10 @@ def execute(args, names, catalog):
                     or name in EXPIRIES
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name in FIRST_INTENTS:
+                check_first_intent_evidence(
+                    case / "runtime", result["first_intent_cut"], FIRST_INTENTS[name]
+                )
             if name in INTENTS:
                 check_intent_evidence(
                     case / "runtime",
