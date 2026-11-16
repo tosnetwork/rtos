@@ -293,6 +293,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        query_slots: Arc<tokio::sync::Semaphore>,
         inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
@@ -364,6 +365,7 @@ struct BoundedReceive {
 
 /// Rldp Node
 pub struct RldpNode {
+    query_slots: Arc<tokio::sync::Semaphore>,
     adnl: Arc<AdnlNode>,
     local_id: Option<Arc<KeyId>>,
     min_timeout_ms: u64,
@@ -386,6 +388,8 @@ pub struct RldpNode {
 }
 
 impl RldpNode {
+    const MAX_PENDING_QUERIES: usize = 8192;
+    const MAX_PENDING_QUERIES_PER_CONNECTION: usize = 256;
     const ACK_DELAY_MS: u64 = 1; // RLDPv2 confirmation delay
     const MAX_OUTBOUNDS_PER_PEER: u32 = 3;
     const SIZE_TRANSFER_WAVE: u32 = 10;
@@ -435,6 +439,7 @@ impl RldpNode {
             min_timeout_ms,
         )?;
         let ret = Self {
+            query_slots: Arc::new(tokio::sync::Semaphore::new(Self::MAX_PENDING_QUERIES)),
             adnl,
             local_id,
             min_timeout_ms,
@@ -905,6 +910,7 @@ impl RldpNode {
             return Ok(None);
         }
         let registration = Arc::new(owned_send::SendRegistration {
+            _query_admission: None,
             v2,
             inbound: v2.then(|| (*transfer_id, tokio_util::sync::CancellationToken::new())),
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
@@ -1192,6 +1198,7 @@ impl RldpNode {
         let control = SendControl::with_protocol_deadline(response_deadline);
         let _cancel = control.guard();
         let registration = Arc::new(owned_send::SendRegistration {
+            _query_admission: None,
             v2,
             inbound: None,
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
@@ -1293,6 +1300,18 @@ impl RldpNode {
             (None::<QueryId>, message)
         };
         let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
+        // This counts queries waiting for answers, including those queued for
+        // a sender. Native RldpIn refuses these independently of transfer capacity.
+        let global_query_admission = if v2 && query_id.is_some() {
+            Some(
+                self.query_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| error!("too many RLDP queries are already awaiting an answer"))?,
+            )
+        } else {
+            None
+        };
         // Native send_message also supplies a ten-second transfer deadline;
         // connection retention is that deadline plus the 120-second idle span.
         let connection_deadline = v2.then(|| {
@@ -1312,6 +1331,14 @@ impl RldpNode {
             Ok(peer) => peer?,
             Err(_) if query_deadline.is_some() => return Err(RldpQueryTimeout.into()),
             Err(_) => return Err(SendCancelled::Deadline.into()),
+        };
+        let query_admission = if let Some(global) = global_query_admission {
+            let connection = peer.query_slots.clone().try_acquire_owned().map_err(|_| {
+                error!("too many RLDP queries are already awaiting an answer from this peer")
+            })?;
+            Some(Arc::new(owned_send::QueryAdmission { _global: global, _connection: connection }))
+        } else {
+            None
         };
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
@@ -1440,6 +1467,7 @@ impl RldpNode {
             (None, None)
         };
         let registration = Arc::new(owned_send::SendRegistration {
+            _query_admission: query_admission,
             v2,
             inbound: if v2 {
                 recv_transfer_id.map(|id| (id, tokio_util::sync::CancellationToken::new()))

@@ -256,6 +256,7 @@ impl PeerTable {
             transfers.clone()
         };
         let peer = Arc::new(RldpPeer {
+            query_slots: Arc::new(Semaphore::new(RldpNode::MAX_PENDING_QUERIES_PER_CONNECTION)),
             inbound_transfers: inbound_transfers.clone(),
             transfers: transfers.clone(),
             outbound_semaphore: Arc::new(Semaphore::new(RldpNode::MAX_OUTBOUNDS_PER_PEER as usize)),

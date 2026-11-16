@@ -376,7 +376,14 @@ where
     })?
 }
 
+pub(super) struct QueryAdmission {
+    pub _global: tokio::sync::OwnedSemaphorePermit,
+    pub _connection: tokio::sync::OwnedSemaphorePermit,
+}
+
 pub(super) struct SendRegistration {
+    // Keep pending-query capacity until actual send/receive owners have drained.
+    pub _query_admission: Option<Arc<QueryAdmission>>,
     pub v2: bool,
     pub inbound: Option<(super::TransferId, CancellationToken)>,
     pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,

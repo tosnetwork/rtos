@@ -181,7 +181,7 @@ async fn topology(
                 if index == 1 {
                     vec![([18; 32], 0), ([39; 32], 1)]
                 } else {
-                    vec![([17 + index as u8; 32], 0)]
+                    vec![([if index == 22 { 79 } else { 17 + index as u8 }; 32], 0)]
                 },
             )
             .unwrap();
@@ -1563,6 +1563,7 @@ async fn rldp2_inbound_id_does_not_alias_active_outbound() {
         let original = parts[0].clone();
         peer.insert_transfer(&peer.transfers, [7; 32], super::RldpTransfer::sender(state)).unwrap();
         let registration = super::owned_send::SendRegistration {
+            _query_admission: None,
             v2: true,
             inbound: None,
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
@@ -1659,6 +1660,129 @@ fn directional_identity_native_effects() -> serde_json::Value {
         (
             "probe_source_sha256",
             include_bytes!("../../../ci/conformance/rldp2_directional_identity_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42;64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for _ in 0..257 { pending.push(rldps[0].query(&query, Some(1024), &peers, true, None)); }
+        let refused = tokio::time::timeout(Duration::from_secs(2), pending.next()).await
+            .expect("query257 must be refused immediately, before its query deadline or sender admission").unwrap();
+        let error = refused.expect_err("capacity overflow cannot answer successfully");
+        assert!(error.to_string().contains("from this peer"), "wrong refusal: {error:#}");
+        assert_eq!(pending.len(),256);
+    }).catch_unwind().await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, _peers) = topology(34).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let local = nodes[1].key_by_tag(0).unwrap();
+        let routes: Vec<_> = (0..34)
+            .filter(|&i| i != 1)
+            .map(|i| {
+                AdnlPeers::with_keys(
+                    local.id().clone(),
+                    nodes[i].key_by_tag(0).unwrap().id().clone(),
+                )
+            })
+            .collect();
+        let (answer, _) = rldps[1].query(&query, Some(1024), &routes[0], true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (index, route) in routes.iter().enumerate() {
+            for _ in 0..if index == 32 { 1 } else { 256 } {
+                pending.push(rldps[1].query(&query, Some(1024), route, true, None));
+            }
+        }
+        let refused = tokio::time::timeout(Duration::from_secs(2), pending.next())
+            .await
+            .expect("query8193 must be refused by the global pending-query cap before its deadline")
+            .unwrap();
+        let error = refused.expect_err("global capacity overflow cannot answer successfully");
+        assert_eq!(error.to_string(), "too many RLDP queries are already awaiting an answer");
+        let expected = query_admission_native_effects();
+        assert_eq!(pending.len(), expected["global_pending"].as_u64().unwrap() as usize);
+        assert_eq!(expected["global_refused"], 1);
+        assert_eq!(expected["global_other"], 0);
+        assert!(pending.next().now_or_never().is_none());
+        assert_eq!(rldps[1].query_slots.available_permits(), 0);
+        drop(pending);
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].query_slots.available_permits() != 8192 {
+                reply.release.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("global query capacity must return after real owner drain");
+        let (answer, _) =
+            rldps[1].query(&query, Some(1024), &routes[32], true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn query_admission_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_query_admission_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_query_admission_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_query_admission_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_query_admission_reference.cpp")
                 .as_slice(),
         ),
         (
