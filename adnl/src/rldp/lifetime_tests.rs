@@ -4068,3 +4068,77 @@ async fn native_application_is_joined_by_node_shutdown() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_answer_envelope_id_does_not_override_authenticated_transfer() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_answer_envelope_context.tsv").trim(),
+        "0 64 1024"
+    );
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_answer_envelope_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_answer_envelope_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_answer_envelope_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_answer_envelope_metadata.json"),
+    );
+    let (reply, packets, nodes, rldps, peers) = pair().await;
+    *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    reply.hold.store(true, Ordering::Release);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let request = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
+        let delivered = AtomicBool::new(false);
+        let query = async {
+            let answer = rldps[0].query(&request, Some(1024), &peers, true, None).await;
+            delivered.store(true, Ordering::Release);
+            answer
+        };
+        let inject = async {
+            tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+            let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+            let id = *peer.inbound_transfers.iter()
+                .find(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_)))
+                .expect("query response must be registered").key();
+            let answer = serialize_boxed(&rldp::message::Answer {
+                query_id: UInt256::default(), data: vec![42; 64],
+            }.into_boxed()).unwrap();
+            let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+            let mut wrong_id = id;
+            wrong_id[0] ^= 1;
+            for transfer_id in [wrong_id, id] {
+                let mut encoder = crate::RaptorqEncoder::with_data(&answer, Some(768));
+                let mut seqno = 0;
+                let chunk = RldpChunk { transfer_id: transfer_id.into(),
+                    fec_type: encoder.params().clone().into_boxed(), part: 0,
+                    total_size: answer.len() as i64, data: encoder.encode(&mut seqno).unwrap(), seqno: 0 };
+                let packet = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+                let before = packets.processed_parts.load(Ordering::Acquire);
+                nodes[1].send_custom(&TaggedByteSlice { object: &packet, #[cfg(feature = "telemetry")] tag: 0 }, &route).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while packets.processed_parts.load(Ordering::Acquire) == before {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }).await.unwrap();
+                if transfer_id == wrong_id {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(!delivered.load(Ordering::Acquire), "wrong transfer must not resolve query");
+                }
+            }
+        };
+        let (answer, ()) = tokio::join!(query, inject);
+        let (answer, _) = answer.expect("native accepts the response by authenticated transfer ID");
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        let actual = serde_json::json!({"wrong_transfer_pending": true, "answer_bytes": 64, "answer_fill": 42});
+        assert_eq!(vec![actual.clone()], native);
+        eprintln!("ANSWER_ENVELOPE_EFFECTS: {actual}");
+    }).catch_unwind().await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
