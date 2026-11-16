@@ -492,7 +492,7 @@ async fn sixteen_large_silent_responses_retain_initialized_encoders() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_outbound_count_matches_native_256() {
-    outbound_count_boundary(false).await;
+    outbound_count_boundary(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -501,16 +501,26 @@ async fn rldp2_outbound_admission_isolated_by_local_identity() {
         include_str!("../../../ci/conformance/rldp2_local_identity_context.tsv").trim(),
         "256 1 64 60"
     );
-    outbound_count_boundary(true).await;
+    outbound_count_boundary(true, false).await;
 }
 
-async fn outbound_count_boundary(second_local: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_outbound_ack_releases_exactly_one_slot() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_ack_reuse_context.tsv").trim(),
+        "257 64 60"
+    );
+    outbound_count_boundary(false, true).await;
+}
+
+async fn outbound_count_boundary(second_local: bool, ack_reuse: bool) {
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_outbound_count_context.tsv").trim(),
         "257"
     );
     use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
     let (reply, packets, nodes, rldps, attacker_peers) = topology(3).await;
+    let mut checked_peer = None;
     let outcome = std::panic::AssertUnwindSafe(async {
         packets.drop_parts.store(true, Ordering::Release);
         reply.response_bytes.store(64, Ordering::Release);
@@ -591,6 +601,131 @@ async fn outbound_count_boundary(second_local: bool) {
             256,
             "native admits only 256 concurrent outbound transfers per connection"
         );
+        let mut completed_id = None;
+        if ack_reuse {
+            let server = nodes[1].key_by_tag(0).unwrap();
+            let client = nodes[0].key_by_tag(0).unwrap();
+            let peer = rldps[1].get_peer(server.id(), client.id(), true, None).await.unwrap();
+            assert_eq!(peer.transfer_slots.available_permits(), 0);
+            let initial = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
+            let id: [u8; 32] = packets
+                .transfers
+                .lock()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+            completed_id = Some(id);
+            let completed_state = rldps[1].get_v2_state(&id, 0).unwrap();
+            let ack = serialize_boxed(
+                &rldp2::messagepart::Complete { transfer_id: UInt256::from(id), part: 0 }
+                    .into_boxed(),
+            )
+            .unwrap();
+            nodes[0]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &ack,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &attacker_peers,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while completed_state.is_finished().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("actual completion must mark the acknowledged part successful");
+            assert_eq!(completed_state.is_finished(), Some(true), "ACK must complete successfully");
+            let completed = u64::from(completed_state.is_finished() == Some(true));
+            // The allocation counter includes this part state. Release our
+            // observer before asserting that its actual allocation was freed.
+            drop(completed_state);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while peer.transfer_slots.available_permits() != 1
+                    || rldps[1].allocated.send_transfers.load(Ordering::Acquire) != 255
+                    || rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) != 2
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("actual completion must release one sender and admission slot");
+            assert!(matches!(
+                rldps[1].transfers.get(&id).unwrap().val(),
+                super::RldpTransfer::Done
+            ));
+            let after_ack = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
+
+            let request = serialize_boxed(
+                &rldp::message::Query {
+                    query_id: UInt256::from([72; 32]),
+                    max_answer_size: 1024,
+                    timeout: super::Version::get() + 60,
+                    data: query_bytes.clone(),
+                }
+                .into_boxed(),
+            )
+            .unwrap();
+            let mut encoder = crate::RaptorqEncoder::with_data(&request, None);
+            let mut seqno = 0;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from([73; 32]),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: request.len() as i64,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: seqno as i32,
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[0]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &attacker_peers,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) != 257
+                    || packets.transfers.lock().unwrap().len() != 257
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("replacement must use the freed slot and reach the wire");
+            assert_eq!(peer.transfer_slots.available_permits(), 0);
+            assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire), 256);
+            let after_replacement = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
+            let started = rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire);
+            // Re-enter the authenticated custom-message handler synchronously,
+            // so duplicate-ACK assertions do not depend on a UDP sleep window.
+            let reverse = AdnlPeers::with_keys(server.id().clone(), client.id().clone());
+            assert!(rldps[1].try_consume_custom(&ack, &reverse).await.unwrap());
+            assert_eq!(peer.transfer_slots.available_permits(), 0);
+            assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire), 256);
+            let actual = serde_json::json!({
+                "initial": initial, "after_ack": after_ack,
+                "after_replacement": after_replacement, "started": started,
+                "completed": completed,
+                "duplicate_ack_retained": rldps[1].allocated.send_transfers.load(Ordering::Acquire),
+            });
+            assert_eq!(actual, ack_reuse_native_effects());
+            eprintln!("ACK_REUSE_EFFECTS: {actual}");
+            checked_peer = Some(peer);
+        }
         if second_local {
             let local = nodes[1].key_by_tag(1).unwrap();
             let remote = nodes[0].key_by_tag(0).unwrap();
@@ -670,6 +805,9 @@ async fn outbound_count_boundary(second_local: bool) {
         assert_eq!(answer.unwrap(), vec![42; 64]);
         for id in packets.transfers.lock().unwrap().iter() {
             let id: [u8; 32] = id.as_slice().try_into().unwrap();
+            if completed_id == Some(id) {
+                continue;
+            }
             assert!(
                 matches!(rldps[1].transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
                 "healthy progress must not evict the silent peer's valid responses"
@@ -682,6 +820,13 @@ async fn outbound_count_boundary(second_local: bool) {
     let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
     for result in stopped {
         result.unwrap();
+    }
+    if let Some(peer) = checked_peer {
+        assert_eq!(
+            peer.transfer_slots.available_permits(),
+            256,
+            "shutdown must restore every sender slot"
+        );
     }
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
@@ -803,4 +948,29 @@ async fn rldp2_connection_eviction_fails_query_and_recovers() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+fn ack_reuse_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_ack_reuse_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_ack_reuse_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_ack_reuse_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_ack_reuse_reference.cpp").as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
 }
