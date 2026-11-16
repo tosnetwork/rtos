@@ -60,20 +60,26 @@ fn reserve_tcp_udp() -> std::io::Result<(UdpSocket, TcpListener, u16)> {
 }
 
 async fn started_tcp_node(seed: u8) -> Result<(TestNode, u16)> {
-    started_tcp_node_with(seed, |_, _, _| Ok(())).await
+    started_tcp_node_with(seed, |_, _, _, tcp| {
+        drop(tcp);
+        Ok(())
+    })
+    .await
 }
 
 async fn started_tcp_node_with(
     seed: u8,
-    mut before_start: impl FnMut(usize, &TestNode, u16) -> Result<()>,
+    mut before_start: impl FnMut(usize, &TestNode, u16, TcpListener) -> Result<()>,
 ) -> Result<(TestNode, u16)> {
     for attempt in 0..8 {
         let (udp, tcp, port) = reserve_tcp_udp()?;
         let node = node_on_port(seed, port).await;
         // Production startup binds its own sockets. Minimize this handoff gap
         // and retry only a real bind collision after fully draining its owner.
-        drop((udp, tcp));
-        let started = match before_start(attempt, &node, port) {
+        drop(udp);
+        // Transfer the reservation to the hook: failure injection must not
+        // drop and rebind it, which races with unrelated port users.
+        let started = match before_start(attempt, &node, port, tcp) {
             Ok(()) => node.start_over_udp_tcp(Vec::new()).await,
             Err(error) => Err(error),
         };
@@ -102,12 +108,18 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
     let mut first_port = 0;
     let mut first_owner = None;
     let mut attempts = 0;
-    let (node, port) = started_tcp_node_with(60, |attempt, node, port| {
+    let (node, port) = started_tcp_node_with(60, |attempt, node, port, tcp| {
         attempts += 1;
         if attempt == 0 {
             first_port = port;
             first_owner = Some(Arc::downgrade(&node.0));
-            held_tcp = Some(TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?);
+            assert_eq!(tcp.local_addr()?.port(), port);
+            assert_eq!(
+                TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse,
+                "the reserved socket must still exclude another TCP bind"
+            );
+            held_tcp = Some(tcp);
         } else {
             assert!(
                 first_owner.as_ref().unwrap().upgrade().is_none(),
@@ -135,7 +147,8 @@ async fn adnl_tcp_fixture_does_not_retry_non_bind_startup_failure() {
     for close_owner in [true, false] {
         let mut attempts = 0;
         let mut owner = None;
-        let result = started_tcp_node_with(61, |_, node, _| {
+        let result = started_tcp_node_with(61, |_, node, _, tcp| {
+            drop(tcp);
             attempts += 1;
             owner = Some(Arc::downgrade(&node.0));
             if close_owner {
