@@ -5,7 +5,7 @@ use crate::{
     node::{AdnlNode, AdnlNodeConfig},
     RldpNode, RldpQueryTimeout,
 };
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use rtos_api::{
     deserialize_boxed, serialize_boxed,
     ton::{rldp2, rpc::overlay::Query},
@@ -73,6 +73,7 @@ struct ResponsePackets {
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
     handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
+    driver: Mutex<Option<Arc<super::connection_driver::ConnectionDriver>>>,
     processed_parts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
@@ -113,6 +114,14 @@ impl Subscriber for ResponsePackets {
         }
         // In tests requiring a negative state assertion, acknowledge processing only
         // after the real handler returns. Consume here to prevent double dispatch.
+        let driver = self.driver.lock().unwrap().clone();
+        if let Some(driver) = driver {
+            driver.submit(super::connection_driver::Command::Receive(bytes.to_vec())).await?;
+            if is_data_part {
+                self.processed_parts.fetch_add(1, Ordering::Release);
+            }
+            return Ok(true);
+        }
         let handler = self.handler.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
         if let Some(handler) = handler {
             let consumed = handler.try_consume_custom(bytes, peers).await?;
@@ -3690,7 +3699,7 @@ async fn rldp2_existing_part_fec_changes_continue_through_adnl() {
     }
 }
 
-async fn check_unsolicited_mtu(name: &str) {
+async fn check_unsolicited_mtu(name: &str, use_driver: bool) {
     use rtos_api::IntoBoxed;
     let native = checked_ack_native_effects(
         include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_context.tsv"),
@@ -3708,6 +3717,88 @@ async fn check_unsolicited_mtu(name: &str) {
     let (reply, packets, nodes, rldps, peers) =
         topology_with_remote_observer(2, Some(remote.clone())).await;
     *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    let driver_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if use_driver {
+        let sent = driver_sent.clone();
+        let node = nodes[0].clone();
+        let rldp = rldps[0].clone();
+        let route = peers.clone();
+        let (driver, mut events) = super::connection_driver::ConnectionDriver::start(
+            *peers.other().data(),
+            node.tasks().clone(),
+            rldp.send_pool.fec_slots(),
+        )
+        .unwrap();
+        let driver = Arc::new(driver);
+        *packets.driver.lock().unwrap() = Some(driver.clone());
+        let owner = node.tasks().clone();
+        let lifetime = owner.clone();
+        owner.spawn("Connection application test route", async move {
+            let mut applications = futures::stream::FuturesUnordered::<
+                futures::future::BoxFuture<'static, Result<()>>,
+            >::new();
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = lifetime.cancelled() => break,
+                    result = applications.next(), if !applications.is_empty() => {
+                        result.unwrap().unwrap();
+                        continue;
+                    },
+                    event = events.recv() => match event { Some(event) => event, None => break },
+                };
+                for (_, result) in event.sent {
+                    result.expect("Connection response completed");
+                    sent.fetch_add(1, Ordering::Release);
+                }
+                for packet in event.packets {
+                    node.send_custom(
+                        &TaggedByteSlice {
+                            object: &packet,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                        &route,
+                    )
+                    .await
+                    .unwrap();
+                }
+                for (id, result) in event.received {
+                    let data = result.expect("native accepted message");
+                    // A callback may submit a response to the same driver. Keep
+                    // draining its output while that command is queued.
+                    assert!(applications.len() < 256, "finite test application bound");
+                    let (driver, node, rldp, route) =
+                        (driver.clone(), node.clone(), rldp.clone(), route.clone());
+                    applications.push(
+                        async move {
+                            RldpNode::process_message(
+                                super::MessageContext {
+                                    driver: Some(&driver),
+                                    adnl: &node,
+                                    peers: &route,
+                                    data: &data,
+                                    transfer_id: id,
+                                    #[cfg(feature = "debug")]
+                                    timestamp: &rldp.timestamp,
+                                },
+                                rldp.subscribers.clone(),
+                                true,
+                                &rldp.peers,
+                                #[cfg(feature = "telemetry")]
+                                rldp.telemetry.send_transfers.clone(),
+                                rldp.allocated.send_transfers.clone(),
+                                &rldp.allocated.response_lifecycle,
+                            )
+                            .await?;
+                            Ok(())
+                        }
+                        .boxed(),
+                    );
+                }
+            }
+        });
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         assert_eq!(rldps[0].peer_inbound_cap(peers.other(), false), 2048);
         assert_eq!(rldps[0].peer_inbound_cap(peers.other(), true), 7680);
@@ -3803,11 +3894,40 @@ async fn check_unsolicited_mtu(name: &str) {
                 expected["payload_sha256"].as_str().unwrap()
             );
         }
+        if use_driver {
+            assert!(
+                peer.inbound_transfers.get(&[0; 32]).is_none(),
+                "driver path must not use legacy receive state"
+            );
+            assert_eq!(rldps[0].allocated.recv_transfers.load(Ordering::Acquire), 0);
+        }
         assert_eq!(reply.messages.load(Ordering::Acquire) as u64, deliver);
         assert_eq!(
             remote.complete_packets.load(Ordering::Acquire) as u64,
             expected["complete_packets"].as_u64().unwrap()
         );
+        if use_driver {
+            let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+            let query = TaggedByteSlice {
+                object: &bytes,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            };
+            let (answer, _) = rldps[1].query(&query, Some(1024), &route, true, None).await.unwrap();
+            assert_eq!(answer.unwrap(), vec![42; 64]);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while driver_sent.load(Ordering::Acquire) != 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("Connection response receives the actual completion ACK");
+            assert_eq!(
+                rldps[0].allocated.send_transfers.load(Ordering::Acquire),
+                0,
+                "Connection response must not create a legacy sender"
+            );
+        }
     })
     .catch_unwind()
     .await;
@@ -3821,17 +3941,37 @@ async fn check_unsolicited_mtu(name: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_unsolicited_mtu_legacy_exact() {
-    check_unsolicited_mtu("legacy_exact").await;
+    check_unsolicited_mtu("legacy_exact", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_unsolicited_mtu_legacy_above() {
-    check_unsolicited_mtu("legacy_above").await;
+    check_unsolicited_mtu("legacy_above", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_unsolicited_mtu_native_exact() {
-    check_unsolicited_mtu("native_exact").await;
+    check_unsolicited_mtu("native_exact", false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_unsolicited_mtu_native_above() {
-    check_unsolicited_mtu("native_above").await;
+    check_unsolicited_mtu("native_above", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_driver_mtu_legacy_exact() {
+    check_unsolicited_mtu("legacy_exact", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_driver_mtu_legacy_above() {
+    check_unsolicited_mtu("legacy_above", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_driver_mtu_native_exact() {
+    check_unsolicited_mtu("native_exact", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_connection_driver_mtu_native_above() {
+    check_unsolicited_mtu("native_above", true).await;
 }

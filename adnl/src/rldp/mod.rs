@@ -329,6 +329,18 @@ declare_counted!(
     }
 );
 
+// Complete application input, independent of a particular transport decoder.
+// Both the legacy receive wrapper and the Connection event route can borrow it.
+struct MessageContext<'a> {
+    driver: Option<&'a connection_driver::ConnectionDriver>,
+    adnl: &'a Arc<AdnlNode>,
+    peers: &'a AdnlPeers,
+    data: &'a [u8],
+    transfer_id: TransferId,
+    #[cfg(feature = "debug")]
+    timestamp: &'a Arc<AtomicPtr<Instant>>,
+}
+
 struct RldpAlloc {
     #[cfg(test)]
     response_lifecycle: Arc<(AtomicU64, AtomicU64)>, // (senders started, inbound handlers finished)
@@ -1093,8 +1105,16 @@ impl RldpNode {
             {
                 return;
             }
-            let send_transfer_id = Self::inbound_loop(
-                &mut context,
+            let send_transfer_id = Self::process_message(
+                MessageContext {
+                    driver: None,
+                    adnl: &context.adnl,
+                    peers: &context.peers,
+                    data: &context.recv_transfer.data,
+                    transfer_id: context.transfer_id,
+                    #[cfg(feature = "debug")]
+                    timestamp: &context.recv_transfer.timestamp,
+                },
                 subscribers,
                 v2,
                 &peer_table,
@@ -1162,8 +1182,8 @@ impl RldpNode {
         Ok(InboundRegistration::Created(queue_sender))
     }
 
-    async fn inbound_loop(
-        context: &mut RecvContext,
+    async fn process_message(
+        context: MessageContext<'_>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         v2: bool,
         peer_table: &Arc<peers::PeerTable>,
@@ -1171,31 +1191,29 @@ impl RldpNode {
         send_counter: Arc<AtomicU64>,
         #[cfg(test)] response_lifecycle: &(AtomicU64, AtomicU64),
     ) -> Result<Option<TransferId>> {
-        fn try_decompress(context: &mut RecvContext, data: &mut Vec<u8>) -> bool {
+        fn try_decompress(adnl: &AdnlNode, data: &mut Vec<u8>) -> bool {
             if let Some(decompressed) = DataCompression::decompress_raw(data) {
-                context.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
+                adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
                 *data = decompressed;
                 true
             } else {
-                context.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
+                adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
             }
         }
 
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let mut query = match deserialize_boxed(&context.recv_transfer.data[..])?
-            .downcast::<RldpMessageBoxed>()
-        {
+        let mut query = match deserialize_boxed(context.data)?.downcast::<RldpMessageBoxed>() {
             Ok(RldpMessageBoxed::Rldp_Query(query)) => query,
             Ok(RldpMessageBoxed::Rldp_Message(mut message)) => {
-                try_decompress(context, &mut message.data);
+                try_decompress(context.adnl, &mut message.data);
                 #[cfg(feature = "debug")]
-                Self::check_timestamp(&context.recv_transfer.timestamp, "Begin message process");
-                if !Custom::process(&subscribers, &message.data, &context.peers).await? {
+                Self::check_timestamp(context.timestamp, "Begin message process");
+                if !Custom::process(&subscribers, &message.data, context.peers).await? {
                     let len = min(16, message.data.len());
                     fail!("No subscribers for message {:?}...", hex::encode(&message.data[..len]));
                 }
                 #[cfg(feature = "debug")]
-                Self::check_timestamp(&context.recv_transfer.timestamp, "End message process");
+                Self::check_timestamp(context.timestamp, "End message process");
                 return Ok(None);
             }
             Ok(message) => fail!("Unexpected {rldp} message: {message:?}"),
@@ -1211,16 +1229,16 @@ impl RldpNode {
                 context.peers.other()
             )
         }
-        let compression = try_decompress(context, &mut query.data);
+        let compression = try_decompress(context.adnl, &mut query.data);
         #[cfg(feature = "debug")]
-        Self::check_timestamp(&context.recv_transfer.timestamp, "Begin query process");
+        Self::check_timestamp(context.timestamp, "Begin query process");
         #[cfg(feature = "telemetry")]
         let query_tag = Self::fetch_tag(&query.data[..]);
-        let Some(answer) = Query::process_rldp(&subscribers, &query, &context.peers).await? else {
+        let Some(answer) = Query::process_rldp(&subscribers, &query, context.peers).await? else {
             fail!("No subscribers for query {:?}", query)
         };
         #[cfg(feature = "debug")]
-        Self::check_timestamp(&context.recv_transfer.timestamp, "End query process");
+        Self::check_timestamp(context.timestamp, "End query process");
         let answer = match answer.try_finalize()? {
             (Some(answer), _) => answer.try_wait().await?,
             (None, answer) => TimedAnswer {
@@ -1248,6 +1266,32 @@ impl RldpNode {
         } else {
             None
         };
+        if let Some(driver) = context.driver {
+            if compression {
+                answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
+            }
+            let (len, max) = (answer.object.data.len(), query.max_answer_size as usize);
+            if len > max {
+                fail!("Exceeded max {rldp} answer size: {} vs {}", len, max)
+            }
+            let mut send_transfer_id = context.transfer_id;
+            for byte in &mut send_transfer_id {
+                *byte ^= 0xff;
+            }
+            let accepted = driver
+                .submit(connection_driver::Command::Send {
+                    id: send_transfer_id,
+                    data: serialize_boxed(&answer.object.into_boxed())?,
+                    deadline: response_deadline,
+                    answer: true,
+                })
+                .await?;
+            #[cfg(test)]
+            if accepted {
+                response_lifecycle.0.fetch_add(1, Ordering::Release);
+            }
+            return Ok(accepted.then_some(send_transfer_id));
+        }
         let peer = peer_table
             .get(
                 context.peers.local(),
@@ -1336,7 +1380,7 @@ impl RldpNode {
             pong,
             send_transfer,
             #[cfg(feature = "debug")]
-            timestamp: context.recv_transfer.timestamp.clone(),
+            timestamp: context.timestamp.clone(),
             transfer_id: context.transfer_id,
             #[cfg(feature = "telemetry")]
             tag,
