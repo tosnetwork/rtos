@@ -125,10 +125,7 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
                 first_owner.as_ref().unwrap().upgrade().is_none(),
                 "failed node must be released before another startup"
             );
-            assert!(
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, first_port)).is_ok(),
-                "partial UDP bind from failed TCP startup must be released"
-            );
+            udp_bind_checked(Ipv4Addr::UNSPECIFIED, first_port, "tcp-failed-owner-released");
         }
         Ok(())
     })
@@ -181,24 +178,33 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
         .await
         .expect("shutdown did not reach actual terminal state")
 }
-fn udp_released(port: u16) {
-    UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap_or_else(|error| {
-        #[cfg(target_os = "linux")]
+fn udp_port_diagnostic(port: u16, stage: &str) {
+    eprintln!(
+        "UDP_PORT_FAILURE stage={stage} port={port} thread={:?}",
+        std::thread::current().name()
+    );
+    #[cfg(target_os = "linux")]
+    for table_path in ["/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(table) = std::fs::read_to_string(table_path) else {
+            eprintln!("UDP_PORT_TABLE_UNAVAILABLE path={table_path}");
+            continue;
+        };
+        let suffix = format!(":{port:04X}");
+        for row in table
+            .lines()
+            .skip(1)
+            .filter(|row| row.split_whitespace().nth(1).is_some_and(|addr| addr.ends_with(&suffix)))
         {
-            let table = std::fs::read_to_string("/proc/net/udp").unwrap();
-            let suffix = format!(":{port:04X}");
-            for row in table.lines().skip(1).filter(|row| {
-                row.split_whitespace().nth(1).is_some_and(|addr| addr.ends_with(&suffix))
-            }) {
-                eprintln!("UDP_REBIND_FAILURE port={port} row={row}");
-                if let Some(inode) = row.split_whitespace().nth(9) {
-                    let target = format!("socket:[{inode}]");
-                    for fd in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+            eprintln!("UDP_PORT_ROW stage={stage} port={port} table={table_path} row={row}");
+            if let Some(inode) = row.split_whitespace().nth(9) {
+                let target = format!("socket:[{inode}]");
+                if let Ok(fds) = std::fs::read_dir("/proc/self/fd") {
+                    for fd in fds.flatten() {
                         if std::fs::read_link(fd.path())
                             .is_ok_and(|link| link.to_string_lossy() == target)
                         {
                             eprintln!(
-                                "UDP_REBIND_OWNER port={port} fd={} inode={inode}",
+                                "UDP_PORT_SELF_FD stage={stage} port={port} fd={} inode={inode}",
                                 fd.file_name().to_string_lossy()
                             );
                         }
@@ -206,8 +212,18 @@ fn udp_released(port: u16) {
                 }
             }
         }
-        panic!("UDP socket still owned: port={port} error={error}")
-    });
+    }
+}
+
+fn udp_bind_checked(address: Ipv4Addr, port: u16, stage: &str) -> UdpSocket {
+    UdpSocket::bind((address, port)).unwrap_or_else(|error| {
+        udp_port_diagnostic(port, stage);
+        panic!("UDP bind failed: stage={stage} address={address} port={port} error={error}")
+    })
+}
+
+fn udp_released(port: u16) {
+    udp_bind_checked(Ipv4Addr::LOCALHOST, port, "post-stop");
 }
 
 fn tcp_released(port: u16) {
@@ -222,7 +238,10 @@ fn tcp_released(port: u16) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_udp_stop_releases_socket_and_node() {
     let (node, port) = node(41).await;
-    node.start_over_udp(Vec::new()).await.unwrap();
+    node.start_over_udp(Vec::new()).await.unwrap_or_else(|error| {
+        udp_port_diagnostic(port, "startup");
+        panic!("UDP startup failed: port={port} error={error:#}");
+    });
     assert!(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err());
     let weak = Arc::downgrade(&node);
     bounded(node.stop_checked()).await.unwrap();
@@ -296,7 +315,10 @@ impl Subscriber for PanicPoll {
 async fn adnl_owned_async_panic_closes_transport_and_is_sticky() {
     let (node, port) = node(43).await;
     let poll = Arc::new(PanicPoll { release: Notify::new() });
-    node.start_over_udp(vec![poll.clone()]).await.unwrap();
+    node.start_over_udp(vec![poll.clone()]).await.unwrap_or_else(|error| {
+        udp_port_diagnostic(port, "startup");
+        panic!("UDP startup failed: port={port} error={error:#}");
+    });
     poll.release.notify_one();
     bounded(node.tasks.cancelled()).await;
     let error = bounded(node.stop_checked()).await.unwrap_err().to_string();
