@@ -93,3 +93,92 @@ async fn native_connection_same_transfer_id_isolated_by_connection() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_query_response_isolated_by_local_and_remote_identity() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_query_identity_context.tsv").trim(),
+        "0 64 1024"
+    );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_query_identity_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_query_identity_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_query_identity_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_query_identity_metadata.json"),
+    );
+    let (reply, requests, nodes, rldps, peers) = topology(3).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    reply.hold.store(true, Ordering::Release);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let requester = peers.other().clone();
+        let answerer = peers.local().clone();
+        let other_local = nodes[1].key_by_tag(1).unwrap();
+        let answerer_key = nodes[0].key_by_tag(0).unwrap();
+        nodes[0].add_peer(&answerer, nodes[1].ip_address_adnl(), None, &other_local).unwrap();
+        nodes[1].add_peer(other_local.id(), nodes[0].ip_address_adnl(), None, &answerer_key).unwrap();
+        let query_route = AdnlPeers::with_keys(requester.clone(), answerer.clone());
+        let before = rldps[1].query_budget.remaining(&query_route);
+        let input = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice { object: &input, #[cfg(feature = "telemetry")] tag: 0 };
+        let resolved = AtomicBool::new(false);
+        let request = async {
+            let result = rldps[1].query(&query, Some(1024), &query_route, true, None).await;
+            resolved.store(true, Ordering::Release);
+            result
+        };
+        let inject = async {
+            tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+            let id = {
+                let ids = requests.transfers.lock().unwrap();
+                assert_eq!(ids.len(), 1);
+                let request: [u8;32] = ids.iter().next().unwrap().as_slice().try_into().unwrap();
+                request.map(|byte| byte ^ 0xff)
+            };
+            let answer = serialize_boxed(&rldp::message::Answer { query_id: UInt256::default(), data: vec![42;64] }.into_boxed()).unwrap();
+            let mut encoder = crate::RaptorqEncoder::with_data(&answer, Some(768));
+            let mut seqno=0;
+            let chunk = RldpChunk { transfer_id:id.into(),fec_type:encoder.params().clone().into_boxed(),part:0,total_size:answer.len() as i64,data:encoder.encode(&mut seqno).unwrap(),seqno:0 };
+            let wire=serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            let routes = [
+                (2, AdnlPeers::with_keys(nodes[2].key_by_tag(0).unwrap().id().clone(), requester.clone())),
+                (0, AdnlPeers::with_keys(answerer.clone(), other_local.id().clone())),
+                (0, AdnlPeers::with_keys(answerer.clone(), requester.clone())),
+            ];
+            for (index,(sender,route)) in routes.iter().enumerate() {
+                let peer=rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+                let native=peer.native.get().expect("actual peer must own native Connection");
+                assert_eq!(native.routed_receives.load(Ordering::Acquire),0);
+                nodes[*sender].send_custom(&TaggedByteSlice { object:&wire, #[cfg(feature="telemetry")] tag:0 },route).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    while native.routed_receives.load(Ordering::Acquire)!=1 { tokio::task::yield_now().await; }
+                }).await.expect("response must reach the actual Connection event route");
+                assert_eq!(inspect(native).await.2,1,"response must have completed FEC decoding");
+                if index<2 {
+                    // Receipt follows waiter routing. The quota check observes
+                    // query state directly, even before its caller is polled.
+                    assert_eq!(rldps[1].query_budget.remaining(&query_route),(before.0-1,before.1-1),"wrong identity must not release the real query");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(!resolved.load(Ordering::Acquire),"wrong identity must not resolve the query");
+                }
+            }
+        };
+        let (answer,())=tokio::time::timeout(Duration::from_secs(5),async { tokio::join!(request,inject) }).await.unwrap();
+        assert_eq!(answer.unwrap().0.unwrap(),vec![42;64]);
+        assert_eq!(rldps[1].query_budget.remaining(&query_route),before);
+        let actual=serde_json::json!({"wrong_remote_pending":true,"wrong_local_pending":true,"decoded_wrong_responses":2,"answer_bytes":64,"answer_fill":42});
+        assert_eq!(vec![actual.clone()],expected);
+        eprintln!("NATIVE_QUERY_IDENTITY: {actual}");
+    }).catch_unwind().await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

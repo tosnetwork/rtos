@@ -65,6 +65,8 @@ pub(super) struct NativeConnection {
     #[cfg(test)]
     pub(super) completed_sends: Arc<AtomicU64>,
     #[cfg(test)]
+    pub(super) routed_receives: Arc<AtomicU64>,
+    #[cfg(test)]
     pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
 }
 impl NativeConnection {
@@ -95,10 +97,14 @@ impl NativeConnection {
             #[cfg(test)]
             completed_sends: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            routed_receives: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
             completed_send_ids: Arc::new(Mutex::new(Vec::new())),
         });
         #[cfg(test)]
         let completed_sends = ret.completed_sends.clone();
+        #[cfg(test)]
+        let routed_receives = ret.routed_receives.clone();
         #[cfg(test)]
         let completed_send_ids = ret.completed_send_ids.clone();
         let lifetime = owner.clone();
@@ -143,6 +149,8 @@ impl NativeConnection {
                 }
                 for (id, result) in event.received {
                     let (data, invalid_answer) = Self::route_received(&waiters, id, result);
+                    #[cfg(test)]
+                    routed_receives.fetch_add(1, Ordering::Release);
                     let _invalid_answer = InvalidAnswer(invalid_answer);
                     let Some(data) = data else { continue };
                     let Some(node) = node.upgrade() else {
