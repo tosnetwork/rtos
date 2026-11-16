@@ -69,7 +69,7 @@ pub(super) struct NativeConnection {
     #[cfg(test)]
     pub(super) processed_data_packets: AtomicU64,
     #[cfg(test)]
-    pub(super) data_receipts: Mutex<BTreeMap<TransferId, u64>>,
+    pub(super) data_receipts: Mutex<BTreeMap<(TransferId, i32), u64>>,
     #[cfg(test)]
     pub(super) data_processed: Notify,
     #[cfg(test)]

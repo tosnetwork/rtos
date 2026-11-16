@@ -4855,3 +4855,6 @@ mod native_runtime_tests;
 
 #[path = "native_identity_tests.rs"]
 mod native_identity_tests;
+
+#[path = "native_byte_budget_tests.rs"]
+mod native_byte_budget_tests;
