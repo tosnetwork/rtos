@@ -123,6 +123,13 @@ impl Constraints {
                     fail!("Bad RaptorQ symbol size: {}", fec_type.symbol_size)
                 }
                 self.check_data_size(fec_type.data_size)?;
+                let expected = (fec_type.data_size as usize).div_ceil(Self::SYMBOL);
+                if usize::try_from(fec_type.symbols_count).ok() != Some(expected) {
+                    fail!(
+                        "Bad RaptorQ symbol count: {}, expected {expected}",
+                        fec_type.symbols_count
+                    )
+                }
             }
             x => fail!("Bad FEC type {:?}", x),
         }
