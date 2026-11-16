@@ -67,6 +67,8 @@ pub(super) struct NativeConnection {
     #[cfg(test)]
     pub(super) routed_receives: Arc<AtomicU64>,
     #[cfg(test)]
+    pub(super) processed_packets: AtomicU64,
+    #[cfg(test)]
     pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
 }
 impl NativeConnection {
@@ -98,6 +100,8 @@ impl NativeConnection {
             completed_sends: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             routed_receives: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            processed_packets: AtomicU64::new(0),
             #[cfg(test)]
             completed_send_ids: Arc::new(Mutex::new(Vec::new())),
         });

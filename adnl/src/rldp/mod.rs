@@ -2717,6 +2717,8 @@ impl Subscriber for RldpNode {
                             mtu: self.peer_inbound_cap(peers.other(), true) as u64,
                         })
                         .await?;
+                    #[cfg(test)]
+                    native.processed_packets.fetch_add(1, Ordering::Release);
                     Ok(true)
                 } else {
                     self.consume_message_part(MessagePart::V2(msg), peers).await
