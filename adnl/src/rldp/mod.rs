@@ -701,9 +701,9 @@ impl RldpNode {
 
     async fn consume_chunk_message(&self, chunk: Chunk, peers: &AdnlPeers) -> Result<()> {
         let transfer_id = chunk.transfer_id();
-        let (v2, part, seqno) = match &chunk {
-            Chunk::V1(RldpMessagePart(chunk)) => (false, chunk.part, chunk.seqno),
-            Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
+        let (v2, part, seqno, total_size) = match &chunk {
+            Chunk::V1(RldpMessagePart(chunk)) => (false, chunk.part, chunk.seqno, chunk.total_size),
+            Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno, chunk.total_size),
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
         let valid_packet = match &chunk {
@@ -747,7 +747,9 @@ impl RldpNode {
         };
         // A solicited receive registration is only a promise of future input.
         // Charge concurrency when the first actual part arrives, in either path.
-        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry, part == 0)? {
+        let within_default_mtu =
+            total_size >= 0 && total_size as u64 <= self.peer_inbound_cap(peers.other(), v2) as u64;
+        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry, part == 0, within_default_mtu)? {
             return Ok(());
         }
         loop {
@@ -796,7 +798,7 @@ impl RldpNode {
                 if !valid_geometry {
                     return Ok(());
                 }
-                match self.inbound(transfer_id, peers, v2, peer.clone(), part).await? {
+                match self.inbound(transfer_id, peers, v2, peer.clone(), part, total_size).await? {
                     InboundRegistration::Created(queue_sender) => queue_sender.send(chunk),
                     InboundRegistration::Existing => continue,
                     InboundRegistration::Refused => break,
@@ -980,6 +982,7 @@ impl RldpNode {
         v2: bool,
         peer: Arc<RldpPeer>,
         part: i32,
+        total_size: i64,
     ) -> Result<InboundRegistration> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let transfer_map = peer.inbound_transfers.clone();
@@ -997,7 +1000,13 @@ impl RldpNode {
             if v2 {
                 // A completed duplicate may have passed initial admission before
                 // its cache entry was pruned. It still cannot reopen with part > 0.
-                if part != 0 {
+                if part != 0
+                    || total_size < 0
+                    || total_size as u64 > self.peer_inbound_cap(peers.other(), v2) as u64
+                {
+                    // Recheck after completed-cache pruning or an MTU lease
+                    // change; do not leave a previously claimed active slot.
+                    peer.inbound_active.lock().unwrap().remove(transfer_id);
                     return Ok(InboundRegistration::Refused);
                 }
                 let mut active = peer.inbound_active.lock().unwrap();
@@ -1042,7 +1051,7 @@ impl RldpNode {
                 *transfer_id,
                 self.allocated.recv_transfers.clone(),
                 v2,
-                Some(self.peer_inbound_cap(peers.other())),
+                Some(self.peer_inbound_cap(peers.other(), v2)),
                 #[cfg(feature = "debug")]
                 self.timestamp.clone(),
             ),
@@ -1918,13 +1927,17 @@ impl RldpNode {
         self.extended_caps.get(peer).map_or(0, |cap| cap.val().load(Ordering::Acquire))
     }
 
-    fn peer_inbound_cap(&self, peer: &Arc<KeyId>) -> usize {
+    fn peer_inbound_cap(&self, peer: &Arc<KeyId>, v2: bool) -> usize {
         if let Some(cap) = self.extended_caps.get(peer) {
             if cap.val().load(Ordering::Relaxed) > 0 {
                 return Constraints::MAX_TOTAL_TRANSFER_SIZE;
             }
         }
-        Constraints::DEFAULT_INBOUND_TRANSFER_SIZE
+        if v2 {
+            rldp2::DEFAULT_MTU as usize
+        } else {
+            Constraints::DEFAULT_INBOUND_TRANSFER_SIZE
+        }
     }
 
     #[cfg(feature = "telemetry")]

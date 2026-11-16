@@ -25,6 +25,7 @@ use std::{
 struct HeldReply {
     messages: std::sync::atomic::AtomicUsize,
     message_received: tokio::sync::Notify,
+    message_hash: Mutex<Option<String>>,
     calls: std::sync::atomic::AtomicUsize,
     response_bytes: std::sync::atomic::AtomicUsize,
     hold: AtomicBool,
@@ -34,7 +35,9 @@ struct HeldReply {
 #[async_trait::async_trait]
 impl Subscriber for HeldReply {
     async fn try_consume_custom(&self, bytes: &[u8], _: &AdnlPeers) -> Result<bool> {
-        if bytes == b"churn" {
+        if bytes == b"churn" || bytes.starts_with(b"mtu:") {
+            *self.message_hash.lock().unwrap() =
+                Some(hex::encode(rtos_block::sha256_digest(bytes)));
             self.messages.fetch_add(1, Ordering::Release);
             self.message_received.notify_one();
             return Ok(true);
@@ -2188,7 +2191,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
         for n in 0..256u32 {
             let mut id = [0; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
-            assert!(peer.admit_inbound(id, true, true).unwrap());
+            assert!(peer.admit_inbound(id, true, true, true).unwrap());
         }
         let stale = [77; 32];
         peer.finish_inbound(
@@ -2198,7 +2201,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
             tokio::time::Instant::now(),
         );
         assert!(
-            peer.admit_inbound(stale, true, true).unwrap(),
+            peer.admit_inbound(stale, true, true, true).unwrap(),
             "completed duplicates bypass active capacity"
         );
         for n in 0..2048u32 {
@@ -2213,7 +2216,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
         }
         assert!(peer.inbound_transfers.get(&stale).is_none());
         assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
-        let created = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0).await.unwrap();
+        let created = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0, 1024).await.unwrap();
         assert!(
             matches!(created, super::InboundRegistration::Refused),
             "pruned completed ID must not bypass full inbound admission at creation"
@@ -2649,7 +2652,7 @@ async fn rldp2_malformed_packet_cannot_admit_or_queue() {
                             Ok(super::RldpTransfer::receiver(tx.clone(), wire_limit))
                         })
                         .unwrap();
-                        assert!(peer.admit_inbound(id, true, true).unwrap());
+                        assert!(peer.admit_inbound(id, true, true, true).unwrap());
                     }
                     let before = peer.inbound_active.lock().unwrap().len();
                     let mut fec = encoder.params().clone();
@@ -3412,7 +3415,7 @@ async fn rldp2_later_first_part_cannot_reopen_a_pruned_completed_id() {
             tokio::time::Instant::now(),
         );
         assert!(
-            peer.admit_inbound(stale, true, false).unwrap(),
+            peer.admit_inbound(stale, true, false, true).unwrap(),
             "completed replay keeps priority even for a later part"
         );
         for n in 0..2048u32 {
@@ -3426,14 +3429,20 @@ async fn rldp2_later_first_part_cannot_reopen_a_pruned_completed_id() {
             );
         }
         assert!(peer.inbound_transfers.get(&stale).is_none());
-        let later = rldps[0].inbound(&stale, &peers, true, peer.clone(), 1).await.unwrap();
+        let later = rldps[0].inbound(&stale, &peers, true, peer.clone(), 1, 1024).await.unwrap();
         assert!(
             matches!(later, super::InboundRegistration::Refused),
             "pruned completed duplicate cannot create a receiver from a later part"
         );
         assert!(peer.inbound_transfers.get(&stale).is_none());
         assert!(peer.inbound_active.lock().unwrap().is_empty());
-        let first = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0).await.unwrap();
+        assert!(peer.admit_inbound(stale, true, true, true).unwrap());
+        let oversized =
+            rldps[0].inbound(&stale, &peers, true, peer.clone(), 0, 7684).await.unwrap();
+        assert!(matches!(oversized, super::InboundRegistration::Refused));
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+        assert!(peer.inbound_active.lock().unwrap().is_empty());
+        let first = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0, 1024).await.unwrap();
         assert!(matches!(first, super::InboundRegistration::Created(_)));
         assert_eq!(peer.inbound_active.lock().unwrap().len(), 1);
     })
@@ -3679,4 +3688,150 @@ async fn rldp2_existing_part_fec_changes_continue_through_adnl() {
             std::panic::resume_unwind(panic);
         }
     }
+}
+
+async fn check_unsolicited_mtu(name: &str) {
+    use rtos_api::IntoBoxed;
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_unsolicited_mtu_metadata.json"),
+    );
+    let expected = native.iter().find(|row| row["id"] == name).unwrap();
+    let line = include_str!("../../../ci/conformance/rldp2_unsolicited_mtu_context.tsv")
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(name))
+        .unwrap();
+    let size: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let remote = Arc::new(ResponsePackets::default());
+    let (reply, packets, nodes, rldps, peers) =
+        topology_with_remote_observer(2, Some(remote.clone())).await;
+    *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    let outcome = std::panic::AssertUnwindSafe(async {
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), false), 2048);
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), true), 7680);
+        rldps[0].change_inbound_cap_for_peers(&[peers.other().clone()], 1).unwrap();
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), false), 16 * 1024 * 1024);
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), true), 16 * 1024 * 1024);
+        rldps[0].change_inbound_cap_for_peers(&[peers.other().clone()], -1).unwrap();
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), false), 2048);
+        assert_eq!(rldps[0].peer_inbound_cap(peers.other(), true), 7680);
+        let mut payload = vec![42; size];
+        payload[..4].copy_from_slice(b"mtu:");
+        let message = serialize_boxed(
+            &rtos_api::ton::rldp::message::Message { id: UInt256::default(), data: payload }
+                .into_boxed(),
+        )
+        .unwrap();
+        assert_eq!(message.len() as u64, expected["wire_size"].as_u64().unwrap());
+        let mut encoder = crate::RaptorqEncoder::with_data(&message, Some(768));
+        let mut wire_packets = Vec::new();
+        for sequence in 0..message.len().div_ceil(768) {
+            let mut seq = sequence as u32;
+            let data = encoder.encode(&mut seq).unwrap();
+            assert_eq!(seq, sequence as u32);
+            wire_packets.push(
+                serialize_boxed(
+                    &rldp2::messagepart::MessagePart(rtos_api::RldpChunk {
+                        transfer_id: UInt256::default(),
+                        fec_type: encoder.params().clone().into_boxed(),
+                        part: 0,
+                        total_size: message.len() as i64,
+                        seqno: seq as i32,
+                        data,
+                    })
+                    .into_boxed(),
+                )
+                .unwrap(),
+            );
+        }
+        let replay = wire_packets[0].clone();
+        let mut transcript = wire_packets.concat();
+        transcript.extend(&replay);
+        assert_eq!(
+            hex::encode(rtos_block::sha256_digest(&transcript)),
+            expected["input_sha256"].as_str().unwrap()
+        );
+        let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let deliver = expected["deliveries"].as_u64().unwrap();
+        for wire in wire_packets.iter().chain(std::iter::once(&replay)) {
+            let before = packets.processed_parts.load(Ordering::Acquire);
+            nodes[1]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while packets.processed_parts.load(Ordering::Acquire) == before {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("authenticated handler returned");
+            if deliver == 0 {
+                // Native drops over-MTU packets before creating any receiver.
+                assert!(
+                    peer.inbound_transfers.get(&[0; 32]).is_none(),
+                    "{name}: over-MTU packet acquired receiver/cache state"
+                );
+                assert!(!peer.inbound_active.lock().unwrap().contains(&[0; 32]));
+            }
+        }
+        if deliver > 0 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while reply.messages.load(Ordering::Acquire) < deliver as usize {
+                    reply.message_received.notified().await;
+                }
+                while remote.complete_packets.load(Ordering::Acquire)
+                    < expected["complete_packets"].as_u64().unwrap() as usize
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("native accepted message must be delivered and replay acknowledged");
+            assert_eq!(
+                reply.message_hash.lock().unwrap().as_deref().unwrap(),
+                expected["payload_sha256"].as_str().unwrap()
+            );
+        }
+        assert_eq!(reply.messages.load(Ordering::Acquire) as u64, deliver);
+        assert_eq!(
+            remote.complete_packets.load(Ordering::Acquire) as u64,
+            expected["complete_packets"].as_u64().unwrap()
+        );
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_unsolicited_mtu_legacy_exact() {
+    check_unsolicited_mtu("legacy_exact").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_unsolicited_mtu_legacy_above() {
+    check_unsolicited_mtu("legacy_above").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_unsolicited_mtu_native_exact() {
+    check_unsolicited_mtu("native_exact").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_unsolicited_mtu_native_above() {
+    check_unsolicited_mtu("native_above").await;
 }
