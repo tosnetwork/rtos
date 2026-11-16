@@ -1688,7 +1688,27 @@ async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
             .expect("query257 must be refused immediately, before its query deadline or sender admission").unwrap();
         let error = refused.expect_err("capacity overflow cannot answer successfully");
         assert!(error.to_string().contains("from this peer"), "wrong refusal: {error:#}");
-        assert_eq!(pending.len(),256);
+        let expected = query_admission_native_effects();
+        assert_eq!(pending.len(), expected["pending"].as_u64().unwrap() as usize);
+        assert_eq!(expected["refused"], 1);
+        assert_eq!(expected["other"], 0);
+        assert!(pending.next().now_or_never().is_none());
+        let peer = rldps[0].peers.find_v2(peers.local(), peers.other()).unwrap();
+        assert_eq!(peer.query_slots.available_permits(), 0);
+        assert_eq!(rldps[0].query_slots.available_permits(), 8192 - 256,
+            "failed connection admission must return its partial global permit");
+        drop(pending);
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[0].query_slots.available_permits() != 8192 {
+                reply.release.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("cancelled query owners must release pending-query admission");
+        assert_eq!(peer.query_slots.available_permits(), 256);
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42;64]);
     }).catch_unwind().await;
     reply.hold.store(false, Ordering::Release);
     reply.release.notify_waiters();
