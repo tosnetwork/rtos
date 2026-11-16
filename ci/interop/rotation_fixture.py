@@ -1694,6 +1694,12 @@ async def run(args, profile, root, artifacts):
                                     target, rpc, identity
                                 )
                             )
+                        if args.verify_propagation_receiver:
+                            from receiver_evidence import collect_receiver_evidence
+
+                            await collect_receiver_evidence(
+                                args, propagation_receiver, target, directory
+                            )
                         return {
                             "propagation_receiver": receiver_receipt,
                             "status": (
@@ -1925,6 +1931,7 @@ def main():
         choices=["after-fsync", "before-write", "after-partial-write"],
         default="after-fsync",
     )
+    parser.add_argument("--verify-propagation-receiver", action="store_true")
     parser.add_argument("--recovery-timeout", type=float, default=180)
     parser.add_argument("--network-fault", choices=list(MODES))
     parser.add_argument(
@@ -2133,6 +2140,12 @@ def main():
         initial_probe_weights(profile)
     from propagation_receiver_fixture import receiver_plan
 
+    if args.verify_propagation_receiver and (
+        receiver_plan(profile) is None or args.interrupt_rust_member is not None
+    ):
+        raise SystemExit(
+            "Receiver body/state verification requires a receiver and uninterrupted rotation"
+        )
     receiver_plan(profile)
     manifest = json.loads((args.snapshot / "manifest.json").read_text())
     require_cpp_baseline(manifest["cpp_source_commit"], profile)
@@ -2187,6 +2200,7 @@ def main():
         "recovery_quorum_fixture.py",
         "signer_expiry_fixture.py",
         "expired_member_restart_fixture.py",
+        "receiver_evidence.py",
     ]:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
