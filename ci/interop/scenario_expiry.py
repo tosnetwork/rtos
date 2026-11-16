@@ -6,6 +6,8 @@ from pathlib import Path
 
 from scenario_matrix import member_id, require_fields
 
+EXPIRIES = frozenset({"signer-expiry", "expired-member-restart"})
+
 
 def check_expiry_evidence(runtime, receipt, recovery, *, passive=False):
     if not isinstance(receipt, dict):

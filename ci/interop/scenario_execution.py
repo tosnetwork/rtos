@@ -27,6 +27,7 @@ from scenario_ack_partition import (
     check_ack_partition_result,
 )
 from scenario_expiry import (
+    EXPIRIES,
     check_expired_full_node_witness,
     check_expiry_authority_copies,
     check_expiry_evidence,
@@ -80,7 +81,7 @@ ROTATIONS = (
     | set(ACK_PARTITIONS)
     | set(INTENTS)
     | set(RETENTIONS)
-    | {"expired-member-restart"}
+    | EXPIRIES
 )
 
 
@@ -207,7 +208,16 @@ def check_result(name, result):
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
     recovery = result.get("recovery")
-    if name == "expired-member-restart":
+    if name == "signer-expiry":
+        check_ack_partition_result(
+            "source-ack-partition-sync-eio",
+            result.get("source_ack_partition_restart"),
+            result.get("source_ack_fault"),
+            result.get("partition_restart"),
+            recovery,
+            signer_expiry=True,
+        )
+    elif name == "expired-member-restart":
         check_passive_recovery_components(
             result.get("source_ack_partition_restart"),
             result.get("source_ack_fault"),
@@ -262,7 +272,7 @@ def check_result(name, result):
         name not in RESTARTS
         and name not in ACK_PARTITIONS
         and name not in INTENTS
-        and name != "expired-member-restart"
+        and name not in EXPIRIES
         and result.get("partition_restart") is not None
     ):
         raise ValueError("Unexpected restart partition receipt")
@@ -270,14 +280,14 @@ def check_result(name, result):
         name not in ACKS
         and name not in ACK_PARTITIONS
         and name not in INTENTS
-        and name != "expired-member-restart"
+        and name not in EXPIRIES
         and result.get("source_ack_fault") is not None
     ):
         raise ValueError("Unexpected source ACK fault receipt")
     if (
         name not in ACK_PARTITIONS
         and name not in INTENTS
-        and name != "expired-member-restart"
+        and name not in EXPIRIES
         and result.get("source_ack_partition_restart") is not None
     ):
         raise ValueError("Unexpected combined ACK partition receipt")
@@ -285,7 +295,9 @@ def check_result(name, result):
     if name not in RETENTIONS and result.get("source_retention_cut") is not None:
         raise ValueError("Unexpected source retention cut")
 
-    if name != "expired-member-restart" and result.get("signer_expiry") is not None:
+    if name == "signer-expiry" and not isinstance(result.get("signer_expiry"), dict):
+        raise TypeError("Missing signer expiry receipt")
+    if name not in EXPIRIES and result.get("signer_expiry") is not None:
         raise ValueError("Unexpected signer expiry receipt")
 
 
@@ -329,15 +341,12 @@ def execute(args, names, catalog):
         or name in RESTARTS
         or name in ACK_PARTITIONS
         or name in INTENTS
-        or name == "expired-member-restart"
+        or name in EXPIRIES
         for name in names
     ):
         inputs.extend(packet_artifacts(args, source))
     if any(
-        name in ACKS
-        or name in ACK_PARTITIONS
-        or name in INTENTS
-        or name == "expired-member-restart"
+        name in ACKS or name in ACK_PARTITIONS or name in INTENTS or name in EXPIRIES
         for name in names
     ):
         inputs.extend(ack_artifacts(args, source))
@@ -423,7 +432,7 @@ def execute(args, names, catalog):
                 )
             if name in RETENTIONS:
                 run += retention_arguments(name, args.source_retention_cut_library)
-            if name == "expired-member-restart":
+            if name in EXPIRIES:
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
@@ -455,14 +464,14 @@ def execute(args, names, catalog):
                     name in RESTARTS
                     or name in ACK_PARTITIONS
                     or name in INTENTS
-                    or name == "expired-member-restart"
+                    or name in EXPIRIES
                 ):
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
                 if (
                     name in ACKS
                     or name in ACK_PARTITIONS
                     or name in INTENTS
-                    or name == "expired-member-restart"
+                    or name in EXPIRIES
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
             if name in INTENTS:
@@ -477,16 +486,20 @@ def execute(args, names, catalog):
                 check_retention_evidence(
                     case / "runtime", result["source_retention_cut"], RETENTIONS[name]
                 )
-            if name == "expired-member-restart":
+            if name in EXPIRIES:
                 runtime = case / "runtime"
                 check_expiry_evidence(
-                    runtime, result["signer_expiry"], result["recovery"], passive=True
+                    runtime,
+                    result["signer_expiry"],
+                    result["recovery"],
+                    passive=name == "expired-member-restart",
                 )
                 check_expiry_raw_witness(runtime, result["signer_expiry"])
                 check_expiry_authority_copies(runtime, result["signer_expiry"])
-                check_expired_full_node_witness(
-                    runtime, result["signer_expiry"], result["recovery"]
-                )
+                if name == "expired-member-restart":
+                    check_expired_full_node_witness(
+                        runtime, result["signer_expiry"], result["recovery"]
+                    )
             if any(digest(path) != expected for path, expected in artifacts.items()):
                 raise ValueError("A scenario suite input changed during execution")
             receipt["completed"].append(

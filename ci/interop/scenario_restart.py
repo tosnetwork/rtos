@@ -24,8 +24,12 @@ def restart_arguments(name, library):
     return result
 
 
-def check_restart_partition(name, receipt, recovery, *, expired_member=False):
+def check_restart_partition(
+    name, receipt, recovery, *, expired_member=False, signer_expiry=False
+):
     member = RESTARTS[name]
+    if signer_expiry and (name != "below-quorum-restart" or expired_member):
+        raise ValueError("Signer expiry requires its member2 below-quorum restart")
     if expired_member and (
         member != 5
         or recovery.get("expired_full_node", {}).get("signing_authority_restored")
@@ -131,9 +135,9 @@ def check_restart_partition(name, receipt, recovery, *, expired_member=False):
             receipt,
             {
                 "survivor_kind": "historical_checkpoint_after_below_quorum_stall",
-                "surviving_weight": 30,
-                "total_weight": 60,
-                "quorum_weight": 40,
+                "surviving_weight": 34 if signer_expiry else 30,
+                "total_weight": 68 if signer_expiry else 60,
+                "quorum_weight": 46 if signer_expiry else 40,
             },
         )
         observation = receipt.get("below_quorum_observation", {})
@@ -150,16 +154,22 @@ def check_restart_partition(name, receipt, recovery, *, expired_member=False):
             plan,
             {
                 "member": 2,
-                "weights": {"0": 10, "2": 30, "4": 10, "5": 10},
-                "total_weight": 60,
-                "quorum_weight": 40,
-                "surviving_weight": 30,
-                "survivor_members": [0, 4, 5],
+                "weights": (
+                    {str(i): 17 for i in (0, 2, 4, 5)}
+                    if signer_expiry
+                    else {"0": 10, "2": 30, "4": 10, "5": 10}
+                ),
+                "total_weight": 68 if signer_expiry else 60,
+                "quorum_weight": 46 if signer_expiry else 40,
+                "surviving_weight": 34 if signer_expiry else 30,
+                "survivor_members": [0, 4] if signer_expiry else [0, 4, 5],
                 "live_endpoints": [0, 1, 3, 4, 5],
                 "settle_seconds": 4,
                 "observe_seconds": 12,
             },
         )
+        if signer_expiry:
+            require_fields(plan, {"unavailable_signer_members": [5]})
         count, duration = (
             observation.get("observation_count"),
             observation.get("observation_elapsed_seconds"),
