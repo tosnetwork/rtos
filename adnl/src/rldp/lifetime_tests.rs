@@ -492,7 +492,7 @@ async fn sixteen_large_silent_responses_retain_initialized_encoders() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_outbound_count_matches_native_256() {
-    outbound_count_boundary(false, false).await;
+    outbound_count_boundary(OutboundBoundary::Count).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -501,7 +501,7 @@ async fn rldp2_outbound_admission_isolated_by_local_identity() {
         include_str!("../../../ci/conformance/rldp2_local_identity_context.tsv").trim(),
         "256 1 64 60"
     );
-    outbound_count_boundary(true, false).await;
+    outbound_count_boundary(OutboundBoundary::LocalIdentity).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -510,10 +510,29 @@ async fn rldp2_outbound_ack_releases_exactly_one_slot() {
         include_str!("../../../ci/conformance/rldp2_ack_reuse_context.tsv").trim(),
         "257 64 60"
     );
-    outbound_count_boundary(false, true).await;
+    outbound_count_boundary(OutboundBoundary::AckReuse).await;
 }
 
-async fn outbound_count_boundary(second_local: bool, ack_reuse: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_refused_query_keeps_deadline_without_implicit_retry() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_refused_query_context.tsv").trim(),
+        "256 60 10 64 1024"
+    );
+    outbound_count_boundary(OutboundBoundary::RefusedQuery).await;
+}
+
+enum OutboundBoundary {
+    Count,
+    LocalIdentity,
+    AckReuse,
+    RefusedQuery,
+}
+
+async fn outbound_count_boundary(mode: OutboundBoundary) {
+    let second_local = matches!(mode, OutboundBoundary::LocalIdentity);
+    let ack_reuse = matches!(mode, OutboundBoundary::AckReuse);
+    let refused_query = matches!(mode, OutboundBoundary::RefusedQuery);
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_outbound_count_context.tsv").trim(),
         "257"
@@ -528,7 +547,8 @@ async fn outbound_count_boundary(second_local: bool, ack_reuse: bool) {
         let query_bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         // Authenticated raw requests advertise a 60s wire deadline and never
         // acknowledge responses; the ordinary client API fixes its own at10s.
-        for index in 0..257 {
+        let request_count = if refused_query { 256 } else { 257 };
+        for index in 0..request_count {
             let request = serialize_boxed(
                 &rldp::message::Query {
                     query_id: UInt256::from({
@@ -581,7 +601,7 @@ async fn outbound_count_boundary(second_local: bool, ack_reuse: bool) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while packets.transfers.lock().unwrap().len() < worker_count
                 || rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) < 256
-                || rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) < 1
+                || rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) < (request_count - 256) as u64
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -601,6 +621,55 @@ async fn outbound_count_boundary(second_local: bool, ack_reuse: bool) {
             256,
             "native admits only 256 concurrent outbound transfers per connection"
         );
+        if refused_query {
+            let server = nodes[1].key_by_tag(0).unwrap();
+            let client = nodes[0].key_by_tag(0).unwrap();
+            let reverse = AdnlPeers::with_keys(server.id().clone(), client.id().clone());
+            let peer = rldps[1].get_peer(server.id(), client.id(), true, None).await.unwrap();
+            assert_eq!(peer.transfer_slots.available_permits(), 0);
+            let saturated = rldps[1].allocated.send_transfers.load(Ordering::Acquire);
+            let request = TaggedByteSlice { object: &query_bytes, #[cfg(feature = "telemetry")] tag: 0 };
+            let started = tokio::time::Instant::now();
+            let query = rldps[1].query(&request, Some(1024), &reverse, true, None);
+            tokio::pin!(query);
+            // Poll on this task: once it yields with the outbound lease held,
+            // no concurrent poll can race freeing the saturated transfer slots.
+            assert!(futures::poll!(query.as_mut()).is_pending());
+            assert_eq!(peer.outbound_semaphore.available_permits(), 2);
+            assert_eq!(reply.calls.load(Ordering::Acquire), 256);
+            packets.drop_parts.store(false, Ordering::Release);
+            let drain = tokio::time::timeout(Duration::from_secs(5), async {
+                while peer.transfer_slots.available_permits() != 256 || rldps[1].allocated.send_transfers.load(Ordering::Acquire) != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            tokio::select! {
+                biased;
+                result = query.as_mut() => panic!("refused query completed while slots drained: {result:?}"),
+                result = drain => result.expect("silent responses must drain before the refused query deadline"),
+            }
+            let drained_before_deadline = started.elapsed() < Duration::from_secs(9);
+            assert!(drained_before_deadline);
+            let result = tokio::time::timeout(Duration::from_secs(12), query.as_mut()).await.expect("refused query must terminate");
+            let elapsed_ms = started.elapsed().as_millis();
+            let timed_out = result.unwrap_err().downcast_ref::<RldpQueryTimeout>().is_some();
+            assert!(timed_out);
+            assert!((9500..13000).contains(&elapsed_ms), "elapsed={elapsed_ms}");
+            let implicit_retry = reply.calls.load(Ordering::Acquire) != 256;
+            assert!(!implicit_retry, "refused query was implicitly retried");
+            let (answer, _) = rldps[1].query(&request, Some(1024), &reverse, true, None).await.unwrap();
+            let answer = answer.unwrap();
+            assert_eq!(answer, vec![42; 64]);
+            assert_eq!(reply.calls.load(Ordering::Acquire), 257);
+            checked_peer = Some(peer);
+            let actual = serde_json::json!({
+                "saturated": saturated, "drained_before_deadline": drained_before_deadline,
+                "timeout": timed_out, "implicit_retry": implicit_retry, "fresh_answer_bytes": answer.len(),
+            });
+            assert_eq!(actual, refused_query_native_effects());
+            eprintln!("REFUSED_QUERY_EFFECTS: {actual} elapsed_ms={elapsed_ms}");
+            return;
+        }
         let mut completed_id = None;
         if ack_reuse {
             let server = nodes[1].key_by_tag(0).unwrap();
@@ -973,4 +1042,32 @@ fn ack_reuse_native_effects() -> serde_json::Value {
         assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
     }
     serde_json::from_slice(effects).unwrap()
+}
+
+fn refused_query_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_refused_query_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_refused_query_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_refused_query_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_refused_query_reference.cpp").as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    let mut effects: serde_json::Value = serde_json::from_slice(effects).unwrap();
+    let elapsed = effects.as_object_mut().unwrap().remove("elapsed_ms").unwrap().as_u64().unwrap();
+    assert!((9500..13000).contains(&elapsed), "native deadline outside comparison window");
+    effects
 }
