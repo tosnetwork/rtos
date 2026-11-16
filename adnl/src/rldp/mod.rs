@@ -747,7 +747,7 @@ impl RldpNode {
         };
         // A solicited receive registration is only a promise of future input.
         // Charge concurrency when the first actual part arrives, in either path.
-        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry)? {
+        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry, part == 0)? {
             return Ok(());
         }
         loop {
@@ -796,7 +796,7 @@ impl RldpNode {
                 if !valid_geometry {
                     return Ok(());
                 }
-                match self.inbound(transfer_id, peers, v2, peer.clone()).await? {
+                match self.inbound(transfer_id, peers, v2, peer.clone(), part).await? {
                     InboundRegistration::Created(queue_sender) => queue_sender.send(chunk),
                     InboundRegistration::Existing => continue,
                     InboundRegistration::Refused => break,
@@ -979,6 +979,7 @@ impl RldpNode {
         peers: &AdnlPeers,
         v2: bool,
         peer: Arc<RldpPeer>,
+        part: i32,
     ) -> Result<InboundRegistration> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let transfer_map = peer.inbound_transfers.clone();
@@ -994,6 +995,11 @@ impl RldpNode {
                 return Ok(InboundRegistration::Existing);
             }
             if v2 {
+                // A completed duplicate may have passed initial admission before
+                // its cache entry was pruned. It still cannot reopen with part > 0.
+                if part != 0 {
+                    return Ok(InboundRegistration::Refused);
+                }
                 let mut active = peer.inbound_active.lock().unwrap();
                 if !active.contains(transfer_id) && active.len() >= 256 {
                     return Ok(InboundRegistration::Refused);

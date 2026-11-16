@@ -343,7 +343,12 @@ impl Drop for PeerTable {
     }
 }
 impl RldpPeer {
-    pub(super) fn admit_inbound(&self, id: TransferId, valid_geometry: bool) -> Result<bool> {
+    pub(super) fn admit_inbound(
+        &self,
+        id: TransferId,
+        valid_geometry: bool,
+        first_part: bool,
+    ) -> Result<bool> {
         let _ids = self.registrations.lock().unwrap();
         if self.closed.is_cancelled() {
             return Err(SendCancelled::PeerEvicted.into());
@@ -363,7 +368,9 @@ impl RldpPeer {
         if active.contains(&id) {
             return Ok(true);
         }
-        if active.len() >= 256 {
+        // A response registration alone is not an open native transfer.
+        // Only part zero may claim the first active receive slot.
+        if !first_part || active.len() >= 256 {
             return Ok(false);
         }
         active.insert(id);

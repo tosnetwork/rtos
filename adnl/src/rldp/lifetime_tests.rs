@@ -200,6 +200,13 @@ async fn pair(
 async fn topology(
     count: usize,
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    topology_with_remote_observer(count, None).await
+}
+
+async fn topology_with_remote_observer(
+    count: usize,
+    remote_observer: Option<Arc<ResponsePackets>>,
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
     let reply = Arc::new(HeldReply::default());
     let packets = Arc::new(ResponsePackets::default());
     let mut nodes = Vec::new();
@@ -237,6 +244,11 @@ async fn topology(
             let mut subscribers: Vec<Arc<dyn Subscriber>> = Vec::new();
             if index == 0 {
                 subscribers.push(packets.clone());
+            }
+            if index == 1 {
+                if let Some(observer) = &remote_observer {
+                    subscribers.push(observer.clone());
+                }
             }
             subscribers.push(rldp.clone());
             // Retain the OS reservation through async construction. Retry only
@@ -2149,7 +2161,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
         for n in 0..256u32 {
             let mut id = [0; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
-            assert!(peer.admit_inbound(id, true).unwrap());
+            assert!(peer.admit_inbound(id, true, true).unwrap());
         }
         let stale = [77; 32];
         peer.finish_inbound(
@@ -2159,7 +2171,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
             tokio::time::Instant::now(),
         );
         assert!(
-            peer.admit_inbound(stale, true).unwrap(),
+            peer.admit_inbound(stale, true, true).unwrap(),
             "completed duplicates bypass active capacity"
         );
         for n in 0..2048u32 {
@@ -2174,7 +2186,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
         }
         assert!(peer.inbound_transfers.get(&stale).is_none());
         assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
-        let created = rldps[0].inbound(&stale, &peers, true, peer.clone()).await.unwrap();
+        let created = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0).await.unwrap();
         assert!(
             matches!(created, super::InboundRegistration::Refused),
             "pruned completed ID must not bypass full inbound admission at creation"
@@ -2610,7 +2622,7 @@ async fn rldp2_malformed_packet_cannot_admit_or_queue() {
                             Ok(super::RldpTransfer::receiver(tx.clone(), wire_limit))
                         })
                         .unwrap();
-                        assert!(peer.admit_inbound(id, true).unwrap());
+                        assert!(peer.admit_inbound(id, true, true).unwrap());
                     }
                     let before = peer.inbound_active.lock().unwrap().len();
                     let mut fec = encoder.params().clone();
@@ -3244,5 +3256,141 @@ async fn rldp2_overdue_ack_progresses_with_ready_receive_queue() {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_later_first_part_does_not_activate_pending_query_receive() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_metadata.json"),
+    );
+    let remote_packets = Arc::new(ResponsePackets::default());
+    let (reply, packets, nodes, rldps, peers) =
+        topology_with_remote_observer(2, Some(remote_packets.clone())).await;
+    *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    let outcome = std::panic::AssertUnwindSafe(async {
+        reply.hold.store(true, Ordering::Release);
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let request = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")] tag: 0,
+        };
+        let deliveries = std::sync::atomic::AtomicUsize::new(0);
+        let query = async {
+            let result = rldps[0].query(&request, Some(2_000_001), &peers, true, None).await;
+            deliveries.fetch_add(1, Ordering::Release);
+            result
+        };
+        let inject = async {
+            tokio::time::timeout(Duration::from_secs(2), reply.entered.notified())
+                .await.expect("real query reaches held server");
+            let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+            let id = *peer.inbound_transfers.iter()
+                .find(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+                .expect("query registers a response before any answer part").key();
+            assert_eq!(peer.inbound_active.lock().unwrap().len(), 0);
+            let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+            let mut actual = Vec::new();
+            for row in &native {
+                let part = row["part"].as_i64().unwrap() as i32;
+                let mut encoder = crate::RaptorqEncoder::with_data(
+                    &vec![42; if part == 0 { 2_000_000 } else { 1 }], None,
+                );
+                let mut seqno = 0;
+                let chunk = RldpChunk {
+                    transfer_id: id.into(), fec_type: encoder.params().clone().into_boxed(),
+                    part, total_size: 2_000_001, data: encoder.encode(&mut seqno).unwrap(), seqno: 0,
+                };
+                let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+                let before = packets.processed_parts.load(Ordering::Acquire);
+                nodes[1].send_custom(&TaggedByteSlice {
+                    object: &wire,
+                    #[cfg(feature = "telemetry")] tag: 0,
+                }, &route).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while packets.processed_parts.load(Ordering::Acquire) == before {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }).await.expect("actual authenticated handler must finish the input");
+                let expected_complete = row["complete_packets"].as_u64().unwrap() as usize;
+                if expected_complete > 0 {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while remote_packets.part_one_completions.load(Ordering::Acquire) < expected_complete {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }).await.expect("later part accepted after part zero must acknowledge its replay");
+                }
+                let active = peer.inbound_active.lock().unwrap().len();
+                let completed = peer.inbound_transfers.iter()
+                    .filter(|e| matches!(e.val(), super::RldpTransfer::Done)).count();
+                actual.push(serde_json::json!({"part":part,"active":active,"completed":completed,"complete_packets":remote_packets.part_one_completions.load(Ordering::Acquire),"deliveries":deliveries.load(Ordering::Acquire)}));
+            }
+            assert_eq!(actual, native, "later parts cannot activate a receive before part zero");
+        };
+        tokio::select! {
+            result = query => panic!("partial transfer must not resolve held query: {result:?}"),
+            () = inject => {},
+        }
+    }).catch_unwind().await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_later_first_part_cannot_reopen_a_pruned_completed_id() {
+    let (_, _, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let stale = [97; 32];
+        peer.finish_inbound(
+            &peer.inbound_transfers,
+            stale,
+            &tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now(),
+        );
+        assert!(
+            peer.admit_inbound(stale, true, false).unwrap(),
+            "completed replay keeps priority even for a later part"
+        );
+        for n in 0..2048u32 {
+            let mut id = [98; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            peer.finish_inbound(
+                &peer.inbound_transfers,
+                id,
+                &tokio_util::sync::CancellationToken::new(),
+                tokio::time::Instant::now(),
+            );
+        }
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+        let later = rldps[0].inbound(&stale, &peers, true, peer.clone(), 1).await.unwrap();
+        assert!(
+            matches!(later, super::InboundRegistration::Refused),
+            "pruned completed duplicate cannot create a receiver from a later part"
+        );
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+        assert!(peer.inbound_active.lock().unwrap().is_empty());
+        let first = rldps[0].inbound(&stale, &peers, true, peer.clone(), 0).await.unwrap();
+        assert!(matches!(first, super::InboundRegistration::Created(_)));
+        assert_eq!(peer.inbound_active.lock().unwrap().len(), 1);
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
