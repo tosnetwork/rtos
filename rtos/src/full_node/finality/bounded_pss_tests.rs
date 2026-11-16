@@ -64,10 +64,7 @@ async fn bounded_pss_real_peer_exact_parts_and_missing_tail() {
                     bytes.len(),
                     &peer,
                     0,
-                    adnl::QueryResponseLimits {
-                        wire_bytes: bytes.len(),
-                        decoded_bytes: bytes.len(),
-                    },
+                    adnl::QueryResponseLimits::from_payload_limit(bytes.len()),
                 )
                 .await
                 .unwrap();
@@ -86,7 +83,7 @@ async fn bounded_pss_real_peer_exact_parts_and_missing_tail() {
                 32,
                 &peer,
                 0,
-                adnl::QueryResponseLimits { wire_bytes: 32, decoded_bytes: 32 },
+                adnl::QueryResponseLimits::from_payload_limit(32),
             )
             .await
             .unwrap();
@@ -124,15 +121,7 @@ fn assert_provider_refused_answer(
         }),
         "real provider must consume the exact oversize injection: {observations:?}"
     );
-    let peer = pair
-        .provider
-        .network()
-        .context()
-        .stack
-        .adnl
-        .key_by_tag(NodeNetwork::TAG_OVERLAY_KEY)
-        .unwrap();
-    assert_eq!(error.to_string(), format!("No bounded RLDP answer from {}", peer.id()));
+    assert!(error.downcast_ref::<adnl::RldpQueryTimeout>().is_some(), "{error:#}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -197,11 +186,33 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
                 64,
                 &peer,
                 0,
-                adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 64 },
+                adnl::QueryResponseLimits::from_payload_limit(64),
             )
             .await
             .unwrap_err();
-        assert_provider_refused_answer(&pair, observations, Some(0), 65, &error);
+        let limit =
+            error.downcast_ref::<adnl::ResponseLimitExceeded>().expect("decoded slice limit");
+        assert_eq!((limit.actual, limit.limit), (65, 64));
+        assert!(
+            pair.provider.overlays_router().unwrap().test_pss_observations().len() > observations
+        );
+        // A payload exceeding the whole wire budget is refused by the provider.
+        let wire_limit = adnl::QueryResponseLimits::from_payload_limit(64).wire_bytes;
+        let observations = pair.provider.overlays_router().unwrap().test_pss_observations().len();
+        inject(&pair, Some(0), vec![0x71; wire_limit + 1]);
+        let error = client
+            .download_persistent_state_part_bounded(
+                &id,
+                pair.master.id(),
+                0,
+                64,
+                &peer,
+                0,
+                adnl::QueryResponseLimits::from_payload_limit(64),
+            )
+            .await
+            .unwrap_err();
+        assert_provider_refused_answer(&pair, observations, Some(0), wire_limit + 1, &error);
         inject(&pair, Some(0), vec![0x72; 64]);
         let restored = client
             .download_persistent_state_part_bounded(
@@ -211,14 +222,17 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
                 64,
                 &peer,
                 0,
-                adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 64 },
+                adnl::QueryResponseLimits::from_payload_limit(64),
             )
             .await
             .unwrap();
         assert_eq!(restored, vec![0x72; 64]);
-        // Neither wire nor decoded allocation may exceed the requested slice.
+        // Wire includes the native envelope allowance; decoded bytes stay slice-bounded.
         for limits in [
-            adnl::QueryResponseLimits { wire_bytes: 65, decoded_bytes: 64 },
+            adnl::QueryResponseLimits {
+                wire_bytes: 64 + adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE + 1,
+                decoded_bytes: 64,
+            },
             adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 65 },
         ] {
             let error = client
@@ -245,7 +259,7 @@ async fn bounded_pss_real_peer_rejects_wire_size_and_signed_length() {
                     64,
                     &peer,
                     0,
-                    adnl::QueryResponseLimits { wire_bytes: 64, decoded_bytes: 64 }
+                    adnl::QueryResponseLimits::from_payload_limit(64)
                 )
                 .await
                 .is_err());

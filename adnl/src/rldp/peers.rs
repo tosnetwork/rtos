@@ -260,6 +260,7 @@ impl PeerTable {
             transfers.clone()
         };
         let peer = Arc::new(RldpPeer {
+            inbound_active: Default::default(),
             inbound_transfers: inbound_transfers.clone(),
             transfers: transfers.clone(),
             outbound_semaphore: Arc::new(Semaphore::new(RldpNode::MAX_OUTBOUNDS_PER_PEER as usize)),
@@ -326,6 +327,7 @@ impl PeerTable {
             }
             if let Some(peer) = weak.upgrade() {
                 peer.completed.lock().unwrap().clear();
+                peer.inbound_active.lock().unwrap().clear();
             }
             drop(ids);
             drained.cancel();
@@ -341,6 +343,32 @@ impl Drop for PeerTable {
     }
 }
 impl RldpPeer {
+    pub(super) fn admit_inbound(&self, id: TransferId, valid_geometry: bool) -> Result<bool> {
+        let _ids = self.registrations.lock().unwrap();
+        if self.closed.is_cancelled() {
+            return Err(SendCancelled::PeerEvicted.into());
+        }
+        // Completed duplicates still receive their completion acknowledgement.
+        if self
+            .inbound_transfers
+            .get(&id)
+            .is_some_and(|entry| matches!(entry.val(), RldpTransfer::Done))
+        {
+            return Ok(true);
+        }
+        if !valid_geometry {
+            return Ok(false);
+        }
+        let mut active = self.inbound_active.lock().unwrap();
+        if active.contains(&id) {
+            return Ok(true);
+        }
+        if active.len() >= 256 {
+            return Ok(false);
+        }
+        active.insert(id);
+        Ok(true)
+    }
     pub(super) fn finish_inbound(
         &self,
         transfers: &lockfree::map::Map<TransferId, RldpTransfer>,
@@ -355,6 +383,7 @@ impl RldpPeer {
         // Old expiry and registration drops must not touch this ID again,
         // including after the completed-ID cache evicts it and it is reused.
         finished.cancel();
+        self.inbound_active.lock().unwrap().remove(&id);
         if self.closed.is_cancelled() {
             return;
         }

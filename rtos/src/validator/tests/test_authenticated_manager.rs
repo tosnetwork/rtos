@@ -473,14 +473,14 @@ async fn run_authenticated_manager_observer_lifecycle(
             let error = manager.update_shards(state.clone()).await.err()
                 .ok_or_else(|| error!("Expected sink initialization failure"))?;
             anyhow::ensure!(error.to_string().contains("Injected transient finality sink"));
-            let failed = live_groups(&manager);
-            let mut stopped = None;
-            for group in failed {
-                if !group.snapshot().await.has_engine {
-                    stopped = Some(group);
-                }
-            }
-            let group = stopped.ok_or_else(|| error!("Partially started group ownership was lost"))?;
+            // Other live groups may legitimately be awaiting their asynchronous
+            // constructor. Inspect the exact session whose sink failed, not an
+            // arbitrary group that happens to have no engine at this instant.
+            let failed_id = engine.failed_finality_sink_session.lock().unwrap().clone()
+                .ok_or_else(|| error!("Injected sink failure did not record its session"))?;
+            let group = group_of(&manager, &failed_id)
+                .ok_or_else(|| error!("Partially started group ownership was lost"))?;
+            anyhow::ensure!(!group.snapshot().await.has_engine, "failed sink unexpectedly created an engine");
             anyhow::ensure!(!group.is_start_pending().await, "failed sink left a permanently pending start");
             let id = group.authenticated_runtime().unwrap().session_id().clone();
             Some((id, group))

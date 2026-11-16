@@ -113,7 +113,7 @@ fn checked_pss_slice(
     limits.validate()?;
     if max_size == 0
         || max_size > (1 << 21)
-        || limits.wire_bytes > max_size
+        || limits.wire_bytes > adnl::QueryResponseLimits::from_payload_limit(max_size).wire_bytes
         || limits.decoded_bytes > max_size
     {
         fail!("Invalid bounded PSS slice size");
@@ -256,7 +256,7 @@ pub struct NetworkDownloadLimits {
 impl NetworkDownloadLimits {
     pub fn proof(bytes: usize, cells: usize, depth: u16) -> Self {
         Self {
-            wire_bytes: bytes,
+            wire_bytes: adnl::QueryResponseLimits::from_payload_limit(bytes).wire_bytes,
             response_bytes: bytes,
             expanded_bytes: bytes,
             block_bytes: 0,

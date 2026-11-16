@@ -62,21 +62,50 @@ impl Subscriber for HeldReply {
 
 #[derive(Default)]
 struct ResponsePackets {
+    complete_packets: std::sync::atomic::AtomicUsize,
+    part_one_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
+    handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
+    processed_parts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
 impl Subscriber for ResponsePackets {
-    async fn try_consume_custom(&self, bytes: &[u8], _: &AdnlPeers) -> Result<bool> {
+    async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
+        let mut is_data_part = false;
         if let Ok(message) = deserialize_boxed(bytes) {
-            if let Ok(rldp2::MessagePart::Rldp2_MessagePart(part)) =
-                message.downcast::<rldp2::MessagePart>()
-            {
-                self.transfers.lock().unwrap().insert(part.0.transfer_id.as_slice().to_vec());
-                if self.drop_parts.load(Ordering::Acquire) {
-                    return Ok(true);
+            if let Ok(part) = message.downcast::<rldp2::MessagePart>() {
+                match part {
+                    rldp2::MessagePart::Rldp2_MessagePart(part) => {
+                        is_data_part = true;
+                        self.transfers
+                            .lock()
+                            .unwrap()
+                            .insert(part.0.transfer_id.as_slice().to_vec());
+                        if self.drop_parts.load(Ordering::Acquire) {
+                            return Ok(true);
+                        }
+                    }
+                    rldp2::MessagePart::Rldp2_Complete(part) => {
+                        self.complete_packets.fetch_add(1, Ordering::Release);
+                        if part.part == 1 {
+                            self.part_one_completions.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+        // In tests requiring a negative state assertion, acknowledge processing only
+        // after the real handler returns. Consume here to prevent double dispatch.
+        let handler = self.handler.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
+        if let Some(handler) = handler {
+            let consumed = handler.try_consume_custom(bytes, peers).await?;
+            if is_data_part {
+                assert!(consumed, "real RLDP handler must consume the test packet");
+                self.processed_parts.fetch_add(1, Ordering::Release);
+            }
+            return Ok(consumed);
         }
         Ok(false) // Observe authenticated packets, then let the real receiver handle them.
     }
@@ -181,7 +210,7 @@ async fn topology(
                 if index == 1 {
                     vec![([18; 32], 0), ([39; 32], 1)]
                 } else {
-                    vec![([17 + index as u8; 32], 0)]
+                    vec![([if index == 22 { 79 } else { 17 + index as u8 }; 32], 0)]
                 },
             )
             .unwrap();
@@ -1563,6 +1592,7 @@ async fn rldp2_inbound_id_does_not_alias_active_outbound() {
         let original = parts[0].clone();
         peer.insert_transfer(&peer.transfers, [7; 32], super::RldpTransfer::sender(state)).unwrap();
         let registration = super::owned_send::SendRegistration {
+            _query_admission: None,
             v2: true,
             inbound: None,
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
@@ -1669,4 +1699,594 @@ fn directional_identity_native_effects() -> serde_json::Value {
         assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
     }
     serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pending_query_admission_refuses_before_waiting_for_sender() {
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42;64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for _ in 0..257 { pending.push(rldps[0].query(&query, Some(1024), &peers, true, None)); }
+        let refused = tokio::time::timeout(Duration::from_secs(2), pending.next()).await
+            .expect("query257 must be refused immediately, before its query deadline or sender admission").unwrap();
+        let error = refused.expect_err("capacity overflow cannot answer successfully");
+        assert!(error.to_string().contains("from this peer"), "wrong refusal: {error:#}");
+        let expected = query_admission_native_effects();
+        assert_eq!(pending.len(), expected["pending"].as_u64().unwrap() as usize);
+        assert_eq!(expected["refused"], 1);
+        assert_eq!(expected["other"], 0);
+        assert!(pending.next().now_or_never().is_none());
+        assert_eq!(rldps[0].query_budget.remaining(&peers).1, 0);
+        assert_eq!(rldps[0].query_budget.remaining(&peers).0, 8192 - 256,
+            "refused connection admission must not consume global capacity");
+        drop(pending);
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[0].query_budget.remaining(&peers) != (8192, 256) {
+                reply.release.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("cancelled query owners must release pending-query admission");
+        assert_eq!(rldps[0].query_budget.remaining(&peers).1, 256);
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42;64]);
+    }).catch_unwind().await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pending_query_global_admission_refuses_before_sender_wait() {
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, _peers) = topology(34).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let local = nodes[1].key_by_tag(0).unwrap();
+        let routes: Vec<_> = (0..34)
+            .filter(|&i| i != 1)
+            .map(|i| {
+                AdnlPeers::with_keys(
+                    local.id().clone(),
+                    nodes[i].key_by_tag(0).unwrap().id().clone(),
+                )
+            })
+            .collect();
+        let (answer, _) = rldps[1].query(&query, Some(1024), &routes[0], true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for (index, route) in routes.iter().enumerate() {
+            for _ in 0..if index == 32 { 1 } else { 256 } {
+                pending.push(rldps[1].query(&query, Some(1024), route, true, None));
+            }
+        }
+        let refused = tokio::time::timeout(Duration::from_secs(2), pending.next())
+            .await
+            .expect("query8193 must be refused by the global pending-query cap before its deadline")
+            .unwrap();
+        let error = refused.expect_err("global capacity overflow cannot answer successfully");
+        assert_eq!(error.to_string(), "too many RLDP queries are already awaiting an answer");
+        let expected = query_admission_native_effects();
+        assert_eq!(pending.len(), expected["global_pending"].as_u64().unwrap() as usize);
+        assert_eq!(expected["global_refused"], 1);
+        assert_eq!(expected["global_other"], 0);
+        assert!(pending.next().now_or_never().is_none());
+        assert_eq!(rldps[1].query_budget.remaining(&routes[0]).0, 0);
+        drop(pending);
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].query_budget.remaining(&routes[0]).0 != 8192 {
+                reply.release.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("global query capacity must return after real owner drain");
+        let (answer, _) =
+            rldps[1].query(&query, Some(1024), &routes[32], true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn query_admission_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_query_admission_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_query_admission_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_query_admission_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_query_admission_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_refused_query_does_not_extend_connection_expiry() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_query_refusal_expiry_context.tsv").trim(),
+        "256 10 1 130.5"
+    );
+    use futures::StreamExt;
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        reply.hold.store(true, Ordering::Release);
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for _ in 0..256 {
+            pending.push(rldps[0].query(&query, Some(1024), &peers, true, None));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.next()).await.is_err(),
+            "all256 admitted queries must still await replies"
+        );
+        assert_eq!(rldps[0].query_budget.remaining(&peers).0, 8192 - 256);
+        // Every admitted query already captured its10s deadline. This cutoff
+        // includes its120s connection retention, but precedes the refused call's.
+        let original_expiry = tokio::time::Instant::now() + Duration::from_millis(130500);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let rejected = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap_err();
+        assert!(rejected.to_string().contains("from this peer"));
+        rldps[0].peers.expire(original_expiry);
+        let live = usize::from(rldps[0].peers.find_v2(peers.local(), peers.other()).is_some());
+        let actual = serde_json::json!({"refused":1,"live_after_original_expiry":live});
+        assert_eq!(
+            actual,
+            query_refusal_expiry_native_effects(),
+            "refused query must not extend the connection beyond admitted-query retention"
+        );
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn query_refusal_expiry_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_query_refusal_expiry_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_query_refusal_expiry_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_incomplete_inbound_transfers_follow_native_cap() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let (_reply, packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+        let mut seqno = 0;
+        let symbol = encoder.encode(&mut seqno).unwrap();
+        let mut source_symbols = vec![symbol.clone()];
+        for index in 1..3u32 {
+            let mut sequence = index;
+            source_symbols.push(encoder.encode(&mut sequence).unwrap());
+        }
+
+        for n in 0..257u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from(id),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: 2048,
+                data: symbol.clone(),
+                seqno: seqno as i32,
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[1]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !packets.transfers.lock().unwrap().contains(id.as_slice()) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("every test part must reach authenticated receiver");
+            if n < 256 {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while peer.inbound_transfers.get(&id).is_none() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("native-admitted partial transfer must remain active");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let live = peer
+            .inbound_transfers
+            .iter()
+            .filter(|entry| matches!(entry.val(), super::RldpTransfer::Recv(_)))
+            .count();
+        assert_eq!(live, 256, "incomplete inbound transfer admission must match native cap");
+        for index in 1..3u32 {
+            let seqno = index;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from([0; 32]),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: 2048,
+                data: source_symbols[index as usize].clone(),
+                seqno: seqno as i32,
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[1]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !peer
+                .inbound_transfers
+                .get(&[0; 32])
+                .is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done))
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("completion must return inbound capacity before upper-layer parsing");
+        let after_completion = peer
+            .inbound_transfers
+            .iter()
+            .filter(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+            .count();
+        let mut retry_id = [0; 32];
+        retry_id[..4].copy_from_slice(&256u32.to_le_bytes());
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from(retry_id),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: 2048,
+            data: symbol.clone(),
+            seqno: 0,
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        nodes[1]
+            .send_custom(
+                &TaggedByteSlice {
+                    object: &wire,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &route,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while peer.inbound_transfers.get(&retry_id).is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("refused transfer must be retryable when capacity returns");
+        let after_retry = peer
+            .inbound_transfers
+            .iter()
+            .filter(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+            .count();
+        // A registered query response shares the same actual inbound capacity.
+        let query_bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice { object: &query_bytes, #[cfg(feature="telemetry")] tag: 0 };
+        let request = rldps[0].query(&query, Some(1024), &peers, true, None);
+        tokio::pin!(request);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut request => panic!("solicited answer bypassed saturated inbound capacity: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        if packets.transfers.lock().unwrap().len() > 257 { break; }
+                    }
+                }
+            }
+        }).await.expect("a solicited answer part must reach the receiver");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut request).await.is_err(),
+            "solicited answer must not bypass saturated inbound capacity");
+        assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
+        for index in 1..3u32 {
+            let seqno = index;
+            let mut id = [0;32]; id[0] = 1;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from(id), fec_type: encoder.params().clone().into_boxed(),
+                part: 0, total_size: 2048, data: source_symbols[index as usize].clone(), seqno: seqno as i32,
+            };
+            let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[1].send_custom(&TaggedByteSlice { object: &wire, #[cfg(feature="telemetry")] tag: 0 }, &route).await.unwrap();
+        }
+        let (answer, _) = tokio::time::timeout(Duration::from_secs(3), &mut request).await
+            .expect("solicited answer must recover after inbound capacity returns").unwrap();
+        assert_eq!(answer.unwrap(), vec![42;64]);
+        let expected = inbound_admission_native_effects();
+        assert_eq!(expected["solicited_blocked"], true);
+        assert_eq!(expected["solicited_recovered"], true);
+
+        assert_eq!(live, expected["inbound"].as_u64().unwrap() as usize);
+        assert_eq!(after_completion, expected["after_completion"].as_u64().unwrap() as usize);
+        assert_eq!(after_retry, expected["after_retry"].as_u64().unwrap() as usize);
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn inbound_admission_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_inbound_admission_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_inbound_admission_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_inbound_admission_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_inbound_admission_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
+    let (_reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        // Exercise the production admission/creation split at an exact interleaving.
+        // UDP saturation and recovery are tested separately above.
+        for n in 0..256u32 {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            assert!(peer.admit_inbound(id, true).unwrap());
+        }
+        let stale = [77; 32];
+        peer.finish_inbound(
+            &peer.inbound_transfers,
+            stale,
+            &tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now(),
+        );
+        assert!(
+            peer.admit_inbound(stale, true).unwrap(),
+            "completed duplicates bypass active capacity"
+        );
+        for n in 0..2048u32 {
+            let mut id = [88; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            peer.finish_inbound(
+                &peer.inbound_transfers,
+                id,
+                &tokio_util::sync::CancellationToken::new(),
+                tokio::time::Instant::now(),
+            );
+        }
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+        assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
+        let created = rldps[0].inbound(&stale, &peers, true, peer.clone()).await.unwrap();
+        assert!(
+            matches!(created, super::InboundRegistration::Refused),
+            "pruned completed ID must not bypass full inbound admission at creation"
+        );
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn inbound_validation_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_inbound_validation_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_inbound_validation_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_inbound_validation_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_inbound_validation_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    async fn send(node: &Arc<AdnlNode>, route: &AdnlPeers, part: i32, total: i64, bytes: &[u8]) {
+        let mut encoder = crate::RaptorqEncoder::with_data(bytes, None);
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from([0; 32]),
+            fec_type: encoder.params().clone().into_boxed(),
+            part,
+            total_size: total,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: seqno as i32,
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        node.send_custom(
+            &TaggedByteSlice {
+                object: &wire,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            route,
+        )
+        .await
+        .unwrap();
+    }
+    let mut actual = Vec::new();
+    for line in include_str!("../../../ci/conformance/rldp2_inbound_validation_context.tsv").lines()
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let name = fields[0];
+        let part: i32 = fields[1].parse().unwrap();
+        let total: i64 = fields[2].parse().unwrap();
+        let bytes: usize = fields[3].parse().unwrap();
+        let (reply, packets, nodes, rldps, peers) = pair().await;
+        *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let replay = name == "completed_replay";
+            let (sender, receiver, route) = if replay { (0,1,peers.clone()) }
+                else { (1,0,AdnlPeers::with_keys(peers.other().clone(), peers.local().clone())) };
+            let peer = rldps[receiver].get_peer(route.other(), route.local(), true, None).await.unwrap();
+            if replay {
+                let warm = serialize_boxed(&rldp::message::Message { id:UInt256::default(),data:b"churn".to_vec() }.into_boxed()).unwrap();
+                send(&nodes[sender], &route, 0, warm.len() as i64, &warm).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while reply.messages.load(Ordering::Acquire) != 1 { reply.message_received.notified().await; }
+                }).await.expect("warm message must actually deliver");
+            }
+            send(&nodes[sender], &route, part, total, &vec![42;bytes]).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let observed = if replay { packets.part_one_completions.load(Ordering::Acquire)>0 }
+                        else { packets.processed_parts.load(Ordering::Acquire)>0 };
+                    if observed { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("input or completed-ID replay acknowledgement must reach the authenticated receiver");
+            let inbound = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Recv(_))).count();
+            let completed = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Done)).count();
+            serde_json::json!({"id":name,"inbound":inbound,"completed":completed,"replay_complete_packets":packets.part_one_completions.load(Ordering::Acquire)})
+        }).catch_unwind().await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        match outcome {
+            Ok(value) => actual.push(value),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    assert_eq!(
+        serde_json::Value::Array(actual),
+        inbound_validation_native_effects(),
+        "invalid part geometry must be dropped before receive allocation or completion caching"
+    );
 }

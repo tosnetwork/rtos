@@ -6,7 +6,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 //! RLDP sender owners. Cancellation requests drain; they never detach active work.
-use super::TARGET;
+use super::{query_admission::QueryAdmission, TARGET};
 use crate::adnl::tasks::AdnlTasks;
 use futures::FutureExt;
 use rtos_block::{error, Result};
@@ -377,6 +377,8 @@ where
 }
 
 pub(super) struct SendRegistration {
+    // Keep pending-query capacity until actual send/receive owners have drained.
+    pub _query_admission: Option<Arc<QueryAdmission>>,
     pub v2: bool,
     pub inbound: Option<(super::TransferId, CancellationToken)>,
     pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
