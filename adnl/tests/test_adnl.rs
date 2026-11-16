@@ -15,6 +15,7 @@ use adnl::{
     node::{AdnlNode, AdnlSendMethod, AdnlSendMethodDetailed, AdnlStatus, DataCompression},
     server::{AdnlServerConfig, AdnlServerConfigJson},
 };
+use futures::FutureExt;
 use rtos_api::{
     ton::{
         adnl::{pong::Pong as AdnlPong, Pong as AdnlPongBoxed},
@@ -32,6 +33,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 include!("../../common/src/config.rs");
 include!("../../common/src/test.rs");
@@ -50,23 +52,66 @@ fn get_tagged_slice(slice: &[u8]) -> TaggedByteSlice<'_> {
     }
 }
 
-async fn init_node(
-    ip: &str,
-    udp_only: bool,
-    ping: &Arc<tokio::sync::Barrier>,
-    drop: Option<Arc<AtomicBool>>,
-) -> Arc<AdnlNode> {
-    let config = get_adnl_config("adnl", ip, vec![KEY_TAG], true).await.unwrap();
-    let node = AdnlNode::with_config(config).await.unwrap();
-    let subscribers: Vec<Arc<dyn Subscriber>> =
-        vec![Arc::new(Mockup::with_params(ping.clone(), drop))];
-    if udp_only {
-        node.start_over_udp(subscribers).await.unwrap();
-    } else {
-        node.start_over_udp_tcp(subscribers).await.unwrap();
+#[derive(Default)]
+struct SessionFixture {
+    nodes: Vec<Arc<AdnlNode>>,
+    finish: CancellationToken,
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl SessionFixture {
+    async fn init_node(
+        &mut self,
+        ip: &str,
+        udp_only: bool,
+        ping: &Arc<tokio::sync::Barrier>,
+        drop: Option<Arc<AtomicBool>>,
+    ) -> Arc<AdnlNode> {
+        let config = get_adnl_config("adnl", ip, vec![KEY_TAG], true).await.unwrap();
+        let node = AdnlNode::with_config(config).await.unwrap();
+        // Retain even a partially started node for failure cleanup.
+        self.nodes.push(node.clone());
+        let subscribers: Vec<Arc<dyn Subscriber>> = vec![Arc::new(Mockup {
+            pong: ping.clone(),
+            drop,
+            finish: self.finish.clone(),
+            entered: self.entered.clone(),
+        })];
+        if udp_only {
+            node.start_over_udp(subscribers).await.unwrap();
+        } else {
+            node.start_over_udp_tcp(subscribers).await.unwrap();
+        }
+        node.set_channel_reset_timeout(CHANNEL_RESET_TIMEOUT_SEC).await;
+        node
     }
-    node.set_channel_reset_timeout(CHANNEL_RESET_TIMEOUT_SEC).await;
-    node
+
+    async fn cleanup(&self) -> Vec<Result<()>> {
+        // A timed-out caller no longer participates in the mock barrier.
+        // Release entered and future callbacks before joining actual workers.
+        self.finish.cancel();
+        futures::future::join_all(self.nodes.iter().map(|node| node.stop_checked())).await
+    }
+
+    async fn report<T>(&self, outcome: std::thread::Result<T>) -> T {
+        let stopped = self.cleanup().await;
+        match outcome {
+            Err(panic) => {
+                for result in stopped {
+                    if let Err(error) = result {
+                        eprintln!("session cleanup after failure: {error}");
+                    }
+                }
+                std::panic::resume_unwind(panic)
+            }
+            Ok(value) => {
+                for result in stopped {
+                    result.unwrap();
+                }
+                value
+            }
+        }
+    }
 }
 
 async fn wait(ping: &Arc<tokio::sync::Barrier>) -> bool {
@@ -79,12 +124,11 @@ async fn wait(ping: &Arc<tokio::sync::Barrier>) -> bool {
 pub struct Mockup {
     pong: Arc<tokio::sync::Barrier>,
     drop: Option<Arc<AtomicBool>>,
+    finish: CancellationToken,
+    entered: Arc<tokio::sync::Notify>,
 }
 
 impl Mockup {
-    pub fn with_params(pong: Arc<tokio::sync::Barrier>, drop: Option<Arc<AtomicBool>>) -> Self {
-        Self { pong, drop }
-    }
     fn compare(mock: &[u8], data: &[u8]) -> bool {
         let xor = data[0] ^ mock[0];
         for i in 1..data.len() {
@@ -106,7 +150,8 @@ impl Subscriber for Mockup {
         } else {
             assert!(false)
         }
-        self.pong.wait().await;
+        self.entered.notify_one();
+        tokio::select! { biased; _ = self.finish.cancelled() => {}, _ = self.pong.wait() => {} }
         Ok(true)
     }
 
@@ -426,45 +471,149 @@ fn run_adnl_session(mode: SendMode, ip1: &str, ip2: &str) {
         let mode = mode.clone();
         let udp_only = mode == SendMode::Fast;
         let packet_size = rt.block_on(async move {
-            let node1 = init_node(ip1, udp_only, &ping, Some(drop1.clone())).await;
-            let node2 = init_node(ip2, udp_only, &ping, Some(drop2.clone())).await;
-            let reset_timeout1 = node1.get_channel_reset_timeout();
-            let reset_timeout2 = node2.get_channel_reset_timeout();
-            let peer1 = node2
-                .add_peer(
-                    node2.key_by_tag(KEY_TAG).unwrap().id(),
-                    node1.ip_address_adnl(),
-                    None,
-                    &node1.key_by_tag(KEY_TAG).unwrap(),
-                )
-                .unwrap()
-                .unwrap();
-            let peer2 = node1
-                .add_peer(
-                    node1.key_by_tag(KEY_TAG).unwrap().id(),
-                    node2.ip_address_adnl(),
-                    None,
-                    &node2.key_by_tag(KEY_TAG).unwrap(),
-                )
-                .unwrap()
-                .unwrap();
-            let peers1 = AdnlPeers::with_keys(peer1.clone(), peer2.clone());
-            let peers2 = AdnlPeers::with_keys(peer2.clone(), peer1.clone());
-            for p in 0..2 {
-                for n in 0..ATTEMPTS {
-                    for k in 0..2 {
-                        let mock = if k == 0 { MOCK_MESSAGE } else { &MOCK_BIG_MESSAGE };
-                        let mut data = Vec::with_capacity(mock.len());
-                        data.extend_from_slice(mock);
-                        for item in data.iter_mut() {
-                            *item ^= n as u8
+            let mut fixture = SessionFixture::default();
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let node1 = fixture.init_node(ip1, udp_only, &ping, Some(drop1.clone())).await;
+                let node2 = fixture.init_node(ip2, udp_only, &ping, Some(drop2.clone())).await;
+                let reset_timeout1 = node1.get_channel_reset_timeout();
+                let reset_timeout2 = node2.get_channel_reset_timeout();
+                let peer1 = node2
+                    .add_peer(
+                        node2.key_by_tag(KEY_TAG).unwrap().id(),
+                        node1.ip_address_adnl(),
+                        None,
+                        &node1.key_by_tag(KEY_TAG).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let peer2 = node1
+                    .add_peer(
+                        node1.key_by_tag(KEY_TAG).unwrap().id(),
+                        node2.ip_address_adnl(),
+                        None,
+                        &node2.key_by_tag(KEY_TAG).unwrap(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let peers1 = AdnlPeers::with_keys(peer1.clone(), peer2.clone());
+                let peers2 = AdnlPeers::with_keys(peer2.clone(), peer1.clone());
+                for p in 0..2 {
+                    for n in 0..ATTEMPTS {
+                        for k in 0..2 {
+                            let mock = if k == 0 { MOCK_MESSAGE } else { &MOCK_BIG_MESSAGE };
+                            let mut data = Vec::with_capacity(mock.len());
+                            data.extend_from_slice(mock);
+                            for item in data.iter_mut() {
+                                *item ^= n as u8
+                            }
+                            let (send_method1, method1_sent, send_method2, method2_sent) =
+                                match mode {
+                                    SendMode::Fast => (
+                                        AdnlSendMethod::Fast,
+                                        AdnlSendMethodDetailed::FastNormal,
+                                        AdnlSendMethod::Fast,
+                                        AdnlSendMethodDetailed::FastNormal,
+                                    ),
+                                    SendMode::Mixed => {
+                                        if (n & 0x01) == 1 {
+                                            (
+                                                AdnlSendMethod::Safe,
+                                                AdnlSendMethodDetailed::Safe,
+                                                AdnlSendMethod::Fast,
+                                                AdnlSendMethodDetailed::FastNormal,
+                                            )
+                                        } else {
+                                            (
+                                                AdnlSendMethod::Fast,
+                                                AdnlSendMethodDetailed::FastNormal,
+                                                AdnlSendMethod::Safe,
+                                                AdnlSendMethodDetailed::Safe,
+                                            )
+                                        }
+                                    }
+                                    SendMode::Safe => (
+                                        AdnlSendMethod::Safe,
+                                        AdnlSendMethodDetailed::Safe,
+                                        AdnlSendMethod::Safe,
+                                        AdnlSendMethodDetailed::Safe,
+                                    ),
+                                };
+                            let data = get_tagged_slice(&data);
+                            let status = node1
+                                .send_custom_get_status(&data, &peers1, send_method1)
+                                .await
+                                .unwrap();
+                            assert!(wait(&ping).await);
+                            if n > 0 {
+                                // Skip first iteration to avoid channel setup side effect
+                                check_status(
+                                    &status,
+                                    method1_sent,
+                                    Some(reset_timeout1),
+                                    &mode,
+                                    "msg 1->2",
+                                );
+                            }
+                            let status = node2
+                                .send_custom_get_status(&data, &peers2, send_method2)
+                                .await
+                                .unwrap();
+                            assert!(wait(&ping).await);
+                            if n > 0 {
+                                // Skip first iteration to avoid channel setup side effect
+                                check_status(
+                                    &status,
+                                    method2_sent,
+                                    Some(reset_timeout2),
+                                    &mode,
+                                    "msg 2->1",
+                                );
+                            }
                         }
+                    }
+                    if p == 1 {
+                        break;
+                    }
+                    // Wait for reset channel due to no feedback
+                    let mut data = Vec::with_capacity(MOCK_MESSAGE.len());
+                    data.extend_from_slice(MOCK_MESSAGE);
+                    println!("Waiting for channel reset...");
+                    let start = now();
+                    let mut reset_at = 0;
+                    loop {
+                        let status = node1
+                            .send_custom_get_status(
+                                &get_tagged_slice(&data),
+                                &peers1,
+                                AdnlSendMethod::Fast,
+                            )
+                            .await
+                            .unwrap();
+                        assert!(wait(&ping).await);
+                        assert!(status.method == AdnlSendMethodDetailed::FastNormal);
+                        if let Some(will_reset_at) = status.reset_at {
+                            if reset_at == 0 {
+                                reset_at = will_reset_at;
+                                assert!(reset_at >= start + reset_timeout1);
+                            } else if (will_reset_at > reset_at) && (reset_at < now()) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                for p in 0..3 {
+                    for n in 0..ATTEMPTS {
+                        let query = TaggedTlObject {
+                            object: AdnlPing { value: n }.into_tl_object(),
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        };
                         let (send_method1, method1_sent, send_method2, method2_sent) = match mode {
                             SendMode::Fast => (
                                 AdnlSendMethod::Fast,
-                                AdnlSendMethodDetailed::FastNormal,
+                                AdnlSendMethodDetailed::FastUrgent,
                                 AdnlSendMethod::Fast,
-                                AdnlSendMethodDetailed::FastNormal,
+                                AdnlSendMethodDetailed::FastUrgent,
                             ),
                             SendMode::Mixed => {
                                 if (n & 0x01) == 1 {
@@ -472,12 +621,12 @@ fn run_adnl_session(mode: SendMode, ip1: &str, ip2: &str) {
                                         AdnlSendMethod::Safe,
                                         AdnlSendMethodDetailed::Safe,
                                         AdnlSendMethod::Fast,
-                                        AdnlSendMethodDetailed::FastNormal,
+                                        AdnlSendMethodDetailed::FastUrgent,
                                     )
                                 } else {
                                     (
                                         AdnlSendMethod::Fast,
-                                        AdnlSendMethodDetailed::FastNormal,
+                                        AdnlSendMethodDetailed::FastUrgent,
                                         AdnlSendMethod::Safe,
                                         AdnlSendMethodDetailed::Safe,
                                     )
@@ -490,181 +639,89 @@ fn run_adnl_session(mode: SendMode, ip1: &str, ip2: &str) {
                                 AdnlSendMethodDetailed::Safe,
                             ),
                         };
-                        let data = get_tagged_slice(&data);
-                        let status = node1
-                            .send_custom_get_status(&data, &peers1, send_method1)
+                        let res = node1
+                            .query_get_status(&query, &peers1, None, send_method1)
                             .await
                             .unwrap();
-                        assert!(wait(&ping).await);
-                        if n > 0 {
-                            // Skip first iteration to avoid channel setup side effect
-                            check_status(
-                                &status,
-                                method1_sent,
-                                Some(reset_timeout1),
-                                &mode,
-                                "msg 1->2",
-                            );
+                        if n > 1 {
+                            // Skip first iterations to avoid channel setup side effect
+                            // Queries may invoke message repeats
+                            check_status(&res.status, method1_sent, None, &mode, "query 1->2");
                         }
-                        let status = node2
-                            .send_custom_get_status(&data, &peers2, send_method2)
+                        match res.reply.unwrap().downcast::<AdnlPongBoxed>() {
+                            Ok(pong) => assert!(pong.value() == &n),
+                            Err(_) => assert!(false),
+                        }
+                        let res = node2
+                            .query_get_status(&query, &peers2, None, send_method2)
                             .await
                             .unwrap();
-                        assert!(wait(&ping).await);
-                        if n > 0 {
-                            // Skip first iteration to avoid channel setup side effect
-                            check_status(
-                                &status,
-                                method2_sent,
-                                Some(reset_timeout2),
-                                &mode,
-                                "msg 2->1",
-                            );
+                        if n > 1 {
+                            // Skip first iterations to avoid channel setup side effect
+                            // Queries may invoke message repeats
+                            check_status(&res.status, method2_sent, None, &mode, "query 2->1");
+                        }
+                        match res.reply.unwrap().downcast::<AdnlPongBoxed>() {
+                            Ok(pong) => assert!(pong.value() == &n),
+                            Err(_) => assert!(false),
                         }
                     }
-                }
-                if p == 1 {
-                    break;
-                }
-                // Wait for reset channel due to no feedback
-                let mut data = Vec::with_capacity(MOCK_MESSAGE.len());
-                data.extend_from_slice(MOCK_MESSAGE);
-                println!("Waiting for channel reset...");
-                let start = now();
-                let mut reset_at = 0;
-                loop {
-                    let status = node1
-                        .send_custom_get_status(
-                            &get_tagged_slice(&data),
-                            &peers1,
-                            AdnlSendMethod::Fast,
-                        )
-                        .await
-                        .unwrap();
-                    assert!(wait(&ping).await);
-                    assert!(status.method == AdnlSendMethodDetailed::FastNormal);
-                    if let Some(will_reset_at) = status.reset_at {
-                        if reset_at == 0 {
-                            reset_at = will_reset_at;
-                            assert!(reset_at >= start + reset_timeout1);
-                        } else if (will_reset_at > reset_at) && (reset_at < now()) {
-                            break;
-                        }
+                    if p == 2 {
+                        break;
                     }
-                }
-            }
-            for p in 0..3 {
-                for n in 0..ATTEMPTS {
-                    let query = TaggedTlObject {
-                        object: AdnlPing { value: n }.into_tl_object(),
-                        #[cfg(feature = "telemetry")]
-                        tag: 0,
-                    };
-                    let (send_method1, method1_sent, send_method2, method2_sent) = match mode {
-                        SendMode::Fast => (
-                            AdnlSendMethod::Fast,
-                            AdnlSendMethodDetailed::FastUrgent,
-                            AdnlSendMethod::Fast,
-                            AdnlSendMethodDetailed::FastUrgent,
-                        ),
-                        SendMode::Mixed => {
-                            if (n & 0x01) == 1 {
-                                (
-                                    AdnlSendMethod::Safe,
-                                    AdnlSendMethodDetailed::Safe,
-                                    AdnlSendMethod::Fast,
-                                    AdnlSendMethodDetailed::FastUrgent,
-                                )
-                            } else {
-                                (
-                                    AdnlSendMethod::Fast,
-                                    AdnlSendMethodDetailed::FastUrgent,
-                                    AdnlSendMethod::Safe,
-                                    AdnlSendMethodDetailed::Safe,
-                                )
+                    // Reset channel due to no feedback
+                    drop1.store(p == 1, Ordering::Relaxed);
+                    drop2.store(p == 0, Ordering::Relaxed);
+                    println!("Waiting for channel reset...");
+                    let start = now();
+                    let mut reset_at = 0;
+                    loop {
+                        let (send_method, method_sent) = if mode == SendMode::Safe {
+                            (AdnlSendMethod::Safe, AdnlSendMethodDetailed::Safe)
+                        } else {
+                            (AdnlSendMethod::Fast, AdnlSendMethodDetailed::FastUrgent)
+                        };
+                        let query = TaggedTlObject {
+                            object: AdnlPing { value: 0 }.into_tl_object(),
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        };
+                        let (node, peers) =
+                            if p == 0 { (&node1, &peers1) } else { (&node2, &peers2) };
+                        let res = node
+                            .query_get_status(&query, peers, Some(500), send_method)
+                            .await
+                            .unwrap();
+                        if let Some(will_reset_at) = res.status.reset_at {
+                            if reset_at == 0 {
+                                reset_at = will_reset_at;
+                                assert!(reset_at >= start + node1.get_channel_reset_timeout());
+                            } else if (will_reset_at > reset_at) && (reset_at < now()) {
+                                break;
                             }
+                        } else {
+                            assert!(
+                                res.status.method == method_sent,
+                                "{} vs {method_sent}",
+                                res.status.method
+                            );
                         }
-                        SendMode::Safe => (
-                            AdnlSendMethod::Safe,
-                            AdnlSendMethodDetailed::Safe,
-                            AdnlSendMethod::Safe,
-                            AdnlSendMethodDetailed::Safe,
-                        ),
-                    };
-                    let res =
-                        node1.query_get_status(&query, &peers1, None, send_method1).await.unwrap();
-                    if n > 1 {
-                        // Skip first iterations to avoid channel setup side effect
-                        // Queries may invoke message repeats
-                        check_status(&res.status, method1_sent, None, &mode, "query 1->2");
                     }
-                    match res.reply.unwrap().downcast::<AdnlPongBoxed>() {
-                        Ok(pong) => assert!(pong.value() == &n),
-                        Err(_) => assert!(false),
-                    }
-                    let res =
-                        node2.query_get_status(&query, &peers2, None, send_method2).await.unwrap();
-                    if n > 1 {
-                        // Skip first iterations to avoid channel setup side effect
-                        // Queries may invoke message repeats
-                        check_status(&res.status, method2_sent, None, &mode, "query 2->1");
-                    }
-                    match res.reply.unwrap().downcast::<AdnlPongBoxed>() {
-                        Ok(pong) => assert!(pong.value() == &n),
-                        Err(_) => assert!(false),
-                    }
+                    drop1.store(false, Ordering::Relaxed);
+                    drop2.store(false, Ordering::Relaxed);
                 }
-                if p == 2 {
-                    break;
-                }
-                // Reset channel due to no feedback
-                drop1.store(p == 1, Ordering::Relaxed);
-                drop2.store(p == 0, Ordering::Relaxed);
-                println!("Waiting for channel reset...");
-                let start = now();
-                let mut reset_at = 0;
-                loop {
-                    let (send_method, method_sent) = if mode == SendMode::Safe {
-                        (AdnlSendMethod::Safe, AdnlSendMethodDetailed::Safe)
-                    } else {
-                        (AdnlSendMethod::Fast, AdnlSendMethodDetailed::FastUrgent)
-                    };
-                    let query = TaggedTlObject {
-                        object: AdnlPing { value: 0 }.into_tl_object(),
-                        #[cfg(feature = "telemetry")]
-                        tag: 0,
-                    };
-                    let (node, peers) = if p == 0 { (&node1, &peers1) } else { (&node2, &peers2) };
-                    let res =
-                        node.query_get_status(&query, peers, Some(500), send_method).await.unwrap();
-                    if let Some(will_reset_at) = res.status.reset_at {
-                        if reset_at == 0 {
-                            reset_at = will_reset_at;
-                            assert!(reset_at >= start + node1.get_channel_reset_timeout());
-                        } else if (will_reset_at > reset_at) && (reset_at < now()) {
-                            break;
-                        }
-                    } else {
-                        assert!(
-                            res.status.method == method_sent,
-                            "{} vs {method_sent}",
-                            res.status.method
-                        );
-                    }
-                }
-                drop1.store(false, Ordering::Relaxed);
-                drop2.store(false, Ordering::Relaxed);
-            }
-            #[cfg(feature = "telemetry")]
-            let size = {
-                let size = node1.telemetry().packet_size.maximum();
-                size.max(node2.telemetry().packet_size.maximum())
-            };
-            #[cfg(not(feature = "telemetry"))]
-            let size = 0;
-            node1.stop().await;
-            node2.stop().await;
-            size
+                #[cfg(feature = "telemetry")]
+                let size = {
+                    let size = node1.telemetry().packet_size.maximum();
+                    size.max(node2.telemetry().packet_size.maximum())
+                };
+                #[cfg(not(feature = "telemetry"))]
+                let size = 0;
+                size
+            })
+            .catch_unwind()
+            .await;
+            fixture.report(outcome).await
         });
         // #[cfg(not(feature = "debug"))]
         break packet_size;
@@ -689,4 +746,58 @@ fn test_adnl_session_mixed() {
 #[test]
 fn test_adnl_session_safe() {
     run_adnl_session(SendMode::Safe, "127.0.0.1:4195", "127.0.0.1:4196");
+}
+
+#[test]
+fn test_adnl_session_failure_cleanup() {
+    let rt = init_test();
+    rt.block_on(async {
+        for stage in 0..3 {
+            let sockets = (0..2)
+                .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+                .collect::<Vec<_>>();
+            let addresses = sockets.iter().map(|s| s.local_addr().unwrap()).collect::<Vec<_>>();
+            drop(sockets);
+            let mut fixture = SessionFixture::default();
+            let ping = Arc::new(tokio::sync::Barrier::new(2));
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let node1 = fixture.init_node(&addresses[0].to_string(), true, &ping, None).await;
+                if stage == 0 {
+                    panic!("controlled session fixture failure");
+                }
+                let node2 = fixture.init_node(&addresses[1].to_string(), true, &ping, None).await;
+                if stage == 1 {
+                    panic!("controlled session fixture failure");
+                }
+                let local = node1.key_by_tag(KEY_TAG).unwrap();
+                let remote = node2.key_by_tag(KEY_TAG).unwrap();
+                node1.add_peer(local.id(), node2.ip_address_adnl(), None, &remote).unwrap();
+                node2.add_peer(remote.id(), node1.ip_address_adnl(), None, &local).unwrap();
+                let route = AdnlPeers::with_keys(local.id().clone(), remote.id().clone());
+                node1.send_custom(&get_tagged_slice(MOCK_MESSAGE), &route).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), fixture.entered.notified())
+                    .await
+                    .unwrap();
+                panic!("controlled session fixture failure");
+            })
+            .catch_unwind()
+            .await;
+            let reported = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::panic::AssertUnwindSafe(fixture.report(outcome)).catch_unwind(),
+            )
+            .await;
+            let released =
+                addresses.iter().all(|address| std::net::UdpSocket::bind(address).is_ok());
+            // Independent rescue also releases a deliberately omitted wakeup.
+            fixture.finish.cancel();
+            for result in fixture.cleanup().await {
+                result.unwrap();
+            }
+            assert!(released, "actual UDP owners must retire before reporting stage {stage}");
+            let panic =
+                reported.expect("failure reporting must finish after actual cleanup").unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"controlled session fixture failure"));
+        }
+    });
 }
