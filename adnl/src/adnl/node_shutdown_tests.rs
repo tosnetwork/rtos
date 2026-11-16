@@ -210,6 +210,34 @@ fn udp_port_diagnostic(port: u16, stage: &str) {
                         }
                     }
                 }
+                // A forked test child can briefly retain CLOEXEC descriptors
+                // until exec. Capture other process owners before inferring a
+                // node leak from a failed port rebind.
+                if let Ok(processes) = std::fs::read_dir("/proc") {
+                    for process in processes.flatten() {
+                        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+                            continue;
+                        };
+                        if pid == std::process::id() {
+                            continue;
+                        }
+                        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+                            continue;
+                        };
+                        for fd in fds.flatten() {
+                            if std::fs::read_link(fd.path())
+                                .is_ok_and(|link| link.to_string_lossy() == target)
+                            {
+                                let comm = std::fs::read_to_string(process.path().join("comm"))
+                                    .unwrap_or_default();
+                                let status = std::fs::read_to_string(process.path().join("status"))
+                                    .unwrap_or_default();
+                                let parent = status.lines().find(|line| line.starts_with("PPid:"));
+                                eprintln!("UDP_PORT_PROCESS_FD stage={stage} port={port} pid={pid} fd={} inode={inode} comm={comm:?} parent={parent:?}", fd.file_name().to_string_lossy());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
