@@ -202,3 +202,240 @@ async fn native_query_churn_bounds_completed_cache_and_retires_sender_ids() {
         result.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_query_replay_after_cache_eviction_preserves_active_response() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_query_replay_retention_context.tsv").trim(),
+        "2048 64 65 60"
+    );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_query_replay_retention_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_query_replay_retention_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_query_replay_retention_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_query_replay_retention_metadata.json"),
+    );
+    fn wire(data: &[u8], id: [u8; 32]) -> Vec<u8> {
+        let mut encoder = crate::RaptorqEncoder::with_data(data, Some(768));
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: id.into(),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: data.len() as i64,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: seqno as i32,
+        };
+        serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap()
+    }
+    let (reply, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        let peer = rldps[1]
+            .get_peer(route.other(), route.local(), true, None)
+            .await
+            .unwrap();
+        let native = peer
+            .native
+            .get()
+            .expect("replayed query responder must use native Connection");
+        let receiver_peer = rldps[0]
+            .get_peer(route.local(), route.other(), true, None)
+            .await
+            .unwrap();
+        let receiver = receiver_peer
+            .native
+            .get()
+            .expect("answer receiver must use native Connection");
+        let (probe, decoded) = tokio::sync::oneshot::channel();
+        *receiver.receive_hash_probe.lock().unwrap() = Some(probe);
+        let request = serialize_boxed(
+            &rldp::message::Query {
+                query_id: [9; 32].into(),
+                max_answer_size: 1024,
+                timeout: super::super::Version::get() + 60,
+                data: serialize_boxed(&Query {
+                    overlay: UInt256::default(),
+                })
+                .unwrap(),
+            }
+            .into_boxed(),
+        )
+        .unwrap();
+        let request_wire = wire(&request, [248; 32]);
+        let started = tokio::time::Instant::now();
+        let send = |data: Vec<u8>| {
+            let nodes = &nodes;
+            let route = &route;
+            async move {
+                nodes[0]
+                    .send_custom(
+                        &TaggedByteSlice {
+                            object: &data,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                        route,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        send(request_wire.clone()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1]
+                .allocated
+                .response_lifecycle
+                .0
+                .load(Ordering::Acquire)
+                != 1
+                || !packets
+                    .transfers
+                    .lock()
+                    .unwrap()
+                    .contains([7u8; 32].as_slice())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("original query must produce a real unacknowledged response");
+        let (done, receipt) = tokio::sync::oneshot::channel();
+        native
+            .driver
+            .submit(super::super::connection_driver::Command::InspectOutboundStarted(done))
+            .await
+            .unwrap();
+        let before = receipt.await.unwrap();
+        let message = serialize_boxed(
+            &rldp::message::Message {
+                id: UInt256::default(),
+                data: b"churn".to_vec(),
+            }
+            .into_boxed(),
+        )
+        .unwrap();
+        for index in 0u32..2048 {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&index.to_le_bytes());
+            let bytes = wire(&message, id);
+            send(bytes.clone()).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while reply.messages.load(Ordering::Acquire) != index as usize + 1 {
+                    tokio::select! {
+                        _=reply.message_received.notified()=>{},
+                        _=tokio::time::sleep(Duration::from_millis(50))=>send(bytes.clone()).await,
+                    }
+                }
+            })
+            .await
+            .expect("churn must reach the real application before the next message");
+        }
+        let (done, receipt) = tokio::sync::oneshot::channel();
+        native
+            .driver
+            .submit(super::super::connection_driver::Command::InspectCompleted(
+                done,
+            ))
+            .await
+            .unwrap();
+        let remembered = receipt.await.unwrap();
+        assert_eq!(remembered.len(), 2048);
+        assert!(
+            !remembered.contains(&[248; 32]),
+            "capacity churn must evict the query receive ID"
+        );
+        assert_eq!(inspect(native).await.1, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "query replay must be caused by capacity, not20s TTL expiry"
+        );
+        reply.response_bytes.store(65, Ordering::Release);
+        send(request_wire).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reply.calls.load(Ordering::Acquire) != 2
+                || rldps[1]
+                    .allocated
+                    .response_lifecycle
+                    .1
+                    .load(Ordering::Acquire)
+                    != 2050
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replayed application must finish its real response admission");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let (done, receipt) = tokio::sync::oneshot::channel();
+        native
+            .driver
+            .submit(super::super::connection_driver::Command::InspectOutboundStarted(done))
+            .await
+            .unwrap();
+        let after = receipt.await.unwrap();
+        assert_eq!(
+            after, 1,
+            "replayed query must not replace its active response"
+        );
+        assert_eq!(
+            rldps[1]
+                .allocated
+                .response_lifecycle
+                .0
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(inspect(native).await.1, 1);
+        assert_eq!(native.completed_sends.load(Ordering::Acquire), 0);
+        packets.drop_parts.store(false, Ordering::Release);
+        let original = serialize_boxed(
+            &rldp::message::Answer {
+                query_id: [9; 32].into(),
+                data: vec![42; 64],
+            }
+            .into_boxed(),
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), decoded)
+                .await
+                .unwrap()
+                .unwrap(),
+            ([7; 32], rtos_block::sha256_digest(original))
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while native.completed_sends.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original response must complete after its real ACK");
+        let retained = inspect(native).await.1;
+        let actual = serde_json::json!({"messages":reply.messages.load(Ordering::Acquire),"queries":reply.calls.load(Ordering::Acquire),"started_before":before,"started_after_replay":after,"retained_after_ack":retained});
+        assert_eq!(vec![actual.clone()], expected);
+        eprintln!(
+            "NATIVE_QUERY_REPLAY_RETENTION: {actual} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        (native.clone(), receiver.clone())
+    })
+    .catch_unwind()
+    .await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    let (native, receiver) = match outcome {
+        Ok(owners) => owners,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    for result in stopped {
+        result.unwrap();
+    }
+    assert_eq!(reply.messages.load(Ordering::Acquire), 2048);
+    assert_eq!(reply.calls.load(Ordering::Acquire), 2);
+    assert_eq!(native.completed_send_ids.lock().unwrap().as_slice(), &[[7; 32]]);
+    assert_eq!(receiver.routed_receives.load(Ordering::Acquire), 1);
+}
