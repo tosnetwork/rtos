@@ -391,11 +391,24 @@ impl RecvTransfer {
                     if (part.received_mask & mask) == 0 {
                         part.received_count += 1;
                         part.received_mask |= mask;
+                    } else {
+                        // Native Ack rejects duplicates before inspecting symbols.
+                        return Ok(None);
                     }
+                } else {
+                    // Symbols outside the acknowledgement window are not new.
+                    return Ok(None);
                 }
                 part.core.get_decoder(fec_type)?
             }
         };
+        if v2 && chunk.data.len() != decoder.params().symbol_size as usize {
+            fail!(
+                "Invalid RLDP2 symbol length: {}, expected {}",
+                chunk.data.len(),
+                decoder.params().symbol_size
+            )
+        }
         if let Some(mut data) = decoder.decode(chunk_seqno_u32, &chunk.data) {
             match &mut self.parts {
                 RecvParts::V1(part) => {

@@ -2740,3 +2740,147 @@ async fn rldp2_fec_symbol_count_matches_native_admission() {
         "FEC symbol count must match native admission before receiver allocation"
     );
 }
+
+fn symbol_length_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp_symbol_length_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp_symbol_length_effects.jsonl");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp_symbol_length_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["exit"], 0);
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp_symbol_length_reference.cpp").as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[test]
+fn rldp2_symbol_length_decoder_matches_native() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let expected = symbol_length_native_effects();
+    let mut actual = Vec::new();
+    for line in include_str!("../../../ci/conformance/rldp_symbol_length_context.tsv").lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let name = fields[0];
+        let length: usize = fields[1].parse().unwrap();
+        let seqno: i32 = fields[2].parse().unwrap();
+        let warm: i32 = fields[3].parse().unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+        let fec = encoder.params().clone().into_boxed();
+        let mut receiver = super::recv::RecvTransfer::new(
+            [0; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            true,
+            None,
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let chunk = |seqno, data| {
+            super::Chunk::V2(rldp2::messagepart::MessagePart(RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: fec.clone(),
+                part: 0,
+                total_size: 2048,
+                seqno,
+                data,
+            }))
+        };
+        if warm >= 0 {
+            let data = if warm == 0 {
+                encoder.encode(&mut 0).unwrap()
+            } else {
+                for i in 0..3 {
+                    encoder.encode(&mut (i as u32)).unwrap();
+                }
+                encoder.encode(&mut (warm as u32)).unwrap()
+            };
+            assert!(receiver.process_chunk(chunk(warm, data)).unwrap().is_none());
+        }
+        let error = receiver.process_chunk(chunk(seqno, vec![42; length])).is_err();
+        assert!(
+            receiver.data.is_empty(),
+            "one or two symbols cannot deliver this three-symbol transfer"
+        );
+        actual.push(serde_json::json!({"id":name,"errors":usize::from(error),"deliveries":0}));
+    }
+    let expected: Vec<_> = expected.as_array().unwrap().iter().map(|row|
+        serde_json::json!({"id":row["id"],"errors":row["errors"],"deliveries":row["deliveries"]})
+    ).collect();
+    assert_eq!(
+        actual, expected,
+        "native decoder rejection must preserve duplicate/window ordering"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_symbol_length_error_retires_actual_receiver() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let (_, _, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+        let chunk = RldpChunk {
+            transfer_id: UInt256::default(),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: 2048,
+            seqno: 0,
+            data: Vec::new(),
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        nodes[1]
+            .send_custom(
+                &TaggedByteSlice {
+                    object: &wire,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &route,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !peer
+                .inbound_transfers
+                .get(&[0; 32])
+                .is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done))
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("malformed symbol must retire the receiver as native does");
+        let expected = symbol_length_native_effects();
+        let row = expected.as_array().unwrap().iter().find(|r| r["id"] == "empty_symbol").unwrap();
+        let active = peer.inbound_active.lock().unwrap().len();
+        let completed = peer
+            .inbound_transfers
+            .iter()
+            .filter(|e| matches!(e.val(), super::RldpTransfer::Done))
+            .count();
+        assert_eq!(active as u64, row["inbound"].as_u64().unwrap());
+        assert_eq!(completed as u64, row["completed"].as_u64().unwrap());
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -1,0 +1,7 @@
+valid_length 768 0 -1
+empty_symbol 0 0 -1
+short_symbol 767 0 -1
+long_symbol 769 0 -1
+duplicate_empty 0 0 0
+old_empty 0 0 40
+next_empty 0 1 0
