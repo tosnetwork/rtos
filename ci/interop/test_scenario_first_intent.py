@@ -106,12 +106,37 @@ def fixture(root, point):
         result["epochs"]["after"][kind] = {
             member_id(i): {
                 "local_collation_log": "node-restart.log" if i == 2 else "node.log",
-                "check": {
-                    "verified_final_certificates": [{"validator_ids": [member_id(2)]}]
-                },
+                "check": {"verified_final_certificates": []},
             }
             for i in (0, 2, 4, 5)
         }
+    vote_check = {
+        "block": {"workchain": -1, "seqno": 200},
+        "created_by": member_id(4),
+        "gen_utime": 20,
+        "key_block": False,
+        "verified_governing_key_blocks": [{}],
+        "configuration": {
+            "current": {
+                "members": [{"validator_id": member_id(i)} for i in (0, 2, 4, 5)]
+            }
+        },
+        "verified_final_certificates": [
+            {"validator_ids": [member_id(2)], "final_certificate_checked": True}
+        ],
+    }
+    sample = root / "checks/200"
+    sample.mkdir(parents=True)
+    raw_vote = json.dumps(vote_check).encode()
+    (sample / "epoch-checked.json").write_bytes(raw_vote)
+    receipt["restarted_at_unix"] = 10.5
+    receipt["post_restart_vote"] = {
+        "validator_id": member_id(2),
+        "block": vote_check["block"],
+        "sample_directory": str(sample),
+        "checked_sha256": sha(raw_vote),
+        "check": vote_check,
+    }
     result["first_intent_cut"] = receipt
     return result
 
@@ -171,7 +196,7 @@ class FirstIntentAdapterTests(unittest.TestCase):
                     lambda r: r["epochs"]["after"]["mc_creators"][member_id(2)].update(
                         local_collation_log="node.log"
                     ),
-                    lambda r: r["epochs"]["after"]["mc_creators"][member_id(2)][
+                    lambda r: r["first_intent_cut"]["post_restart_vote"][
                         "check"
                     ].update(verified_final_certificates=[]),
                 ]
