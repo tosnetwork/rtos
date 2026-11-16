@@ -159,12 +159,37 @@ impl Subscriber for ResponsePackets {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_rldp2_query_does_not_start_a_late_response() {
+    late_response_case(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_expired_query_does_not_start_a_late_response() {
+    late_response_case(true).await;
+}
+
+async fn late_response_case(native_mode: bool) {
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_late_response_context.tsv").trim(),
         "10 64 1024 1100 500"
     );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_late_response_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_late_response_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_late_response_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_late_response_metadata.json"),
+    );
     let (reply, packets, nodes, rldps, peers) = pair().await;
+    if native_mode {
+        for node in &rldps {
+            node.peers.enable_native_for_tests();
+        }
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
+        let responder = rldps[1].get_peer(peers.other(),peers.local(),true,None).await.unwrap();
+        let requester = rldps[0].get_peer(peers.local(),peers.other(),true,None).await.unwrap();
+        if native_mode {
+            assert!(responder.native.get().is_some() && requester.native.get().is_some());
+        }
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         let query = TaggedByteSlice {
             object: &bytes,
@@ -184,6 +209,13 @@ async fn expired_rldp2_query_does_not_start_a_late_response() {
         })
         .await
         .unwrap();
+        if native_mode {
+            let native=responder.native.get().unwrap();
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while native.completed_sends.load(Ordering::Acquire)!=1 {tokio::task::yield_now().await;}
+            }).await.expect("positive native control must settle before holding the next response");
+            assert_eq!(native_identity_tests::inspect(native).await.1,0);
+        }
         reply.hold.store(true, Ordering::Release);
         let request = rldps[0].query(&query, Some(1024), &peers, true, None);
         let observe = async {
@@ -219,8 +251,21 @@ async fn expired_rldp2_query_does_not_start_a_late_response() {
             0,
             "expired response retained a live sender despite no received packets"
         );
+        let live = if native_mode {
+            native_identity_tests::inspect(responder.native.get().unwrap()).await.1
+        } else {rldps[1].allocated.send_transfers.load(Ordering::Acquire) as usize};
+        let actual=serde_json::json!({"query_timeout_seconds":10,"late_response_started":rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire)-started_before,"live":live});
+        assert_eq!(vec![actual.clone()],expected);
+        eprintln!("LATE_RESPONSE native={native_mode}: {actual}");
         let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42; 64], "same peer must recover");
+        if native_mode {
+            let native=responder.native.get().unwrap();
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while native.completed_sends.load(Ordering::Acquire)!=2 {tokio::task::yield_now().await;}
+            }).await.expect("recovery native control must actually finish sending");
+            assert_eq!(native_identity_tests::inspect(native).await.1,0);
+        }
     })
     .catch_unwind()
     .await;
