@@ -357,6 +357,12 @@ impl QueryResponseLimits {
         Ok(())
     }
 }
+enum InboundRegistration {
+    Created(tokio::sync::mpsc::UnboundedSender<Chunk>),
+    Existing,
+    Refused,
+}
+
 struct BoundedReceive {
     limits: QueryResponseLimits,
     token: tokio_util::task::task_tracker::TaskTrackerToken,
@@ -713,12 +719,12 @@ impl RldpNode {
                     );
                     break;
                 }
-            } else if let Some(queue_sender) =
-                self.inbound(transfer_id, peers, v2, peer.clone()).await?
-            {
-                queue_sender.send(chunk)
             } else {
-                continue;
+                match self.inbound(transfer_id, peers, v2, peer.clone()).await? {
+                    InboundRegistration::Created(queue_sender) => queue_sender.send(chunk),
+                    InboundRegistration::Existing => continue,
+                    InboundRegistration::Refused => break,
+                }
             };
             match result {
                 Ok(()) => (),
@@ -898,7 +904,7 @@ impl RldpNode {
         peers: &AdnlPeers,
         v2: bool,
         peer: Arc<RldpPeer>,
-    ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Chunk>>> {
+    ) -> Result<InboundRegistration> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
         let transfer_map = peer.inbound_transfers.clone();
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
@@ -906,6 +912,18 @@ impl RldpNode {
             let mut ids = peer.registrations.lock().unwrap();
             if peer.closed.is_cancelled() {
                 return Err(SendCancelled::PeerEvicted.into());
+            }
+            // The initial completed-ID check may race cache pruning. Recheck
+            // missing receiver creation while completion/retirement is excluded.
+            if transfer_map.get(transfer_id).is_some() {
+                return Ok(InboundRegistration::Existing);
+            }
+            if v2 {
+                let mut active = peer.inbound_active.lock().unwrap();
+                if !active.contains(transfer_id) && active.len() >= 256 {
+                    return Ok(InboundRegistration::Refused);
+                }
+                active.insert(*transfer_id);
             }
             let inserted = add_unbound_object_to_map(&transfer_map, *transfer_id, || {
                 Ok(RldpTransfer::Recv(queue_sender.clone()))
@@ -916,7 +934,7 @@ impl RldpNode {
             inserted
         };
         if !inserted {
-            return Ok(None);
+            return Ok(InboundRegistration::Existing);
         }
         let registration = Arc::new(owned_send::SendRegistration {
             _query_admission: None,
@@ -1050,7 +1068,7 @@ impl RldpNode {
                     tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)), Some(expiry_peer), inbound_finished.clone()) => {},
             }
         });
-        Ok(Some(queue_sender))
+        Ok(InboundRegistration::Created(queue_sender))
     }
 
     async fn inbound_loop(

@@ -2106,3 +2106,52 @@ fn inbound_admission_native_effects() -> serde_json::Value {
     }
     serde_json::from_slice(effects).unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
+    let (_reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        // Exercise the production admission/creation split at an exact interleaving.
+        // UDP saturation and recovery are tested separately above.
+        for n in 0..256u32 {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            assert!(peer.admit_inbound(id).unwrap());
+        }
+        let stale = [77; 32];
+        peer.finish_inbound(
+            &peer.inbound_transfers,
+            stale,
+            &tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now(),
+        );
+        assert!(peer.admit_inbound(stale).unwrap(), "completed duplicates bypass active capacity");
+        for n in 0..2048u32 {
+            let mut id = [88; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            peer.finish_inbound(
+                &peer.inbound_transfers,
+                id,
+                &tokio_util::sync::CancellationToken::new(),
+                tokio::time::Instant::now(),
+            );
+        }
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+        assert_eq!(peer.inbound_active.lock().unwrap().len(), 256);
+        let created = rldps[0].inbound(&stale, &peers, true, peer.clone()).await.unwrap();
+        assert!(
+            matches!(created, super::InboundRegistration::Refused),
+            "pruned completed ID must not bypass full inbound admission at creation"
+        );
+        assert!(peer.inbound_transfers.get(&stale).is_none());
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
