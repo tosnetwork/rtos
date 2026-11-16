@@ -71,7 +71,7 @@ pub async fn download_pss_part<T: Write + Seek>(
                     max_size,
                     &peer,
                     attempt,
-                    adnl::QueryResponseLimits { wire_bytes: max_size, decoded_bytes: max_size },
+                    adnl::QueryResponseLimits::from_payload_limit(max_size),
                 )
                 .await
         }

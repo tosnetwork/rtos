@@ -167,6 +167,10 @@ impl EngineOperations for Engine {
                     crate::history_read_budget::ReadKind::Proof,
                     budget.limits().single_proof_bytes,
                 )?;
+                rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
+                    budget.as_ref(),
+                    adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE,
+                )?;
                 let graph = budget.reserve_network_graph()?;
                 let limits = crate::network::full_node_overlay_client::NetworkDownloadLimits::proof(
                     reservation.allowance().min(graph.bytes),

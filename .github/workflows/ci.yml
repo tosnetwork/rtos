@@ -160,6 +160,9 @@ jobs:
           free -m
           df -h /
 
+      - name: Check resource observer
+        run: python3 ci/test_resource_sampling.py
+
       - name: Build workspace binary tests
         run: bash ci/run_with_resources.sh build-bins cargo test --release --bins --features ci_run --no-run
 

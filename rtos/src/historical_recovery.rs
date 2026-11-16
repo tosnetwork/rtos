@@ -232,6 +232,9 @@ impl Request {
                 self.budget.as_ref(),
                 maximum
                     .checked_mul(2)
+                    .and_then(|bytes| {
+                        bytes.checked_add(adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE)
+                    })
                     .ok_or_else(|| error!("Historical transport workspace overflow"))?,
             )?;
             let chunk = client
@@ -242,7 +245,7 @@ impl Request {
                     maximum,
                     &peer,
                     0,
-                    adnl::QueryResponseLimits { wire_bytes: maximum, decoded_bytes: maximum },
+                    adnl::QueryResponseLimits::from_payload_limit(maximum),
                 )
                 .await?;
             if chunk.len() != maximum {
@@ -281,7 +284,10 @@ impl Request {
         // workspace separately before reserving the remaining graph capacity.
         rtos_block::merkle_apply_budget::MerkleApplyBudget::workspace(
             self.budget.as_ref(),
-            maximum.checked_mul(6).ok_or_else(|| error!("Historical pair workspace overflow"))?,
+            maximum
+                .checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE))
+                .ok_or_else(|| error!("Historical pair workspace overflow"))?,
         )?;
         let graph = self.budget.reserve_network_graph()?;
         let maximum = maximum.min(graph.bytes / 2);

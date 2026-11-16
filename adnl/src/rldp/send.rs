@@ -127,6 +127,7 @@ impl RaptorqEncoder {
 }
 
 pub(crate) struct SendContext {
+    pub(super) admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(super) control: Arc<super::SendControl>,
     pub(super) permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(super) registration: Arc<super::owned_send::SendRegistration>,
@@ -681,6 +682,7 @@ impl SendPartV2 {
 }
 
 pub(crate) struct SendPartContextV2 {
+    pub(crate) fec_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) adnl: Arc<AdnlNode>,
     pub(crate) part_states: Arc<Vec<Arc<SendPartStateV2>>>,
     pub(crate) peer: Arc<RldpPeer>,
@@ -833,6 +835,7 @@ impl SendPartStateV2 {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum SendTransferState {
     V1(Arc<SendPartStateV1>),
     V2(Arc<Vec<Arc<SendPartStateV2>>>),
@@ -921,7 +924,15 @@ mod sibling_wake_tests {
     fn rldp_sibling_wake_real_ack_releases_shared_window() {
         let (tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
         let peer = Arc::new(RldpPeer {
+            inbound_active: Default::default(),
+            inbound_transfers: Arc::new(lockfree::map::Map::new()),
+            transfers: Arc::new(lockfree::map::Map::new()),
             outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            transfer_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+            closed: tokio_util::sync::CancellationToken::new(),
+            drained: tokio_util::sync::CancellationToken::new(),
+            registrations: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            completed: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tx,
             stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
             idle: Arc::new(tokio::sync::Notify::new()),
@@ -1064,8 +1075,16 @@ mod owned_ack_tests {
         for panic in [false, true] {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let peer = Arc::new(RldpPeer {
+                inbound_active: Default::default(),
+                inbound_transfers: Arc::new(lockfree::map::Map::new()),
+                transfers: Arc::new(lockfree::map::Map::new()),
                 tx,
                 outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                transfer_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+                closed: tokio_util::sync::CancellationToken::new(),
+                drained: tokio_util::sync::CancellationToken::new(),
+                registrations: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                completed: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 stats: StatsV2::new(StatsConfigV2::default(), 1000).unwrap(),
                 idle: Arc::new(tokio::sync::Notify::new()),
                 counter: Arc::new(AtomicU64::new(0)).into(),

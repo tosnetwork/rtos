@@ -6,7 +6,7 @@
  * This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND.
  */
 //! RLDP sender owners. Cancellation requests drain; they never detach active work.
-use super::TARGET;
+use super::{query_admission::QueryAdmission, TARGET};
 use crate::adnl::tasks::AdnlTasks;
 use futures::FutureExt;
 use rtos_block::{error, Result};
@@ -23,6 +23,7 @@ pub(super) enum SendCancelled {
     CallerDropped,
     Deadline,
     OwnerClosed,
+    PeerEvicted,
     SiblingFailed,
 }
 impl std::fmt::Display for SendCancelled {
@@ -33,6 +34,7 @@ impl std::fmt::Display for SendCancelled {
 impl std::error::Error for SendCancelled {}
 
 pub(super) struct SendControl {
+    pub(super) protocol_deadline: Option<std::time::Instant>,
     token: CancellationToken,
     reason: Mutex<Option<SendCancelled>>,
     parts: tokio_util::task::TaskTracker,
@@ -48,7 +50,11 @@ pub(super) struct SendControl {
 }
 impl SendControl {
     pub fn new() -> Arc<Self> {
+        Self::with_protocol_deadline(None)
+    }
+    pub fn with_protocol_deadline(protocol_deadline: Option<std::time::Instant>) -> Arc<Self> {
         Arc::new(Self {
+            protocol_deadline,
             token: CancellationToken::new(),
             reason: Mutex::new(None),
             parts: tokio_util::task::TaskTracker::new(),
@@ -64,11 +70,16 @@ impl SendControl {
         })
     }
     pub fn deadline(&self) -> std::time::Duration {
+        let remaining = self
+            .protocol_deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
         #[cfg(test)]
         if let Some(deadline) = *self.test_deadline.lock().unwrap() {
-            return deadline;
+            return remaining.map_or(deadline, |remaining| remaining.min(deadline));
         }
-        std::time::Duration::from_millis(super::RldpNode::TIMEOUT_OUTBOUND_HARD_MS)
+        remaining.unwrap_or_else(|| {
+            std::time::Duration::from_millis(super::RldpNode::TIMEOUT_OUTBOUND_HARD_MS)
+        })
     }
     pub fn cancel(&self, reason: SendCancelled) {
         let mut previous = self.reason.lock().unwrap();
@@ -81,6 +92,9 @@ impl SendControl {
         self.token.cancelled().await;
     }
     pub fn check(&self) -> Result<()> {
+        if self.protocol_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.cancel(SendCancelled::Deadline);
+        }
         if let Some(reason) = *self.reason.lock().unwrap() {
             return Err(reason.into());
         }
@@ -135,6 +149,7 @@ pub(super) struct SendWorkerPool {
     admission: Arc<Mutex<bool>>,
     started: std::sync::OnceLock<()>,
     pub(super) workers: usize,
+    fec_slots: std::sync::OnceLock<Arc<Semaphore>>,
 }
 impl SendWorkerPool {
     pub fn new(owner: Arc<AdnlTasks>) -> Self {
@@ -144,8 +159,68 @@ impl SendWorkerPool {
             admission: Arc::new(Mutex::new(true)),
             started: std::sync::OnceLock::new(),
             workers: num_cpus::get().clamp(1, 8),
+            fec_slots: std::sync::OnceLock::new(),
         }
     }
+    pub(super) fn fec_slots(&self) -> Arc<Semaphore> {
+        self.fec_slots.get_or_init(|| Arc::new(Semaphore::new(self.workers))).clone()
+    }
+
+    // Like native connection actors, an ACK wait yields without occupying a
+    // scarce compute worker. The real blocking FEC work has a separate limit.
+    pub(super) fn submit_v2(
+        &self,
+        control: Arc<SendControl>,
+        work: impl Future<Output = Result<bool>> + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<bool>>> {
+        let open = self.admission.lock().unwrap();
+        if !*open || self.owner.is_closed() {
+            return Err(SendCancelled::OwnerClosed.into());
+        }
+        let owner_token = self.owner.enter()?;
+        let token = control.parts.token();
+        let (done, result) = oneshot::channel();
+        let job = Job {
+            control,
+            done,
+            work: Box::pin(async move {
+                let _token = token;
+                work.await
+            }),
+        };
+        self.owner.spawn_admitted(
+            "RLDP V2 part",
+            owner_token,
+            Self::run_job(job, self.owner.clone()),
+        );
+        Ok(result)
+    }
+
+    async fn run_job(job: Job, owner: Arc<AdnlTasks>) {
+        if owner.is_closed() {
+            job.control.cancel(SendCancelled::OwnerClosed);
+        }
+        let mut panicked = false;
+        let mut result = match job.control.check() {
+            Err(error) => Err(error),
+            Ok(()) => match std::panic::AssertUnwindSafe(job.work).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => {
+                    panicked = true;
+                    Err(error!("RLDP part panicked"))
+                }
+            },
+        };
+        if result.as_ref().err().is_some_and(|e| e.downcast_ref::<FecTaskFailed>().is_some()) {
+            panicked = true;
+        }
+        job.control.record_failure(&mut result);
+        if panicked {
+            owner.failed("RLDP sender worker panicked".into());
+        }
+        let _ = job.done.send(result);
+    }
+
     pub fn submit(
         &self,
         control: Arc<SendControl>,
@@ -182,24 +257,7 @@ impl SendWorkerPool {
                             break;
                         }
                         if let Some(job) = core.queue.pop() {
-                            if owner.is_closed() { job.control.cancel(SendCancelled::OwnerClosed); }
-                            let mut panicked = false;
-                            let mut result = match job.control.check() {
-                                Err(error) => Err(error),
-                                Ok(()) => match std::panic::AssertUnwindSafe(job.work).catch_unwind().await {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        panicked = true;
-                                        Err(error!("RLDP part panicked"))
-                                    }
-                                },
-                            };
-                            if result.as_ref().err().is_some_and(|e| e.downcast_ref::<FecTaskFailed>().is_some()) {
-                                panicked = true;
-                            }
-                            job.control.record_failure(&mut result);
-                            if panicked { owner.failed("RLDP sender worker panicked".into()); }
-                            let _ = job.done.send(result);
+                            Self::run_job(job, owner.clone()).await;
                         }
                     }
                 });
@@ -256,6 +314,31 @@ pub(super) async fn supervise(
     }
 }
 
+// A permit remains with the actual blocking owner until its JoinHandle ends.
+// Cancellation can reject queued work, but never releases a running FEC slot.
+pub(super) async fn fec_limited<T, R, F>(
+    state: T,
+    control: Arc<SendControl>,
+    owner: Arc<AdnlTasks>,
+    capacity: Arc<Semaphore>,
+    work: F,
+) -> Result<(T, R)>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: FnOnce(&mut T) -> Result<R> + Send + 'static,
+{
+    let permit = tokio::select! {
+        biased;
+        _ = control.cancelled() => { control.check()?; unreachable!() },
+        _ = owner.cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+        permit = capacity.acquire_owned() => permit?,
+    };
+    let ((state, _permit), result) =
+        fec((state, permit), control, owner, move |(state, _)| work(state)).await?;
+    Ok((state, result))
+}
+
 // Called only by retained send owners. There is intentionally no timeout/select
 // around the real handle: running encoder work cannot be forcibly cancelled.
 pub(super) async fn fec<T, R, F>(
@@ -294,39 +377,125 @@ where
 }
 
 pub(super) struct SendRegistration {
+    // Retain cancellation fallback; completed queries release logical admission
+    // before returning, independently of these transport resource owners.
+    pub _query_admission: Option<Arc<QueryAdmission>>,
+    pub v2: bool,
+    pub inbound: Option<(super::TransferId, CancellationToken)>,
+    pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
     pub transfers: Arc<lockfree::map::Map<super::TransferId, super::RldpTransfer>>,
     pub send: super::TransferId,
     pub receive: Option<super::TransferId>,
     pub owner: Arc<AdnlTasks>,
     pub bounded_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
+fn with_live_peer(
+    peer: &Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
+    action: impl FnOnce(Option<&mut std::collections::HashSet<super::TransferId>>),
+) {
+    if let Some((weak, closed)) = peer {
+        if let Some(peer) = weak.upgrade() {
+            let mut ids = peer.registrations.lock().unwrap();
+            if !closed.is_cancelled() {
+                action(Some(&mut ids));
+            }
+        }
+    } else {
+        action(None);
+    }
+}
+impl SendRegistration {
+    pub(super) fn finish_inbound(&self) {
+        if let (Some((id, finished)), Some((peer, _))) = (&self.inbound, &self.peer) {
+            if let Some(peer) = peer.upgrade() {
+                peer.finish_inbound(
+                    &peer.inbound_transfers,
+                    *id,
+                    finished,
+                    tokio::time::Instant::now(),
+                );
+            }
+        }
+    }
+}
 impl Drop for SendRegistration {
     fn drop(&mut self) {
-        self.transfers.insert(self.send, super::RldpTransfer::Done);
-        if let Some(id) = self.receive {
-            self.transfers.insert(id, super::RldpTransfer::Done);
+        if let Some((id, _)) = &self.inbound {
+            self.finish_inbound();
+            if *id == self.send {
+                return;
+            }
+            if self.receive == Some(*id) {
+                self.receive = None;
+            }
         }
+        // Native RLDP2 retires outbound IDs at completion. Only inbound IDs
+        // participate in replay suppression; no sender tombstone or timer is needed.
+        if self.v2 {
+            with_live_peer(&self.peer, |ids| {
+                if let Some(entry) = self.transfers.get(&self.send) {
+                    entry.val().release_v2_sender();
+                }
+                self.transfers.remove(&self.send);
+                if let Some(ids) = ids {
+                    let inbound_exists = self
+                        .peer
+                        .as_ref()
+                        .and_then(|(weak, _)| weak.upgrade())
+                        .is_some_and(|peer| peer.inbound_transfers.get(&self.send).is_some());
+                    if !inbound_exists {
+                        ids.remove(&self.send);
+                    }
+                }
+            });
+            return;
+        }
+        with_live_peer(&self.peer, |_| {
+            self.transfers.insert(self.send, super::RldpTransfer::Done);
+            if let Some(id) = self.receive {
+                self.transfers.insert(id, super::RldpTransfer::Done);
+            }
+        });
         let transfers = self.transfers.clone();
         let send = self.send;
         let receive = self.receive;
         let owner = self.owner.clone();
-        // The query capacity lease ends with the real transfer, not with its
-        // small tombstone's expiry timer.
+        let peer = self.peer.clone();
         let expiry = async move {
             tokio::select! {
                 _ = owner.cancelled() => {},
+                _ = async {
+                    if let Some((_, closed)) = &peer { closed.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
                 _ = tokio::time::sleep(std::time::Duration::from_millis(super::RldpNode::TIMEOUT_MAX_MS * 2)) => {},
             }
-            transfers.remove(&send);
-            if let Some(id) = receive {
-                transfers.remove(&id);
-            }
+            with_live_peer(&peer, |ids| {
+                transfers.remove(&send);
+                if let Some(id) = receive {
+                    transfers.remove(&id);
+                }
+                if let Some(ids) = ids {
+                    ids.remove(&send);
+                    if let Some(id) = receive {
+                        ids.remove(&id);
+                    }
+                }
+            });
         };
         if self.owner.spawn_or_return("RLDP transfer expiry", expiry).is_err() {
-            self.transfers.remove(&self.send);
-            if let Some(id) = self.receive {
-                self.transfers.remove(&id);
-            }
+            with_live_peer(&self.peer, |ids| {
+                self.transfers.remove(&send);
+                if let Some(id) = receive {
+                    self.transfers.remove(&id);
+                }
+                if let Some(ids) = ids {
+                    ids.remove(&send);
+                    if let Some(id) = receive {
+                        ids.remove(&id);
+                    }
+                }
+            });
         }
     }
 }

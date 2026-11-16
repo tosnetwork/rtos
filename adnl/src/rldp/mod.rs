@@ -70,6 +70,8 @@ use send::{
 };
 
 mod owned_send;
+mod peers;
+mod query_admission;
 use owned_send::{SendCancelled, SendControl, SendWorkerPool};
 
 pub mod rldp2;
@@ -121,6 +123,13 @@ impl Constraints {
                     fail!("Bad RaptorQ symbol size: {}", fec_type.symbol_size)
                 }
                 self.check_data_size(fec_type.data_size)?;
+                let expected = (fec_type.data_size as usize).div_ceil(Self::SYMBOL);
+                if usize::try_from(fec_type.symbols_count).ok() != Some(expected) {
+                    fail!(
+                        "Bad RaptorQ symbol count: {}, expected {expected}",
+                        fec_type.symbols_count
+                    )
+                }
             }
             x => fail!("Bad FEC type {:?}", x),
         }
@@ -146,10 +155,43 @@ enum MessagePart {
 
 type TransferId = [u8; 32];
 
+struct ReceiveRegistration {
+    sender: tokio::sync::mpsc::UnboundedSender<Chunk>,
+    bounded_wire_limit: Option<usize>,
+}
+
 enum RldpTransfer {
-    Recv(tokio::sync::mpsc::UnboundedSender<Chunk>),
-    Send(SendTransferState),
+    Recv(ReceiveRegistration),
+    Send(std::sync::Mutex<Option<SendTransferState>>),
     Done,
+}
+
+impl RldpTransfer {
+    fn receiver(
+        sender: tokio::sync::mpsc::UnboundedSender<Chunk>,
+        bounded_wire_limit: Option<usize>,
+    ) -> Self {
+        Self::Recv(ReceiveRegistration { sender, bounded_wire_limit })
+    }
+    fn sender(state: SendTransferState) -> Self {
+        Self::Send(std::sync::Mutex::new(Some(state)))
+    }
+    fn sender_state(&self) -> Option<SendTransferState> {
+        match self {
+            Self::Send(state) => state.lock().unwrap().clone(),
+            _ => None,
+        }
+    }
+    fn release_v2_sender(&self) {
+        if let Self::Send(state) = self {
+            let mut state = state.lock().unwrap();
+            if matches!(*state, Some(SendTransferState::V2(_))) {
+                // A lock-free map reader may defer entry reclamation. Release
+                // payload ownership at actual sender drain, independently of that entry.
+                state.take();
+            }
+        }
+    }
 }
 
 // The expiry is an update, never a new registration. A delayed timer must not
@@ -159,11 +201,22 @@ async fn expire_inbound_transfer(
     transfer_id: TransferId,
     owner: Arc<crate::adnl::tasks::AdnlTasks>,
     timer: impl std::future::Future<Output = ()>,
+    peer: Option<Arc<RldpPeer>>,
+    finished: Option<tokio_util::sync::CancellationToken>,
 ) {
     tokio::select! {
         biased;
         _ = owner.cancelled() => return,
         _ = timer => {},
+    }
+    // Cancellation in the caller's select cannot stop a mutation already
+    // polling on another worker. Serialize the final write with old-generation
+    // close/cleanup, so an expired timer cannot overwrite a reopened ID.
+    let _ids = peer.as_ref().map(|peer| peer.registrations.lock().unwrap());
+    if peer.as_ref().is_some_and(|peer| peer.closed.is_cancelled())
+        || finished.as_ref().is_some_and(|finished| finished.is_cancelled())
+    {
+        return;
     }
     transfers.insert_with(transfer_id, |_, _, found| {
         if found.is_some() {
@@ -213,8 +266,10 @@ impl SendJob {
         let owner = self.ctx.adnl.tasks().clone();
         let control = self.ctx.control.clone();
         let permit = self.ctx.permit.clone();
+        let admission = self.ctx.admission.clone();
         let registration = self.ctx.registration.clone();
-        let result =
+        let closed = peer.closed.clone();
+        let work =
             owned_send::supervise(control.clone(), owner.clone(), control.deadline(), async {
                 control.check()?;
                 if self.v2 {
@@ -227,19 +282,29 @@ impl SendJob {
                     }
                 } else {
                     let work_control = control.clone();
+                    let fec_slots = pool.fec_slots();
                     let receipt = pool.submit(work_control, async move {
-                        RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms).await
+                        RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms, fec_slots).await
                     })?;
                     receipt.await.map_err(|_| error!("RLDP v1 owner lost its receipt"))?
                 }
-            })
-            .await;
+            });
+        tokio::pin!(work);
+        let result = tokio::select! {
+            biased;
+            _ = closed.cancelled() => {
+                control.cancel(if owner.is_closed() { SendCancelled::OwnerClosed } else { SendCancelled::PeerEvicted });
+                work.await
+            },
+            result = &mut work => result,
+        };
         if !matches!(result, Ok(true)) {
             control.cancel(SendCancelled::SiblingFailed);
         }
         control.drain().await;
         let result = control.take_failure().unwrap_or(result);
         drop(permit);
+        drop(admission);
         drop(registration);
         self.done.send(result).ok();
     }
@@ -247,7 +312,15 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        inbound_active: std::sync::Mutex<HashSet<TransferId>>,
+        inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
+        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
+        transfer_slots: Arc<tokio::sync::Semaphore>,
+        closed: tokio_util::sync::CancellationToken,
+        drained: tokio_util::sync::CancellationToken,
+        registrations: Arc<std::sync::Mutex<HashSet<TransferId>>>,
+        completed: std::sync::Mutex<std::collections::VecDeque<(TransferId, tokio::time::Instant)>>,
         tx: tokio::sync::mpsc::UnboundedSender<SendJob>,
         stats: StatsV2,
         #[cfg(test)]
@@ -256,6 +329,8 @@ declare_counted!(
 );
 
 struct RldpAlloc {
+    #[cfg(test)]
+    response_lifecycle: Arc<(AtomicU64, AtomicU64)>, // (senders started, inbound handlers finished)
     peers: Arc<AtomicU64>,
     send_transfers: Arc<AtomicU64>,
     recv_transfers: Arc<AtomicU64>,
@@ -270,12 +345,34 @@ struct RldpTelemetry {
 
 pub use rtos_api::DecodeLimitExceeded as ResponseLimitExceeded;
 
+#[derive(Debug)]
+pub struct RldpQueryTimeout;
+
+impl std::fmt::Display for RldpQueryTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RLDP2 query deadline expired")
+    }
+}
+
+impl std::error::Error for RldpQueryTimeout {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct QueryResponseLimits {
+    /// Entire serialized RLDP answer, including its TL envelope.
     pub wire_bytes: usize,
     pub decoded_bytes: usize,
 }
 impl QueryResponseLimits {
+    /// Native state-download callers reserve this allowance above payload size.
+    pub const ENVELOPE_ALLOWANCE: usize = 1024;
+
+    /// Bound decoded payload while allowing native-compatible wire framing.
+    /// Entry points still validate both limits against the transport maximum;
+    /// saturation makes an overflowing request fail that validation.
+    pub fn from_payload_limit(bytes: usize) -> Self {
+        Self { wire_bytes: bytes.saturating_add(Self::ENVELOPE_ALLOWANCE), decoded_bytes: bytes }
+    }
+
     pub fn validate(self) -> Result<()> {
         for value in [self.wire_bytes, self.decoded_bytes] {
             if value == 0 || value > Constraints::MAX_TOTAL_TRANSFER_SIZE {
@@ -289,6 +386,12 @@ impl QueryResponseLimits {
         Ok(())
     }
 }
+enum InboundRegistration {
+    Created(tokio::sync::mpsc::UnboundedSender<Chunk>),
+    Existing,
+    Refused,
+}
+
 struct BoundedReceive {
     limits: QueryResponseLimits,
     token: tokio_util::task::task_tracker::TaskTrackerToken,
@@ -298,10 +401,11 @@ struct BoundedReceive {
 
 /// Rldp Node
 pub struct RldpNode {
+    query_budget: Arc<query_admission::QueryBudget>,
     adnl: Arc<AdnlNode>,
     local_id: Option<Arc<KeyId>>,
     min_timeout_ms: u64,
-    peers: lockfree::map::Map<Arc<KeyId>, Arc<RldpPeer>>,
+    peers: Arc<peers::PeerTable>,
     extended_caps: lockfree::map::Map<Arc<KeyId>, Arc<AtomicI32>>,
     send_pool: Arc<SendWorkerPool>,
     #[cfg(feature = "telemetry")]
@@ -320,6 +424,8 @@ pub struct RldpNode {
 }
 
 impl RldpNode {
+    const MAX_PENDING_QUERIES: usize = 8192;
+    const MAX_PENDING_QUERIES_PER_CONNECTION: usize = 256;
     const ACK_DELAY_MS: u64 = 1; // RLDPv2 confirmation delay
     const MAX_OUTBOUNDS_PER_PEER: u32 = 3;
     const SIZE_TRANSFER_WAVE: u32 = 10;
@@ -347,6 +453,8 @@ impl RldpNode {
             send_transfers: adnl.add_metric("Alloc RLDP send"),
         };
         let allocated = RldpAlloc {
+            #[cfg(test)]
+            response_lifecycle: Arc::new((AtomicU64::new(0), AtomicU64::new(0))),
             peers: Arc::new(AtomicU64::new(0)),
             recv_transfers: Arc::new(AtomicU64::new(0)),
             send_transfers: Arc::new(AtomicU64::new(0)),
@@ -358,17 +466,29 @@ impl RldpNode {
         #[cfg(feature = "debug")]
         let timestamp = Box::new(Instant::now());
         let send_pool = Arc::new(SendWorkerPool::new(adnl.tasks().clone()));
+        let transfers = Arc::new(lockfree::map::Map::new());
+        let peers = peers::PeerTable::new(
+            adnl.clone(),
+            send_pool.clone(),
+            transfers.clone(),
+            allocated.peers.clone(),
+            min_timeout_ms,
+        )?;
         let ret = Self {
+            query_budget: query_admission::QueryBudget::new(
+                Self::MAX_PENDING_QUERIES,
+                Self::MAX_PENDING_QUERIES_PER_CONNECTION,
+            ),
             adnl,
             local_id,
             min_timeout_ms,
-            peers: lockfree::map::Map::new(),
+            peers,
             extended_caps: lockfree::map::Map::new(),
             send_pool,
             #[cfg(feature = "telemetry")]
             stats: Arc::new(RldpStats::default()),
             subscribers: Arc::new(subscribers),
-            transfers: Arc::new(lockfree::map::Map::new()),
+            transfers,
             #[cfg(feature = "debug")]
             timestamp: Arc::new(AtomicPtr::new(Box::into_raw(timestamp))),
             #[cfg(feature = "telemetry")]
@@ -585,10 +705,58 @@ impl RldpNode {
             Chunk::V1(RldpMessagePart(chunk)) => (false, chunk.part, chunk.seqno),
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
+        let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        let valid_packet = match &chunk {
+            Chunk::V1(_) => true,
+            Chunk::V2(Rldp2MessagePart(part)) => {
+                const CONSTRAINTS: Constraints = Constraints { data_size: Constraints::SLICE };
+                // Native rejects negative wire integers here, but a nonnegative
+                // ID beyond the decoder's 24-bit range terminates the transfer.
+                part.seqno >= 0 && CONSTRAINTS.check_fec_type(&part.fec_type).is_ok()
+            }
+        };
+        // Explicit bounded queries report a declared wire-limit violation
+        // before decoding. This notification must not claim an inbound slot.
+        if let Chunk::V2(Rldp2MessagePart(part)) = &chunk {
+            if let Some(entry) = peer.inbound_transfers.get(transfer_id) {
+                if let RldpTransfer::Recv(registration) = entry.val() {
+                    if valid_packet
+                        && registration.bounded_wire_limit.is_some_and(|limit| {
+                            usize::try_from(part.total_size).is_ok_and(|total| total > limit)
+                        })
+                    {
+                        let _ = registration.sender.send(chunk);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let valid_geometry = match &chunk {
+            Chunk::V1(_) => true,
+            Chunk::V2(Rldp2MessagePart(chunk)) => {
+                let total = chunk.total_size as u64;
+                let part = chunk.part as u64;
+                let width = Constraints::SLICE as u64;
+                valid_packet
+                    && chunk.total_size > 0
+                    && chunk.part >= 0
+                    && part < total.div_ceil(width)
+                    && matches!(&chunk.fec_type, FecType::Fec_RaptorQ(fec)
+                        if fec.data_size as u64 == (total - part * width).min(width))
+            }
+        };
+        // A solicited receive registration is only a promise of future input.
+        // Charge concurrency when the first actual part arrives, in either path.
+        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry, part == 0)? {
+            return Ok(());
+        }
         loop {
-            let result = if let Some(transfer) = self.transfers.get(transfer_id) {
+            let result = if let Some(transfer) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(queue_sender) = transfer.val() {
-                    queue_sender.send(chunk)
+                    if !valid_geometry {
+                        return Ok(());
+                    }
+                    queue_sender.sender.send(chunk)
                 } else {
                     // Chunk for a completed transfer — send Complete only (no Confirm),
                     // matching C++ behavior for both RLDP V1 and V2.
@@ -622,10 +790,17 @@ impl RldpNode {
                     );
                     break;
                 }
-            } else if let Some(queue_sender) = self.inbound(transfer_id, peers, v2)? {
-                queue_sender.send(chunk)
             } else {
-                continue;
+                // A completed ID can be pruned after the initial check. Invalid
+                // geometry must still never create a replacement receiver.
+                if !valid_geometry {
+                    return Ok(());
+                }
+                match self.inbound(transfer_id, peers, v2, peer.clone(), part).await? {
+                    InboundRegistration::Created(queue_sender) => queue_sender.send(chunk),
+                    InboundRegistration::Existing => continue,
+                    InboundRegistration::Refused => break,
+                }
             };
             match result {
                 Ok(()) => (),
@@ -642,10 +817,9 @@ impl RldpNode {
                 let RldpMessagePart(part) = part;
                 (Self::check_message(Some(&part.fec_type), part.seqno), false)
             }
-            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(part)) => {
-                let Rldp2MessagePart(part) = part;
-                (Self::check_message(Some(&part.fec_type), part.seqno), true)
-            }
+            // V2 checks completed IDs before validating packet parameters.
+            // The chunk path validates live/new transfers before admission.
+            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(_)) => (Ok(()), true),
             MessagePart::V1(RldpMessagePartBoxed::Rldp_Confirm(confirm)) => {
                 (Self::check_message(None, confirm.seqno), false)
             }
@@ -668,6 +842,9 @@ impl RldpNode {
             );
             return Ok(true);
         }
+        if v2 {
+            self.peers.get(peers.local(), peers.other(), true, None).await?;
+        }
         match msg {
             MessagePart::V1(RldpMessagePartBoxed::Rldp_Complete(msg)) => {
                 if let Some(state) = self.get_v1_state(msg.transfer_id.as_ref(), msg.part as u32) {
@@ -675,7 +852,9 @@ impl RldpNode {
                 }
             }
             MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_Complete(msg)) => {
-                if let Some(state) = self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32) {
+                if let Some(state) =
+                    self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32, peers)
+                {
                     state.set_finished(true)
                 }
             }
@@ -685,7 +864,9 @@ impl RldpNode {
                 }
             }
             MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_Confirm(msg)) => {
-                if let Some(state) = self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32) {
+                if let Some(state) =
+                    self.get_v2_state(msg.transfer_id.as_ref(), msg.part as u32, peers)
+                {
                     state.set_recv_info(
                         msg.max_seqno as u32,
                         msg.received_count as u32,
@@ -725,90 +906,37 @@ impl RldpNode {
             .get(transfer_id)
             .ok_or_else(|| error!("No state for transfer {}", base64_encode(transfer_id)))?
             .val()
+            .sender_state()
         {
-            RldpTransfer::Send(SendTransferState::V2(state)) => Ok(state.clone()),
+            Some(SendTransferState::V2(state)) => Ok(state.clone()),
             _ => fail!("Wrong state for transfer {}", base64_encode(transfer_id)),
         }
     }
 
-    fn get_peer(&self, id: &Arc<KeyId>) -> Result<Arc<RldpPeer>> {
-        let ret = loop {
-            if let Some(peer) = self.peers.get(id) {
-                break peer.val().clone();
-            }
-            let min_timeout_ms = self.min_timeout_ms;
-            let transfers = self.transfers.clone();
-            let send_pool = self.send_pool.clone();
-            add_counted_object_to_map(&self.peers, id.clone(), || {
-                let permits = Self::MAX_OUTBOUNDS_PER_PEER as usize;
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-                let ret = Arc::new(RldpPeer {
-                    outbound_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
-                    tx,
-                    stats: StatsV2::new(StatsConfigV2::default(), min_timeout_ms)?,
-                    #[cfg(test)]
-                    idle: Arc::new(tokio::sync::Notify::new()),
-                    counter: self.allocated.peers.clone().into(),
-                });
-                // Weak ref so the task does not keep `tx` (owned by RldpPeer) alive
-                let weak_peer = Arc::downgrade(&ret);
-                #[cfg(test)]
-                let idle = ret.idle.clone();
-                let transfers = transfers.clone();
-                let send_pool = send_pool.clone();
-                let owner = self.adnl.tasks().clone();
-                let token = owner.enter()?;
-                let lifetime = owner.clone();
-                owner.spawn_admitted("RLDP peer sender", token, async move {
-                    let mut tasks = futures::stream::FuturesUnordered::new();
-                    loop {
-                        #[cfg(test)] idle.notify_one();
-                        tokio::select! {
-                            biased;
-                            _ = lifetime.cancelled() => {
-                                rx.close();
-                                while let Ok(job) = rx.try_recv() {
-                                    job.ctx.control.cancel(SendCancelled::OwnerClosed);
-                                    let _ = job.done.send(Err(SendCancelled::OwnerClosed.into()));
-                                }
-                                break;
-                            }
-                            job = rx.recv() => match job {
-                                Some(job) => {
-                                    // Do not retain our own sender while waiting on rx.
-                                    if let Some(peer) = weak_peer.upgrade() {
-                                        tasks.push(job.run(peer, &transfers, &send_pool, min_timeout_ms));
-                                    } else {
-                                        job.ctx.control.cancel(SendCancelled::OwnerClosed);
-                                        let _ = job.done.send(Err(SendCancelled::OwnerClosed.into()));
-                                    }
-                                },
-                                None => break,
-                            },
-                            _ = tasks.next(), if !tasks.is_empty() => {}
-                        }
-                    }
-                    while tasks.next().await.is_some() {}
-                });
-                #[cfg(feature = "telemetry")]
-                self.telemetry.peers.update(self.allocated.peers.load(Ordering::Relaxed));
-                Ok(ret)
-            })?;
-        };
-        ret.stats.v1.on_connect();
-        Ok(ret)
+    async fn get_peer(
+        &self,
+        local: &Arc<KeyId>,
+        id: &Arc<KeyId>,
+        v2: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Arc<RldpPeer>> {
+        let peer = self.peers.get(local, id, v2, deadline).await?;
+        peer.stats.v1.on_connect();
+        #[cfg(feature = "telemetry")]
+        self.telemetry.peers.update(self.allocated.peers.load(Ordering::Relaxed));
+        Ok(peer)
     }
 
     fn get_v1_state(&self, transfer_id: &TransferId, part: u32) -> Option<Arc<SendPartStateV1>> {
         let mut ret = None;
         if let Some(transfer) = self.transfers.get(transfer_id) {
-            match transfer.val() {
-                RldpTransfer::Send(SendTransferState::V1(state)) => {
+            match transfer.val().sender_state() {
+                Some(SendTransferState::V1(state)) => {
                     if state.part() == part {
                         ret.replace(state.clone());
                     }
                 }
-                RldpTransfer::Send(SendTransferState::V2(_)) => log::warn!(
+                Some(SendTransferState::V2(_)) => log::warn!(
                     target: TARGET,
                     "Received V1 message in V2 transfer {}",
                     base64_encode(transfer.key())
@@ -819,16 +947,22 @@ impl RldpNode {
         ret
     }
 
-    fn get_v2_state(&self, transfer_id: &TransferId, part: u32) -> Option<Arc<SendPartStateV2>> {
+    fn get_v2_state(
+        &self,
+        transfer_id: &TransferId,
+        part: u32,
+        peers: &AdnlPeers,
+    ) -> Option<Arc<SendPartStateV2>> {
+        let peer = self.peers.find_v2(peers.local(), peers.other())?;
         let mut ret = None;
-        if let Some(transfer) = self.transfers.get(transfer_id) {
-            match transfer.val() {
-                RldpTransfer::Send(SendTransferState::V1(_)) => log::warn!(
+        if let Some(transfer) = peer.transfers.get(transfer_id) {
+            match transfer.val().sender_state() {
+                Some(SendTransferState::V1(_)) => log::warn!(
                     target: TARGET,
                     "Received V2 message in V1 transfer {}",
                     base64_encode(transfer.key())
                 ),
-                RldpTransfer::Send(SendTransferState::V2(states)) => {
+                Some(SendTransferState::V2(states)) => {
                     if (part as usize) < states.len() {
                         ret.replace(states[part as usize].clone());
                     }
@@ -839,22 +973,56 @@ impl RldpNode {
         ret
     }
 
-    fn inbound(
+    async fn inbound(
         &self,
         transfer_id: &TransferId,
         peers: &AdnlPeers,
         v2: bool,
-    ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Chunk>>> {
+        peer: Arc<RldpPeer>,
+        part: i32,
+    ) -> Result<InboundRegistration> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
+        let transfer_map = peer.inbound_transfers.clone();
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-        let inserted = add_unbound_object_to_map(&self.transfers, *transfer_id, || {
-            Ok(RldpTransfer::Recv(queue_sender.clone()))
-        })?;
+        let inserted = {
+            let mut ids = peer.registrations.lock().unwrap();
+            if peer.closed.is_cancelled() {
+                return Err(SendCancelled::PeerEvicted.into());
+            }
+            // The initial completed-ID check may race cache pruning. Recheck
+            // missing receiver creation while completion/retirement is excluded.
+            if transfer_map.get(transfer_id).is_some() {
+                return Ok(InboundRegistration::Existing);
+            }
+            if v2 {
+                // A completed duplicate may have passed initial admission before
+                // its cache entry was pruned. It still cannot reopen with part > 0.
+                if part != 0 {
+                    return Ok(InboundRegistration::Refused);
+                }
+                let mut active = peer.inbound_active.lock().unwrap();
+                if !active.contains(transfer_id) && active.len() >= 256 {
+                    return Ok(InboundRegistration::Refused);
+                }
+                active.insert(*transfer_id);
+            }
+            let inserted = add_unbound_object_to_map(&transfer_map, *transfer_id, || {
+                Ok(RldpTransfer::receiver(queue_sender.clone(), None))
+            })?;
+            if inserted {
+                ids.insert(*transfer_id);
+            }
+            inserted
+        };
         if !inserted {
-            return Ok(None);
+            return Ok(InboundRegistration::Existing);
         }
         let registration = Arc::new(owned_send::SendRegistration {
-            transfers: self.transfers.clone(),
+            _query_admission: None,
+            v2,
+            inbound: v2.then(|| (*transfer_id, tokio_util::sync::CancellationToken::new())),
+            peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
+            transfers: transfer_map.clone(),
             send: *transfer_id,
             receive: None,
             owner: self.adnl.tasks().clone(),
@@ -884,30 +1052,47 @@ impl RldpNode {
         };
         #[cfg(feature = "telemetry")]
         self.telemetry.recv_transfers.update(self.allocated.recv_transfers.load(Ordering::Relaxed));
-        let peer = self.get_peer(peers.other())?;
+        let peer_table = self.peers.clone();
         #[cfg(feature = "telemetry")]
         let stats = self.stats.clone();
         #[cfg(feature = "telemetry")]
         let send_metric = self.telemetry.send_transfers.clone();
         let send_counter = self.allocated.send_transfers.clone();
+        #[cfg(test)]
+        let response_lifecycle = self.allocated.response_lifecycle.clone();
         let subscribers = self.subscribers.clone();
-        let transfers = self.transfers.clone();
+        let transfers = transfer_map.clone();
         let owner = self.adnl.tasks().clone();
         let token = owner.enter()?;
         let lifetime = owner.clone();
+        let inbound_finished = registration.inbound.as_ref().map(|(_, finished)| finished.clone());
+        let connection_closed = peer.closed.clone();
+        let expiry_peer = peer.clone();
         owner.spawn_admitted("RLDP inbound", token, async move {
             let _registration = registration;
-            Self::receive_loop(&mut context, v2).await;
-            transfers.insert(context.transfer_id, RldpTransfer::Done);
+            tokio::select! {
+                biased;
+                _ = peer.closed.cancelled() => return,
+                _ = Self::receive_loop(&mut context, v2) => {},
+            }
+            if v2 {
+                _registration.finish_inbound();
+            } else if peer
+                .insert_transfer(&transfers, context.transfer_id, RldpTransfer::Done)
+                .is_err()
+            {
+                return;
+            }
             let send_transfer_id = Self::inbound_loop(
                 &mut context,
                 subscribers,
-                transfers.clone(),
                 v2,
-                &peer,
+                &peer_table,
                 #[cfg(feature = "telemetry")]
                 send_metric,
                 send_counter,
+                #[cfg(test)]
+                &response_lifecycle,
             )
             .await
             .unwrap_or_else(|e| {
@@ -919,6 +1104,8 @@ impl RldpNode {
                 );
                 None
             });
+            #[cfg(test)]
+            response_lifecycle.1.fetch_add(1, Ordering::Release);
             #[cfg(feature = "telemetry")]
             let all = stats.transfers_recv_all.load(Ordering::Relaxed);
             #[cfg(feature = "telemetry")]
@@ -928,38 +1115,51 @@ impl RldpNode {
                 target: TARGET,
                 "{rldp} STAT recv: transfers total {all}, active {now}"
             );
+            // V2 retains only a bounded completed ID, not the receiver, decoded
+            // payload and two per-transfer expiry tasks for another20seconds.
+            if v2 {
+                return;
+            }
             tokio::select! {
                 _ = lifetime.cancelled() => {},
                 _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)) => {},
             }
-            if let Some(send_transfer_id) = send_transfer_id {
-                transfers.remove(&send_transfer_id);
+            let mut ids = peer.registrations.lock().unwrap();
+            if !peer.closed.is_cancelled() {
+                if let Some(send_transfer_id) = send_transfer_id {
+                    transfers.remove(&send_transfer_id);
+                    ids.remove(&send_transfer_id);
+                }
+                transfers.remove(&context.transfer_id);
+                ids.remove(&context.transfer_id);
             }
-            transfers.remove(&context.transfer_id);
         });
-        let transfers = self.transfers.clone();
+        let transfers = transfer_map.clone();
         let transfer_id = *transfer_id;
         let lifetime = owner.clone();
         owner.spawn("RLDP inbound expiry", async move {
-            expire_inbound_transfer(
-                transfers,
-                transfer_id,
-                lifetime,
-                tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)),
-            )
-            .await;
+            tokio::select! {
+                biased;
+                _ = connection_closed.cancelled() => {},
+                _ = async {
+                    if let Some(finished) = &inbound_finished { finished.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
+                _ = expire_inbound_transfer(transfers, transfer_id, lifetime,
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)), Some(expiry_peer), inbound_finished.clone()) => {},
+            }
         });
-        Ok(Some(queue_sender))
+        Ok(InboundRegistration::Created(queue_sender))
     }
 
     async fn inbound_loop(
         context: &mut RecvContext,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
-        transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         v2: bool,
-        peer: &Arc<RldpPeer>,
+        peer_table: &Arc<peers::PeerTable>,
         #[cfg(feature = "telemetry")] send_metric: Arc<Metric>,
         send_counter: Arc<AtomicU64>,
+        #[cfg(test)] response_lifecycle: &(AtomicU64, AtomicU64),
     ) -> Result<Option<TransferId>> {
         fn try_decompress(context: &mut RecvContext, data: &mut Vec<u8>) -> bool {
             if let Some(decompressed) = DataCompression::decompress_raw(data) {
@@ -1020,6 +1220,47 @@ impl RldpNode {
             },
         };
         let Some(mut answer) = answer.answer else { return Ok(None) };
+        // Match the native response path: a subscriber may finish after the
+        // wire query deadline, in which case no new transfer may be opened.
+        let response_deadline = if v2 {
+            let monotonic_now = std::time::Instant::now();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+            let Some(remaining) = u64::try_from(query.timeout)
+                .ok()
+                .and_then(|seconds| Duration::from_secs(seconds).checked_sub(now))
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Ok(None);
+            };
+            // Native limits a response to the wire deadline or 60 seconds,
+            // whichever is sooner. Keep one monotonic deadline across queues.
+            Some(monotonic_now + remaining.min(Duration::from_secs(60)))
+        } else {
+            None
+        };
+        let peer = peer_table
+            .get(
+                context.peers.local(),
+                context.peers.other(),
+                v2,
+                response_deadline.map(tokio::time::Instant::from_std),
+            )
+            .await?;
+        let transfers = peer.transfers.clone();
+        if response_deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return Ok(None);
+        }
+
+        // Native RldpConnection::send refuses before retaining outbound state.
+        // This is shared by requests and responses on the same peer.
+        let admission = if v2 {
+            match peer.transfer_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            None
+        };
         if compression {
             answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
         }
@@ -1042,14 +1283,33 @@ impl RldpNode {
             context.peers.other()
         );
         let (ping, pong) = tokio::sync::mpsc::unbounded_channel();
-        let (send_transfer, send_transfer_state) =
-            SendTransfer::new(data, send_transfer_id.clone(), send_counter.clone(), ping, v2)?;
+        if response_deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return Ok(None);
+        }
+        let create = || {
+            let (transfer, state) =
+                SendTransfer::new(data, send_transfer_id, send_counter.clone(), ping, v2)?;
+            Ok((RldpTransfer::sender(state), transfer))
+        };
+        let send_transfer = if v2 {
+            let Some(transfer) = peer.try_insert_outbound_with(send_transfer_id, create)? else {
+                return Ok(None);
+            };
+            transfer
+        } else {
+            peer.insert_transfer_with(&transfers, send_transfer_id, create)?
+        };
         #[cfg(feature = "telemetry")]
         send_metric.update(send_counter.load(Ordering::Relaxed));
-        transfers.insert(send_transfer_id, RldpTransfer::Send(send_transfer_state));
-        let control = SendControl::new();
+        #[cfg(test)]
+        response_lifecycle.0.fetch_add(1, Ordering::Release);
+        let control = SendControl::with_protocol_deadline(response_deadline);
         let _cancel = control.guard();
         let registration = Arc::new(owned_send::SendRegistration {
+            _query_admission: None,
+            v2,
+            inbound: None,
+            peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: transfers.clone(),
             send: send_transfer_id,
             receive: None,
@@ -1057,6 +1317,7 @@ impl RldpNode {
             bounded_permit: None,
         });
         let context_send = SendContext {
+            admission,
             registration,
             control,
             permit: None,
@@ -1121,6 +1382,11 @@ impl RldpNode {
         bounded: Option<BoundedReceive>,
         control: Option<Arc<SendControl>>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
+        // Native gives both send_message and send_query a transfer deadline;
+        // the same deadline includes peer admission and queued sender work.
+        let transfer_deadline =
+            v2.then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
+        let query_deadline = transfer_deadline.filter(|_| max_answer_size.is_some());
         let response_limits = bounded.as_ref().map(|scope| scope.limits);
         let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
         #[cfg(feature = "telemetry")]
@@ -1145,7 +1411,26 @@ impl RldpNode {
             (None::<QueryId>, message)
         };
         let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
-        let peer = self.get_peer(peers.other())?;
+        // This counts queries waiting for answers, including those queued for
+        // a sender. Native RldpIn refuses these independently of transfer capacity.
+        let query_admission =
+            if v2 && query_id.is_some() { Some(self.query_budget.acquire(peers)?) } else { None };
+        // Native send_message also supplies a ten-second transfer deadline;
+        // connection retention is that deadline plus the 120-second idle span.
+        let connection_deadline = transfer_deadline;
+        let get_peer = self.get_peer(peers.local(), peers.other(), v2, connection_deadline);
+        let peer = match tokio::time::timeout_at(
+            transfer_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS)
+            }),
+            get_peer,
+        )
+        .await
+        {
+            Ok(peer) => peer?,
+            Err(_) if query_deadline.is_some() => return Err(RldpQueryTimeout.into()),
+            Err(_) => return Err(SendCancelled::Deadline.into()),
+        };
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
@@ -1154,6 +1439,20 @@ impl RldpNode {
         let permit = tokio::select! {
             _ = control.cancelled() => { control.check()?; unreachable!() },
             _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+            _ = async {
+                if let Some(deadline) = transfer_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                control.cancel(SendCancelled::Deadline);
+                return if query_deadline.is_some() {
+                    Err(RldpQueryTimeout.into())
+                } else {
+                    Err(SendCancelled::Deadline.into())
+                };
+            },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
         #[cfg(feature = "telemetry")]
@@ -1163,6 +1462,18 @@ impl RldpNode {
             peers.other(),
             peer.outbound_semaphore.available_permits(),
         );
+        let admission = if v2 {
+            match peer.transfer_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(Arc::new(permit)),
+                Err(_) => {
+                    // Native silently drops a send at capacity. A query still
+                    // completes at its original deadline, without a retry.
+                    return self.refused_outbound(query_deadline, &control, &peer).await;
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "telemetry")]
         let all = RldpStats::inc(&self.stats.transfers_sent_all);
         #[cfg(feature = "telemetry")]
@@ -1172,24 +1483,43 @@ impl RldpNode {
         let (ping, pong) = tokio::sync::mpsc::unbounded_channel();
         let total_to_send = data.len();
         let send_transfer_id: TransferId = rand::thread_rng().gen();
-        let (send_transfer, send_transfer_state) = SendTransfer::new(
-            data,
-            send_transfer_id.clone(),
-            self.allocated.send_transfers.clone(),
-            ping,
-            v2,
-        )?;
+        let create = || {
+            let (transfer, state) = SendTransfer::new(
+                data,
+                send_transfer_id,
+                self.allocated.send_transfers.clone(),
+                ping,
+                v2,
+            )?;
+            Ok((RldpTransfer::sender(state), transfer))
+        };
+        let send_transfer = if v2 {
+            let Some(transfer) = peer.try_insert_outbound_with(send_transfer_id, create)? else {
+                drop(admission);
+                return self.refused_outbound(query_deadline, &control, &peer).await;
+            };
+            transfer
+        } else {
+            peer.insert_transfer_with(&peer.transfers, send_transfer_id, create)?
+        };
         #[cfg(feature = "telemetry")]
         self.telemetry.send_transfers.update(self.allocated.send_transfers.load(Ordering::Relaxed));
-        self.transfers.insert(send_transfer_id.clone(), RldpTransfer::Send(send_transfer_state));
         let (recv_context, recv_transfer_id) = if query_id.is_some() {
             let mut recv_transfer_id = send_transfer_id;
             for x in &mut recv_transfer_id {
                 *x ^= 0xFF
             }
             let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
-            let expected_total_size = max_answer_size
-                .map(|s| (s as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD));
+            let expected_total_size = max_answer_size.map(|size| {
+                if v2 {
+                    // V2 limits the complete serialized response, including its
+                    // envelope. A zero receive limit selects the default MTU.
+                    usize::try_from(if size == 0 { rldp2::DEFAULT_MTU } else { size })
+                        .unwrap_or(usize::MAX)
+                } else {
+                    (size as usize).saturating_add(Constraints::RLDP_ANSWER_TL_OVERHEAD)
+                }
+            });
             let recv_transfer = RecvTransfer::new(
                 recv_transfer_id,
                 self.allocated.recv_transfers.clone(),
@@ -1202,7 +1532,14 @@ impl RldpNode {
             self.telemetry
                 .recv_transfers
                 .update(self.allocated.recv_transfers.load(Ordering::Relaxed));
-            self.transfers.insert(recv_transfer_id, RldpTransfer::Recv(queue_sender));
+            peer.insert_transfer(
+                &peer.inbound_transfers,
+                recv_transfer_id,
+                RldpTransfer::receiver(
+                    queue_sender,
+                    if bounded.is_some() { expected_total_size } else { None },
+                ),
+            )?;
             let recv_context = RecvContext {
                 adnl: self.adnl.clone(),
                 peers: peers.clone(),
@@ -1228,13 +1565,22 @@ impl RldpNode {
             (None, None)
         };
         let registration = Arc::new(owned_send::SendRegistration {
-            transfers: self.transfers.clone(),
+            _query_admission: query_admission.clone(),
+            v2,
+            inbound: if v2 {
+                recv_transfer_id.map(|id| (id, tokio_util::sync::CancellationToken::new()))
+            } else {
+                None
+            },
+            peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
+            transfers: peer.transfers.clone(),
             send: send_transfer_id,
             receive: recv_transfer_id,
             owner: self.adnl.tasks().clone(),
             bounded_permit: retained_permit,
         });
         let send_context = SendContext {
+            admission,
             registration: registration.clone(),
             control: control.clone(),
             permit: Some(permit.clone()),
@@ -1258,9 +1604,21 @@ impl RldpNode {
             peers.other(),
             query_id.is_some(),
         );
-        let res = match tokio::time::timeout(
-            control.deadline(),
-            self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer, bounded),
+        let hard_deadline = tokio::time::Instant::now() + control.deadline();
+        let deadline =
+            transfer_deadline.map_or(hard_deadline, |transfer| transfer.min(hard_deadline));
+        let res = match tokio::time::timeout_at(
+            deadline,
+            async {
+                tokio::select! {
+                    biased;
+                    _ = peer.closed.cancelled() => {
+                        control.cancel(SendCancelled::PeerEvicted);
+                        Err(SendCancelled::PeerEvicted.into())
+                    },
+                    result = self.outbound_loop(send_context, recv_context, &send_transfer_id, v2, &peer, bounded) => result,
+                }
+            },
         )
         .await
         {
@@ -1269,14 +1627,18 @@ impl RldpNode {
                 control.cancel(SendCancelled::Deadline);
                 log::warn!(
                     target: TARGET,
-                    "outbound HARD TIMEOUT after {} ms: transfer {} to {}, query={}, \
+                    "outbound deadline after {} ms: transfer {} to {}, query={}, \
                      total_to_send={total_to_send}",
-                    Self::TIMEOUT_OUTBOUND_HARD_MS,
+                    outbound_started_at.elapsed().as_millis(),
                     base64_encode(&send_transfer_id),
                     peers.other(),
                     query_id.is_some(),
                 );
-                Err(SendCancelled::Deadline.into())
+                if query_deadline.is_some_and(|query| query <= deadline) {
+                    Err(RldpQueryTimeout.into())
+                } else {
+                    Err(SendCancelled::Deadline.into())
+                }
             }
         };
         log::debug!(
@@ -1287,8 +1649,13 @@ impl RldpNode {
             outbound_started_at.elapsed().as_millis(),
             res.is_ok(),
         );
-        // Actual sender/receiver descendants retain their registration. A caller
-        // timeout only cancels them; it cannot release their IDs or permits.
+        // Native removes the pending query when its result is delivered. Its
+        // logical admission must not wait for transport descendants to drop.
+        if let Some(admission) = &query_admission {
+            admission.release();
+        }
+        // Actual sender/receiver descendants still retain their registration,
+        // transport IDs and resource permits until they have drained.
         drop(registration);
         #[cfg(feature = "telemetry")]
         let all = self.stats.transfers_sent_all.load(Ordering::Relaxed);
@@ -1314,6 +1681,19 @@ impl RldpNode {
                     if answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
+                        // Native RLDP2 checks the original payload limit even
+                        // when a zero transport limit selected the default MTU.
+                        if v2 {
+                            if let Some(limit) = max_answer_size {
+                                if answer.data.len() as u64 > limit {
+                                    return Err(ResponseLimitExceeded {
+                                        limit: usize::try_from(limit).unwrap_or(usize::MAX),
+                                        actual: answer.data.len(),
+                                    }
+                                    .into());
+                                }
+                            }
+                        }
                         let decompressed = match response_limits {
                             Some(limits) => DataCompression::decompress_raw_bounded(
                                 &answer.data,
@@ -1366,6 +1746,22 @@ impl RldpNode {
         }
     }
 
+    async fn refused_outbound(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        control: &SendControl,
+        peer: &RldpPeer,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return Err(RldpQueryTimeout.into()),
+                _ = control.cancelled() => { control.check()?; unreachable!() },
+                _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+            }
+        }
+        Ok((None, peer.stats.v1.roundtrip()))
+    }
+
     async fn outbound_loop(
         &self,
         send_context: SendContext,
@@ -1392,7 +1788,14 @@ impl RldpNode {
             self.adnl.tasks().spawn_admitted("RLDP outbound receiver", token, async move {
                 let _registration = registration;
                 let _permit = permit;
-                Self::receive_loop_controlled(&mut recv_context, v2, Some(&control)).await;
+                Self::receive_loop_controlled(
+                    &mut recv_context,
+                    v2,
+                    Some(&control),
+                    v2 && !propagate_failure,
+                )
+                .await;
+                _registration.finish_inbound();
                 let _ = ping.send(recv_context.recv_transfer);
                 if let Some(scope) = bounded {
                     let _ = scope.done.send(());
@@ -1416,7 +1819,7 @@ impl RldpNode {
         } else {
             "Outbound sent"
         });
-        self.transfers.insert(*send_transfer_id, RldpTransfer::Done);
+        peer.insert_transfer(&peer.transfers, *send_transfer_id, RldpTransfer::Done)?;
         let outbound_str = if recv_state.is_some() { "outbound query" } else { "outbound message" };
         if ok {
             log::trace!(target: TARGET, "RLDP {outbound_str} sent in transfer {transfer_str}");
@@ -1431,7 +1834,7 @@ impl RldpNode {
         let Some((recv_state, mut pong)) = recv_state else {
             return Ok(None);
         };
-        self.wait_answer(peer, &transfer_str, recv_state, &mut pong, propagate_failure).await
+        self.wait_answer(peer, &transfer_str, recv_state, &mut pong, propagate_failure, v2).await
     }
 
     async fn wait_answer(
@@ -1441,6 +1844,7 @@ impl RldpNode {
         recv_state: Arc<RecvTransferState>,
         recv_pong: &mut tokio::sync::mpsc::UnboundedReceiver<RecvTransfer>,
         propagate_failure: bool,
+        v2: bool,
     ) -> Result<Option<Vec<u8>>> {
         let start_ms = peer.stats.v1.timestamp_ms();
         let mut last_warn_ms = start_ms;
@@ -1453,8 +1857,10 @@ impl RldpNode {
                 Ok(Some(reply)) => {
                     log::trace!(target: TARGET, "Got reply in {transfer_str}");
                     peer.stats.v1.update(self.min_timeout_ms);
-                    if propagate_failure {
-                        if let Some(error) = reply.failure {
+                    if let Some(error) = reply.failure {
+                        // Native RLDP2 forwards a decoder failure to the query
+                        // promise; it is not a successful empty answer.
+                        if propagate_failure || v2 {
                             return Err(error);
                         }
                     }
@@ -1488,7 +1894,7 @@ impl RldpNode {
                 }
                 peer.stats.v1.update(self.min_timeout_ms);
                 updates = new_updates;
-            } else if peer.stats.v1.try_timeout(start_ms) {
+            } else if !v2 && peer.stats.v1.try_timeout(start_ms) {
                 log::warn!(
                     target: TARGET,
                     "Weak activity in RLDP {transfer_str} last {} ms, aborting",
@@ -1524,18 +1930,35 @@ impl RldpNode {
     #[cfg(feature = "telemetry")]
     fn print_stats(&self) {}
 
+    async fn receive_chunk(
+        context: &mut RecvContext,
+        v2: bool,
+        confirmations_sent: &mut u32,
+    ) -> std::result::Result<Option<Chunk>, tokio::time::error::Elapsed> {
+        let spin = Duration::from_millis(Self::ACK_DELAY_MS);
+        // Like the native connection turn, service due ACKs even when the
+        // receive queue is immediately ready; traffic must not starve timers.
+        if v2 {
+            match context.send_confirmations().await {
+                Ok(sent) => *confirmations_sent = confirmations_sent.saturating_add(sent),
+                Err(e) => log::warn!(target: TARGET, "RLDPv2 confirmation error: {e}"),
+            }
+        }
+        tokio::time::timeout(spin, context.queue_reader.recv()).await
+    }
+
     async fn receive_loop(context: &mut RecvContext, v2: bool) {
-        Self::receive_loop_controlled(context, v2, None).await;
+        Self::receive_loop_controlled(context, v2, None, false).await;
     }
 
     async fn receive_loop_controlled(
         context: &mut RecvContext,
         v2: bool,
         control: Option<&Arc<SendControl>>,
+        discard_oversize: bool,
     ) {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let spin = Duration::from_millis(Self::ACK_DELAY_MS);
         let start = std::time::Instant::now();
         let mut last_diag = start;
         let mut packets_received: u32 = 0;
@@ -1557,20 +1980,10 @@ impl RldpNode {
                 );
                 last_diag = std::time::Instant::now();
             }
-            let job = match tokio::time::timeout(spin, context.queue_reader.recv()).await {
+            let job = match Self::receive_chunk(context, v2, &mut confirmations_sent).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
-                Err(_) => {
-                    if v2 {
-                        match context.send_confirmations().await {
-                            Ok(sent) => {
-                                confirmations_sent = confirmations_sent.saturating_add(sent)
-                            }
-                            Err(e) => log::warn!(target: TARGET, "{rldp} confirmation error: {e}"),
-                        }
-                    }
-                    continue;
-                }
+                Err(_) => continue,
             };
             packets_received = packets_received.saturating_add(1);
             let (chunk_v2, chunk_part, chunk_seqno, chunk_data_len) = match &job {
@@ -1589,6 +2002,11 @@ impl RldpNode {
             }
             match context.recv_transfer.process_chunk(job) {
                 Err(e) => {
+                    if discard_oversize && e.downcast_ref::<ResponseLimitExceeded>().is_some() {
+                        // Invalid response parts do not complete a query. Its
+                        // absolute deadline remains in charge of completion.
+                        continue;
+                    }
                     log::warn!(
                         target: TARGET,
                         "{rldp} error in {transfer_str}: {e}, dropping transfer"
@@ -1636,6 +2054,7 @@ impl RldpNode {
         mut context: SendContext,
         peer: &Arc<RldpPeer>,
         min_timeout_ms: u64,
+        fec_slots: Arc<tokio::sync::Semaphore>,
     ) -> Result<bool> {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "to");
         let SendTransfer::V1(mut transfer) = context.send_transfer else {
@@ -1653,10 +2072,11 @@ impl RldpNode {
                 context.control.cancel(SendCancelled::OwnerClosed);
             }
             context.control.check()?;
-            let (returned, mut transfer_wave) = owned_send::fec(
+            let (returned, mut transfer_wave) = owned_send::fec_limited(
                 transfer,
                 context.control.clone(),
                 context.adnl.tasks().clone(),
+                fec_slots.clone(),
                 |part| part.start_next_part(),
             )
             .await?;
@@ -1684,10 +2104,11 @@ impl RldpNode {
                         last_seqno = transfer.state().seqno_send()
                     }
                     context.control.check()?;
-                    let (returned, (object, do_next)) = owned_send::fec(
+                    let (returned, (object, do_next)) = owned_send::fec_limited(
                         transfer,
                         context.control.clone(),
                         context.adnl.tasks().clone(),
+                        fec_slots.clone(),
                         |part| {
                             let (bytes, next) = part.prepare_chunk()?;
                             Ok((bytes.to_vec(), next))
@@ -1822,6 +2243,7 @@ impl RldpNode {
             {
                 let transfer = part_transfers.remove(0);
                 let part_context = SendPartContextV2 {
+                    fec_slots: pool.fec_slots(),
                     adnl: context.adnl.clone(),
                     part_states: transfer_state.clone(),
                     peer: peer.clone(),
@@ -1837,7 +2259,7 @@ impl RldpNode {
                 };
                 let child_control = control.clone();
                 let permit = context.permit.clone();
-                match pool.submit(control.clone(), async move {
+                match pool.submit_v2(control.clone(), async move {
                     let _permit = permit;
                     Self::send_one_part_v2(
                         transfer,
@@ -1907,16 +2329,21 @@ impl RldpNode {
         let transfer = OwnedSendPart { part: transfer, peer: context.peer.clone() };
         #[cfg(test)]
         let hook = control.test_after_start.lock().unwrap().clone();
-        let (mut transfer, early) =
-            owned_send::fec(transfer, control.clone(), context.adnl.tasks().clone(), move |part| {
+        let (mut transfer, early) = owned_send::fec_limited(
+            transfer,
+            control.clone(),
+            context.adnl.tasks().clone(),
+            context.fec_slots.clone(),
+            move |part| {
                 part.start()?;
                 #[cfg(test)]
                 if let Some(hook) = hook {
                     return hook(part.state().part());
                 }
                 Ok(None::<bool>)
-            })
-            .await?;
+            },
+        )
+        .await?;
         if let Some(result) = early {
             return Ok(result);
         }
@@ -1978,16 +2405,17 @@ impl RldpNode {
                 );
                 context.peer.stats.v1.update(min_timeout_ms);
                 updates += new_received
-            } else if context.peer.stats.v1.try_timeout(start_ms) {
-                transfer.state().set_finished(false);
-                continue;
             }
+            // V2 ends at its native absolute transfer deadline, enforced by
+            // the outbound owner (or the response control). Legacy adaptive
+            // statistics govern pacing, not an additional early failure.
             new_received = 0;
             let peer = context.peer.clone();
-            let (returned, prepared) = owned_send::fec(
+            let (returned, prepared) = owned_send::fec_limited(
                 transfer,
                 control.clone(),
                 context.adnl.tasks().clone(),
+                context.fec_slots.clone(),
                 move |part| {
                     Ok(match part.prepare_chunk(&peer)? {
                         SendActionV2::Send((bytes, info)) => Ok((bytes.to_vec(), info)),
@@ -2085,3 +2513,6 @@ impl Subscriber for RldpNode {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests;

@@ -142,7 +142,7 @@ impl RecvContext {
             confirm.max_seqno = part.core.max_seqno as i32;
             confirm.received_count = part.received_count as i32;
             confirm.received_mask = part.received_mask as i32;
-            part.confirm_at = 0;
+            part.confirmation_sent(elapsed);
             serialize_bare_inplace(&mut self.recv_transfer.buf, confirm)?;
             let reply = TaggedByteSlice {
                 object: &self.recv_transfer.buf[..],
@@ -197,10 +197,30 @@ struct RecvPartV1 {
 
 struct RecvPartV2 {
     confirm_at: u64,
+    confirm_retries: u8,
     core: RecvPart,
     data: Option<Vec<u8>>,
     received_count: u32,
     received_mask: u32,
+}
+
+impl RecvPartV2 {
+    fn schedule_confirmation(&mut self, elapsed: u64) {
+        self.confirm_retries = 0;
+        let next = elapsed.saturating_add(RldpNode::ACK_DELAY_MS);
+        if self.confirm_at == 0 || next < self.confirm_at {
+            self.confirm_at = next;
+        }
+    }
+
+    fn confirmation_sent(&mut self, elapsed: u64) {
+        self.confirm_retries = self.confirm_retries.saturating_add(1);
+        self.confirm_at = if self.confirm_retries <= 7 {
+            elapsed.saturating_add(RldpNode::ACK_DELAY_MS * (1u64 << self.confirm_retries))
+        } else {
+            0
+        };
+    }
 }
 
 enum RecvParts {
@@ -277,6 +297,14 @@ impl RecvTransfer {
 
     #[allow(clippy::boxed_local)]
     pub(crate) fn process_chunk(&mut self, chunk: Chunk) -> Result<Option<TaggedByteSlice<'_>>> {
+        self.process_chunk_at(chunk, self.start.elapsed().as_millis() as u64)
+    }
+
+    fn process_chunk_at(
+        &mut self,
+        chunk: Chunk,
+        elapsed: u64,
+    ) -> Result<Option<TaggedByteSlice<'_>>> {
         #[cfg(feature = "debug")]
         {
             self.total_data_packets += 1
@@ -304,7 +332,16 @@ impl RecvTransfer {
             fail!("Unsupported FEC type in RLDP packet")
         };
         let total_size = if let Some(total_size) = self.total_size {
-            if total_size != chunk.total_size as usize {
+            // Native V2 validates each packet's geometry but keeps the first
+            // transfer total. A changed declaration does not reset the decoder.
+            if v2 {
+                let max_wire =
+                    Constraints::MAX_TOTAL_TRANSFER_SIZE + Constraints::RLDP_ANSWER_TL_OVERHEAD;
+                let cap = self.expected_total_size.map(|s| s.min(max_wire)).unwrap_or(max_wire);
+                if chunk.total_size as usize > cap {
+                    return Ok(None);
+                }
+            } else if total_size != chunk.total_size as usize {
                 log::warn!(
                     "Incorrect total size {} in RLDP chunk - expected {total_size}, skipping",
                     chunk.total_size
@@ -343,6 +380,28 @@ impl RecvTransfer {
             },
             RecvParts::V2(parts) => {
                 let part = if chunk_part_usize >= parts.len() {
+                    // Native InboundTransfer::get_part only opens the next part.
+                    // A skipped part must be retransmitted after its predecessor
+                    // has been admitted; do not allocate or decode holes.
+                    if chunk_part_usize != parts.len() {
+                        return Ok(None);
+                    }
+                    // Native reserves offsets when a decoder is opened, not
+                    // when its data finishes decoding. Include unfinished parts.
+                    let offset = parts
+                        .iter()
+                        .try_fold(0usize, |sum, part| {
+                            sum.checked_add(
+                                part.core
+                                    .decoder
+                                    .as_ref()
+                                    .map_or(0, |decoder| decoder.params().data_size as usize),
+                            )
+                        })
+                        .ok_or_else(|| error!("RLDP part offsets overflow"))?;
+                    if offset > total_size || fec_type.data_size as usize > total_size - offset {
+                        fail!("RLDP part exceeds original transfer size {total_size}");
+                    }
                     let mut in_transit = parts.len();
                     if in_transit > Constraints::MAX_PARTS_IN_TRANSIT {
                         for part in parts.iter() {
@@ -363,6 +422,7 @@ impl RecvTransfer {
                     while parts.len() <= chunk_part_usize {
                         let part = RecvPartV2 {
                             confirm_at: 0,
+                            confirm_retries: 0,
                             core: RecvPart::new(),
                             data: None,
                             received_count: 0,
@@ -391,11 +451,33 @@ impl RecvTransfer {
                     if (part.received_mask & mask) == 0 {
                         part.received_count += 1;
                         part.received_mask |= mask;
+                    } else {
+                        // Native Ack rejects duplicates before inspecting symbols.
+                        return Ok(None);
                     }
+                } else {
+                    // Symbols outside the acknowledgement window are not new.
+                    return Ok(None);
                 }
-                part.core.get_decoder(fec_type)?
+                // Native InboundTransfer::get_part retains the decoder chosen
+                // by the first packet. Later valid FEC declarations do not
+                // replace it; outer packet geometry is checked before enqueue.
+                if part.core.decoder.is_none() {
+                    part.core.get_decoder(fec_type)?;
+                }
+                part.core.decoder.as_mut().expect("decoder initialized above")
             }
         };
+        if v2 && chunk.data.len() != decoder.params().symbol_size as usize {
+            fail!(
+                "Invalid RLDP2 symbol length: {}, expected {}",
+                chunk.data.len(),
+                decoder.params().symbol_size
+            )
+        }
+        if v2 {
+            Constraints::check_seqno(chunk_seqno_u32)?;
+        }
         if let Some(mut data) = decoder.decode(chunk_seqno_u32, &chunk.data) {
             match &mut self.parts {
                 RecvParts::V1(part) => {
@@ -415,6 +497,8 @@ impl RecvTransfer {
                     }
                 }
                 RecvParts::V2(parts) => {
+                    // Native finish_part removes the receiver, including its ACK timer.
+                    parts[chunk_part_usize].confirm_at = 0;
                     parts[chunk_part_usize].data = Some(data);
                     let mut len = 0;
                     for part in parts.iter() {
@@ -438,7 +522,13 @@ impl RecvTransfer {
                 &self.timestamp,
                 format!("Send part recv complete, seqno {}", chunk.seqno).as_str(),
             );
-            self.build_part_completed_reply(chunk.part)
+            // Native RLDP2 acknowledges completed parts on a subsequent packet,
+            // not on the symbol that first finishes decoding the part.
+            if matches!(self.parts, RecvParts::V2(_)) {
+                Ok(None)
+            } else {
+                self.build_part_completed_reply(chunk.part)
+            }
         } else {
             match &mut self.parts {
                 RecvParts::V1(part) => {
@@ -466,8 +556,7 @@ impl RecvTransfer {
                     }
                 }
                 RecvParts::V2(parts) => {
-                    parts[chunk_part_usize].confirm_at =
-                        self.start.elapsed().as_millis() as u64 + RldpNode::ACK_DELAY_MS;
+                    parts[chunk_part_usize].schedule_confirmation(elapsed);
                     Ok(None)
                 }
             }
@@ -550,5 +639,478 @@ mod bounded_receive_tests {
         assert!(error.downcast_ref::<crate::ResponseLimitExceeded>().is_some());
         assert_eq!(receiver.data.capacity(), 0);
         assert!(receiver.total_size.is_none());
+    }
+}
+
+#[cfg(test)]
+mod completion_timer_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn completed_rldp2_part_cancels_pending_confirmation() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_metadata.json"),
+        );
+        assert_eq!(native[0]["confirm_packets"], 0);
+        assert_eq!(native[0]["deliveries"], 0);
+        let bytes = native[0]["bytes"].as_u64().unwrap() as usize;
+        let data = vec![42; bytes];
+        let mut encoder = crate::RaptorqEncoder::with_data(&data, Some(768));
+        let fec = encoder.params().clone().into_boxed();
+        let mut receiver = RecvTransfer::new(
+            [0; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            true,
+            Some(bytes + 1),
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let mut first_complete = 0usize;
+        let mut duplicate = None;
+        for index in 0..bytes.div_ceil(768) {
+            let mut seqno = index as u32;
+            let symbol = encoder.encode(&mut seqno).unwrap();
+            if index == 0 {
+                duplicate = Some((seqno, symbol.clone()));
+            }
+            first_complete += usize::from(
+                receiver
+                    .process_chunk(Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                        transfer_id: UInt256::default(),
+                        fec_type: fec.clone(),
+                        part: 0,
+                        total_size: (bytes + 1) as i64,
+                        seqno: seqno as i32,
+                        data: symbol,
+                    })))
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+        assert_eq!(native[0]["first_complete"], first_complete);
+        let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+        assert_eq!(parts[0].data.as_ref().unwrap(), &data, "first part really decoded");
+        assert!(receiver.data.is_empty(), "whole transfer must still await its next part");
+        assert_eq!(
+            parts[0].confirm_at, 0,
+            "native removes the completed part receiver and its pending ACK"
+        );
+        let (seqno, symbol) = duplicate.unwrap();
+        let reply = receiver
+            .process_chunk(Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: fec,
+                part: 0,
+                total_size: (bytes + 1) as i64,
+                seqno: seqno as i32,
+                data: symbol,
+            })))
+            .unwrap();
+        assert_eq!(native[0]["duplicate_complete"], usize::from(reply.is_some()));
+    }
+}
+
+#[cfg(test)]
+mod ack_retry_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+    #[test]
+    fn rldp2_ack_retry_schedule_matches_native() {
+        let expected = super::super::lifetime_tests::ack_retry_native_effects();
+        let mut previous = String::new();
+        let new_receiver = || {
+            RecvTransfer::new(
+                [0; 32],
+                Arc::new(AtomicU64::new(0)),
+                true,
+                None,
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            )
+        };
+        let mut receiver = new_receiver();
+        let mut actual = Vec::new();
+        for line in include_str!("../../../ci/conformance/rldp2_ack_retries_context.tsv").lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let name = fields[0];
+            let op = fields[1];
+            let ms: u64 = fields[2].parse().unwrap();
+            let seqno: i32 = fields[3].parse().unwrap();
+            if name != previous {
+                receiver = new_receiver();
+                previous = name.to_owned();
+            }
+            let mut accepted = false;
+            let mut sent = false;
+            if op == "recv" {
+                let before = match &receiver.parts {
+                    RecvParts::V2(parts) => parts.first().map_or(0, |p| p.received_count),
+                    _ => unreachable!(),
+                };
+                // Native RldpReceiver uses wire seqno + 1. Keep this incomplete
+                // so we exercise the real production receive/ACK state machine.
+                let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                    transfer_id: UInt256::default(),
+                    fec_type: FecTypeRaptorQ {
+                        data_size: 8192,
+                        symbol_size: 768,
+                        symbols_count: 11,
+                    }
+                    .into_boxed(),
+                    part: 0,
+                    total_size: 8192,
+                    seqno: seqno - 1,
+                    data: vec![42; 768],
+                }));
+                assert!(receiver.process_chunk_at(chunk, ms).unwrap().is_none());
+                let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+                accepted = parts[0].received_count > before;
+            } else {
+                let RecvParts::V2(parts) = &mut receiver.parts else { unreachable!() };
+                let part = &mut parts[0];
+                if part.confirm_at != 0 && part.confirm_at <= ms {
+                    sent = true;
+                    part.confirmation_sent(ms);
+                }
+            }
+            let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+            let next = parts[0].confirm_at;
+            let ready = next != 0 && next <= ms;
+            actual.push(serde_json::json!({"case":name,"op":op,"ms":ms,"accepted":accepted,"sent":sent,"ready":ready,"next_ms":if ready {0}else{next}}));
+        }
+        assert_eq!(actual, expected, "ACK retry cap/reset/deadline must match native scheduling");
+        #[allow(dead_code)]
+        struct PreviousPart {
+            confirm_at: u64,
+            core: RecvPart,
+            data: Option<Vec<u8>>,
+            received_count: u32,
+            received_mask: u32,
+        }
+        let before = std::mem::size_of::<PreviousPart>();
+        let after = std::mem::size_of::<RecvPartV2>();
+        eprintln!("ACK_PART_BYTES: before={before} after={after}");
+        assert!(after <= before + 8, "bounded retry counter must not add unbounded per-part state");
+    }
+}
+
+#[cfg(test)]
+mod sequential_part_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_skipped_part_does_not_decode_or_ack_before_predecessor() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_metadata.json"),
+        );
+        let mut receiver = RecvTransfer::new(
+            [0; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            true,
+            Some(4_000_001),
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let mut completes = 0;
+        for row in native {
+            let part = row["part"].as_i64().unwrap() as i32;
+            let mut encoder = crate::RaptorqEncoder::with_data(
+                &vec![42; if part < 2 { 2_000_000 } else { 1 }],
+                Some(768),
+            );
+            let mut seqno = 0;
+            let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part,
+                total_size: 4_000_001,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: 0,
+            }));
+            completes += usize::from(receiver.process_chunk(chunk).unwrap().is_some());
+            assert_eq!(
+                completes,
+                row["complete_packets"].as_u64().unwrap() as usize,
+                "completed-part replay effects after input part {part}"
+            );
+            assert_eq!(
+                usize::from(!receiver.data.is_empty()),
+                row["deliveries"].as_u64().unwrap() as usize
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transfer_size_change_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_changed_total_preserves_native_decoder_admission() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_metadata.json"),
+        );
+        assert_eq!(native.len(), 5, "all declared size-change cases must be present");
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (line, row) in
+            include_str!("../../../ci/conformance/rldp2_transfer_size_changes_context.tsv")
+                .lines()
+                .zip(native)
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let values: Vec<usize> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            let (original, changed, part, bytes, seq) =
+                (values[0], values[1], values[2], values[3], values[4]);
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(4_000_001),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut errors = 0;
+            let mut completes = 0;
+            for (total, index, size, sequence) in [
+                (original, 0, 2_000_000, 0),
+                (changed, part, bytes, seq),
+                (changed, part, bytes, seq),
+            ] {
+                let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                let mut number = sequence as u32;
+                let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                    transfer_id: UInt256::default(),
+                    fec_type: encoder.params().clone().into_boxed(),
+                    part: index as i32,
+                    total_size: total as i64,
+                    data: encoder.encode(&mut number).unwrap(),
+                    seqno: sequence as i32,
+                }));
+                match receiver.process_chunk(chunk) {
+                    Ok(reply) => completes += usize::from(reply.is_some()),
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    }
+                }
+            }
+            let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+            let received = parts
+                .iter()
+                .filter(|p| p.data.is_none())
+                .map(|p| p.received_count)
+                .max()
+                .unwrap_or(0);
+            actual.push(serde_json::json!({"id":fields[0],"errors":errors,"received":if errors==0 {Some(received)}else{None},"completes":if errors==0{Some(completes)}else{None}}));
+            let native_error = row["errors"].as_u64().unwrap();
+            expected.push(serde_json::json!({"id":row["id"],"errors":native_error,"received":if native_error==0{Some(row["max_received"].clone())}else{None},"completes":if native_error==0{Some(row["complete_packets"].clone())}else{None}}));
+        }
+        assert_eq!(actual, expected, "native total-size mutation effects");
+    }
+}
+
+#[cfg(test)]
+mod existing_part_fec_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_existing_part_keeps_original_fec_decoder() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_metadata.json"),
+        );
+        assert_eq!(native.len(), 5, "all declared size-change cases must be present");
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (line, row) in
+            include_str!("../../../ci/conformance/rldp2_existing_part_fec_context.tsv")
+                .lines()
+                .zip(native)
+        {
+            // Invalid geometry is rejected by consume_chunk_message, before
+            // this processor. This row is outside the processor comparison.
+            if row["id"] == "invalid_geometry" {
+                continue;
+            }
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let values: Vec<usize> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            let (original, changed, bytes, seq) = (values[0], values[1], values[2], values[3]);
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(4_000_001),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut errors = 0;
+            let mut completes = 0;
+            for (total, index, size, sequence) in
+                [(original, 0, original, 0), (changed, 0, bytes, seq), (changed, 0, bytes, seq)]
+            {
+                let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                let mut number = sequence as u32;
+                let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                    transfer_id: UInt256::default(),
+                    fec_type: encoder.params().clone().into_boxed(),
+                    part: index as i32,
+                    total_size: total as i64,
+                    data: encoder.encode(&mut number).unwrap(),
+                    seqno: sequence as i32,
+                }));
+                match receiver.process_chunk(chunk) {
+                    Ok(reply) => completes += usize::from(reply.is_some()),
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    }
+                }
+            }
+            let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+            let received = parts
+                .iter()
+                .filter(|p| p.data.is_none())
+                .map(|p| p.received_count)
+                .max()
+                .unwrap_or(0);
+            actual.push(serde_json::json!({"id":fields[0],"errors":errors,"received":if errors==0 {Some(received)}else{None},"completes":if errors==0{Some(completes)}else{None}}));
+            let native_error = row["errors"].as_u64().unwrap();
+            expected.push(serde_json::json!({"id":row["id"],"errors":native_error,"received":if native_error==0{Some(row["max_received"].clone())}else{None},"completes":if native_error==0{Some(row["complete_packets"].clone())}else{None}}));
+        }
+        assert_eq!(actual, expected, "native existing-part FEC mutation effects");
+    }
+}
+
+#[cfg(test)]
+mod multipart_assembly_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    fn send(
+        receiver: &mut RecvTransfer,
+        encoder: &mut crate::RaptorqEncoder,
+        part: usize,
+        total: usize,
+        sequence: u32,
+        transcript: &mut Vec<u8>,
+    ) -> usize {
+        let mut seq = sequence;
+        let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+            transfer_id: UInt256::default(),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: part as i32,
+            total_size: total as i64,
+            data: encoder.encode(&mut seq).unwrap(),
+            seqno: sequence as i32,
+        }));
+        let Chunk::V2(ref wire) = chunk else { unreachable!() };
+        transcript.extend(rtos_api::serialize_boxed(&wire.clone().into_boxed()).unwrap());
+        usize::from(receiver.process_chunk(chunk).unwrap().is_some())
+    }
+
+    #[test]
+    fn rldp2_multipart_assembly_matches_native_completion_order() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_multipart_assembly_metadata.json"),
+        );
+        assert_eq!(native.len(), 24);
+        let mut checked = 0;
+        for line in
+            include_str!("../../../ci/conformance/rldp2_multipart_assembly_context.tsv").lines()
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let count: usize = fields[1].parse().unwrap();
+            let total = (count - 1) * 2_000_000 + 769;
+            let mut encoders: Vec<_> = (0..count)
+                .map(|part| {
+                    let data: Vec<_> = (0..if part + 1 == count { 769 } else { 2_000_000 })
+                        .map(|i| ((i * 17 + part * 29) % 251) as u8)
+                        .collect();
+                    crate::RaptorqEncoder::with_data(&data, Some(768))
+                })
+                .collect();
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(total),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut completes = 0;
+            let mut transcript = Vec::new();
+            for row in native.iter().filter(|row| row["id"] == fields[0]) {
+                let part = row["part"].as_u64().unwrap() as usize;
+                match row["phase"].as_str().unwrap() {
+                    "admitted" => {
+                        for (index, encoder) in encoders.iter_mut().enumerate() {
+                            completes +=
+                                send(&mut receiver, encoder, index, total, 0, &mut transcript);
+                        }
+                    }
+                    "decoded" => {
+                        let size: usize = if part + 1 == count { 769 } else { 2_000_000 };
+                        for seq in 1..size.div_ceil(768) {
+                            completes += send(
+                                &mut receiver,
+                                &mut encoders[part],
+                                part,
+                                total,
+                                seq as u32,
+                                &mut transcript,
+                            );
+                        }
+                    }
+                    "replay" => {
+                        // Rust source symbols are consumed in order. A fresh
+                        // encoder regenerates the original seq0 for replay.
+                        let data: Vec<_> = (0..if part + 1 == count { 769 } else { 2_000_000 })
+                            .map(|i| ((i * 17 + part * 29) % 251) as u8)
+                            .collect();
+                        let mut replay = crate::RaptorqEncoder::with_data(&data, Some(768));
+                        completes +=
+                            send(&mut receiver, &mut replay, part, total, 0, &mut transcript)
+                    }
+                    _ => panic!("unknown native phase"),
+                }
+                // This checks processor assembly and reply effects. Native owner
+                // removal and application delivery counts require an entry test.
+                assert_eq!(
+                    hex::encode(rtos_block::sha256_digest(&transcript)),
+                    row["input_sha256"].as_str().unwrap(),
+                    "input packets: {row}"
+                );
+                assert_eq!(row["errors"], 0);
+                assert_eq!(completes as u64, row["complete_packets"].as_u64().unwrap(), "{row}");
+                assert_eq!(receiver.data.len() as u64, row["size"].as_u64().unwrap(), "{row}");
+                let digest = if receiver.data.is_empty() {
+                    String::new()
+                } else {
+                    hex::encode(rtos_block::sha256_digest(&receiver.data))
+                };
+                assert_eq!(digest, row["sha256"].as_str().unwrap(), "{row}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, native.len());
     }
 }

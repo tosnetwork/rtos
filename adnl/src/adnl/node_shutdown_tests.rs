@@ -3,7 +3,7 @@ use super::*;
 use crate::common::{QueryAnswer, TimedAnswer};
 use rtos_api::AnyBoxedSerialize;
 use std::{
-    net::{TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::atomic::AtomicBool,
 };
 use tokio::sync::{oneshot, Notify};
@@ -22,9 +22,15 @@ impl Drop for TestNode {
 }
 
 async fn node(seed: u8) -> (TestNode, u16) {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     let port = socket.local_addr().unwrap().port();
+    let node = node_on_port(seed, port).await;
+    // Keep the reservation through asynchronous node construction.
     drop(socket);
+    (node, port)
+}
+
+async fn node_on_port(seed: u8, port: u16) -> TestNode {
     let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys(
         &format!("127.0.0.1:{port}"),
         vec![([seed; 32], 0)],
@@ -37,8 +43,139 @@ async fn node(seed: u8) -> (TestNode, u16) {
     )
     .await
     .unwrap();
-    (TestNode(node), port)
+    TestNode(node)
 }
+
+fn reserve_tcp_udp() -> std::io::Result<(UdpSocket, TcpListener, u16)> {
+    for _ in 0..64 {
+        let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let port = udp.local_addr()?.port();
+        match TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            Ok(tcp) => return Ok((udp, tcp, port)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no shared TCP/UDP test port"))
+}
+
+async fn started_tcp_node(seed: u8) -> Result<(TestNode, u16)> {
+    started_tcp_node_with(seed, |_, _, _, tcp| {
+        drop(tcp);
+        Ok(())
+    })
+    .await
+}
+
+async fn started_tcp_node_with(
+    seed: u8,
+    mut before_start: impl FnMut(usize, &TestNode, u16, TcpListener) -> Result<()>,
+) -> Result<(TestNode, u16)> {
+    for attempt in 0..8 {
+        let (udp, tcp, port) = reserve_tcp_udp()?;
+        let node = node_on_port(seed, port).await;
+        // Production startup binds its own sockets. Minimize this handoff gap
+        // and retry only a real bind collision after fully draining its owner.
+        drop(udp);
+        // Transfer the reservation to the hook: failure injection must not
+        // drop and rebind it, which races with unrelated port users.
+        let started = match before_start(attempt, &node, port, tcp) {
+            Ok(()) => node.start_over_udp_tcp(Vec::new()).await,
+            Err(error) => Err(error),
+        };
+        match started {
+            Ok(()) => return Ok((node, port)),
+            Err(error) => {
+                let retry = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse);
+                bounded(node.stop_checked()).await.map_err(|cleanup| {
+                    error!("TCP fixture startup failed: {error:#}; cleanup failed: {cleanup:#}")
+                })?;
+                drop(node);
+                if !retry || attempt == 7 {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    unreachable!("last failed startup returns its error")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
+    let mut held_tcp = None;
+    let mut first_port = 0;
+    let mut first_owner = None;
+    let mut attempts = 0;
+    let (node, port) = started_tcp_node_with(60, |attempt, node, port, tcp| {
+        attempts += 1;
+        if attempt == 0 {
+            first_port = port;
+            first_owner = Some(Arc::downgrade(&node.0));
+            assert_eq!(tcp.local_addr()?.port(), port);
+            assert_eq!(
+                TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).unwrap_err().kind(),
+                std::io::ErrorKind::AddrInUse,
+                "the reserved socket must still exclude another TCP bind"
+            );
+            held_tcp = Some(tcp);
+        } else {
+            assert!(
+                first_owner.as_ref().unwrap().upgrade().is_none(),
+                "failed node must be released before another startup"
+            );
+            assert!(
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, first_port)).is_ok(),
+                "partial UDP bind from failed TCP startup must be released"
+            );
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_ne!(port, first_port);
+    assert!(held_tcp.is_some());
+    bounded(node.stop_checked()).await.unwrap();
+    udp_released(port);
+    tcp_released(port);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adnl_tcp_fixture_does_not_retry_non_bind_startup_failure() {
+    for close_owner in [true, false] {
+        let mut attempts = 0;
+        let mut owner = None;
+        let result = started_tcp_node_with(61, |_, node, _, tcp| {
+            drop(tcp);
+            attempts += 1;
+            owner = Some(Arc::downgrade(&node.0));
+            if close_owner {
+                node.tasks.close();
+                Ok(())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+            }
+        })
+        .await;
+        let error = match result {
+            Ok(_) => panic!("non-bind failure must refuse startup"),
+            Err(error) => error,
+        };
+        if close_owner {
+            assert!(error.to_string().contains("ADNL task admission closed"), "{error:#}");
+        } else {
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(attempts, 1, "non-bind errors must not be retried");
+        assert!(owner.unwrap().upgrade().is_none());
+    }
+}
+
 async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), future)
         .await
@@ -179,8 +316,7 @@ async fn adnl_owned_receiver_thread_panic_is_joined() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_tcp_accept_and_udp_are_joined() {
-    let (node, port) = node(45).await;
-    node.start_over_udp_tcp(Vec::new()).await.unwrap();
+    let (node, port) = started_tcp_node(45).await.unwrap();
     let peer = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     bounded(node.stop_checked()).await.unwrap();
     drop(peer);
@@ -378,10 +514,8 @@ async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
-    let (server, server_port) = node(50).await;
-    let (client, client_port) = node(51).await;
-    server.start_over_udp_tcp(Vec::new()).await.unwrap();
-    client.start_over_udp_tcp(Vec::new()).await.unwrap();
+    let (server, server_port) = started_tcp_node(50).await.unwrap();
+    let (client, client_port) = started_tcp_node(51).await.unwrap();
     let local = client.key_by_tag(0).unwrap();
     let remote = server.key_by_tag(0).unwrap();
     client.add_peer(local.id(), server.ip_address_adnl(), None, &remote).unwrap();

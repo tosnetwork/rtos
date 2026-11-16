@@ -1,0 +1,90 @@
+{
+  "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+  "input_sha256": "7233551b204cf6c46351804904605ba88283a374dc116c839a844b223f4ec121",
+  "probe_source_sha256": "058fb4f446fc2d79da63111d5bfd369047c99b4f6b10bb7cd101438638c676db",
+  "scope": "Native runtime caller completion, complete payload and minimum timeout duration; packet/resource effects not captured",
+  "effects": [
+    {
+      "id": "empty",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "id": "one_byte",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 1,
+      "payload_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    {
+      "id": "tight_payload",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "wire_below",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "wire_exact",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 1,
+      "payload_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    {
+      "id": "boundary",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 1024,
+      "payload_sha256": "2bce1ba628720664be4b9fdd77aae0678e5f0f3f02fc6ff641ec879094f6a404"
+    },
+    {
+      "id": "reverse",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 1024,
+      "payload_sha256": "2bce1ba628720664be4b9fdd77aae0678e5f0f3f02fc6ff641ec879094f6a404"
+    },
+    {
+      "id": "multipart",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 200000,
+      "payload_sha256": "e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb"
+    },
+    {
+      "id": "oversize",
+      "status": "timeout",
+      "error_code": 652,
+      "payload_bytes": 0,
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timeout_not_before_ms": 9500
+    },
+    {
+      "id": "recovery",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 64,
+      "payload_sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    },
+    {
+      "id": "reverse_recovery",
+      "status": "answer",
+      "error_code": 0,
+      "payload_bytes": 64,
+      "payload_sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    }
+  ],
+  "query_timeout_ms": 10000,
+  "timeout_tolerance_ms": 500
+}
