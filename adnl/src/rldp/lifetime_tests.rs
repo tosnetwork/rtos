@@ -2585,3 +2585,83 @@ async fn rldp2_completed_packet_validation_matches_native() {
         "completed IDs must be acknowledged before packet validation"
     );
 }
+
+// The production TL handler must reject malformed live/new input before it
+// claims capacity or queues data, including the bounded wire-limit shortcut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_malformed_packet_cannot_admit_or_queue() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let (_, _, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+        let mut sequence = 0;
+        let symbol = encoder.encode(&mut sequence).unwrap();
+        for registered in [false, true] {
+            for wire_limit in [None, Some(1024)] {
+                for (seqno, symbol_size) in [(-1, 768), (0, 1)] {
+                    let id = [73; 32];
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    if registered {
+                        super::add_unbound_object_to_map(&peer.inbound_transfers, id, || {
+                            Ok(super::RldpTransfer::receiver(tx.clone(), wire_limit))
+                        })
+                        .unwrap();
+                        assert!(peer.admit_inbound(id, true).unwrap());
+                    }
+                    let before = peer.inbound_active.lock().unwrap().len();
+                    let mut fec = encoder.params().clone();
+                    fec.symbol_size = symbol_size;
+                    let chunk = RldpChunk {
+                        transfer_id: UInt256::from(id),
+                        fec_type: fec.into_boxed(),
+                        part: 0,
+                        total_size: 2048,
+                        seqno,
+                        data: symbol.clone(),
+                    };
+                    let wire =
+                        serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed())
+                            .unwrap();
+                    assert!(rldps[0].try_consume_custom(&wire, &peers).await.unwrap());
+                    let after = peer.inbound_active.lock().unwrap().len();
+                    assert_eq!(after, before, "malformed input must not claim an inbound slot");
+                    assert!(
+                        matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+                        "malformed input must not reach the decoder or bounded-limit notification"
+                    );
+                    assert_eq!(peer.inbound_transfers.get(&id).is_some(), registered);
+                    if registered {
+                        // A valid packet still reaches this same live registration.
+                        let chunk = RldpChunk {
+                            transfer_id: UInt256::from(id),
+                            fec_type: encoder.params().clone().into_boxed(),
+                            part: 0,
+                            total_size: 2048,
+                            seqno: 0,
+                            data: symbol.clone(),
+                        };
+                        let wire =
+                            serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed())
+                                .unwrap();
+                        assert!(rldps[0].try_consume_custom(&wire, &peers).await.unwrap());
+                        assert!(
+                            rx.try_recv().is_ok(),
+                            "valid control must reach the registered receiver"
+                        );
+                        peer.inbound_transfers.remove(&id);
+                        peer.inbound_active.lock().unwrap().remove(&id);
+                    }
+                }
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
