@@ -23,8 +23,6 @@ use crate::{
 };
 use futures::stream::StreamExt;
 use rand::Rng;
-#[cfg(feature = "telemetry")]
-use rtos_api::BoxedSerialize;
 use rtos_api::{
     deserialize_boxed, serialize_boxed,
     ton::{
@@ -41,6 +39,8 @@ use rtos_api::{
     },
     AnyBoxedSerialize, IntoBoxed,
 };
+#[cfg(feature = "telemetry")]
+use rtos_api::{BoxedSerialize, Constructor};
 use rtos_block::{base64_encode, error, fail, KeyId, Result, UInt256};
 #[cfg(feature = "debug")]
 use std::sync::atomic::AtomicPtr;
@@ -699,8 +699,9 @@ impl RldpNode {
         }
     }
 
-    async fn consume_chunk_message(&self, chunk: Chunk, peers: &AdnlPeers) -> Result<()> {
-        let transfer_id = chunk.transfer_id();
+    async fn consume_chunk_message(&self, mut chunk: Chunk, peers: &AdnlPeers) -> Result<()> {
+        let transfer_id_value = *chunk.transfer_id();
+        let transfer_id = &transfer_id_value;
         let (v2, part, seqno, total_size) = match &chunk {
             Chunk::V1(RldpMessagePart(chunk)) => (false, chunk.part, chunk.seqno, chunk.total_size),
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno, chunk.total_size),
@@ -806,7 +807,20 @@ impl RldpNode {
             };
             match result {
                 Ok(()) => (),
-                Err(tokio::sync::mpsc::error::SendError(_)) => (),
+                Err(tokio::sync::mpsc::error::SendError(returned)) => {
+                    // A handler can hold the old queue sender across successful
+                    // completion. Retry only when completion is already visible;
+                    // closed failed/cancelled receivers must not spin or reopen.
+                    if v2
+                        && peer
+                            .inbound_transfers
+                            .get(transfer_id)
+                            .is_some_and(|entry| matches!(entry.val(), RldpTransfer::Done))
+                    {
+                        chunk = returned;
+                        continue;
+                    }
+                }
             }
             break;
         }
@@ -1082,7 +1096,7 @@ impl RldpNode {
             tokio::select! {
                 biased;
                 _ = peer.closed.cancelled() => return,
-                _ = Self::receive_loop(&mut context, v2) => {},
+                _ = Self::receive_loop_controlled(&mut context, v2, None, false, Some(&_registration)) => {},
             }
             if v2 {
                 _registration.finish_inbound();
@@ -1802,6 +1816,7 @@ impl RldpNode {
                     v2,
                     Some(&control),
                     v2 && !propagate_failure,
+                    Some(&_registration),
                 )
                 .await;
                 _registration.finish_inbound();
@@ -1961,7 +1976,7 @@ impl RldpNode {
     }
 
     async fn receive_loop(context: &mut RecvContext, v2: bool) {
-        Self::receive_loop_controlled(context, v2, None, false).await;
+        Self::receive_loop_controlled(context, v2, None, false, None).await;
     }
 
     async fn receive_loop_controlled(
@@ -1969,6 +1984,7 @@ impl RldpNode {
         v2: bool,
         control: Option<&Arc<SendControl>>,
         discard_oversize: bool,
+        registration: Option<&owned_send::SendRegistration>,
     ) {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "from");
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
@@ -2058,9 +2074,47 @@ impl RldpNode {
                 log::warn!("INTERNAL ERROR: {rldp} total size not set")
             }
         }
-        // Graceful close
+        // Publish completion before closing the queue so new packets take the
+        // completed-ID path. Already accepted packets still belong to this
+        // receiver and must get native Complete replies instead of being lost.
+        let completed = v2
+            && context.recv_transfer.failure.is_none()
+            && context.recv_transfer.total_size == Some(context.recv_transfer.data.len());
+        if completed {
+            if let Some(registration) = registration {
+                registration.finish_inbound();
+            }
+        }
         context.queue_reader.close();
-        while context.queue_reader.recv().await.is_some() {}
+        while let Some(chunk) = context.queue_reader.recv().await {
+            if !completed || context.adnl.tasks().is_closed() {
+                continue;
+            }
+            let Chunk::V2(Rldp2MessagePart(chunk)) = chunk else { continue };
+            let reply =
+                Rldp2Complete { transfer_id: chunk.transfer_id, part: chunk.part }.into_boxed();
+            let data = match serialize_boxed(&reply) {
+                Ok(data) => data,
+                Err(error) => {
+                    log::warn!(target: TARGET, "RLDPv2 Complete encoding: {error}");
+                    continue;
+                }
+            };
+            if let Err(error) = context
+                .adnl
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &data,
+                        #[cfg(feature = "telemetry")]
+                        tag: Rldp2Complete::constructor_const(),
+                    },
+                    &context.peers,
+                )
+                .await
+            {
+                log::warn!(target: TARGET, "RLDPv2 queued Complete reply: {error}");
+            }
+        }
     }
 
     async fn send_loop_v1(
