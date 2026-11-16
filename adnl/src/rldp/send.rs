@@ -681,6 +681,7 @@ impl SendPartV2 {
 }
 
 pub(crate) struct SendPartContextV2 {
+    pub(crate) fec_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) adnl: Arc<AdnlNode>,
     pub(crate) part_states: Arc<Vec<Arc<SendPartStateV2>>>,
     pub(crate) peer: Arc<RldpPeer>,

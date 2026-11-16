@@ -227,8 +227,9 @@ impl SendJob {
                     }
                 } else {
                     let work_control = control.clone();
+                    let fec_slots = pool.fec_slots();
                     let receipt = pool.submit(work_control, async move {
-                        RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms).await
+                        RldpNode::send_loop_v1(self.ctx, &peer, min_timeout_ms, fec_slots).await
                     })?;
                     receipt.await.map_err(|_| error!("RLDP v1 owner lost its receipt"))?
                 }
@@ -1734,6 +1735,7 @@ impl RldpNode {
         mut context: SendContext,
         peer: &Arc<RldpPeer>,
         min_timeout_ms: u64,
+        fec_slots: Arc<tokio::sync::Semaphore>,
     ) -> Result<bool> {
         let transfer_str = Self::transfer_string(&context.transfer_id, &context.peers, "to");
         let SendTransfer::V1(mut transfer) = context.send_transfer else {
@@ -1751,10 +1753,11 @@ impl RldpNode {
                 context.control.cancel(SendCancelled::OwnerClosed);
             }
             context.control.check()?;
-            let (returned, mut transfer_wave) = owned_send::fec(
+            let (returned, mut transfer_wave) = owned_send::fec_limited(
                 transfer,
                 context.control.clone(),
                 context.adnl.tasks().clone(),
+                fec_slots.clone(),
                 |part| part.start_next_part(),
             )
             .await?;
@@ -1782,10 +1785,11 @@ impl RldpNode {
                         last_seqno = transfer.state().seqno_send()
                     }
                     context.control.check()?;
-                    let (returned, (object, do_next)) = owned_send::fec(
+                    let (returned, (object, do_next)) = owned_send::fec_limited(
                         transfer,
                         context.control.clone(),
                         context.adnl.tasks().clone(),
+                        fec_slots.clone(),
                         |part| {
                             let (bytes, next) = part.prepare_chunk()?;
                             Ok((bytes.to_vec(), next))
@@ -1920,6 +1924,7 @@ impl RldpNode {
             {
                 let transfer = part_transfers.remove(0);
                 let part_context = SendPartContextV2 {
+                    fec_slots: pool.fec_slots(),
                     adnl: context.adnl.clone(),
                     part_states: transfer_state.clone(),
                     peer: peer.clone(),
@@ -1935,7 +1940,7 @@ impl RldpNode {
                 };
                 let child_control = control.clone();
                 let permit = context.permit.clone();
-                match pool.submit(control.clone(), async move {
+                match pool.submit_v2(control.clone(), async move {
                     let _permit = permit;
                     Self::send_one_part_v2(
                         transfer,
@@ -2005,16 +2010,21 @@ impl RldpNode {
         let transfer = OwnedSendPart { part: transfer, peer: context.peer.clone() };
         #[cfg(test)]
         let hook = control.test_after_start.lock().unwrap().clone();
-        let (mut transfer, early) =
-            owned_send::fec(transfer, control.clone(), context.adnl.tasks().clone(), move |part| {
+        let (mut transfer, early) = owned_send::fec_limited(
+            transfer,
+            control.clone(),
+            context.adnl.tasks().clone(),
+            context.fec_slots.clone(),
+            move |part| {
                 part.start()?;
                 #[cfg(test)]
                 if let Some(hook) = hook {
                     return hook(part.state().part());
                 }
                 Ok(None::<bool>)
-            })
-            .await?;
+            },
+        )
+        .await?;
         if let Some(result) = early {
             return Ok(result);
         }
@@ -2084,10 +2094,11 @@ impl RldpNode {
             }
             new_received = 0;
             let peer = context.peer.clone();
-            let (returned, prepared) = owned_send::fec(
+            let (returned, prepared) = owned_send::fec_limited(
                 transfer,
                 control.clone(),
                 context.adnl.tasks().clone(),
+                context.fec_slots.clone(),
                 move |part| {
                     Ok(match part.prepare_chunk(&peer)? {
                         SendActionV2::Send((bytes, info)) => Ok((bytes.to_vec(), info)),

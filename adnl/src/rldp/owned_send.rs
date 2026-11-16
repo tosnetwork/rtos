@@ -148,6 +148,7 @@ pub(super) struct SendWorkerPool {
     admission: Arc<Mutex<bool>>,
     started: std::sync::OnceLock<()>,
     pub(super) workers: usize,
+    fec_slots: std::sync::OnceLock<Arc<Semaphore>>,
 }
 impl SendWorkerPool {
     pub fn new(owner: Arc<AdnlTasks>) -> Self {
@@ -157,8 +158,68 @@ impl SendWorkerPool {
             admission: Arc::new(Mutex::new(true)),
             started: std::sync::OnceLock::new(),
             workers: num_cpus::get().clamp(1, 8),
+            fec_slots: std::sync::OnceLock::new(),
         }
     }
+    pub(super) fn fec_slots(&self) -> Arc<Semaphore> {
+        self.fec_slots.get_or_init(|| Arc::new(Semaphore::new(self.workers))).clone()
+    }
+
+    // Like native connection actors, an ACK wait yields without occupying a
+    // scarce compute worker. The real blocking FEC work has a separate limit.
+    pub(super) fn submit_v2(
+        &self,
+        control: Arc<SendControl>,
+        work: impl Future<Output = Result<bool>> + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<bool>>> {
+        let open = self.admission.lock().unwrap();
+        if !*open || self.owner.is_closed() {
+            return Err(SendCancelled::OwnerClosed.into());
+        }
+        let owner_token = self.owner.enter()?;
+        let token = control.parts.token();
+        let (done, result) = oneshot::channel();
+        let job = Job {
+            control,
+            done,
+            work: Box::pin(async move {
+                let _token = token;
+                work.await
+            }),
+        };
+        self.owner.spawn_admitted(
+            "RLDP V2 part",
+            owner_token,
+            Self::run_job(job, self.owner.clone()),
+        );
+        Ok(result)
+    }
+
+    async fn run_job(job: Job, owner: Arc<AdnlTasks>) {
+        if owner.is_closed() {
+            job.control.cancel(SendCancelled::OwnerClosed);
+        }
+        let mut panicked = false;
+        let mut result = match job.control.check() {
+            Err(error) => Err(error),
+            Ok(()) => match std::panic::AssertUnwindSafe(job.work).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => {
+                    panicked = true;
+                    Err(error!("RLDP part panicked"))
+                }
+            },
+        };
+        if result.as_ref().err().is_some_and(|e| e.downcast_ref::<FecTaskFailed>().is_some()) {
+            panicked = true;
+        }
+        job.control.record_failure(&mut result);
+        if panicked {
+            owner.failed("RLDP sender worker panicked".into());
+        }
+        let _ = job.done.send(result);
+    }
+
     pub fn submit(
         &self,
         control: Arc<SendControl>,
@@ -195,24 +256,7 @@ impl SendWorkerPool {
                             break;
                         }
                         if let Some(job) = core.queue.pop() {
-                            if owner.is_closed() { job.control.cancel(SendCancelled::OwnerClosed); }
-                            let mut panicked = false;
-                            let mut result = match job.control.check() {
-                                Err(error) => Err(error),
-                                Ok(()) => match std::panic::AssertUnwindSafe(job.work).catch_unwind().await {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        panicked = true;
-                                        Err(error!("RLDP part panicked"))
-                                    }
-                                },
-                            };
-                            if result.as_ref().err().is_some_and(|e| e.downcast_ref::<FecTaskFailed>().is_some()) {
-                                panicked = true;
-                            }
-                            job.control.record_failure(&mut result);
-                            if panicked { owner.failed("RLDP sender worker panicked".into()); }
-                            let _ = job.done.send(result);
+                            Self::run_job(job, owner.clone()).await;
                         }
                     }
                 });
@@ -267,6 +311,31 @@ pub(super) async fn supervise(
             Err(error!("RLDP transfer panicked"))
         }
     }
+}
+
+// A permit remains with the actual blocking owner until its JoinHandle ends.
+// Cancellation can reject queued work, but never releases a running FEC slot.
+pub(super) async fn fec_limited<T, R, F>(
+    state: T,
+    control: Arc<SendControl>,
+    owner: Arc<AdnlTasks>,
+    capacity: Arc<Semaphore>,
+    work: F,
+) -> Result<(T, R)>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: FnOnce(&mut T) -> Result<R> + Send + 'static,
+{
+    let permit = tokio::select! {
+        biased;
+        _ = control.cancelled() => { control.check()?; unreachable!() },
+        _ = owner.cancelled() => return Err(SendCancelled::OwnerClosed.into()),
+        permit = capacity.acquire_owned() => permit?,
+    };
+    let ((state, _permit), result) =
+        fec((state, permit), control, owner, move |(state, _)| work(state)).await?;
+    Ok((state, result))
 }
 
 // Called only by retained send owners. There is intentionally no timeout/select

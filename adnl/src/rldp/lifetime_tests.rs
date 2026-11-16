@@ -149,11 +149,17 @@ async fn expired_rldp2_query_does_not_start_a_late_response() {
 
 async fn pair(
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    topology(2).await
+}
+
+async fn topology(
+    count: usize,
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
     let reply = Arc::new(HeldReply::default());
     let packets = Arc::new(ResponsePackets::default());
     let mut nodes = Vec::new();
     let mut rldps = Vec::new();
-    for index in 0..2 {
+    for index in 0..count {
         let mut attempts = 0;
         let (node, rldp) = loop {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -205,10 +211,13 @@ async fn pair(
         nodes.push(node);
         rldps.push(rldp);
     }
-    let keys = [nodes[0].key_by_tag(0).unwrap(), nodes[1].key_by_tag(0).unwrap()];
-    for index in 0..2 {
+    let keys: Vec<_> = nodes.iter().map(|node| node.key_by_tag(0).unwrap()).collect();
+    for index in (0..count).filter(|&index| index != 1) {
         nodes[index]
-            .add_peer(keys[index].id(), nodes[1 - index].ip_address_adnl(), None, &keys[1 - index])
+            .add_peer(keys[index].id(), nodes[1].ip_address_adnl(), None, &keys[1])
+            .unwrap();
+        nodes[1]
+            .add_peer(keys[1].id(), nodes[index].ip_address_adnl(), None, &keys[index])
             .unwrap();
     }
     let peers = AdnlPeers::with_keys(keys[0].id().clone(), keys[1].id().clone());
@@ -264,6 +273,101 @@ async fn unacknowledged_rldp2_response_keeps_the_query_deadline() {
         packets.drop_parts.store(false, Ordering::Release);
         let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
         assert_eq!(answer.unwrap(), vec![42; 64], "same peer must recover after expiry");
+    })
+    .catch_unwind()
+    .await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    for result in stopped {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_rldp2_peer_does_not_starve_a_healthy_peer() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_sender_fairness_context.tsv").trim(),
+        "8 60 10 64 1024"
+    );
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    let (_reply, packets, nodes, rldps, attacker_peers) = topology(3).await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        let worker_count = rldps[1].send_pool.workers;
+        let query_bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        // Authenticated raw requests advertise a 60s wire deadline and never
+        // acknowledge responses; the ordinary client API fixes its own at10s.
+        for index in 0..8 {
+            let request = serialize_boxed(
+                &rldp::message::Query {
+                    query_id: UInt256::from([80 + index as u8; 32]),
+                    max_answer_size: 1024,
+                    timeout: super::Version::get() + 60,
+                    data: query_bytes.clone(),
+                }
+                .into_boxed(),
+            )
+            .unwrap();
+            let mut encoder = crate::RaptorqEncoder::with_data(&request, None);
+            let mut seqno = 0;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from([120 + index as u8; 32]),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: request.len() as i64,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: seqno as i32,
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[0]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &attacker_peers,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while packets.transfers.lock().unwrap().len() < worker_count
+                || rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) < 8
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every silent response must reach an actual sender worker");
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire), 8);
+        let healthy = nodes[2].key_by_tag(0).unwrap();
+        let server = nodes[1].key_by_tag(0).unwrap();
+        let peers = AdnlPeers::with_keys(healthy.id().clone(), server.id().clone());
+        let data = TaggedByteSlice {
+            object: &query_bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let (answer, _) = tokio::time::timeout(
+            Duration::from_secs(12),
+            rldps[2].query(&data, Some(1024), &peers, true, None),
+        )
+        .await
+        .expect("healthy query must finish")
+        .expect("silent peer starved the healthy query");
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        for id in packets.transfers.lock().unwrap().iter() {
+            let id: [u8; 32] = id.as_slice().try_into().unwrap();
+            assert!(
+                matches!(rldps[1].transfers.get(&id).unwrap().val(), super::RldpTransfer::Send(_)),
+                "healthy progress must not evict the silent peer's valid responses"
+            );
+        }
     })
     .catch_unwind()
     .await;

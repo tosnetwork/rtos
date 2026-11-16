@@ -601,13 +601,19 @@ async fn rldp_owned_close_before_workers_first_poll_rejects_queue() {
 
 #[tokio::test]
 async fn rldp_owned_async_part_panic_has_sticky_completion() {
-    let owner = AdnlTasks::new();
-    let pool = pool(&owner);
-    let receipt = pool
-        .submit(SendControl::new(), async { panic!("controlled asynchronous part panic") })
+    for cooperative in [false, true] {
+        let owner = AdnlTasks::new();
+        let pool = pool(&owner);
+        let work = async { panic!("controlled asynchronous part panic") };
+        let receipt = if cooperative {
+            pool.submit_v2(SendControl::new(), work)
+        } else {
+            pool.submit(SendControl::new(), work)
+        }
         .unwrap();
-    assert!(bounded(receipt).await.unwrap().is_err());
-    assert!(bounded(owner.wait()).await.unwrap_err().to_string().contains("panicked"));
+        assert!(bounded(receipt).await.unwrap().is_err());
+        assert!(bounded(owner.wait()).await.unwrap_err().to_string().contains("panicked"));
+    }
 }
 
 #[tokio::test]
@@ -694,4 +700,63 @@ async fn rldp_owned_expired_protocol_deadline_skips_queued_work() {
         matches!(error.downcast_ref::<SendCancelled>(), Some(SendCancelled::Deadline)),
         "{error:#}"
     );
+}
+
+#[tokio::test]
+async fn rldp_cooperative_fec_limit_survives_cancellation_until_real_join() {
+    let owner = AdnlTasks::new();
+    let pool = pool(&owner);
+    let capacity = pool.fec_slots();
+    let gate = Arc::new(Gate::default());
+    let _release = Release(gate.clone());
+    let (entered, started) = oneshot::channel();
+    let control = SendControl::new();
+    let work_control = control.clone();
+    let work_owner = owner.clone();
+    let slots = capacity.clone();
+    let first = pool
+        .submit_v2(control.clone(), async move {
+            fec_limited((), work_control, work_owner, slots, move |_| {
+                entered.send(()).unwrap();
+                gate.wait();
+                Ok(())
+            })
+            .await?;
+            Ok(true)
+        })
+        .unwrap();
+    bounded(started).await.unwrap();
+    assert_eq!(capacity.available_permits(), 0);
+    control.cancel(SendCancelled::CallerDropped);
+    assert_eq!(capacity.available_permits(), 0, "cancellation cannot release a running FEC slot");
+    let later = SendControl::with_protocol_deadline(Some(
+        std::time::Instant::now() + Duration::from_millis(40),
+    ));
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    let slots = capacity.clone();
+    let work_owner = owner.clone();
+    let work_control = later.clone();
+    let second = pool
+        .submit_v2(later.clone(), async move {
+            fec_limited((), work_control, work_owner, slots, move |_| {
+                flag.store(true, Ordering::Release);
+                Ok(())
+            })
+            .await?;
+            Ok(true)
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    _release.0.release();
+    let _ = bounded(first).await.unwrap();
+    let result = bounded(second).await.unwrap();
+    bounded(owner.wait()).await.unwrap();
+    assert!(!ran.load(Ordering::Acquire));
+    assert!(result.is_err());
+    assert!(matches!(
+        later.take_failure().unwrap().unwrap_err().downcast_ref::<SendCancelled>(),
+        Some(SendCancelled::Deadline)
+    ));
+    assert_eq!(capacity.available_permits(), 1);
 }
