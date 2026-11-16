@@ -82,6 +82,8 @@ pub(super) struct NativeConnection {
     #[cfg(test)]
     pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
     #[cfg(test)]
+    pub(super) failed_send_ids: Arc<Mutex<Vec<TransferId>>>,
+    #[cfg(test)]
     pub(super) query_send_results: Mutex<Vec<(TransferId, bool)>>,
     #[cfg(test)]
     pub(super) retired_registrations: Arc<AtomicU64>,
@@ -129,6 +131,8 @@ impl NativeConnection {
             #[cfg(test)]
             completed_send_ids: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
+            failed_send_ids: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
             query_send_results: Mutex::new(Vec::new()),
             #[cfg(test)]
             retired_registrations: Arc::new(AtomicU64::new(0)),
@@ -139,6 +143,8 @@ impl NativeConnection {
         let routed_receives = ret.routed_receives.clone();
         #[cfg(test)]
         let completed_send_ids = ret.completed_send_ids.clone();
+        #[cfg(test)]
+        let failed_send_ids = ret.failed_send_ids.clone();
         let lifetime = owner.clone();
         owner.spawn_admitted("RLDP2 Connection events", token, async move {
             // Keep this entry's capacity until actual transport work ends.
@@ -157,6 +163,10 @@ impl NativeConnection {
                     if result.is_ok() {
                         completed_send_ids.lock().unwrap().push(id);
                         completed_sends.fetch_add(1, Ordering::Release);
+                    }
+                    #[cfg(test)]
+                    if result.is_err() {
+                        failed_send_ids.lock().unwrap().push(id);
                     }
                     if let Some(reply) = waiters.lock().unwrap().sent.remove(&id) {
                         let _ = reply.send(result.map_err(|error| error!("RLDP2 send: {error}")));

@@ -389,3 +389,118 @@ async fn native_sender_progress(
         "stop must join both actual native drivers"
     );
 }
+
+fn sender_deadline_effects() -> Vec<serde_json::Value> {
+    checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_metadata.json"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_sender_absolute_deadlines_match_native() {
+    let expected = sender_deadline_effects();
+    let (_, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome=std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true,Ordering::Release);
+        let peer=rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+        let native=peer.native.get().expect("deadline probe requires actual native Connection");
+        let mut ids=Vec::new();
+        for (index,row) in expected.iter().enumerate() {
+            let id=[180+index as u8;32]; ids.push(id);
+            let deadline=std::time::Instant::now()+Duration::from_millis(row["deadline_ms"].as_u64().unwrap());
+            assert!(native.driver.submit(super::super::connection_driver::Command::Send {id,data:b"query".to_vec(),deadline:Some(deadline),answer:false}).await.unwrap());
+        }
+        let loss=expected[0]["loss_ms"].as_u64().unwrap();
+        assert!(expected.iter().all(|row|row["loss_ms"]==loss));
+        tokio::time::sleep(Duration::from_millis(loss)).await;
+        let (done,receipt)=tokio::sync::oneshot::channel();
+        native.driver.submit(super::super::connection_driver::Command::InspectEncoders(done)).await.unwrap();
+        let retained=receipt.await.unwrap();
+        let failed=native.failed_send_ids.lock().unwrap().clone();
+        let mut actual=Vec::new();
+        for (row,id) in expected.iter().zip(&ids) {
+            assert!(packets.transfers.lock().unwrap().contains(id.as_slice()),"each deadline sender must emit an actual UDP packet");
+            actual.push(serde_json::json!({"deadline_ms":row["deadline_ms"],"loss_ms":loss,"pending":retained.iter().filter(|(sent,_,_)|sent==id).count(),"expired":failed.iter().filter(|sent|*sent==id).count()}));
+        }
+        assert_eq!(actual,expected);
+        assert_eq!(native.completed_sends.load(Ordering::Acquire),0);
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0);
+        eprintln!("NATIVE_SENDER_DEADLINES: {}",serde_json::to_string(&actual).unwrap());
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_query_survives_loss_until_absolute_deadline() {
+    let expected = sender_deadline_effects();
+    let (_, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        let peer = rldps[1].get_peer(route.other(), route.local(), true, None).await.unwrap();
+        let native = peer.native.get().expect("query must use actual native Connection");
+        let reverse = AdnlPeers::with_keys(route.other().clone(), route.local().clone());
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let request = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let query = rldps[1].query(&request, Some(1024), &reverse, true, None);
+        let loss = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while native.query_send_results.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("query must actually submit before measuring loss");
+            tokio::time::sleep(Duration::from_millis(expected[0]["loss_ms"].as_u64().unwrap()))
+                .await;
+            assert_eq!(inspect(native).await.1, expected[0]["pending"].as_u64().unwrap() as usize);
+            assert!(native.failed_send_ids.lock().unwrap().is_empty());
+            assert!(
+                !packets.transfers.lock().unwrap().is_empty(),
+                "loss control must observe real packets"
+            );
+            packets.drop_parts.store(false, Ordering::Release);
+        };
+        let (result, ()) = tokio::join!(query, loss);
+        assert_eq!(result.unwrap().0, Some(vec![42; 64]));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while native.waiter_counts() != (0, 0)
+                || native.completed_sends.load(Ordering::Acquire) != 1
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovered request must complete and retire actual waiters");
+        assert_eq!(inspect(native).await.1, 0);
+    })
+    .catch_unwind()
+    .await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
