@@ -1285,6 +1285,7 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
         "2049\t64\t60"
     );
     let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let cleanup_gate = Arc::new(tokio::sync::Semaphore::new(0));
     let outcome = std::panic::AssertUnwindSafe(async {
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
         let query = TaggedByteSlice {
@@ -1295,6 +1296,18 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
         let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
         let started = tokio::time::Instant::now();
         for value in 0..2049usize {
+            if value == 2048 {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while rldps[0].allocated.query_receiver_finished.load(Ordering::Acquire) != 2048
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("earlier query receivers must finish before the controlled final one");
+                *rldps[0].allocated.query_receiver_cleanup_gate.lock().unwrap() =
+                    Some(cleanup_gate.clone());
+            }
             let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
             assert_eq!(answer.unwrap(), vec![42; 64]);
             if [0, 127, 128, 2047, 2048].contains(&value) {
@@ -1333,6 +1346,48 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
         .await
         .expect("all response handlers must observe actual sender completion");
         assert_eq!(reply.calls.load(Ordering::Acquire), 2049);
+        // Hold the final query receiver after it delivers the answer. The
+        // former allocation/response-handler waits all pass, while its exact
+        // request registration is still live. This is an observation window,
+        // not proof of a leaked sender.
+        {
+            let ids = peer.registrations.lock().unwrap();
+            let completed = peer.completed.lock().unwrap();
+            let residual: Vec<_> = ids
+                .iter()
+                .filter(|id| !completed.iter().any(|(done, _)| done == *id))
+                .copied()
+                .collect();
+            let last_request = completed.back().unwrap().0.map(|byte| byte ^ 0xff);
+            // Assertions must not poison the peer's locks on a failed probe.
+            drop(completed);
+            drop(ids);
+            assert_eq!(peer.transfer_slots.available_permits(), 256);
+            assert_eq!(
+                residual,
+                vec![last_request],
+                "only the controlled receiver retains its request registration"
+            );
+            for id in &residual {
+                assert!(peer
+                    .transfers
+                    .get(id)
+                    .is_some_and(|entry| matches!(entry.val(), super::RldpTransfer::Done)));
+            }
+            eprintln!(
+                "RETIREMENT_HELD_RECEIVER: residual={} finished={}",
+                residual.len(),
+                rldps[0].allocated.query_receiver_finished.load(Ordering::Acquire)
+            );
+        }
+        cleanup_gate.close();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[0].allocated.query_receiver_finished.load(Ordering::Acquire) != 2049 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all query receivers must release their actual registrations");
         for (side, peer) in [peer, other].iter().enumerate() {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while peer.transfer_slots.available_permits() != 256 {
@@ -1346,6 +1401,25 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
             eprintln!(
                 "OUTBOUND_RETIREMENT: side={side} completed=2049 outbound_retained={retained}"
             );
+            if retained != 0 {
+                let ids = peer.registrations.lock().unwrap();
+                let completed = peer.completed.lock().unwrap();
+                for id in ids.iter().filter(|id| !completed.iter().any(|(done, _)| done == *id)) {
+                    let send = peer.transfers.get(id).map(|entry| match entry.val() {
+                        super::RldpTransfer::Done => "done",
+                        super::RldpTransfer::Send(_) => "send",
+                        super::RldpTransfer::Recv(_) => "recv",
+                    });
+                    let recv = peer.inbound_transfers.get(id).map(|entry| match entry.val() {
+                        super::RldpTransfer::Done => "done",
+                        super::RldpTransfer::Send(_) => "send",
+                        super::RldpTransfer::Recv(_) => "recv",
+                    });
+                    eprintln!(
+                        "RETIREMENT_RESIDUAL: side={side} id={id:?} send={send:?} recv={recv:?}"
+                    );
+                }
+            }
             assert_eq!(
                 retained,
                 expected["outbound_retained"].as_u64().unwrap() as usize,
@@ -1359,6 +1433,7 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
     })
     .catch_unwind()
     .await;
+    cleanup_gate.close();
     for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
         result.unwrap();
     }
