@@ -23,6 +23,8 @@ use std::{
 
 #[derive(Default)]
 struct HeldReply {
+    messages: std::sync::atomic::AtomicUsize,
+    message_received: tokio::sync::Notify,
     calls: std::sync::atomic::AtomicUsize,
     response_bytes: std::sync::atomic::AtomicUsize,
     hold: AtomicBool,
@@ -31,6 +33,14 @@ struct HeldReply {
 }
 #[async_trait::async_trait]
 impl Subscriber for HeldReply {
+    async fn try_consume_custom(&self, bytes: &[u8], _: &AdnlPeers) -> Result<bool> {
+        if bytes == b"churn" {
+            self.messages.fetch_add(1, Ordering::Release);
+            self.message_received.notify_one();
+            return Ok(true);
+        }
+        Ok(false)
+    }
     async fn try_consume_query(&self, object: TLObject, _: &AdnlPeers) -> Result<QueryResult> {
         match object.downcast::<Query>() {
             Ok(_) => {
@@ -1070,4 +1080,131 @@ fn refused_query_native_effects() -> serde_json::Value {
     let elapsed = effects.as_object_mut().unwrap().remove("elapsed_ms").unwrap().as_u64().unwrap();
     assert!((9500..13000).contains(&elapsed), "native deadline outside comparison window");
     effects
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_completed_retention_matches_native_under_churn() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_completed_churn_context.tsv").trim(),
+        "2049"
+    );
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let message = serialize_boxed(&rldp::message::Message { id: UInt256::default(), data: b"churn".to_vec() }.into_boxed()).unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&message, None);
+        let mut seqno = 0;
+        let symbol = encoder.encode(&mut seqno).unwrap();
+        let wire = |value: u32| {
+            let mut id = [0; 32]; id[..4].copy_from_slice(&value.to_le_bytes());
+            let chunk = RldpChunk { transfer_id: UInt256::from(id), fec_type: encoder.params().clone().into_boxed(), part: 0, total_size: message.len() as i64, data: symbol.clone(), seqno: seqno as i32 };
+            serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap()
+        };
+        let started = tokio::time::Instant::now();
+        for value in 0..2049u32 {
+            let wire = wire(value);
+            nodes[0].send_custom(&TaggedByteSlice { object: &wire, #[cfg(feature = "telemetry")] tag: 0 }, &peers).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while reply.messages.load(Ordering::Acquire) < value as usize + 1 { reply.message_received.notified().await; }
+            }).await.expect("unique message did not reach actual subscriber");
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "churn must precede20s expiry");
+        let unique_delivered = reply.messages.load(Ordering::Acquire);
+        assert_eq!(unique_delivered, 2049);
+        let remembered = rldps[1].transfers.iter().filter(|entry| matches!(entry.val(), super::RldpTransfer::Done)).count();
+        assert_eq!(remembered, 2048, "native bounds completed IDs independently of time");
+        let oldest = wire(0);
+        nodes[0].send_custom(&TaggedByteSlice { object: &oldest, #[cfg(feature = "telemetry")] tag: 0 }, &peers).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reply.messages.load(Ordering::Acquire) < 2050 { reply.message_received.notified().await; }
+        }).await.expect("native reassembles oldest ID after cache eviction");
+        let oldest_replayed = reply.messages.load(Ordering::Acquire) == 2050;
+        // A remembered ID is suppressed synchronously by the normal handler.
+        let reverse = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        assert!(rldps[1].try_consume_custom(&wire(2048), &reverse).await.unwrap());
+        let delivered = reply.messages.load(Ordering::Acquire);
+        let actual = serde_json::json!({"unique_delivered":unique_delivered,"remembered":remembered,"oldest_replayed":oldest_replayed,"recent_suppressed":delivered==2050,"delivered":delivered});
+        assert_eq!(actual, completed_churn_native_effects());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].allocated.recv_transfers.load(Ordering::Acquire) != 0 { tokio::task::yield_now().await; }
+        }).await.expect("completed receivers must release their payload/context without a20s timer");
+        eprintln!("COMPLETED_CHURN_FINAL: {actual} live_receivers=0 elapsed_ms={}", started.elapsed().as_millis());
+    }).catch_unwind().await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn completed_churn_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_completed_churn_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_completed_churn_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_completed_churn_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_completed_churn_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_solicited_replies_share_native_completed_bound() {
+    let (_reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let started = tokio::time::Instant::now();
+        for value in 0..2049usize {
+            let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
+            assert_eq!(answer.unwrap(), vec![42; 64]);
+            if [0, 127, 128, 2047, 2048].contains(&value) {
+                assert_eq!(peer.completed.lock().unwrap().len(), (value + 1).min(2048));
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must observe the count bound before TTL pruning"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[0].allocated.recv_transfers.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        eprintln!(
+            "SOLICITED_CHURN: replies=2049 remembered=2048 live_receivers=0 elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }

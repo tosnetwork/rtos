@@ -377,6 +377,7 @@ where
 }
 
 pub(super) struct SendRegistration {
+    pub inbound: Option<(super::TransferId, CancellationToken)>,
     pub peer: Option<(std::sync::Weak<super::RldpPeer>, CancellationToken)>,
     pub transfers: Arc<lockfree::map::Map<super::TransferId, super::RldpTransfer>>,
     pub send: super::TransferId,
@@ -399,8 +400,26 @@ fn with_live_peer(
         action(None);
     }
 }
+impl SendRegistration {
+    pub(super) fn finish_inbound(&self) {
+        if let (Some((id, finished)), Some((peer, _))) = (&self.inbound, &self.peer) {
+            if let Some(peer) = peer.upgrade() {
+                peer.finish_inbound(&self.transfers, *id, finished, tokio::time::Instant::now());
+            }
+        }
+    }
+}
 impl Drop for SendRegistration {
     fn drop(&mut self) {
+        if let Some((id, _)) = &self.inbound {
+            self.finish_inbound();
+            if *id == self.send {
+                return;
+            }
+            if self.receive == Some(*id) {
+                self.receive = None;
+            }
+        }
         with_live_peer(&self.peer, |_| {
             self.transfers.insert(self.send, super::RldpTransfer::Done);
             if let Some(id) = self.receive {

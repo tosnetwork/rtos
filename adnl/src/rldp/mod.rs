@@ -161,6 +161,7 @@ async fn expire_inbound_transfer(
     owner: Arc<crate::adnl::tasks::AdnlTasks>,
     timer: impl std::future::Future<Output = ()>,
     peer: Option<Arc<RldpPeer>>,
+    finished: Option<tokio_util::sync::CancellationToken>,
 ) {
     tokio::select! {
         biased;
@@ -171,7 +172,9 @@ async fn expire_inbound_transfer(
     // polling on another worker. Serialize the final write with old-generation
     // close/cleanup, so an expired timer cannot overwrite a reopened ID.
     let _ids = peer.as_ref().map(|peer| peer.registrations.lock().unwrap());
-    if peer.as_ref().is_some_and(|peer| peer.closed.is_cancelled()) {
+    if peer.as_ref().is_some_and(|peer| peer.closed.is_cancelled())
+        || finished.as_ref().is_some_and(|finished| finished.is_cancelled())
+    {
         return;
     }
     transfers.insert_with(transfer_id, |_, _, found| {
@@ -273,6 +276,7 @@ declare_counted!(
         closed: tokio_util::sync::CancellationToken,
         drained: tokio_util::sync::CancellationToken,
         registrations: Arc<std::sync::Mutex<HashSet<TransferId>>>,
+        completed: std::sync::Mutex<std::collections::VecDeque<(TransferId, tokio::time::Instant)>>,
         tx: tokio::sync::mpsc::UnboundedSender<SendJob>,
         stats: StatsV2,
         #[cfg(test)]
@@ -862,6 +866,7 @@ impl RldpNode {
             return Ok(None);
         }
         let registration = Arc::new(owned_send::SendRegistration {
+            inbound: v2.then(|| (*transfer_id, tokio_util::sync::CancellationToken::new())),
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: self.transfers.clone(),
             send: *transfer_id,
@@ -906,6 +911,7 @@ impl RldpNode {
         let owner = self.adnl.tasks().clone();
         let token = owner.enter()?;
         let lifetime = owner.clone();
+        let inbound_finished = registration.inbound.as_ref().map(|(_, finished)| finished.clone());
         let connection_closed = peer.closed.clone();
         let expiry_peer = peer.clone();
         owner.spawn_admitted("RLDP inbound", token, async move {
@@ -915,7 +921,12 @@ impl RldpNode {
                 _ = peer.closed.cancelled() => return,
                 _ = Self::receive_loop(&mut context, v2) => {},
             }
-            if peer.insert_transfer(&transfers, context.transfer_id, RldpTransfer::Done).is_err() {
+            if v2 {
+                _registration.finish_inbound();
+            } else if peer
+                .insert_transfer(&transfers, context.transfer_id, RldpTransfer::Done)
+                .is_err()
+            {
                 return;
             }
             let send_transfer_id = Self::inbound_loop(
@@ -951,6 +962,11 @@ impl RldpNode {
                 target: TARGET,
                 "{rldp} STAT recv: transfers total {all}, active {now}"
             );
+            // V2 retains only a bounded completed ID, not the receiver, decoded
+            // payload and two per-transfer expiry tasks for another20seconds.
+            if v2 {
+                return;
+            }
             tokio::select! {
                 _ = lifetime.cancelled() => {},
                 _ = tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS * 2)) => {},
@@ -972,8 +988,12 @@ impl RldpNode {
             tokio::select! {
                 biased;
                 _ = connection_closed.cancelled() => {},
+                _ = async {
+                    if let Some(finished) = &inbound_finished { finished.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
                 _ = expire_inbound_transfer(transfers, transfer_id, lifetime,
-                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)), Some(expiry_peer)) => {},
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_MAX_MS)), Some(expiry_peer), inbound_finished.clone()) => {},
             }
         });
         Ok(Some(queue_sender))
@@ -1125,6 +1145,7 @@ impl RldpNode {
         let control = SendControl::with_protocol_deadline(response_deadline);
         let _cancel = control.guard();
         let registration = Arc::new(owned_send::SendRegistration {
+            inbound: None,
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: transfers.clone(),
             send: send_transfer_id,
@@ -1371,6 +1392,11 @@ impl RldpNode {
             (None, None)
         };
         let registration = Arc::new(owned_send::SendRegistration {
+            inbound: if v2 {
+                recv_transfer_id.map(|id| (id, tokio_util::sync::CancellationToken::new()))
+            } else {
+                None
+            },
             peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
             transfers: self.transfers.clone(),
             send: send_transfer_id,
@@ -1572,6 +1598,7 @@ impl RldpNode {
                     v2 && !propagate_failure,
                 )
                 .await;
+                _registration.finish_inbound();
                 let _ = ping.send(recv_context.recv_transfer);
                 if let Some(scope) = bounded {
                     let _ = scope.done.send(());

@@ -240,6 +240,7 @@ impl PeerTable {
             closed: CancellationToken::new(),
             drained: CancellationToken::new(),
             registrations: Arc::new(Mutex::new(HashSet::new())),
+            completed: Mutex::new(std::collections::VecDeque::new()),
             stats: StatsV2::new(StatsConfigV2::default(), self.min_timeout_ms)?,
             #[cfg(test)]
             idle: Arc::new(Notify::new()),
@@ -292,6 +293,9 @@ impl PeerTable {
             for id in ids.drain() {
                 transfers.remove(&id);
             }
+            if let Some(peer) = weak.upgrade() {
+                peer.completed.lock().unwrap().clear();
+            }
             drop(ids);
             drained.cancel();
             wake.notify_one();
@@ -306,6 +310,39 @@ impl Drop for PeerTable {
     }
 }
 impl RldpPeer {
+    pub(super) fn finish_inbound(
+        &self,
+        transfers: &lockfree::map::Map<TransferId, RldpTransfer>,
+        id: TransferId,
+        finished: &CancellationToken,
+        now: Instant,
+    ) {
+        let mut ids = self.registrations.lock().unwrap();
+        if finished.is_cancelled() {
+            return;
+        }
+        // Old expiry and registration drops must not touch this ID again,
+        // including after the completed-ID cache evicts it and it is reused.
+        finished.cancel();
+        if self.closed.is_cancelled() {
+            return;
+        }
+        transfers.insert(id, RldpTransfer::Done);
+        ids.insert(id);
+        let mut completed = self.completed.lock().unwrap();
+        completed.push_back((id, now + Duration::from_secs(20)));
+        // Native trims only on completion: retain a minimum128 entries, expire
+        // older entries after20s, and bound the cache unconditionally at2048.
+        while completed.len() > 2048
+            || (completed.len() > 128 && completed.front().is_some_and(|(_, at)| *at <= now))
+        {
+            let (old, _) = completed.pop_front().unwrap();
+            if transfers.get(&old).is_some_and(|entry| matches!(entry.val(), RldpTransfer::Done)) {
+                transfers.remove(&old);
+                ids.remove(&old);
+            }
+        }
+    }
     fn close(&self, _transfers: &lockfree::map::Map<TransferId, RldpTransfer>) {
         let _ids = self.registrations.lock().unwrap();
         self.closed.cancel();
