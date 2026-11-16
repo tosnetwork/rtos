@@ -87,8 +87,8 @@ def fixture(root, point):
         "all_six_mc_four_wc_states_match": True,
         "path": str(target),
         "namespace": str(namespace),
-        "old_process": {"pid": 100, "start_ticks": 10},
-        "new_process": {"pid": 200, "start_ticks": 20},
+        "old_process": {"pid": 100, "start_ticks": "10"},
+        "new_process": {"pid": 200, "start_ticks": "20"},
         "bytes": len(raw),
         "sha256": sha(raw),
         "intended_bytes": len(intended),
@@ -117,6 +117,33 @@ def fixture(root, point):
 
 
 class FirstIntentAdapterTests(unittest.TestCase):
+    def test_process_starttime_uses_native_decimal_text_and_numeric_order(self):
+        from scenario_first_intent import check_first_intent_result
+
+        with TemporaryDirectory() as tmp:
+            result = fixture(Path(tmp), "before-write")
+            receipt = result["first_intent_cut"]
+            receipt["old_process"]["start_ticks"] = "99"
+            receipt["new_process"]["start_ticks"] = "100"
+            check_first_intent_result("first-intent-before-write", result)
+            for bad in [
+                100,
+                True,
+                None,
+                "",
+                "0",
+                "0100",
+                "-1",
+                "1.0",
+                " 100",
+                "１００",
+                "98",
+            ]:
+                with self.subTest(start_ticks=bad):
+                    receipt["new_process"]["start_ticks"] = bad
+                    with self.assertRaisesRegex(ValueError, "process identity"):
+                        check_first_intent_result("first-intent-before-write", result)
+
     def test_both_cuts_are_wired(self):
         catalog = validate(json.loads(CATALOG.read_text()), CATALOG.parent)
         for point in ("before-write", "after-partial-write"):

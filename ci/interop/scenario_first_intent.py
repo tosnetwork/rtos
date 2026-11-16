@@ -69,15 +69,21 @@ def check_first_intent_result(name, result):
     ):
         raise ValueError("First-intent recovery/rotation exceeded original budget")
     old, new = receipt["old_process"], receipt["new_process"]
+    # /proc starttime is retained as decimal text by the process owner.
+    ticks = [p.get("start_ticks") for p in (old, new)]
     if (
-        any(
-            type(p.get(k)) is not int or p[k] <= 0
-            for p in (old, new)
-            for k in ("pid", "start_ticks")
+        any(type(p.get("pid")) is not int or p["pid"] <= 0 for p in (old, new))
+        or any(
+            type(value) is not str
+            or not value.isascii()
+            or not value.isdecimal()
+            or value.startswith("0")
+            for value in ticks
         )
         or old["pid"] == new["pid"]
-        or new["start_ticks"] < old["start_ticks"]
     ):
+        raise ValueError("First-intent restart process identity differs")
+    if int(ticks[1]) < int(ticks[0]):
         raise ValueError("First-intent restart process identity differs")
     member = member_id(2)
     after = result["epochs"]["after"]
