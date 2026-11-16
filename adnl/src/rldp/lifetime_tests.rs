@@ -2470,3 +2470,118 @@ async fn rldp2_message_uses_native_ten_second_deadline() {
         std::panic::resume_unwind(panic);
     }
 }
+
+fn completed_packet_validation_native_effects() -> serde_json::Value {
+    let context =
+        include_bytes!("../../../ci/conformance/rldp2_completed_packet_validation_context.tsv");
+    let effects =
+        include_bytes!("../../../ci/conformance/rldp2_completed_packet_validation_effects.jsonl");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_completed_packet_validation_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["exit"], 0);
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!(
+                "../../../ci/conformance/rldp2_completed_packet_validation_reference.cpp"
+            )
+            .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_completed_packet_validation_matches_native() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    async fn send(
+        node: &Arc<AdnlNode>,
+        route: &AdnlPeers,
+        part: i32,
+        total: i64,
+        bytes: &[u8],
+        forced_seqno: Option<i32>,
+        symbol_size: i32,
+    ) {
+        let mut encoder = crate::RaptorqEncoder::with_data(bytes, None);
+        let mut seqno = 0;
+        let mut fec = encoder.params().clone();
+        fec.symbol_size = symbol_size;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from([0; 32]),
+            fec_type: fec.into_boxed(),
+            part,
+            total_size: total,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: forced_seqno.unwrap_or(seqno as i32),
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        node.send_custom(
+            &TaggedByteSlice {
+                object: &wire,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            route,
+        )
+        .await
+        .unwrap();
+    }
+    let mut actual = Vec::new();
+    for line in
+        include_str!("../../../ci/conformance/rldp2_completed_packet_validation_context.tsv")
+            .lines()
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let name = fields[0];
+        let forced_seqno: i32 = fields[1].parse().unwrap();
+        let symbol_size: i32 = fields[2].parse().unwrap();
+        let (reply, packets, nodes, rldps, peers) = pair().await;
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let (sender, receiver, route) = (0, 1, peers.clone());
+            let peer = rldps[receiver].get_peer(route.other(), route.local(), true, None).await.unwrap();
+            {
+                let warm = serialize_boxed(&rldp::message::Message { id:UInt256::default(),data:b"churn".to_vec() }.into_boxed()).unwrap();
+                send(&nodes[sender], &route, 0, warm.len() as i64, &warm, None, 768).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while reply.messages.load(Ordering::Acquire) != 1 { reply.message_received.notified().await; }
+                }).await.expect("warm message must actually deliver");
+            }
+            send(&nodes[sender], &route, 1, 2048, &vec![42;2048], Some(forced_seqno), symbol_size).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let observed = packets.part_one_completions.load(Ordering::Acquire) > 0;
+                    if observed { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.unwrap_or_else(|error| panic!("{name}: input or completed-ID replay acknowledgement must reach the authenticated receiver: {error}"));
+            let inbound = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Recv(_))).count();
+            let completed = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Done)).count();
+            serde_json::json!({"id":name,"inbound":inbound,"completed":completed,"replay_complete_packets":packets.part_one_completions.load(Ordering::Acquire)})
+        }).catch_unwind().await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        match outcome {
+            Ok(value) => actual.push(value),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    assert_eq!(
+        serde_json::Value::Array(actual),
+        completed_packet_validation_native_effects(),
+        "completed IDs must be acknowledged before packet validation"
+    );
+}

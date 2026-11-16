@@ -699,14 +699,22 @@ impl RldpNode {
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        let valid_packet = match &chunk {
+            Chunk::V1(_) => true,
+            Chunk::V2(Rldp2MessagePart(part)) => {
+                Self::check_message(Some(&part.fec_type), part.seqno).is_ok()
+            }
+        };
         // Explicit bounded queries report a declared wire-limit violation
         // before decoding. This notification must not claim an inbound slot.
         if let Chunk::V2(Rldp2MessagePart(part)) = &chunk {
             if let Some(entry) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(registration) = entry.val() {
-                    if registration.bounded_wire_limit.is_some_and(|limit| {
-                        usize::try_from(part.total_size).is_ok_and(|total| total > limit)
-                    }) {
+                    if valid_packet
+                        && registration.bounded_wire_limit.is_some_and(|limit| {
+                            usize::try_from(part.total_size).is_ok_and(|total| total > limit)
+                        })
+                    {
                         let _ = registration.sender.send(chunk);
                         return Ok(());
                     }
@@ -719,7 +727,8 @@ impl RldpNode {
                 let total = chunk.total_size as u64;
                 let part = chunk.part as u64;
                 let width = Constraints::SLICE as u64;
-                chunk.total_size > 0
+                valid_packet
+                    && chunk.total_size > 0
                     && chunk.part >= 0
                     && part < total.div_ceil(width)
                     && matches!(&chunk.fec_type, FecType::Fec_RaptorQ(fec)
@@ -798,10 +807,9 @@ impl RldpNode {
                 let RldpMessagePart(part) = part;
                 (Self::check_message(Some(&part.fec_type), part.seqno), false)
             }
-            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(part)) => {
-                let Rldp2MessagePart(part) = part;
-                (Self::check_message(Some(&part.fec_type), part.seqno), true)
-            }
+            // V2 checks completed IDs before validating packet parameters.
+            // The chunk path validates live/new transfers before admission.
+            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(_)) => (Ok(()), true),
             MessagePart::V1(RldpMessagePartBoxed::Rldp_Confirm(confirm)) => {
                 (Self::check_message(None, confirm.seqno), false)
             }
