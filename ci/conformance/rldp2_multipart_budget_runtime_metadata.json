@@ -1,11 +1,11 @@
 {
   "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
-  "cases_sha256": "d62ce056666e5c75eaa853563308e01146e1a7833e48581dbba2c4ee4dcdab5d",
+  "cases_sha256": "052a9bc6b0577f9a3d3c2d942cc9eacbf4a9f78024488f44a6dbc0fd3b493811",
   "native_source": "/tos/worktrees/tos/rtos-conformance-latest-5af405d",
   "native_build": "/tos/build/rtos-conformance-latest-5af405d",
   "runner_source_sha256": "2855676a32f30eb9d308cff1af6b5a7f10b3dc985a8a31bacd9ca6447fb171a9",
-  "probe_source_sha256": "74fc037228f5f95d84154197882493c37d65bb41b3fe50c207955086650d50b9",
-  "probe_binary_sha256": "694d8943fe1f504f3ec4fbc3cbefb0799e44e69087cec239295773abe8e2d339",
+  "probe_source_sha256": "d470e6ec47db19e91ff63d0934625ad1354f129b1201cb6c7fb4af6de7564fee",
+  "probe_binary_sha256": "313cd948cc6b37e22f1012dac70c6d78f82c4a2af17cbb12c0094780acba3d00",
   "exit": 0,
   "compile_command": [
     "/usr/bin/clang++-21",
@@ -52,13 +52,13 @@
     "-c",
     "/tos/worktrees/rtos/rldp2-connection-driver/ci/conformance/rldp2_multipart_budget_runtime_reference.cpp",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-native-multipart-budget/native-final/probe.o"
+    "/datax/rtos-conformance/2026-11-16-native-multipart-geometry/native/probe.o"
   ],
   "link_command": [
     "/usr/bin/clang++-21",
-    "/datax/rtos-conformance/2026-11-16-native-multipart-budget/native-final/probe.o",
+    "/datax/rtos-conformance/2026-11-16-native-multipart-geometry/native/probe.o",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-native-multipart-budget/native-final/probe",
+    "/datax/rtos-conformance/2026-11-16-native-multipart-geometry/native/probe",
     "-Wl,--start-group",
     "adnl/libadnl.a",
     "adnl/libadnltest.a",
@@ -150,5 +150,5 @@
     "-lpthread",
     "-ldl"
   ],
-  "effects_sha256": "0d352afef0ba21d51deacdd7cb5e08ff62ec30b4ac9df050c7b0c94061c4ded5"
+  "effects_sha256": "2dfcd6360b1c0e07cc044fabdad97fb9a557312ea3aca75e5dc522fe719885b6"
 }

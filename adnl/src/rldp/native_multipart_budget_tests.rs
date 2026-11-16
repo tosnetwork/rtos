@@ -90,7 +90,7 @@ async fn check_case(
 ) -> Vec<serde_json::Value> {
     use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
     assert!((2..=3).contains(&count));
-    assert_eq!(tail, 772);
+    assert!((4..=2_000_000).contains(&tail) && tail % 4 == 0);
     let (reply, _, nodes, rldps, peers) = topology_configured(2, None, false, true).await;
     for node in &rldps {
         node.peers.enable_native_for_tests();
