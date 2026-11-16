@@ -332,7 +332,16 @@ impl RecvTransfer {
             fail!("Unsupported FEC type in RLDP packet")
         };
         let total_size = if let Some(total_size) = self.total_size {
-            if total_size != chunk.total_size as usize {
+            // Native V2 validates each packet's geometry but keeps the first
+            // transfer total. A changed declaration does not reset the decoder.
+            if v2 {
+                let max_wire =
+                    Constraints::MAX_TOTAL_TRANSFER_SIZE + Constraints::RLDP_ANSWER_TL_OVERHEAD;
+                let cap = self.expected_total_size.map(|s| s.min(max_wire)).unwrap_or(max_wire);
+                if chunk.total_size as usize > cap {
+                    return Ok(None);
+                }
+            } else if total_size != chunk.total_size as usize {
                 log::warn!(
                     "Incorrect total size {} in RLDP chunk - expected {total_size}, skipping",
                     chunk.total_size
@@ -376,6 +385,22 @@ impl RecvTransfer {
                     // has been admitted; do not allocate or decode holes.
                     if chunk_part_usize != parts.len() {
                         return Ok(None);
+                    }
+                    // Native reserves offsets when a decoder is opened, not
+                    // when its data finishes decoding. Include unfinished parts.
+                    let offset = parts
+                        .iter()
+                        .try_fold(0usize, |sum, part| {
+                            sum.checked_add(
+                                part.core
+                                    .decoder
+                                    .as_ref()
+                                    .map_or(0, |decoder| decoder.params().data_size as usize),
+                            )
+                        })
+                        .ok_or_else(|| error!("RLDP part offsets overflow"))?;
+                    if offset > total_size || fec_type.data_size as usize > total_size - offset {
+                        fail!("RLDP part exceeds original transfer size {total_size}");
                     }
                     let mut in_transit = parts.len();
                     if in_transit > Constraints::MAX_PARTS_IN_TRANSIT {
@@ -815,5 +840,78 @@ mod sequential_part_tests {
                 row["deliveries"].as_u64().unwrap() as usize
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_size_change_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_changed_total_preserves_native_decoder_admission() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_metadata.json"),
+        );
+        assert_eq!(native.len(), 5, "all declared size-change cases must be present");
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (line, row) in
+            include_str!("../../../ci/conformance/rldp2_transfer_size_changes_context.tsv")
+                .lines()
+                .zip(native)
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let values: Vec<usize> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            let (original, changed, part, bytes, seq) =
+                (values[0], values[1], values[2], values[3], values[4]);
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(4_000_001),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut errors = 0;
+            let mut completes = 0;
+            for (total, index, size, sequence) in [
+                (original, 0, 2_000_000, 0),
+                (changed, part, bytes, seq),
+                (changed, part, bytes, seq),
+            ] {
+                let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                let mut number = sequence as u32;
+                let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                    transfer_id: UInt256::default(),
+                    fec_type: encoder.params().clone().into_boxed(),
+                    part: index as i32,
+                    total_size: total as i64,
+                    data: encoder.encode(&mut number).unwrap(),
+                    seqno: sequence as i32,
+                }));
+                match receiver.process_chunk(chunk) {
+                    Ok(reply) => completes += usize::from(reply.is_some()),
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    }
+                }
+            }
+            let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+            let received = parts
+                .iter()
+                .filter(|p| p.data.is_none())
+                .map(|p| p.received_count)
+                .max()
+                .unwrap_or(0);
+            actual.push(serde_json::json!({"id":fields[0],"errors":errors,"received":if errors==0 {Some(received)}else{None},"completes":if errors==0{Some(completes)}else{None}}));
+            let native_error = row["errors"].as_u64().unwrap();
+            expected.push(serde_json::json!({"id":row["id"],"errors":native_error,"received":if native_error==0{Some(row["max_received"].clone())}else{None},"completes":if native_error==0{Some(row["complete_packets"].clone())}else{None}}));
+        }
+        assert_eq!(actual, expected, "native total-size mutation effects");
     }
 }

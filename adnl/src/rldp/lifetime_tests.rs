@@ -3422,3 +3422,120 @@ async fn rldp2_later_first_part_cannot_reopen_a_pruned_completed_id() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_changed_total_overruns_original_receive_and_recovers() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    // Native RldpIn::receive_message forwards the transport error to the
+    // matching query promise; it must not become a successful empty reply.
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_transfer_size_changes_metadata.json"),
+    );
+    let effect = native.iter().find(|r| r["id"] == "changed_next_oversize").unwrap();
+    assert_eq!(effect["errors"], 1);
+    assert_eq!(effect["active"], 0);
+    assert_eq!(effect["completed"], 1);
+    let (reply, packets, nodes, rldps, peers) = pair().await;
+    *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    let outcome = std::panic::AssertUnwindSafe(async {
+        reply.hold.store(true, Ordering::Release);
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let query = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let request = rldps[0].query(&query, Some(4_000_001), &peers, true, None);
+        let inject = async {
+            tokio::time::timeout(Duration::from_secs(2), reply.entered.notified())
+                .await
+                .expect("real query must reach held subscriber");
+            let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+            let id = *peer
+                .inbound_transfers
+                .iter()
+                .find(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+                .expect("query must register its answer transfer")
+                .key();
+            let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+            for (part, total, size) in [(0, 2_000_001, 2_000_000), (1, 2_000_002, 2)] {
+                let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                let mut seqno = 0;
+                let chunk = RldpChunk {
+                    transfer_id: id.into(),
+                    fec_type: encoder.params().clone().into_boxed(),
+                    part,
+                    total_size: total,
+                    data: encoder.encode(&mut seqno).unwrap(),
+                    seqno: 0,
+                };
+                let wire =
+                    serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+                let before = packets.processed_parts.load(Ordering::Acquire);
+                nodes[1]
+                    .send_custom(
+                        &TaggedByteSlice {
+                            object: &wire,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0,
+                        },
+                        &route,
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while packets.processed_parts.load(Ordering::Acquire) == before {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("authenticated handler must enqueue each packet in order");
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !peer
+                    .inbound_transfers
+                    .get(&id)
+                    .is_some_and(|e| matches!(e.val(), super::RldpTransfer::Done))
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("overrun must retire the actual receive into completed cache");
+            assert!(!peer.inbound_active.lock().unwrap().contains(&id));
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(request, inject) })
+                .await
+                .expect("decoder error must resolve query before its deadline");
+        let error = result.expect_err("native decoder errors must propagate to the query caller");
+        assert!(
+            error.to_string().contains("original transfer size"),
+            "expected the actual part offset error, got {error}"
+        );
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_one();
+        let (answer, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            rldps[0].query(&query, Some(1024), &peers, true, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64], "same peer must recover after the error");
+    })
+    .catch_unwind()
+    .await;
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_waiters();
+    reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

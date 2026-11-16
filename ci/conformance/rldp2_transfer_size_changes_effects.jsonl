@@ -1,0 +1,5 @@
+{"id":"same","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":2}
+{"id":"changed_existing","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":2}
+{"id":"changed_next_oversize","active":0,"completed":1,"errors":1,"deliveries":0,"complete_packets":1,"max_received":0}
+{"id":"changed_next_shrink","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":1,"max_received":1}
+{"id":"over_cap","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":1}
