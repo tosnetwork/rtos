@@ -62,6 +62,7 @@ impl Subscriber for HeldReply {
 
 #[derive(Default)]
 struct ResponsePackets {
+    confirm_packets: std::sync::atomic::AtomicUsize,
     complete_packets: std::sync::atomic::AtomicUsize,
     part_one_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
@@ -86,13 +87,15 @@ impl Subscriber for ResponsePackets {
                             return Ok(true);
                         }
                     }
+                    rldp2::MessagePart::Rldp2_Confirm(_) => {
+                        self.confirm_packets.fetch_add(1, Ordering::Release);
+                    }
                     rldp2::MessagePart::Rldp2_Complete(part) => {
                         self.complete_packets.fetch_add(1, Ordering::Release);
                         if part.part == 1 {
                             self.part_one_completions.fetch_add(1, Ordering::Release);
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -2874,6 +2877,73 @@ async fn rldp2_symbol_length_error_retires_actual_receiver() {
             .count();
         assert_eq!(active as u64, row["inbound"].as_u64().unwrap());
         assert_eq!(completed as u64, row["completed"].as_u64().unwrap());
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+pub(super) fn ack_retry_native_effects() -> Vec<serde_json::Value> {
+    checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_ack_retries_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_retries_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_retries_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_ack_retries_metadata.json"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_ack_retries_without_new_symbols_match_native() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let expected = ack_retry_native_effects()
+        .iter()
+        .filter(|row| {
+            row["case"] == "retry" && row["ms"].as_u64().unwrap() < 1000 && row["sent"] == true
+        })
+        .count();
+    assert_eq!(expected, 8);
+    let (_, packets, nodes, _, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], None);
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::default(),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: 2048,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: 0,
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        nodes[0]
+            .send_custom(
+                &TaggedByteSlice {
+                    object: &wire,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &peers,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while packets.confirm_packets.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "native sends {expected} confirmations without new symbols; Rust sent {}",
+                packets.confirm_packets.load(Ordering::Acquire)
+            )
+        });
+        assert_eq!(packets.confirm_packets.load(Ordering::Acquire), expected);
     })
     .catch_unwind()
     .await;
