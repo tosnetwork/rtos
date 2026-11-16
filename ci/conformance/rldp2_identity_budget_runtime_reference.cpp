@@ -54,6 +54,14 @@ int main() {
   feed(*other, 0);
   auto independent = other->inbound_transfer_count();
   CHECK(independent == 1);
+  // A still-owned native connection retains its allocations until destruction.
+  feed(*connections[4], 0);
+  auto held_blocked = connections[4]->inbound_transfer_count();
+  auto held_decoders = budget->identity_decoders(a);
+  auto held_bytes = budget->identity_bytes(a);
+  feed(*other, 1);
+  auto other_while_held = other->inbound_transfer_count();
+  CHECK(held_blocked == 0 && held_decoders == 1024 && other_while_held == 2);
   connections[0].reset();
   auto after_eviction = budget->identity_decoders(a);
   auto bytes_after_eviction = budget->identity_bytes(a);
@@ -62,7 +70,7 @@ int main() {
   CHECK(retried == 1);
   auto after_retry = budget->identity_decoders(a);
   auto bytes_after_retry = budget->identity_bytes(a);
-  CHECK(budget->identity_decoders(b) == 1);
+  CHECK(budget->identity_decoders(b) == 2);
   connections.clear();
   other.reset();
   CHECK(budget->identity_decoders(a) == 0 && budget->identity_bytes(a) == 0);
@@ -71,6 +79,10 @@ int main() {
             << ",\"full_bytes\":" << full_bytes
             << ",\"blocked_inbound\":" << blocked
             << ",\"other_inbound\":" << independent
+            << ",\"held_decoders\":" << held_decoders
+            << ",\"held_bytes\":" << held_bytes
+            << ",\"held_blocked\":" << held_blocked
+            << ",\"other_while_held\":" << other_while_held
             << ",\"after_eviction\":" << after_eviction
             << ",\"bytes_after_eviction\":" << bytes_after_eviction
             << ",\"retry_inbound\":" << retried

@@ -4,8 +4,8 @@
   "native_source": "/tos/worktrees/tos/rtos-conformance-latest-5af405d",
   "native_build": "/tos/build/rtos-conformance-latest-5af405d",
   "runner_source_sha256": "2855676a32f30eb9d308cff1af6b5a7f10b3dc985a8a31bacd9ca6447fb171a9",
-  "probe_source_sha256": "c3ed6954df98a03a1919ca8390ad5557ab8e913f45eb7154293ea79f5bad5a41",
-  "probe_binary_sha256": "1610da3fa715f20a43e0a7d5724c3d4037fb4af821bbdd72d3e324f60c9a7c9d",
+  "probe_source_sha256": "b6368454da1b4efc1e432fd52ac3f9b67eb80df056df47847405eccbaafeb882",
+  "probe_binary_sha256": "53110a92b7fa74903be8cec362ebaac14a0922cbb995b2187c5670c7c4cdfe22",
   "exit": 0,
   "compile_command": [
     "/usr/bin/clang++-21",
@@ -52,13 +52,13 @@
     "-c",
     "/tos/worktrees/rtos/rldp2-connection-driver/ci/conformance/rldp2_identity_budget_runtime_reference.cpp",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-native-identity-budget/native/probe.o"
+    "/datax/rtos-conformance/2026-11-16-native-retiring-identity-budget/native/probe.o"
   ],
   "link_command": [
     "/usr/bin/clang++-21",
-    "/datax/rtos-conformance/2026-11-16-native-identity-budget/native/probe.o",
+    "/datax/rtos-conformance/2026-11-16-native-retiring-identity-budget/native/probe.o",
     "-o",
-    "/datax/rtos-conformance/2026-11-16-native-identity-budget/native/probe",
+    "/datax/rtos-conformance/2026-11-16-native-retiring-identity-budget/native/probe",
     "-Wl,--start-group",
     "adnl/libadnl.a",
     "adnl/libadnltest.a",
@@ -150,5 +150,5 @@
     "-lpthread",
     "-ldl"
   ],
-  "effects_sha256": "dcbd3787daaa767b25d154b81eafd22a551621e81c4b4dc54aec4b914c04abb1"
+  "effects_sha256": "9e6aefabe02087839414cecac1631ec2ef65d75233a18c938217d4456da40ae5"
 }

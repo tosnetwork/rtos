@@ -199,6 +199,7 @@ async fn native_identity_budget_shared_across_connections_and_released_on_evicti
     let a = nodes[1].key_by_tag(0).unwrap();
     let b = nodes[6].key_by_tag(0).unwrap();
     let budget = super::super::rldp2::budget::InboundBudget::process_default();
+    let (release, blocked_work) = std::sync::mpsc::channel();
     let outcome = std::panic::AssertUnwindSafe(async {
         let local = nodes[0].key_by_tag(0).unwrap();
         nodes[0].add_peer(local.id(), nodes[6].ip_address_adnl(), None, &b).unwrap();
@@ -218,14 +219,22 @@ async fn native_identity_budget_shared_across_connections_and_released_on_evicti
                 let route = AdnlPeers::with_keys(source.id().clone(), target.id().clone());
                 let peer = rldps[receiver].get_peer(target.id(), source.id(), true, None).await.unwrap();
                 let native = peer.native.get().expect("real peer must use native Connection");
-                let before = native.processed_data_packets.load(Ordering::Acquire);
                 let mut id = [0; 32];
                 id[..2].copy_from_slice(&n.to_le_bytes());
+                let before = native.data_receipts.lock().unwrap().get(&(id,0,0)).copied().unwrap_or_default();
                 let chunk = RldpChunk { transfer_id: id.into(), fec_type: fec.clone(), part: 0, total_size: 2048, seqno: 0, data: symbol.clone() };
                 let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
                 nodes[sender].send_custom(&TaggedByteSlice { object: &wire, #[cfg(feature="telemetry")] tag: 0 }, &route).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while native.processed_data_packets.load(Ordering::Acquire) == before { tokio::task::yield_now().await; }
+                    loop {
+                        if native.data_receipts.lock().unwrap().get(&(id,0,0)).copied().unwrap_or_default()>before {break;}
+                        tokio::select! {
+                            _=native.data_processed.notified()=>{},
+                            _=tokio::time::sleep(Duration::from_millis(50))=>{
+                                nodes[sender].send_custom(&TaggedByteSlice {object:&wire,#[cfg(feature="telemetry")]tag:0},&route).await.unwrap();
+                            }
+                        }
+                    }
                 }).await.expect("including refused packets, actual Connection processing must finish");
                 inspect(native).await.0
             }
@@ -244,18 +253,43 @@ async fn native_identity_budget_shared_across_connections_and_released_on_evicti
             let independent = feed(6, 0, 0).await;
             assert_eq!(independent, 1, "another remote identity must retain its own quota");
             let route = AdnlPeers::with_keys(local.id().clone(), a.id().clone());
+            let old = rldps[0].get_peer(route.local(),route.other(),true,None).await.unwrap();
+            let native=old.native.get().unwrap();
+            let (started,entered)=tokio::sync::oneshot::channel();
+            let started=Arc::new(Mutex::new(Some(started)));
+            let blocked_work=Arc::new(Mutex::new(blocked_work));
+            *native.driver.test_control().test_after_fec.lock().unwrap()=Some(Arc::new(move || {
+                if let Some(started)=started.lock().unwrap().take() {
+                    let _=started.send(());
+                    let _=blocked_work.lock().unwrap().recv();
+                }
+            }));
+            let driver=native.driver.clone();
+            let command=tokio::spawn(async move {driver.submit(super::super::connection_driver::Command::Mtu(7680)).await});
+            entered.await.unwrap();
             let retired = rldps[0].peers.evict_for_test(&route);
+            assert!(retired.closed.is_cancelled());
+            let held=budget.identity_usage(a.id().data());
+            assert_eq!(held.decoders,1024,"closing owner must retain its decoder quota until actual work joins");
+            assert!(!retired.drained.is_cancelled());
+            let held_blocked=feed(1,5,0).await;
+            assert_eq!(held_blocked,0,"another connection cannot borrow the closing owner's quota");
+            let other_while_held=feed(6,0,1).await;
+            assert_eq!(other_while_held,2,"independent identity must progress while old work is held");
+            release.send(()).unwrap();
             retired.drained.cancelled().await;
+            let _=command.await.unwrap();
             let evicted = budget.identity_usage(a.id().data());
             assert_eq!(evicted.decoders, 768, "actual retired owner must release its 256 decoders");
             let retried = feed(1, 5, 0).await;
             assert_eq!(retried, 1, "budget refusal must remain retryable after actual release");
             let retry = budget.identity_usage(a.id().data());
-            assert_eq!(budget.identity_usage(b.id().data()).decoders, 1);
-            serde_json::json!({"full_decoders":full.decoders,"full_bytes":full.bytes,"blocked_inbound":blocked,"other_inbound":independent,"after_eviction":evicted.decoders,"bytes_after_eviction":evicted.bytes,"retry_inbound":retried,"after_retry":retry.decoders,"bytes_after_retry":retry.bytes})
+            assert_eq!(budget.identity_usage(b.id().data()).decoders, 2);
+            serde_json::json!({"full_decoders":full.decoders,"full_bytes":full.bytes,"blocked_inbound":blocked,"other_inbound":independent,"held_decoders":held.decoders,"held_bytes":held.bytes,"held_blocked":held_blocked,"other_while_held":other_while_held,"after_eviction":evicted.decoders,"bytes_after_eviction":evicted.bytes,"retry_inbound":retried,"after_retry":retry.decoders,"bytes_after_retry":retry.bytes})
         }).await.expect("qualification must complete before incomplete receives expire");
         actual
     }).catch_unwind().await;
+    let _ = release.send(());
     for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
         result.unwrap();
     }
