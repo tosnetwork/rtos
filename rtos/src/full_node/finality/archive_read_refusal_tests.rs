@@ -94,15 +94,25 @@ async fn archive_context_real_missing_files_calibrate_fallback_counters() {
         assert!(!publication.is::<ArchiveContextError>());
         assert_eq!(engine.db().test_read_refusal_effects(), [1, 0]);
         engine.initialize_full_node_overlays(adnl::DhtSearchPolicy::default()).await.unwrap();
-        let budget = limits();
-        let history = crate::boot::load_history_proof_with_budget(
-            engine.as_ref(), target.id(), false, false, Some(&budget),
-        ).await.err().unwrap();
-        assert_eq!(history.downcast_ref::<HistoryBudgetExceeded>().map(|e| e.0),
-            Some("network graph capacity"), "{history:#}");
-        assert!(!history.is::<ArchiveContextError>());
-        assert_eq!(budget.local_proof_fallbacks(), 1);
-        eprintln!("fallback_calibration publication=1 history=1 publication_error={publication:#} history_error={history:#}");
+        // The transport envelope is reserved before the network graph. Keep both
+        // refusal boundaries covered: neither may hide a missing-file fallback.
+        for (cells, cell_bytes, expected) in [
+            (0, 0, "Merkle workspace"),
+            (0, adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE + 1, "network graph capacity"),
+            (1, adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE, "network graph capacity"),
+        ] {
+            let budget = HistoryReadBudget::new(HistoryReadLimits {
+                cells, cell_bytes, ..Default::default()
+            });
+            let history = crate::boot::load_history_proof_with_budget(
+                engine.as_ref(), target.id(), false, false, Some(&budget),
+            ).await.err().unwrap();
+            assert_eq!(history.downcast_ref::<HistoryBudgetExceeded>().map(|e| e.0),
+                Some(expected), "cells={cells} cell_bytes={cell_bytes}: {history:#}");
+            assert!(!history.is::<ArchiveContextError>());
+            assert_eq!(budget.local_proof_fallbacks(), 1);
+            eprintln!("fallback_calibration publication=1 history=1 cells={cells} cell_bytes={cell_bytes} publication_error={publication:#} history_error={history:#}");
+        }
     }).catch_unwind().await;
     close(engine).await;
     drop(dir);
