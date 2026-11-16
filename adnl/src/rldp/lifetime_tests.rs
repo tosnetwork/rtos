@@ -1082,11 +1082,33 @@ async fn rldp2_connection_count_matches_native_global_cap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_connection_eviction_fails_query_and_recovers() {
+    check_connection_eviction(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_connection_table_eviction_fails_query_and_recovers() {
+    check_connection_eviction(true).await;
+}
+
+async fn check_connection_eviction(use_native: bool) {
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_connection_query_context.tsv").trim(),
         "4097 10 64 1024"
     );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_connection_query_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_connection_query_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_connection_query_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_connection_query_metadata.json"),
+    );
+    assert_eq!(expected.len(), 1);
+    let expected = &expected[0];
     let (reply, _, nodes, rldps, peers) = pair().await;
+    if use_native {
+        for node in &rldps {
+            node.peers.enable_native_for_tests();
+        }
+    }
     let outcome = std::panic::AssertUnwindSafe(async {
         reply.hold.store(true, Ordering::Release);
         let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
@@ -1104,26 +1126,50 @@ async fn rldp2_connection_eviction_fails_query_and_recovers() {
                 id[..4].copy_from_slice(&index.to_le_bytes());
                 let route =
                     AdnlPeers::with_keys(local.id().clone(), rtos_block::KeyId::from_data(id));
-                assert!(rldps[0]
-                    .message(
-                        &TaggedByteSlice {
-                            object: b"x",
-                            #[cfg(feature = "telemetry")]
-                            tag: 0
-                        },
-                        &route,
-                        true,
-                        None
-                    )
-                    .await
-                    .is_err());
+                if use_native {
+                    // Exercise the actual table/driver owners without awaiting a
+                    // fabricated address's transport deadline. The pending query
+                    // and recovery query still traverse real UDP.
+                    // Match native send_message's ten-second deadline, which
+                    // also orders connection retention/eviction in the table.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    let peer = rldps[0]
+                        .get_peer(route.local(), route.other(), true, Some(deadline))
+                        .await
+                        .unwrap();
+                    assert!(
+                        peer.native.get().is_some(),
+                        "eviction qualification must use actual Connection"
+                    );
+                } else {
+                    assert!(rldps[0]
+                        .message(
+                            &TaggedByteSlice {
+                                object: b"x",
+                                #[cfg(feature = "telemetry")]
+                                tag: 0
+                            },
+                            &route,
+                            true,
+                            None
+                        )
+                        .await
+                        .is_err());
+                }
             }
-            assert_eq!(rldps[0].allocated.peers.load(Ordering::Acquire), 4096);
-            assert_eq!(rldps[0].peers.evicted.load(Ordering::Acquire), 2);
+            assert_eq!(
+                rldps[0].allocated.peers.load(Ordering::Acquire) as u64,
+                expected["live"].as_u64().unwrap()
+            );
+            assert_eq!(
+                rldps[0].peers.evicted.load(Ordering::Acquire) as u64,
+                expected["evicted"].as_u64().unwrap()
+            );
             reply.hold.store(false, Ordering::Release);
             reply.release.notify_one();
         };
         let (answer, ()) = tokio::join!(request, flood);
+        assert_eq!(expected["evicted_query"], true);
         let error = answer.unwrap_err();
         assert!(
             matches!(
@@ -1133,7 +1179,11 @@ async fn rldp2_connection_eviction_fails_query_and_recovers() {
             "{error:#}"
         );
         let answer = rldps[0].query(&data, Some(1024), &peers, true, None).await.unwrap();
-        assert_eq!(answer.0.unwrap(), vec![42; 64], "fresh query must recover after eviction");
+        assert_eq!(
+            answer.0.unwrap(),
+            vec![42; expected["answer_bytes"].as_u64().unwrap() as usize],
+            "fresh query must recover after eviction"
+        );
     })
     .catch_unwind()
     .await;
