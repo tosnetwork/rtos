@@ -2718,7 +2718,16 @@ impl Subscriber for RldpNode {
                         })
                         .await?;
                     #[cfg(test)]
-                    native.processed_packets.fetch_add(1, Ordering::Release);
+                    if let Rldp2MessagePartBoxed::Rldp2_MessagePart(part) = msg {
+                        *native
+                            .data_receipts
+                            .lock()
+                            .unwrap()
+                            .entry(*part.0.transfer_id.as_array())
+                            .or_default() += 1;
+                        native.processed_data_packets.fetch_add(1, Ordering::Release);
+                        native.data_processed.notify_one();
+                    }
                     Ok(true)
                 } else {
                     self.consume_message_part(MessagePart::V2(msg), peers).await

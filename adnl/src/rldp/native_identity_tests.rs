@@ -218,14 +218,14 @@ async fn native_identity_budget_shared_across_connections_and_released_on_evicti
                 let route = AdnlPeers::with_keys(source.id().clone(), target.id().clone());
                 let peer = rldps[receiver].get_peer(target.id(), source.id(), true, None).await.unwrap();
                 let native = peer.native.get().expect("real peer must use native Connection");
-                let before = native.processed_packets.load(Ordering::Acquire);
+                let before = native.processed_data_packets.load(Ordering::Acquire);
                 let mut id = [0; 32];
                 id[..2].copy_from_slice(&n.to_le_bytes());
                 let chunk = RldpChunk { transfer_id: id.into(), fec_type: fec.clone(), part: 0, total_size: 2048, seqno: 0, data: symbol.clone() };
                 let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
                 nodes[sender].send_custom(&TaggedByteSlice { object: &wire, #[cfg(feature="telemetry")] tag: 0 }, &route).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while native.processed_packets.load(Ordering::Acquire) == before { tokio::task::yield_now().await; }
+                    while native.processed_data_packets.load(Ordering::Acquire) == before { tokio::task::yield_now().await; }
                 }).await.expect("including refused packets, actual Connection processing must finish");
                 inspect(native).await.0
             }
@@ -270,5 +270,142 @@ async fn native_identity_budget_shared_across_connections_and_released_on_evicti
     actual["released_b_decoders"] = released_b.decoders.into();
     actual["released_b_bytes"] = released_b.bytes.into();
     eprintln!("NATIVE_IDENTITY_BUDGET: {actual}");
+    assert_eq!(vec![actual], expected);
+}
+
+#[test]
+fn native_global_decoder_budget_preserves_solicited_capacity() {
+    const CHILD: &str = "RTOS_GLOBAL_DECODER_BUDGET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The production budget is process-global. A fresh process excludes
+        // other parallel fixtures without replacing it with a smaller budget.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rldp::lifetime_tests::native_identity_tests::native_global_decoder_budget_preserves_solicited_capacity", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "isolated global-budget qualification failed: {}",
+            output.status
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_global_decoder_budget());
+}
+
+async fn check_global_decoder_budget() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_global_budget_runtime_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_global_budget_runtime_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_global_budget_runtime_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_global_budget_runtime_metadata.json"),
+    );
+    let (_, _, nodes, rldps, _) = topology_configured(13, None, false, true).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let budget = super::super::rldp2::budget::InboundBudget::process_default();
+    assert_eq!(budget.usage(), super::super::rldp2::budget::Usage::default());
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for sender in 1..=8 {
+            for receiver in [0, 9, 10, 11] {
+                let source = nodes[sender].key_by_tag(0).unwrap();
+                let target = nodes[receiver].key_by_tag(0).unwrap();
+                nodes[sender].add_peer(source.id(), nodes[receiver].ip_address_adnl(), None, &target).unwrap();
+                nodes[receiver].add_peer(target.id(), nodes[sender].ip_address_adnl(), None, &source).unwrap();
+            }
+        }
+        let source = nodes[12].key_by_tag(0).unwrap();
+        let target = nodes[0].key_by_tag(0).unwrap();
+        nodes[12].add_peer(source.id(), nodes[0].ip_address_adnl(), None, &target).unwrap();
+        nodes[0].add_peer(target.id(), nodes[12].ip_address_adnl(), None, &source).unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; 2048], Some(768));
+        let mut seqno = 0;
+        let symbol = encoder.encode(&mut seqno).unwrap();
+        let fec = encoder.params().clone().into_boxed();
+        let feed = |sender: usize, receiver: usize, n: u16, solicited: bool| {
+            let nodes=&nodes; let rldps=&rldps; let symbol=&symbol; let fec=&fec;
+            async move {
+                let source=nodes[sender].key_by_tag(0).unwrap();
+                let target=nodes[receiver].key_by_tag(0).unwrap();
+                let peer=rldps[receiver].get_peer(target.id(),source.id(),true,None).await.unwrap();
+                let native=peer.native.get().expect("real peer must use native Connection");
+                let mut id=[0;32]; id[..2].copy_from_slice(&n.to_le_bytes());
+                if solicited {
+                    assert!(native.driver.submit(super::super::connection_driver::Command::ReceiveLimit {
+                        id, deadline:std::time::Instant::now()+Duration::from_secs(60),max_size:2048,
+                    }).await.unwrap());
+                }
+                let before=native.data_receipts.lock().unwrap().get(&id).copied().unwrap_or_default();
+                let chunk=RldpChunk {transfer_id:id.into(),fec_type:fec.clone(),part:0,total_size:2048,seqno:0,data:symbol.clone()};
+                let wire=serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+                let route=AdnlPeers::with_keys(source.id().clone(),target.id().clone());
+                nodes[sender].send_custom(&TaggedByteSlice {object:&wire,#[cfg(feature="telemetry")] tag:0},&route).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    loop {
+                        if native.data_receipts.lock().unwrap().get(&id).copied().unwrap_or_default()>before {break;}
+                        tokio::select! {
+                            _=native.data_processed.notified()=>{},
+                            _=tokio::time::sleep(Duration::from_millis(50))=>{
+                                // UDP may lose a packet. Retransmit the same symbol;
+                                // only this transfer's actual processing receipt counts.
+                                nodes[sender].send_custom(&TaggedByteSlice {object:&wire,#[cfg(feature="telemetry")] tag:0},&route).await.unwrap();
+                            }
+                        }
+                    }
+                }).await.expect("actual Packet processing, including refusal, must finish");
+                inspect(native).await.0
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(8),async {
+            for sender in 1..=8 {
+                for receiver in [0,9,10,11] {
+                    for n in 0..256 {assert_eq!(feed(sender,receiver,n,false).await,usize::from(n)+1);}
+                }
+            }
+            let unsol_full=budget.unsolicited_usage().decoders;
+            assert_eq!(unsol_full,8192);
+            let unsol_blocked=feed(12,0,0,false).await;
+            assert_eq!(unsol_blocked,0,"unsolicited traffic must not consume the solicited reserve");
+            for receiver in 1..=8 {
+                for sender in [0,9,10,11] {
+                    for n in 0..256 {assert_eq!(feed(sender,receiver,n,true).await,usize::from(n)+1,"solicited reserve must remain usable");}
+                }
+            }
+            let full=budget.usage();
+            assert_eq!(full.decoders,16384);
+            let blocked=feed(12,0,1,true).await;
+            assert_eq!(blocked,0,"solicited traffic must also respect the global total");
+            let route=AdnlPeers::with_keys(nodes[0].key_by_tag(0).unwrap().id().clone(),nodes[1].key_by_tag(0).unwrap().id().clone());
+            let retired=rldps[0].peers.evict_for_test(&route);
+            retired.drained.cancelled().await;
+            let evicted=budget.usage().decoders;
+            let unsol_evicted=budget.unsolicited_usage().decoders;
+            assert_eq!(evicted,16128);
+            // Retry the packet under its retained receive limit; do not register twice.
+            assert_eq!(feed(12,0,1,false).await,1);
+            assert_eq!(feed(12,0,0,false).await,2);
+            serde_json::json!({"unsolicited_full":unsol_full,"unsolicited_blocked":unsol_blocked,"full_decoders":full.decoders,"full_bytes":full.bytes,"total_blocked":blocked,"after_eviction":evicted,"unsolicited_after_eviction":unsol_evicted,"after_retry":budget.usage().decoders,"unsolicited_after_retry":budget.unsolicited_usage().decoders})
+        }).await.expect("all live receivers must be checked before the native ten-second expiry")
+    }).catch_unwind().await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    let mut actual = match outcome {
+        Ok(actual) => actual,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    actual["released_decoders"] = budget.usage().decoders.into();
+    actual["released_bytes"] = budget.usage().bytes.into();
+    actual["released_identities"] = budget.identity_count().into();
+    eprintln!("NATIVE_GLOBAL_BUDGET: {actual}");
     assert_eq!(vec![actual], expected);
 }
