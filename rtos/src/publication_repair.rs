@@ -287,6 +287,9 @@ async fn repair_owned(
                         budget.as_ref(),
                         maximum
                             .checked_mul(6)
+                            .and_then(|bytes| {
+                                bytes.checked_add(adnl::QueryResponseLimits::ENVELOPE_ALLOWANCE)
+                            })
                             .ok_or_else(|| error!("Repair network workspace overflow"))?,
                     )?;
                     let graph = budget.reserve_network_graph()?;

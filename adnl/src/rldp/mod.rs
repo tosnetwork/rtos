@@ -351,10 +351,21 @@ impl std::error::Error for RldpQueryTimeout {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct QueryResponseLimits {
+    /// Entire serialized RLDP answer, including its TL envelope.
     pub wire_bytes: usize,
     pub decoded_bytes: usize,
 }
 impl QueryResponseLimits {
+    /// Native state-download callers reserve this allowance above payload size.
+    pub const ENVELOPE_ALLOWANCE: usize = 1024;
+
+    /// Bound decoded payload while allowing native-compatible wire framing.
+    /// Entry points still validate both limits against the transport maximum;
+    /// saturation makes an overflowing request fail that validation.
+    pub fn from_payload_limit(bytes: usize) -> Self {
+        Self { wire_bytes: bytes.saturating_add(Self::ENVELOPE_ALLOWANCE), decoded_bytes: bytes }
+    }
+
     pub fn validate(self) -> Result<()> {
         for value in [self.wire_bytes, self.decoded_bytes] {
             if value == 0 || value > Constraints::MAX_TOTAL_TRANSFER_SIZE {
