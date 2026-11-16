@@ -74,6 +74,8 @@ pub(super) struct NativeConnection {
     pub(super) data_processed: Notify,
     #[cfg(test)]
     pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
+    #[cfg(test)]
+    pub(super) query_send_results: Mutex<Vec<(TransferId, bool)>>,
 }
 impl NativeConnection {
     pub(super) fn start(
@@ -112,6 +114,8 @@ impl NativeConnection {
             data_processed: Notify::new(),
             #[cfg(test)]
             completed_send_ids: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            query_send_results: Mutex::new(Vec::new()),
         });
         #[cfg(test)]
         let completed_sends = ret.completed_sends.clone();
@@ -310,6 +314,10 @@ impl NativeConnection {
                 accepted = this.driver.submit(connection_driver::Command::Send {
                     id: send, data, deadline: Some(deadline.into_std()), answer: false,
                 }).await?;
+                #[cfg(test)]
+                if receive.is_some() {
+                    this.query_send_results.lock().unwrap().push((send, accepted));
+                }
                 // This lease bounds submission owners, not queries awaiting an
                 // application answer. The blocking command has actually joined;
                 // native Connection transfer/receive limits now own admission.

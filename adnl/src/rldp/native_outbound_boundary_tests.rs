@@ -179,3 +179,91 @@ async fn boundary(mode: OutboundBoundary) {
         result.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_outbound_refused_query_keeps_deadline_without_retry() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_refused_query_context.tsv").trim(),
+        "256 60 10 64 1024"
+    );
+    let expected = refused_query_native_effects();
+    let (reply, packets, nodes, rldps, route) = topology(2).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        reply.response_bytes.store(64, Ordering::Release);
+        let peer = rldps[1].get_peer(route.other(),route.local(),true,None).await.unwrap();
+        let native = peer.native.get().expect("actual responder must use native Connection");
+        for index in 0..256 { feed(&nodes[0],&rldps[1],&route,index,u64::from(index+1)).await; }
+        let saturated = inspect(native).await.1;
+        assert_eq!(saturated,256);
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0);
+        let initial_submissions = native.query_send_results.lock().unwrap().clone();
+        assert!(initial_submissions.is_empty());
+        let reverse = AdnlPeers::with_keys(route.other().clone(),route.local().clone());
+        let before = rldps[1].query_budget.remaining(&reverse);
+        let bytes = serialize_boxed(&Query {overlay:UInt256::default()}).unwrap();
+        let request = TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0};
+        let started = tokio::time::Instant::now();
+        let query = rldps[1].query(&request,Some(1024),&reverse,true,None);
+        tokio::pin!(query);
+        // A single poll can stop at ReceiveLimit before Send. Wait for the
+        // actual Send command result before releasing any saturated capacity.
+        tokio::select! {
+            biased;
+            result = query.as_mut() => panic!("refused query completed before its deadline: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5),async {
+                while native.query_send_results.lock().unwrap().is_empty() { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }) => result.expect("query must reach actual native Send admission"),
+        }
+        let refused = native.query_send_results.lock().unwrap().clone();
+        assert_eq!(refused.len(),1);
+        assert!(!refused[0].1,"saturated native sender must reject the active query");
+        assert_eq!(inspect(native).await.1,256);
+        assert_eq!(rldps[1].query_budget.remaining(&reverse),(before.0-1,before.1-1));
+        assert_eq!(reply.calls.load(Ordering::Acquire),256);
+        packets.drop_parts.store(false, Ordering::Release);
+        tokio::select! {
+            biased;
+            result = query.as_mut() => panic!("refused query completed while send slots drained: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5),async {
+                while inspect(native).await.1 != 0 { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }) => result.expect("original responses must drain before query deadline"),
+        }
+        let drained_before_deadline = started.elapsed() < Duration::from_secs(9);
+        assert!(drained_before_deadline);
+        let observed_submissions = native.query_send_results.lock().unwrap().clone();
+        assert_eq!(observed_submissions,refused);
+        let result = tokio::time::timeout(Duration::from_secs(12),query.as_mut()).await.expect("refused query must terminate");
+        let elapsed_ms = started.elapsed().as_millis();
+        let timed_out = result.unwrap_err().downcast_ref::<RldpQueryTimeout>().is_some();
+        assert!(timed_out);
+        assert!((9500..13000).contains(&elapsed_ms),"elapsed={elapsed_ms}");
+        let implicit_retry = reply.calls.load(Ordering::Acquire)!=256;
+        assert!(!implicit_retry);
+        let observed_submissions = native.query_send_results.lock().unwrap().clone();
+        assert_eq!(observed_submissions,refused);
+        assert_eq!(rldps[1].query_budget.remaining(&reverse),before);
+        let (answer,_) = tokio::time::timeout(Duration::from_secs(12),rldps[1].query(&request,Some(1024),&reverse,true,None)).await.unwrap().unwrap();
+        let answer = answer.unwrap();
+        assert_eq!(answer,vec![42;64]);
+        assert_eq!(reply.calls.load(Ordering::Acquire),257);
+        let submissions = native.query_send_results.lock().unwrap().clone();
+        assert_eq!(submissions.len(),2);
+        assert!(submissions[1].1);
+        assert_ne!(submissions[1].0,refused[0].0);
+        let actual = serde_json::json!({"saturated":saturated,"drained_before_deadline":drained_before_deadline,"timeout":timed_out,"implicit_retry":implicit_retry,"fresh_answer_bytes":answer.len()});
+        assert_eq!(actual,expected);
+        eprintln!("NATIVE_REFUSED_QUERY: {actual} elapsed_ms={elapsed_ms}");
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
