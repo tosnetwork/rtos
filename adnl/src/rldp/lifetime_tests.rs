@@ -89,22 +89,30 @@ struct ResponsePackets {
     part_two_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
+    drop_next_part: AtomicBool,
+    dropped_parts: std::sync::atomic::AtomicUsize,
+    processed_transfer_ids: Mutex<HashSet<Vec<u8>>>,
+    processed: tokio::sync::Notify,
     handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
     processed_parts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
 impl Subscriber for ResponsePackets {
     async fn try_consume_custom(&self, bytes: &[u8], peers: &AdnlPeers) -> Result<bool> {
-        let mut is_data_part = false;
+        let mut data_transfer_id = None;
         if let Ok(message) = deserialize_boxed(bytes) {
             if let Ok(part) = message.downcast::<rldp2::MessagePart>() {
                 match part {
                     rldp2::MessagePart::Rldp2_MessagePart(part) => {
-                        is_data_part = true;
+                        data_transfer_id = Some(part.0.transfer_id.as_slice().to_vec());
                         self.transfers
                             .lock()
                             .unwrap()
                             .insert(part.0.transfer_id.as_slice().to_vec());
+                        if self.drop_next_part.swap(false, Ordering::AcqRel) {
+                            self.dropped_parts.fetch_add(1, Ordering::Release);
+                            return Ok(true);
+                        }
                         if self.drop_parts.load(Ordering::Acquire) {
                             return Ok(true);
                         }
@@ -137,9 +145,11 @@ impl Subscriber for ResponsePackets {
         let handler = self.handler.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
         if let Some(handler) = handler {
             let consumed = handler.try_consume_custom(bytes, peers).await?;
-            if is_data_part {
+            if let Some(id) = data_transfer_id {
                 assert!(consumed, "real RLDP handler must consume the test packet");
+                self.processed_transfer_ids.lock().unwrap().insert(id);
                 self.processed_parts.fetch_add(1, Ordering::Release);
+                self.processed.notify_one();
             }
             return Ok(consumed);
         }
@@ -2118,6 +2128,7 @@ async fn check_incomplete_inbound_transfers(use_native: bool) {
         }
     }
     *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+    packets.drop_next_part.store(true, Ordering::Release);
     let budget = super::rldp2::budget::InboundBudget::process_default();
     let identity = *peers.other().data();
     if use_native {
@@ -2136,7 +2147,6 @@ async fn check_incomplete_inbound_transfers(use_native: bool) {
         }
 
         for n in 0..257u32 {
-            let processed_before = packets.processed_parts.load(Ordering::Acquire);
             let mut id = [0u8; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
             let chunk = RldpChunk {
@@ -2161,9 +2171,19 @@ async fn check_incomplete_inbound_transfers(use_native: bool) {
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
-                while !packets.transfers.lock().unwrap().contains(id.as_slice())
-                    || packets.processed_parts.load(Ordering::Acquire) == processed_before {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                while !packets.processed_transfer_ids.lock().unwrap().contains(id.as_slice()) {
+                    tokio::select! {
+                        _ = packets.processed.notified() => {},
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            // Raw ADNL fixture traffic has no RLDP sender to
+                            // retransmit a lost datagram. Retry this same symbol;
+                            // seeing a packet before the handler is not enough.
+                            nodes[1].send_custom(&TaggedByteSlice {
+                                object: &wire,
+                                #[cfg(feature = "telemetry")] tag: 0,
+                            }, &route).await.unwrap();
+                        }
+                    }
                 }
             })
             .await
@@ -2178,6 +2198,7 @@ async fn check_incomplete_inbound_transfers(use_native: bool) {
                 .expect("native-admitted partial transfer must remain active");
             }
         }
+        assert_eq!(packets.dropped_parts.load(Ordering::Acquire), 1, "controlled first datagram loss must actually occur");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let live = inbound_test_count(&peer, use_native).await;
         let at_cap = budget.identity_usage(&identity);
