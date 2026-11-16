@@ -371,6 +371,12 @@ impl RecvTransfer {
             },
             RecvParts::V2(parts) => {
                 let part = if chunk_part_usize >= parts.len() {
+                    // Native InboundTransfer::get_part only opens the next part.
+                    // A skipped part must be retransmitted after its predecessor
+                    // has been admitted; do not allocate or decode holes.
+                    if chunk_part_usize != parts.len() {
+                        return Ok(None);
+                    }
                     let mut in_transit = parts.len();
                     if in_transit > Constraints::MAX_PARTS_IN_TRANSIT {
                         for part in parts.iter() {
@@ -758,5 +764,56 @@ mod ack_retry_tests {
         let after = std::mem::size_of::<RecvPartV2>();
         eprintln!("ACK_PART_BYTES: before={before} after={after}");
         assert!(after <= before + 8, "bounded retry counter must not add unbounded per-part state");
+    }
+}
+
+#[cfg(test)]
+mod sequential_part_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_skipped_part_does_not_decode_or_ack_before_predecessor() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_metadata.json"),
+        );
+        let mut receiver = RecvTransfer::new(
+            [0; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            true,
+            Some(4_000_001),
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let mut completes = 0;
+        for row in native {
+            let part = row["part"].as_i64().unwrap() as i32;
+            let mut encoder = crate::RaptorqEncoder::with_data(
+                &vec![42; if part < 2 { 2_000_000 } else { 1 }],
+                Some(768),
+            );
+            let mut seqno = 0;
+            let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: encoder.params().clone().into_boxed(),
+                part,
+                total_size: 4_000_001,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: 0,
+            }));
+            completes += usize::from(receiver.process_chunk(chunk).unwrap().is_some());
+            assert_eq!(
+                completes,
+                row["complete_packets"].as_u64().unwrap() as usize,
+                "completed-part replay effects after input part {part}"
+            );
+            assert_eq!(
+                usize::from(!receiver.data.is_empty()),
+                row["deliveries"].as_u64().unwrap() as usize
+            );
+        }
     }
 }

@@ -65,6 +65,7 @@ struct ResponsePackets {
     confirm_packets: std::sync::atomic::AtomicUsize,
     complete_packets: std::sync::atomic::AtomicUsize,
     part_one_completions: std::sync::atomic::AtomicUsize,
+    part_two_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
     handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
@@ -94,6 +95,8 @@ impl Subscriber for ResponsePackets {
                         self.complete_packets.fetch_add(1, Ordering::Release);
                         if part.part == 1 {
                             self.part_one_completions.fetch_add(1, Ordering::Release);
+                        } else if part.part == 2 {
+                            self.part_two_completions.fetch_add(1, Ordering::Release);
                         }
                     }
                 }
@@ -3261,14 +3264,39 @@ async fn rldp2_overdue_ack_progresses_with_ready_receive_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_later_first_part_does_not_activate_pending_query_receive() {
+    check_native_part_admission(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_skipped_part_recovers_after_predecessor_over_adnl() {
+    check_native_part_admission(true).await;
+}
+
+async fn check_native_part_admission(sequential: bool) {
     use rtos_api::{IntoBoxed, RldpChunk};
-    let native = checked_ack_native_effects(
-        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_context.tsv"),
-        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_effects.jsonl"),
-        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_reference.cpp"),
-        include_bytes!("../../../ci/conformance/rldp2_first_part_admission_metadata.json"),
-    );
+    let total_size = if sequential { 4_000_001 } else { 2_000_001 };
+    let last_part = if sequential { 2 } else { 1 };
+    let native = if sequential {
+        checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_sequential_part_admission_metadata.json"),
+        )
+    } else {
+        checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_first_part_admission_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_first_part_admission_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_first_part_admission_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_first_part_admission_metadata.json"),
+        )
+    };
     let remote_packets = Arc::new(ResponsePackets::default());
+    let completed_parts = if sequential {
+        &remote_packets.part_two_completions
+    } else {
+        &remote_packets.part_one_completions
+    };
     let (reply, packets, nodes, rldps, peers) =
         topology_with_remote_observer(2, Some(remote_packets.clone())).await;
     *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
@@ -3281,7 +3309,7 @@ async fn rldp2_later_first_part_does_not_activate_pending_query_receive() {
         };
         let deliveries = std::sync::atomic::AtomicUsize::new(0);
         let query = async {
-            let result = rldps[0].query(&request, Some(2_000_001), &peers, true, None).await;
+            let result = rldps[0].query(&request, Some(total_size), &peers, true, None).await;
             deliveries.fetch_add(1, Ordering::Release);
             result
         };
@@ -3298,12 +3326,12 @@ async fn rldp2_later_first_part_does_not_activate_pending_query_receive() {
             for row in &native {
                 let part = row["part"].as_i64().unwrap() as i32;
                 let mut encoder = crate::RaptorqEncoder::with_data(
-                    &vec![42; if part == 0 { 2_000_000 } else { 1 }], None,
+                    &vec![42; if part < last_part { 2_000_000 } else { 1 }], None,
                 );
                 let mut seqno = 0;
                 let chunk = RldpChunk {
                     transfer_id: id.into(), fec_type: encoder.params().clone().into_boxed(),
-                    part, total_size: 2_000_001, data: encoder.encode(&mut seqno).unwrap(), seqno: 0,
+                    part, total_size: total_size as i64, data: encoder.encode(&mut seqno).unwrap(), seqno: 0,
                 };
                 let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
                 let before = packets.processed_parts.load(Ordering::Acquire);
@@ -3319,17 +3347,17 @@ async fn rldp2_later_first_part_does_not_activate_pending_query_receive() {
                 let expected_complete = row["complete_packets"].as_u64().unwrap() as usize;
                 if expected_complete > 0 {
                     tokio::time::timeout(Duration::from_secs(2), async {
-                        while remote_packets.part_one_completions.load(Ordering::Acquire) < expected_complete {
+                        while completed_parts.load(Ordering::Acquire) < expected_complete {
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }
-                    }).await.expect("later part accepted after part zero must acknowledge its replay");
+                    }).await.expect("last part accepted after its predecessor must acknowledge its replay");
                 }
                 let active = peer.inbound_active.lock().unwrap().len();
                 let completed = peer.inbound_transfers.iter()
                     .filter(|e| matches!(e.val(), super::RldpTransfer::Done)).count();
-                actual.push(serde_json::json!({"part":part,"active":active,"completed":completed,"complete_packets":remote_packets.part_one_completions.load(Ordering::Acquire),"deliveries":deliveries.load(Ordering::Acquire)}));
+                actual.push(serde_json::json!({"part":part,"active":active,"completed":completed,"complete_packets":completed_parts.load(Ordering::Acquire),"deliveries":deliveries.load(Ordering::Acquire)}));
             }
-            assert_eq!(actual, native, "later parts cannot activate a receive before part zero");
+            assert_eq!(actual, native, "native part admission and recovery effects");
         };
         tokio::select! {
             result = query => panic!("partial transfer must not resolve held query: {result:?}"),
