@@ -73,6 +73,7 @@ struct ResponsePackets {
     confirm_packets: std::sync::atomic::AtomicUsize,
     confirm_received: Mutex<Option<(Vec<u8>, i32)>>,
     complete_packets: std::sync::atomic::AtomicUsize,
+    complete_transfer_ids: Mutex<HashSet<Vec<u8>>>,
     part_one_completions: std::sync::atomic::AtomicUsize,
     part_two_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
@@ -106,6 +107,10 @@ impl Subscriber for ResponsePackets {
                         self.confirm_packets.fetch_add(1, Ordering::Release);
                     }
                     rldp2::MessagePart::Rldp2_Complete(part) => {
+                        self.complete_transfer_ids
+                            .lock()
+                            .unwrap()
+                            .insert(part.transfer_id.as_slice().to_vec());
                         self.complete_packets.fetch_add(1, Ordering::Release);
                         if part.part == 1 {
                             self.part_one_completions.fetch_add(1, Ordering::Release);
@@ -4563,7 +4568,8 @@ async fn rldp2_completed_receive_preserves_queued_replay_ack() {
                 #[cfg(feature = "debug")]
                 Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
             ),
-            transfer_id: [0; 32],
+            // Solicited contexts name the outgoing request, not the response.
+            transfer_id: [255; 32],
             #[cfg(feature = "debug")]
             loss_fn: None,
         };
@@ -4580,6 +4586,11 @@ async fn rldp2_completed_receive_preserves_queued_replay_ack() {
         assert_eq!(
             packets.complete_packets.load(Ordering::Acquire) as u64,
             expected["complete_packets"].as_u64().unwrap()
+        );
+        assert_eq!(
+            *packets.complete_transfer_ids.lock().unwrap(),
+            HashSet::from([vec![0; 32]]),
+            "Complete must identify the received response, not its request"
         );
         drop(tx);
     })

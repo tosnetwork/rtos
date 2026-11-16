@@ -2198,8 +2198,8 @@ impl RldpNode {
                 continue;
             }
             let Chunk::V2(Rldp2MessagePart(chunk)) = chunk else { continue };
-            let reply = Rldp2Complete { transfer_id: context.transfer_id.into(), part: chunk.part }
-                .into_boxed();
+            let reply =
+                Rldp2Complete { transfer_id: chunk.transfer_id, part: chunk.part }.into_boxed();
             let data = match serialize_boxed(&reply) {
                 Ok(data) => data,
                 Err(error) => {
