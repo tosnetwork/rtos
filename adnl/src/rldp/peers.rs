@@ -1,10 +1,14 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
 //! Native RLDP2 connection admission, expiration and retirement ownership.
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, Weak};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Mutex, Weak},
+};
+use tokio::{
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 type Key = (Arc<KeyId>, Arc<KeyId>);
