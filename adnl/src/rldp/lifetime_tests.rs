@@ -23,6 +23,7 @@ use std::{
 
 #[derive(Default)]
 struct HeldReply {
+    concurrent_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     messages: std::sync::atomic::AtomicUsize,
     message_received: tokio::sync::Notify,
     message_hash: Mutex<Option<String>>,
@@ -48,6 +49,10 @@ impl Subscriber for HeldReply {
         match object.downcast::<Query>() {
             Ok(_) => {
                 self.calls.fetch_add(1, Ordering::Release);
+                let concurrent_gate = self.concurrent_gate.lock().unwrap().clone();
+                if let Some(gate) = concurrent_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
                 if self.hold.load(Ordering::Acquire) {
                     self.entered.notify_one();
                     self.release.notified().await;
@@ -4379,6 +4384,105 @@ async fn native_active_cancellation_retains_bounded_scope_through_actual_fec_joi
     if !query.is_finished() {
         query.abort();
         let _ = query.await;
+    }
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_active_queries_do_not_hold_command_admission_while_awaiting_answers() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_query_concurrency_context.tsv").trim(),
+        "256 10 64 1024"
+    );
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_query_concurrency_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_query_concurrency_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_query_concurrency_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_query_concurrency_metadata.json"),
+    );
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *reply.concurrent_gate.lock().unwrap() = Some(gate.clone());
+    let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+    let mut callers = Vec::new();
+    let before = rldps[0].query_budget.remaining(&peers);
+    for _ in 0..256 {
+        let node = rldps[0].clone();
+        let route = peers.clone();
+        let bytes = bytes.clone();
+        callers.push(tokio::spawn(async move {
+            node.query(
+                &TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                Some(1024),
+                &route,
+                true,
+                None,
+            )
+            .await
+        }));
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reply.calls.load(Ordering::Acquire) != 256 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("native delivers 256 held queries, Rust delivered {}", reply.calls.load(Ordering::Acquire)));
+        assert!(callers.iter().all(|caller| !caller.is_finished()));
+        let pending = before.1 - rldps[0].query_budget.remaining(&peers).1;
+        assert_eq!(pending, 256);
+        let data = TaggedByteSlice { object: &bytes, #[cfg(feature = "telemetry")] tag: 0 };
+        let extra = rldps[0].query(&data, Some(1024), &peers, true, None).await.unwrap_err();
+        assert!(extra.to_string().contains("from this peer"), "{extra:#}");
+        tokio::time::timeout(Duration::from_secs(2), rldps[0].message(
+            &TaggedByteSlice { object: b"churn", #[cfg(feature = "telemetry")] tag: 0 },
+            &peers, true, None)).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reply.messages.load(Ordering::Acquire) != 1 { reply.message_received.notified().await; }
+        }).await.unwrap();
+        assert!(callers.iter().all(|caller| !caller.is_finished()));
+        gate.add_permits(256);
+        for caller in &mut callers {
+            let (answer, _) = tokio::time::timeout(Duration::from_secs(5), caller).await.unwrap().unwrap().unwrap();
+            assert_eq!(answer.unwrap(), vec![42; 64]);
+        }
+        assert_eq!(rldps[0].query_budget.remaining(&peers), before);
+        gate.add_permits(1);
+        let (answer, _) = rldps[0].query(&data, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        assert_eq!(rldps[0].query_budget.remaining(&peers), before);
+        for node in &rldps {
+            assert_eq!(node.allocated.send_transfers.load(Ordering::Acquire), 0);
+            assert_eq!(node.allocated.recv_transfers.load(Ordering::Acquire), 0);
+        }
+        let actual = serde_json::json!({"held": pending, "pending": pending,
+            "extra_refused": extra.to_string().contains("from this peer"),
+            "messages": reply.messages.load(Ordering::Acquire), "answers": callers.len(),
+            "recovery_bytes": 64, "pending_end": before.1 - rldps[0].query_budget.remaining(&peers).1 });
+        assert_eq!(vec![actual.clone()], native);
+        eprintln!("QUERY_CONCURRENCY_EFFECTS: {actual}");
+    }).catch_unwind().await;
+    for caller in &callers {
+        if !caller.is_finished() {
+            caller.abort();
+        }
+    }
+    gate.add_permits(257);
+    for caller in callers {
+        if !caller.is_finished() {
+            let _ = caller.await;
+        }
     }
     for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
         result.unwrap();

@@ -248,7 +248,7 @@ impl NativeConnection {
         let this = self.clone();
         let (done, result) = oneshot::channel();
         self.owner.spawn_admitted("RLDP2 outbound query/message", token, async move {
-            let _permit = permit;
+            let mut command_permit = Some(permit);
             let _bounded = bounded;
             let send: TransferId = rand::thread_rng().gen();
             let receive = max_answer_size.map(|_| send.map(|byte| byte ^ 0xff));
@@ -283,6 +283,10 @@ impl NativeConnection {
                 accepted = this.driver.submit(connection_driver::Command::Send {
                     id: send, data, deadline: Some(deadline.into_std()), answer: false,
                 }).await?;
+                // This lease bounds submission owners, not queries awaiting an
+                // application answer. The blocking command has actually joined;
+                // native Connection transfer/receive limits now own admission.
+                drop(command_permit.take());
                 if receive.is_some() {
                     // Native ignores send refusal for a query: its receive limit
                     // remains live until an answer or the original deadline.
