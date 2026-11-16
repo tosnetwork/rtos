@@ -4960,3 +4960,6 @@ mod native_byte_budget_tests;
 
 #[path = "native_multipart_budget_tests.rs"]
 mod native_multipart_budget_tests;
+
+#[path = "native_outbound_boundary_tests.rs"]
+mod native_outbound_boundary_tests;
