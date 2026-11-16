@@ -1124,7 +1124,7 @@ async fn rldp2_completed_retention_matches_native_under_churn() {
         assert!(started.elapsed() < Duration::from_secs(10), "churn must precede20s expiry");
         let unique_delivered = reply.messages.load(Ordering::Acquire);
         assert_eq!(unique_delivered, 2049);
-        let remembered = rldps[1].peers.find_v2(peers.other(), peers.local()).unwrap().transfers.iter().filter(|entry| matches!(entry.val(), super::RldpTransfer::Done)).count();
+        let remembered = rldps[1].peers.find_v2(peers.other(), peers.local()).unwrap().inbound_transfers.iter().filter(|entry| matches!(entry.val(), super::RldpTransfer::Done)).count();
         assert_eq!(remembered, 2048, "native bounds completed IDs independently of time");
         let oldest = wire(0);
         nodes[0].send_custom(&TaggedByteSlice { object: &oldest, #[cfg(feature = "telemetry")] tag: 0 }, &peers).await.unwrap();
@@ -1528,6 +1528,137 @@ fn outbound_id_reuse_native_effects() -> serde_json::Value {
         (
             "probe_source_sha256",
             include_bytes!("../../../ci/conformance/rldp2_outbound_id_reuse_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_inbound_id_does_not_alias_active_outbound() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_directional_identity_context.tsv").trim(),
+        "64 60"
+    );
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[1].get_peer(peers.other(), peers.local(), true, None).await.unwrap();
+        let (ping, _pong) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, state) = super::SendTransfer::new(
+            vec![42u8; 64].into(),
+            [7; 32],
+            rldps[1].allocated.send_transfers.clone(),
+            ping,
+            true,
+        )
+        .unwrap();
+        let super::SendTransferState::V2(parts) = &state else { unreachable!() };
+        let original = parts[0].clone();
+        peer.insert_transfer(&peer.transfers, [7; 32], super::RldpTransfer::sender(state)).unwrap();
+        let registration = super::owned_send::SendRegistration {
+            v2: true,
+            inbound: None,
+            peer: Some((Arc::downgrade(&peer), peer.closed.clone())),
+            transfers: peer.transfers.clone(),
+            send: [7; 32],
+            receive: None,
+            owner: nodes[1].tasks().clone(),
+            bounded_permit: None,
+        };
+        let message = serialize_boxed(
+            &rldp::message::Message { id: UInt256::default(), data: b"churn".to_vec() }
+                .into_boxed(),
+        )
+        .unwrap();
+        let mut encoder = crate::RaptorqEncoder::with_data(&message, None);
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from([7; 32]),
+            fec_type: encoder.params().clone().into_boxed(),
+            part: 0,
+            total_size: message.len() as i64,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: seqno as i32,
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        nodes[0]
+            .send_custom(
+                &TaggedByteSlice {
+                    object: &wire,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &peers,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reply.messages.load(Ordering::Acquire) != 1 {
+                reply.message_received.notified().await;
+            }
+        })
+        .await
+        .expect("inbound payload must deliver despite same-ID active outbound sender");
+        assert_eq!(
+            original.is_finished(),
+            None,
+            "inbound completion must not finish outbound state"
+        );
+        let reverse = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let ack = serialize_boxed(
+            &rldp2::messagepart::Complete { transfer_id: UInt256::from([7; 32]), part: 0 }
+                .into_boxed(),
+        )
+        .unwrap();
+        assert!(rldps[1].try_consume_custom(&ack, &reverse).await.unwrap());
+        assert_eq!(original.is_finished(), Some(true));
+        drop(sender);
+        drop(registration);
+        assert!(
+            peer.registrations.lock().unwrap().contains(&[7; 32]),
+            "retiring sender must retain the inbound registration"
+        );
+        let actual = serde_json::json!({
+            "delivered": reply.messages.load(Ordering::Acquire),
+            "outbound_pending_after_inbound": true,
+            "ack_completed": usize::from(original.is_finished() == Some(true)),
+            "outbound_retained": peer.transfers.iter().count(),
+            "inbound_remembered": peer.completed.lock().unwrap().len(),
+        });
+        assert_eq!(actual, directional_identity_native_effects());
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire), 0);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn directional_identity_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_directional_identity_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_directional_identity_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_directional_identity_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_directional_identity_reference.cpp")
                 .as_slice(),
         ),
         (

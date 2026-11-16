@@ -249,7 +249,14 @@ impl PeerTable {
         } else {
             self.transfers.clone()
         };
+        // Native has separate directional namespaces. V1 retains its shared table.
+        let inbound_transfers = if permit.is_some() {
+            Arc::new(lockfree::map::Map::with_incin(self.transfers.incin()))
+        } else {
+            transfers.clone()
+        };
         let peer = Arc::new(RldpPeer {
+            inbound_transfers: inbound_transfers.clone(),
             transfers: transfers.clone(),
             outbound_semaphore: Arc::new(Semaphore::new(RldpNode::MAX_OUTBOUNDS_PER_PEER as usize)),
             transfer_slots: Arc::new(Semaphore::new(256)),
@@ -311,6 +318,7 @@ impl PeerTable {
                     entry.val().release_v2_sender();
                 }
                 transfers.remove(&id);
+                inbound_transfers.remove(&id);
             }
             if let Some(peer) = weak.upgrade() {
                 peer.completed.lock().unwrap().clear();
@@ -358,7 +366,10 @@ impl RldpPeer {
             let (old, _) = completed.pop_front().unwrap();
             if transfers.get(&old).is_some_and(|entry| matches!(entry.val(), RldpTransfer::Done)) {
                 transfers.remove(&old);
-                ids.remove(&old);
+                // Keep the union registration while the other direction is active.
+                if self.transfers.get(&old).is_none() {
+                    ids.remove(&old);
+                }
             }
         }
     }

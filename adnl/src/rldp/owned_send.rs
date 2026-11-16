@@ -405,7 +405,12 @@ impl SendRegistration {
     pub(super) fn finish_inbound(&self) {
         if let (Some((id, finished)), Some((peer, _))) = (&self.inbound, &self.peer) {
             if let Some(peer) = peer.upgrade() {
-                peer.finish_inbound(&self.transfers, *id, finished, tokio::time::Instant::now());
+                peer.finish_inbound(
+                    &peer.inbound_transfers,
+                    *id,
+                    finished,
+                    tokio::time::Instant::now(),
+                );
             }
         }
     }
@@ -430,7 +435,14 @@ impl Drop for SendRegistration {
                 }
                 self.transfers.remove(&self.send);
                 if let Some(ids) = ids {
-                    ids.remove(&self.send);
+                    let inbound_exists = self
+                        .peer
+                        .as_ref()
+                        .and_then(|(weak, _)| weak.upgrade())
+                        .is_some_and(|peer| peer.inbound_transfers.get(&self.send).is_some());
+                    if !inbound_exists {
+                        ids.remove(&self.send);
+                    }
                 }
             });
             return;

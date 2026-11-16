@@ -293,6 +293,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         outbound_semaphore: Arc<tokio::sync::Semaphore>,
         transfer_slots: Arc<tokio::sync::Semaphore>,
@@ -662,7 +663,7 @@ impl RldpNode {
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
         loop {
-            let result = if let Some(transfer) = peer.transfers.get(transfer_id) {
+            let result = if let Some(transfer) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(queue_sender) = transfer.val() {
                     queue_sender.send(chunk)
                 } else {
@@ -885,7 +886,7 @@ impl RldpNode {
         peer: Arc<RldpPeer>,
     ) -> Result<Option<tokio::sync::mpsc::UnboundedSender<Chunk>>> {
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let transfer_map = peer.transfers.clone();
+        let transfer_map = peer.inbound_transfers.clone();
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
         let inserted = {
             let mut ids = peer.registrations.lock().unwrap();
@@ -1410,7 +1411,7 @@ impl RldpNode {
                 .recv_transfers
                 .update(self.allocated.recv_transfers.load(Ordering::Relaxed));
             peer.insert_transfer(
-                &peer.transfers,
+                &peer.inbound_transfers,
                 recv_transfer_id,
                 RldpTransfer::Recv(queue_sender),
             )?;
