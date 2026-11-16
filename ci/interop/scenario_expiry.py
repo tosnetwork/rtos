@@ -89,9 +89,17 @@ def check_expiry_evidence(runtime, receipt, recovery, *, passive=False):
     if receipt.get("refusal_line") not in (
         expected + "signing generation expired and retired",
         expected + "signing journal stopped/retired",
+        expected + "Retired recovery has no signing or voting authority",
     ):
         raise ValueError("Signing refusal belongs to a different session")
-    if "signing generation expired and retired" not in receipt.get("expiry_line", ""):
+    if "signing generation expired and retired" not in receipt.get(
+        "expiry_line", ""
+    ) and not (
+        receipt.get("authority_kind") == "configured_pq_custody"
+        and receipt.get("expiry_line") == receipt.get("refusal_line")
+        and receipt.get("refusal_line")
+        == expected + "Retired recovery has no signing or voting authority"
+    ):
         raise ValueError("Missing natural signing expiry observation")
     if passive:
         require_fields(receipt, {"old_process_replaced": True})
@@ -140,6 +148,32 @@ def check_expiry_authority_copies(runtime, receipt):
     directory = runtime / "signer-expiry"
     owned = (runtime / "rust-5").resolve()
     bindings = receipt["authority_file_hashes"]
+    if receipt.get("authority_kind") == "configured_pq_custody":
+        from custody_expiry_authority import capture_custody_authority
+
+        authority = capture_custody_authority(owned, receipt["plan"]["expire_at"])
+        if authority["authority_file_hashes"] != bindings or authority[
+            "loaded_line"
+        ] != receipt.get("custody_loaded_line"):
+            raise ValueError("Original custody authority binding differs")
+        if (
+            json.loads((directory / "original-custody.json").read_text())
+            != json.loads((owned / "config.json").read_text())["pq_consensus"]
+            or (directory / "original-validator-prepared.json").read_bytes()
+            != (owned / "validator-prepared.json").read_bytes()
+        ):
+            raise ValueError("Saved custody authority differs from original")
+        profile = json.loads((directory / "original-profile.json").read_text())
+        if profile != {**authority, "session": receipt["session"]}:
+            raise ValueError("Custody public summary differs from bound authority")
+        selected = json.loads((directory / "selected-runtime.json").read_text())
+        if (
+            selected.get("session") != receipt["session"]
+            or selected.get("shard_workchain") != -1
+            or selected.get("role") != "validator"
+        ):
+            raise ValueError("Custody runtime differs from original signer")
+        return
     expected = {
         "isolated-signing.json",
         "isolated-signing-schedule.json",
