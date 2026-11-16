@@ -4963,3 +4963,6 @@ mod native_multipart_budget_tests;
 
 #[path = "native_outbound_boundary_tests.rs"]
 mod native_outbound_boundary_tests;
+
+#[path = "native_completed_churn_tests.rs"]
+mod native_completed_churn_tests;
