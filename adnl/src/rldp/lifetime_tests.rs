@@ -1220,7 +1220,7 @@ async fn rldp2_solicited_replies_share_native_completed_bound() {
         let started = tokio::time::Instant::now();
         for value in 0..2049usize {
             let (answer, _) = rldps[0].query(&query, Some(1024), &peers, true, None).await.unwrap();
-            assert_eq!(answer.unwrap(), vec![42; 64]);
+            assert_eq!(answer, Some(vec![42; 64]), "query {value} must return its answer");
             if [0, 127, 128, 2047, 2048].contains(&value) {
                 assert_eq!(peer.completed.lock().unwrap().len(), (value + 1).min(2048));
             }
@@ -2270,7 +2270,7 @@ async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
                     if observed { break; }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }).await.expect("input or completed-ID replay acknowledgement must reach the authenticated receiver");
+            }).await.unwrap_or_else(|error| panic!("{name}: input or completed-ID replay acknowledgement must reach the authenticated receiver: {error}"));
             let inbound = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Recv(_))).count();
             let completed = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Done)).count();
             serde_json::json!({"id":name,"inbound":inbound,"completed":completed,"replay_complete_packets":packets.part_one_completions.load(Ordering::Acquire)})
@@ -2289,4 +2289,184 @@ async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
         inbound_validation_native_effects(),
         "invalid part geometry must be dropped before receive allocation or completion caching"
     );
+}
+
+// Exercise the same decoder method called by RldpNode's receive owner. This
+// synchronous boundary makes the absence of a first Complete deterministic.
+#[test]
+fn rldp2_decoder_completion_ack_matches_native() {
+    use rtos_api::{IntoBoxed, RldpChunk};
+    use std::sync::atomic::AtomicU64;
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_completion_ack_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_completion_ack_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_completion_ack_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_completion_ack_metadata.json"),
+    );
+    let mut actual = Vec::new();
+    for line in include_str!("../../../ci/conformance/rldp2_completion_ack_context.tsv").lines() {
+        let bytes: usize = line.parse().unwrap();
+        let payload = vec![42; bytes];
+        let mut encoder = crate::RaptorqEncoder::with_data(&payload, Some(768));
+        let fec = encoder.params().clone().into_boxed();
+        let mut receiver = super::recv::RecvTransfer::new(
+            [0; 32],
+            Arc::new(AtomicU64::new(0)),
+            true,
+            None,
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let chunk = |seqno: i32, data: Vec<u8>| {
+            super::Chunk::V2(rldp2::messagepart::MessagePart(RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: fec.clone(),
+                part: 0,
+                total_size: bytes as i64,
+                seqno,
+                data,
+            }))
+        };
+        let mut first_symbol = None;
+        let mut first_complete = 0;
+        for index in 0..bytes.div_ceil(768) {
+            let mut seqno = index as u32;
+            let data = encoder.encode(&mut seqno).unwrap();
+            if index == 0 {
+                first_symbol = Some((seqno, data.clone()));
+            }
+            if receiver.process_chunk(chunk(seqno as i32, data)).unwrap().is_some() {
+                first_complete += 1;
+            }
+        }
+        assert_eq!(receiver.data, payload, "real decoder must deliver all bytes");
+        let (seqno, data) = first_symbol.unwrap();
+        let duplicate_complete =
+            usize::from(receiver.process_chunk(chunk(seqno as i32, data)).unwrap().is_some());
+        assert_eq!(receiver.data, payload, "duplicate must not append delivered bytes");
+        actual.push(serde_json::json!({"bytes":bytes,"first_complete":first_complete,
+            "duplicate_complete":duplicate_complete,"deliveries":1}));
+    }
+    assert_eq!(actual, expected, "first decode and duplicate ACKs must match native");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_query_sender_survives_legacy_adaptive_timeout() {
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_absolute_deadline_metadata.json"),
+    );
+    assert_eq!(native[0]["pending"], 1);
+    assert_eq!(native[0]["expired"], 0);
+    assert_eq!(native[0]["deadline_ms"], RldpNode::TIMEOUT_MAX_MS);
+    let loss_ms = native[0]["loss_ms"].as_u64().unwrap();
+    let (_reply, packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        let node = rldps[1].clone();
+        let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let query = tokio::spawn(async move {
+            let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+            node.query(
+                &TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                Some(1024),
+                &route,
+                true,
+                None,
+            )
+            .await
+        });
+        // Native forwards the query's absolute deadline to its sender. Losing
+        // the first 700ms of packets must not trigger the old 500ms timeout.
+        tokio::time::sleep(Duration::from_millis(loss_ms)).await;
+        let prematurely_finished = query.is_finished();
+        packets.drop_parts.store(false, Ordering::Release);
+        let result =
+            tokio::time::timeout(Duration::from_secs(9), query).await.unwrap().unwrap().unwrap();
+        assert!(!prematurely_finished, "V2 sender ended before the native query deadline");
+        assert_eq!(result.0, Some(vec![42; 64]));
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+pub(super) fn checked_ack_native_effects(
+    context: &[u8],
+    effects: &[u8],
+    source: &[u8],
+    metadata: &[u8],
+) -> Vec<serde_json::Value> {
+    let meta: serde_json::Value = serde_json::from_slice(metadata).unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    assert_eq!(meta["exit"], 0);
+    for (key, bytes) in [
+        ("cases_sha256", context),
+        ("effects_sha256", effects),
+        ("probe_source_sha256", source),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    std::str::from_utf8(effects)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_message_uses_native_ten_second_deadline() {
+    let (_reply, packets, nodes, rldps, peers) = pair().await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(12),
+            rldps[1].message(
+                &TaggedByteSlice {
+                    object: b"churn",
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &route,
+                true,
+                None,
+            ),
+        )
+        .await
+        .expect("native message deadline must precede legacy hard timeout")
+        .unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_secs(10),
+            "message ended before native deadline"
+        );
+        assert!(matches!(
+            error.downcast_ref::<super::SendCancelled>(),
+            Some(super::SendCancelled::Deadline)
+        ));
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }

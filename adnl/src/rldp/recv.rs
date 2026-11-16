@@ -415,6 +415,8 @@ impl RecvTransfer {
                     }
                 }
                 RecvParts::V2(parts) => {
+                    // Native finish_part removes the receiver, including its ACK timer.
+                    parts[chunk_part_usize].confirm_at = 0;
                     parts[chunk_part_usize].data = Some(data);
                     let mut len = 0;
                     for part in parts.iter() {
@@ -438,7 +440,13 @@ impl RecvTransfer {
                 &self.timestamp,
                 format!("Send part recv complete, seqno {}", chunk.seqno).as_str(),
             );
-            self.build_part_completed_reply(chunk.part)
+            // Native RLDP2 acknowledges completed parts on a subsequent packet,
+            // not on the symbol that first finishes decoding the part.
+            if matches!(self.parts, RecvParts::V2(_)) {
+                Ok(None)
+            } else {
+                self.build_part_completed_reply(chunk.part)
+            }
         } else {
             match &mut self.parts {
                 RecvParts::V1(part) => {
@@ -550,5 +558,77 @@ mod bounded_receive_tests {
         assert!(error.downcast_ref::<crate::ResponseLimitExceeded>().is_some());
         assert_eq!(receiver.data.capacity(), 0);
         assert!(receiver.total_size.is_none());
+    }
+}
+
+#[cfg(test)]
+mod completion_timer_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn completed_rldp2_part_cancels_pending_confirmation() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_completed_part_timer_metadata.json"),
+        );
+        assert_eq!(native[0]["confirm_packets"], 0);
+        assert_eq!(native[0]["deliveries"], 0);
+        let bytes = native[0]["bytes"].as_u64().unwrap() as usize;
+        let data = vec![42; bytes];
+        let mut encoder = crate::RaptorqEncoder::with_data(&data, Some(768));
+        let fec = encoder.params().clone().into_boxed();
+        let mut receiver = RecvTransfer::new(
+            [0; 32],
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            true,
+            Some(bytes + 1),
+            #[cfg(feature = "debug")]
+            Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+        );
+        let mut first_complete = 0usize;
+        let mut duplicate = None;
+        for index in 0..bytes.div_ceil(768) {
+            let mut seqno = index as u32;
+            let symbol = encoder.encode(&mut seqno).unwrap();
+            if index == 0 {
+                duplicate = Some((seqno, symbol.clone()));
+            }
+            first_complete += usize::from(
+                receiver
+                    .process_chunk(Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                        transfer_id: UInt256::default(),
+                        fec_type: fec.clone(),
+                        part: 0,
+                        total_size: (bytes + 1) as i64,
+                        seqno: seqno as i32,
+                        data: symbol,
+                    })))
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+        assert_eq!(native[0]["first_complete"], first_complete);
+        let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+        assert_eq!(parts[0].data.as_ref().unwrap(), &data, "first part really decoded");
+        assert!(receiver.data.is_empty(), "whole transfer must still await its next part");
+        assert_eq!(
+            parts[0].confirm_at, 0,
+            "native removes the completed part receiver and its pending ACK"
+        );
+        let (seqno, symbol) = duplicate.unwrap();
+        let reply = receiver
+            .process_chunk(Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                transfer_id: UInt256::default(),
+                fec_type: fec,
+                part: 0,
+                total_size: (bytes + 1) as i64,
+                seqno: seqno as i32,
+                data: symbol,
+            })))
+            .unwrap();
+        assert_eq!(native[0]["duplicate_complete"], usize::from(reply.is_some()));
     }
 }

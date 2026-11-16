@@ -1358,8 +1358,11 @@ impl RldpNode {
         bounded: Option<BoundedReceive>,
         control: Option<Arc<SendControl>>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        let query_deadline = (v2 && max_answer_size.is_some())
-            .then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
+        // Native gives both send_message and send_query a transfer deadline;
+        // the same deadline includes peer admission and queued sender work.
+        let transfer_deadline =
+            v2.then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
+        let query_deadline = transfer_deadline.filter(|_| max_answer_size.is_some());
         let response_limits = bounded.as_ref().map(|scope| scope.limits);
         let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
         #[cfg(feature = "telemetry")]
@@ -1390,14 +1393,10 @@ impl RldpNode {
             if v2 && query_id.is_some() { Some(self.query_budget.acquire(peers)?) } else { None };
         // Native send_message also supplies a ten-second transfer deadline;
         // connection retention is that deadline plus the 120-second idle span.
-        let connection_deadline = v2.then(|| {
-            query_deadline.unwrap_or_else(|| {
-                tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS)
-            })
-        });
+        let connection_deadline = transfer_deadline;
         let get_peer = self.get_peer(peers.local(), peers.other(), v2, connection_deadline);
         let peer = match tokio::time::timeout_at(
-            query_deadline.unwrap_or_else(|| {
+            transfer_deadline.unwrap_or_else(|| {
                 tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS)
             }),
             get_peer,
@@ -1417,14 +1416,18 @@ impl RldpNode {
             _ = control.cancelled() => { control.check()?; unreachable!() },
             _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
             _ = async {
-                if let Some(deadline) = query_deadline {
+                if let Some(deadline) = transfer_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             } => {
                 control.cancel(SendCancelled::Deadline);
-                return Err(RldpQueryTimeout.into());
+                return if query_deadline.is_some() {
+                    Err(RldpQueryTimeout.into())
+                } else {
+                    Err(SendCancelled::Deadline.into())
+                };
             },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
@@ -1578,7 +1581,8 @@ impl RldpNode {
             query_id.is_some(),
         );
         let hard_deadline = tokio::time::Instant::now() + control.deadline();
-        let deadline = query_deadline.map_or(hard_deadline, |query| query.min(hard_deadline));
+        let deadline =
+            transfer_deadline.map_or(hard_deadline, |transfer| transfer.min(hard_deadline));
         let res = match tokio::time::timeout_at(
             deadline,
             async {
@@ -2368,12 +2372,10 @@ impl RldpNode {
                 );
                 context.peer.stats.v1.update(min_timeout_ms);
                 updates += new_received
-            } else if control.protocol_deadline.is_none()
-                && context.peer.stats.v1.try_timeout(start_ms)
-            {
-                transfer.state().set_finished(false);
-                continue;
             }
+            // V2 ends at its native absolute transfer deadline, enforced by
+            // the outbound owner (or the response control). Legacy adaptive
+            // statistics govern pacing, not an additional early failure.
             new_received = 0;
             let peer = context.peer.clone();
             let (returned, prepared) = owned_send::fec_limited(
