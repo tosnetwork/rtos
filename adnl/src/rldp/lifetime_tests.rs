@@ -62,6 +62,8 @@ impl Subscriber for HeldReply {
 
 #[derive(Default)]
 struct ResponsePackets {
+    complete_packets: std::sync::atomic::AtomicUsize,
+    part_one_completions: std::sync::atomic::AtomicUsize,
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
 }
@@ -69,12 +71,24 @@ struct ResponsePackets {
 impl Subscriber for ResponsePackets {
     async fn try_consume_custom(&self, bytes: &[u8], _: &AdnlPeers) -> Result<bool> {
         if let Ok(message) = deserialize_boxed(bytes) {
-            if let Ok(rldp2::MessagePart::Rldp2_MessagePart(part)) =
-                message.downcast::<rldp2::MessagePart>()
-            {
-                self.transfers.lock().unwrap().insert(part.0.transfer_id.as_slice().to_vec());
-                if self.drop_parts.load(Ordering::Acquire) {
-                    return Ok(true);
+            if let Ok(part) = message.downcast::<rldp2::MessagePart>() {
+                match part {
+                    rldp2::MessagePart::Rldp2_MessagePart(part) => {
+                        self.transfers
+                            .lock()
+                            .unwrap()
+                            .insert(part.0.transfer_id.as_slice().to_vec());
+                        if self.drop_parts.load(Ordering::Acquire) {
+                            return Ok(true);
+                        }
+                    }
+                    rldp2::MessagePart::Rldp2_Complete(part) => {
+                        self.complete_packets.fetch_add(1, Ordering::Release);
+                        if part.part == 1 {
+                            self.part_one_completions.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2117,7 +2131,7 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
         for n in 0..256u32 {
             let mut id = [0; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
-            assert!(peer.admit_inbound(id).unwrap());
+            assert!(peer.admit_inbound(id, true).unwrap());
         }
         let stale = [77; 32];
         peer.finish_inbound(
@@ -2126,7 +2140,10 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
             &tokio_util::sync::CancellationToken::new(),
             tokio::time::Instant::now(),
         );
-        assert!(peer.admit_inbound(stale).unwrap(), "completed duplicates bypass active capacity");
+        assert!(
+            peer.admit_inbound(stale, true).unwrap(),
+            "completed duplicates bypass active capacity"
+        );
         for n in 0..2048u32 {
             let mut id = [88; 32];
             id[..4].copy_from_slice(&n.to_le_bytes());
@@ -2154,4 +2171,109 @@ async fn rldp2_pruned_completed_id_rechecks_inbound_admission_at_creation() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+fn inbound_validation_native_effects() -> serde_json::Value {
+    let context = include_bytes!("../../../ci/conformance/rldp2_inbound_validation_context.tsv");
+    let effects = include_bytes!("../../../ci/conformance/rldp2_inbound_validation_effects.json");
+    let meta: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/conformance/rldp2_inbound_validation_metadata.json"
+    ))
+    .unwrap();
+    assert_eq!(meta["reference_commit"], include_str!("../../../ci/conformance/REFERENCE").trim());
+    for (key, bytes) in [
+        ("cases_sha256", context.as_slice()),
+        ("effects_sha256", effects.as_slice()),
+        (
+            "probe_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_inbound_validation_reference.cpp")
+                .as_slice(),
+        ),
+        (
+            "runner_source_sha256",
+            include_bytes!("../../../ci/conformance/rldp2_runtime_reference.py").as_slice(),
+        ),
+    ] {
+        assert_eq!(meta[key], hex::encode(rtos_block::sha256_digest(bytes)), "{key}");
+    }
+    serde_json::from_slice(effects).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_invalid_part_geometry_does_not_allocate_receive_state() {
+    use rtos_api::{ton::rldp, IntoBoxed, RldpChunk};
+    async fn send(node: &Arc<AdnlNode>, route: &AdnlPeers, part: i32, total: i64, bytes: &[u8]) {
+        let mut encoder = crate::RaptorqEncoder::with_data(bytes, None);
+        let mut seqno = 0;
+        let chunk = RldpChunk {
+            transfer_id: UInt256::from([0; 32]),
+            fec_type: encoder.params().clone().into_boxed(),
+            part,
+            total_size: total,
+            data: encoder.encode(&mut seqno).unwrap(),
+            seqno: seqno as i32,
+        };
+        let wire = serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+        node.send_custom(
+            &TaggedByteSlice {
+                object: &wire,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            },
+            route,
+        )
+        .await
+        .unwrap();
+    }
+    let mut actual = Vec::new();
+    for line in include_str!("../../../ci/conformance/rldp2_inbound_validation_context.tsv").lines()
+    {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let name = fields[0];
+        let part: i32 = fields[1].parse().unwrap();
+        let total: i64 = fields[2].parse().unwrap();
+        let bytes: usize = fields[3].parse().unwrap();
+        let (reply, packets, nodes, rldps, peers) = pair().await;
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let replay = name == "completed_replay";
+            let (sender, receiver, route) = if replay { (0,1,peers.clone()) }
+                else { (1,0,AdnlPeers::with_keys(peers.other().clone(), peers.local().clone())) };
+            let peer = rldps[receiver].get_peer(route.other(), route.local(), true, None).await.unwrap();
+            if replay {
+                let warm = serialize_boxed(&rldp::message::Message { id:UInt256::default(),data:b"churn".to_vec() }.into_boxed()).unwrap();
+                send(&nodes[sender], &route, 0, warm.len() as i64, &warm).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while reply.messages.load(Ordering::Acquire) != 1 { reply.message_received.notified().await; }
+                }).await.expect("warm message must actually deliver");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                eprintln!("GEOMETRY_WARM_COMPLETE_PACKETS {}", packets.complete_packets.load(Ordering::Acquire));
+            }
+            send(&nodes[sender], &route, part, total, &vec![42;bytes]).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let observed = if replay { packets.part_one_completions.load(Ordering::Acquire)>0 }
+                        else { !packets.transfers.lock().unwrap().is_empty() };
+                    if observed { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("input or completed-ID replay acknowledgement must reach the authenticated receiver");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let inbound = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Recv(_))).count();
+            let completed = peer.inbound_transfers.iter().filter(|e| matches!(e.val(),super::RldpTransfer::Done)).count();
+            serde_json::json!({"id":name,"inbound":inbound,"completed":completed,"replay_complete_packets":packets.part_one_completions.load(Ordering::Acquire)})
+        }).catch_unwind().await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        match outcome {
+            Ok(value) => actual.push(value),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    assert_eq!(
+        serde_json::Value::Array(actual),
+        inbound_validation_native_effects(),
+        "invalid part geometry must be dropped before receive allocation or completion caching"
+    );
 }

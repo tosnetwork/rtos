@@ -1,0 +1,1 @@
+[{"id":"valid","inbound":1,"completed":0,"replay_complete_packets":0},{"id":"out_of_range","inbound":0,"completed":0,"replay_complete_packets":0},{"id":"fec_short","inbound":0,"completed":0,"replay_complete_packets":0},{"id":"fec_long","inbound":0,"completed":0,"replay_complete_packets":0},{"id":"completed_replay","inbound":0,"completed":1,"replay_complete_packets":1}]

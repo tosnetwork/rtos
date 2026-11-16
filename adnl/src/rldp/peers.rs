@@ -343,7 +343,7 @@ impl Drop for PeerTable {
     }
 }
 impl RldpPeer {
-    pub(super) fn admit_inbound(&self, id: TransferId) -> Result<bool> {
+    pub(super) fn admit_inbound(&self, id: TransferId, valid_geometry: bool) -> Result<bool> {
         let _ids = self.registrations.lock().unwrap();
         if self.closed.is_cancelled() {
             return Err(SendCancelled::PeerEvicted.into());
@@ -355,6 +355,9 @@ impl RldpPeer {
             .is_some_and(|entry| matches!(entry.val(), RldpTransfer::Done))
         {
             return Ok(true);
+        }
+        if !valid_geometry {
+            return Ok(false);
         }
         let mut active = self.inbound_active.lock().unwrap();
         if active.contains(&id) {

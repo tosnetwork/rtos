@@ -148,13 +148,24 @@ enum MessagePart {
 
 type TransferId = [u8; 32];
 
+struct ReceiveRegistration {
+    sender: tokio::sync::mpsc::UnboundedSender<Chunk>,
+    bounded_wire_limit: Option<usize>,
+}
+
 enum RldpTransfer {
-    Recv(tokio::sync::mpsc::UnboundedSender<Chunk>),
+    Recv(ReceiveRegistration),
     Send(std::sync::Mutex<Option<SendTransferState>>),
     Done,
 }
 
 impl RldpTransfer {
+    fn receiver(
+        sender: tokio::sync::mpsc::UnboundedSender<Chunk>,
+        bounded_wire_limit: Option<usize>,
+    ) -> Self {
+        Self::Recv(ReceiveRegistration { sender, bounded_wire_limit })
+    }
     fn sender(state: SendTransferState) -> Self {
         Self::Send(std::sync::Mutex::new(Some(state)))
     }
@@ -677,15 +688,45 @@ impl RldpNode {
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        // Explicit bounded queries report a declared wire-limit violation
+        // before decoding. This notification must not claim an inbound slot.
+        if let Chunk::V2(Rldp2MessagePart(part)) = &chunk {
+            if let Some(entry) = peer.inbound_transfers.get(transfer_id) {
+                if let RldpTransfer::Recv(registration) = entry.val() {
+                    if registration.bounded_wire_limit.is_some_and(|limit| {
+                        usize::try_from(part.total_size).is_ok_and(|total| total > limit)
+                    }) {
+                        let _ = registration.sender.send(chunk);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let valid_geometry = match &chunk {
+            Chunk::V1(_) => true,
+            Chunk::V2(Rldp2MessagePart(chunk)) => {
+                let total = chunk.total_size as u64;
+                let part = chunk.part as u64;
+                let width = Constraints::SLICE as u64;
+                chunk.total_size > 0
+                    && chunk.part >= 0
+                    && part < total.div_ceil(width)
+                    && matches!(&chunk.fec_type, FecType::Fec_RaptorQ(fec)
+                        if fec.data_size as u64 == (total - part * width).min(width))
+            }
+        };
         // A solicited receive registration is only a promise of future input.
         // Charge concurrency when the first actual part arrives, in either path.
-        if v2 && !peer.admit_inbound(*transfer_id)? {
+        if v2 && !peer.admit_inbound(*transfer_id, valid_geometry)? {
             return Ok(());
         }
         loop {
             let result = if let Some(transfer) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(queue_sender) = transfer.val() {
-                    queue_sender.send(chunk)
+                    if !valid_geometry {
+                        return Ok(());
+                    }
+                    queue_sender.sender.send(chunk)
                 } else {
                     // Chunk for a completed transfer — send Complete only (no Confirm),
                     // matching C++ behavior for both RLDP V1 and V2.
@@ -720,6 +761,11 @@ impl RldpNode {
                     break;
                 }
             } else {
+                // A completed ID can be pruned after the initial check. Invalid
+                // geometry must still never create a replacement receiver.
+                if !valid_geometry {
+                    return Ok(());
+                }
                 match self.inbound(transfer_id, peers, v2, peer.clone()).await? {
                     InboundRegistration::Created(queue_sender) => queue_sender.send(chunk),
                     InboundRegistration::Existing => continue,
@@ -926,7 +972,7 @@ impl RldpNode {
                 active.insert(*transfer_id);
             }
             let inserted = add_unbound_object_to_map(&transfer_map, *transfer_id, || {
-                Ok(RldpTransfer::Recv(queue_sender.clone()))
+                Ok(RldpTransfer::receiver(queue_sender.clone(), None))
             })?;
             if inserted {
                 ids.insert(*transfer_id);
@@ -1451,7 +1497,10 @@ impl RldpNode {
             peer.insert_transfer(
                 &peer.inbound_transfers,
                 recv_transfer_id,
-                RldpTransfer::Recv(queue_sender),
+                RldpTransfer::receiver(
+                    queue_sender,
+                    if bounded.is_some() { expected_total_size } else { None },
+                ),
             )?;
             let recv_context = RecvContext {
                 adnl: self.adnl.clone(),

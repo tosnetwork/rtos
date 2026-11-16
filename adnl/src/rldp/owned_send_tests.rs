@@ -640,7 +640,7 @@ async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
         let transfers = Arc::new(lockfree::map::Map::new());
         let id = [91; 32];
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        transfers.insert(id, super::super::RldpTransfer::Recv(sender));
+        transfers.insert(id, super::super::RldpTransfer::receiver(sender, None));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -680,7 +680,7 @@ async fn rldp_owned_inbound_expiry_cannot_revive_removed_registration() {
     let transfers = Arc::new(lockfree::map::Map::new());
     let id = [92; 32];
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    transfers.insert(id, super::super::RldpTransfer::Recv(sender));
+    transfers.insert(id, super::super::RldpTransfer::receiver(sender, None));
     super::super::expire_inbound_transfer(
         transfers.clone(),
         id,
@@ -934,12 +934,15 @@ async fn rldp_old_inbound_expiry_preserves_reopened_registration() {
     let old = rldp.get_peer(local.id(), local.id(), true, Some(now)).await.unwrap();
     let id = [94; 32];
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    old.insert_transfer(&old.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    old.insert_transfer(&old.transfers, id, super::super::RldpTransfer::receiver(sender, None))
+        .unwrap();
     rldp.peers.expire(now + Duration::from_secs(120));
     let fresh = rldp.get_peer(local.id(), local.id(), true, None).await.unwrap();
     assert!(old.drained.is_cancelled());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    fresh.insert_transfer(&fresh.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    fresh
+        .insert_transfer(&fresh.transfers, id, super::super::RldpTransfer::receiver(sender, None))
+        .unwrap();
     // The old timer's completion can already be in flight on another worker.
     // Its final mutation must be serialized with close and generation cleanup.
     super::super::expire_inbound_transfer(
@@ -985,7 +988,8 @@ async fn rldp_completed_id_reuse_is_safe_from_old_expiry_and_drop() {
     }
     assert!(peer.transfers.get(&id).is_none());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    peer.insert_transfer(&peer.transfers, id, super::super::RldpTransfer::Recv(sender)).unwrap();
+    peer.insert_transfer(&peer.transfers, id, super::super::RldpTransfer::receiver(sender, None))
+        .unwrap();
     super::super::expire_inbound_transfer(
         peer.transfers.clone(),
         id,
