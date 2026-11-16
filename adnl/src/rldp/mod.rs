@@ -2723,7 +2723,7 @@ impl Subscriber for RldpNode {
                             .data_receipts
                             .lock()
                             .unwrap()
-                            .entry((*part.0.transfer_id.as_array(), part.0.seqno))
+                            .entry((*part.0.transfer_id.as_array(), part.0.part, part.0.seqno))
                             .or_default() += 1;
                         native.processed_data_packets.fetch_add(1, Ordering::Release);
                         native.data_processed.notify_one();

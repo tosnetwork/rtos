@@ -344,14 +344,14 @@ async fn check_global_decoder_budget() {
                         id, deadline:std::time::Instant::now()+Duration::from_secs(60),max_size:2048,
                     }).await.unwrap());
                 }
-                let before=native.data_receipts.lock().unwrap().get(&(id, 0)).copied().unwrap_or_default();
+                let before=native.data_receipts.lock().unwrap().get(&(id, 0, 0)).copied().unwrap_or_default();
                 let chunk=RldpChunk {transfer_id:id.into(),fec_type:fec.clone(),part:0,total_size:2048,seqno:0,data:symbol.clone()};
                 let wire=serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
                 let route=AdnlPeers::with_keys(source.id().clone(),target.id().clone());
                 nodes[sender].send_custom(&TaggedByteSlice {object:&wire,#[cfg(feature="telemetry")] tag:0},&route).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2),async {
                     loop {
-                        if native.data_receipts.lock().unwrap().get(&(id, 0)).copied().unwrap_or_default()>before {break;}
+                        if native.data_receipts.lock().unwrap().get(&(id, 0, 0)).copied().unwrap_or_default()>before {break;}
                         tokio::select! {
                             _=native.data_processed.notified()=>{},
                             _=tokio::time::sleep(Duration::from_millis(50))=>{

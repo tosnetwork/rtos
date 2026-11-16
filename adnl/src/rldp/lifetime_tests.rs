@@ -4858,3 +4858,6 @@ mod native_identity_tests;
 
 #[path = "native_byte_budget_tests.rs"]
 mod native_byte_budget_tests;
+
+#[path = "native_multipart_budget_tests.rs"]
+mod native_multipart_budget_tests;

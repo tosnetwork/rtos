@@ -68,7 +68,7 @@ async fn check_byte_budget() {
                 if solicited {assert!(native.driver.submit(super::super::connection_driver::Command::ReceiveLimit {
                     id,deadline:std::time::Instant::now()+Duration::from_secs(60),max_size:size,
                 }).await.unwrap());}
-                let key=(id,seq as i32);
+                let key=(id,0,seq as i32);
                 let before=native.data_receipts.lock().unwrap().get(&key).copied().unwrap_or_default();
                 let chunk=RldpChunk {transfer_id:id.into(),fec_type:if little {small_fec.clone()}else{large_fec.clone()},part:0,total_size:size as i64,seqno:seq as i32,data:if little {small_symbol.clone()}else{large_symbols[seq as usize].clone()}};
                 let wire=serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
