@@ -1251,6 +1251,15 @@ async fn rldp2_outbound_completion_retires_sender_ids() {
         }
         let other = rldps[1].get_peer(peers.other(), peers.local(), true, None).await.unwrap();
         let expected = outbound_retirement_native_effects();
+        // Admission is released just before the final sender registration.
+        // The response-handler receipt is published after both have drained.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) != 2049 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all response handlers must observe actual sender completion");
         assert_eq!(reply.calls.load(Ordering::Acquire), 2049);
         for (side, peer) in [peer, other].iter().enumerate() {
             tokio::time::timeout(Duration::from_secs(5), async {
