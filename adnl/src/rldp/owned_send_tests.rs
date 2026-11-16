@@ -302,7 +302,7 @@ async fn rldp_owned_query_deadline_includes_peer_admission_wait() {
     let rldp = rldp(&adnl);
     let local = adnl.key_by_tag(0).unwrap();
     let peers = AdnlPeers::with_keys(local.id().clone(), local.id().clone());
-    let peer = rldp.get_peer(local.id()).unwrap();
+    let peer = rldp.get_peer(local.id(), local.id()).unwrap();
     let capacity = peer.outbound_semaphore.available_permits();
     let occupied = peer.outbound_semaphore.clone().try_acquire_many_owned(capacity as u32).unwrap();
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -339,7 +339,7 @@ async fn rldp_owned_idle_peer_does_not_retain_own_sender() {
     let adnl = node().await;
     let rldp = rldp(&adnl);
     let key = adnl.key_by_tag(0).unwrap();
-    let peer = rldp.get_peer(key.id()).unwrap();
+    let peer = rldp.get_peer(key.id(), key.id()).unwrap();
     let weak = Arc::downgrade(&peer);
     let idle = peer.idle.clone();
     bounded(idle.notified()).await;
@@ -375,7 +375,7 @@ async fn rldp_owned_public_v1_v2_cancellation_retains_real_sender() {
                 let rldp = rldp(&adnl);
                 let local = adnl.key_by_tag(0).unwrap();
                 let peers = AdnlPeers::with_keys(local.id().clone(), local.id().clone());
-                let peer = rldp.get_peer(local.id()).unwrap();
+                let peer = rldp.get_peer(local.id(), local.id()).unwrap();
                 let control = SendControl::new();
                 *rldp.test_control.lock().unwrap() = Some(control.clone());
                 if stop == 1 {
@@ -466,7 +466,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
         let adnl = node().await;
         let rldp = rldp(&adnl);
         let local = adnl.key_by_tag(0).unwrap();
-        let peer = rldp.get_peer(local.id()).unwrap();
+        let peer = rldp.get_peer(local.id(), local.id()).unwrap();
         let mut pool = SendWorkerPool::new(adnl.tasks().clone());
         pool.workers = 2; // Two real active siblings, still below production max8.
         let pool = Arc::new(pool);
@@ -513,7 +513,9 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             v2: true,
             done,
             ctx: SendContext {
-                admission: None,
+                admission: Some(Arc::new(
+                    peer.transfer_slots.clone().acquire_owned().await.unwrap(),
+                )),
                 adnl: adnl.clone(),
                 peers: AdnlPeers::with_keys(local.id().clone(), local.id().clone()),
                 pong: tokio::sync::mpsc::unbounded_channel().1,
@@ -541,6 +543,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             bounded(control.cancelled()).await;
             assert!(matches!(receipt.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
             assert_eq!(peer.outbound_semaphore.available_permits(), 2);
+            assert_eq!(peer.transfer_slots.available_permits(), 255);
             assert!(rldp.transfers.get(&id).is_some());
             assert!(tokio::time::timeout(Duration::from_millis(20), adnl.stop_checked())
                 .await
@@ -573,6 +576,7 @@ async fn rldp_owned_first_part_outcome_waits_for_sibling_fec() {
             }
         }
         assert_eq!(peer.outbound_semaphore.available_permits(), 3);
+        assert_eq!(peer.transfer_slots.available_permits(), 256);
         assert!(rldp.transfers.get(&id).is_none());
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);

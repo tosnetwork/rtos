@@ -168,7 +168,11 @@ async fn topology(
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let (_, config) = AdnlNodeConfig::from_ip_address_and_private_keys(
                 &socket.local_addr().unwrap().to_string(),
-                vec![([17 + index as u8; 32], 0)],
+                if index == 1 {
+                    vec![([18; 32], 0), ([39; 32], 1)]
+                } else {
+                    vec![([17 + index as u8; 32], 0)]
+                },
             )
             .unwrap();
             let node = AdnlNode::with_config(
@@ -488,6 +492,19 @@ async fn sixteen_large_silent_responses_retain_initialized_encoders() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_outbound_count_matches_native_256() {
+    outbound_count_boundary(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_outbound_admission_isolated_by_local_identity() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_local_identity_context.tsv").trim(),
+        "256 1 64 60"
+    );
+    outbound_count_boundary(true).await;
+}
+
+async fn outbound_count_boundary(second_local: bool) {
     assert_eq!(
         include_str!("../../../ci/conformance/rldp2_outbound_count_context.tsv").trim(),
         "257"
@@ -504,7 +521,11 @@ async fn rldp2_outbound_count_matches_native_256() {
         for index in 0..257 {
             let request = serialize_boxed(
                 &rldp::message::Query {
-                    query_id: UInt256::from([80 + index as u8; 32]),
+                    query_id: UInt256::from({
+                        let mut id = [80; 32];
+                        id[..4].copy_from_slice(&(index as u32).to_le_bytes());
+                        id
+                    }),
                     max_answer_size: 1024,
                     timeout: super::Version::get() + 60,
                     data: query_bytes.clone(),
@@ -550,6 +571,7 @@ async fn rldp2_outbound_count_matches_native_256() {
         tokio::time::timeout(Duration::from_secs(5), async {
             while packets.transfers.lock().unwrap().len() < worker_count
                 || rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) < 256
+                || rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) < 1
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -569,6 +591,67 @@ async fn rldp2_outbound_count_matches_native_256() {
             256,
             "native admits only 256 concurrent outbound transfers per connection"
         );
+        if second_local {
+            let local = nodes[1].key_by_tag(1).unwrap();
+            let remote = nodes[0].key_by_tag(0).unwrap();
+            nodes[0].add_peer(remote.id(), nodes[1].ip_address_adnl(), None, &local).unwrap();
+            nodes[1].add_peer(local.id(), nodes[0].ip_address_adnl(), None, &remote).unwrap();
+            let route = AdnlPeers::with_keys(remote.id().clone(), local.id().clone());
+            let request = serialize_boxed(
+                &rldp::message::Query {
+                    query_id: UInt256::from([19; 32]),
+                    max_answer_size: 1024,
+                    timeout: super::Version::get() + 60,
+                    data: query_bytes.clone(),
+                }
+                .into_boxed(),
+            )
+            .unwrap();
+            let mut encoder = crate::RaptorqEncoder::with_data(&request, None);
+            let mut seqno = 0;
+            let chunk = RldpChunk {
+                transfer_id: UInt256::from([51; 32]),
+                fec_type: encoder.params().clone().into_boxed(),
+                part: 0,
+                total_size: request.len() as i64,
+                data: encoder.encode(&mut seqno).unwrap(),
+                seqno: seqno as i32,
+            };
+            let wire =
+                serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed()).unwrap();
+            nodes[0]
+                .send_custom(
+                    &TaggedByteSlice {
+                        object: &wire,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0,
+                    },
+                    &route,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while reply.calls.load(Ordering::Acquire) < 258 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("second local identity must receive authenticated query");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire) < 257
+                    && rldps[1].allocated.response_lifecycle.1.load(Ordering::Acquire) < 2
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("second handler must start a sender or finish refusing");
+            assert_eq!(
+                rldps[1].allocated.response_lifecycle.0.load(Ordering::Acquire),
+                257,
+                "one saturated local identity must not consume another identity's admission"
+            );
+        }
         let healthy = nodes[2].key_by_tag(0).unwrap();
         let server = nodes[1].key_by_tag(0).unwrap();
         let peers = AdnlPeers::with_keys(healthy.id().clone(), server.id().clone());

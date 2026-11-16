@@ -318,7 +318,7 @@ pub struct RldpNode {
     adnl: Arc<AdnlNode>,
     local_id: Option<Arc<KeyId>>,
     min_timeout_ms: u64,
-    peers: lockfree::map::Map<Arc<KeyId>, Arc<RldpPeer>>,
+    peers: lockfree::map::Map<(Arc<KeyId>, Arc<KeyId>), Arc<RldpPeer>>,
     extended_caps: lockfree::map::Map<Arc<KeyId>, Arc<AtomicI32>>,
     send_pool: Arc<SendWorkerPool>,
     #[cfg(feature = "telemetry")]
@@ -750,15 +750,16 @@ impl RldpNode {
         }
     }
 
-    fn get_peer(&self, id: &Arc<KeyId>) -> Result<Arc<RldpPeer>> {
+    fn get_peer(&self, local: &Arc<KeyId>, id: &Arc<KeyId>) -> Result<Arc<RldpPeer>> {
+        let connection = (local.clone(), id.clone());
         let ret = loop {
-            if let Some(peer) = self.peers.get(id) {
+            if let Some(peer) = self.peers.get(&connection) {
                 break peer.val().clone();
             }
             let min_timeout_ms = self.min_timeout_ms;
             let transfers = self.transfers.clone();
             let send_pool = self.send_pool.clone();
-            add_counted_object_to_map(&self.peers, id.clone(), || {
+            add_counted_object_to_map(&self.peers, connection.clone(), || {
                 let permits = Self::MAX_OUTBOUNDS_PER_PEER as usize;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 let ret = Arc::new(RldpPeer {
@@ -904,7 +905,7 @@ impl RldpNode {
         };
         #[cfg(feature = "telemetry")]
         self.telemetry.recv_transfers.update(self.allocated.recv_transfers.load(Ordering::Relaxed));
-        let peer = self.get_peer(peers.other())?;
+        let peer = self.get_peer(peers.local(), peers.other())?;
         #[cfg(feature = "telemetry")]
         let stats = self.stats.clone();
         #[cfg(feature = "telemetry")]
@@ -1205,7 +1206,7 @@ impl RldpNode {
             (None::<QueryId>, message)
         };
         let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
-        let peer = self.get_peer(peers.other())?;
+        let peer = self.get_peer(peers.local(), peers.other())?;
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
