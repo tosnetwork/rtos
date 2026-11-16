@@ -346,6 +346,10 @@ struct MessageContext<'a> {
 struct RldpAlloc {
     #[cfg(test)]
     response_lifecycle: Arc<(AtomicU64, AtomicU64)>, // (senders started, inbound handlers finished)
+    #[cfg(test)]
+    query_receiver_finished: Arc<AtomicU64>,
+    #[cfg(test)]
+    query_receiver_cleanup_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     peers: Arc<AtomicU64>,
     send_transfers: Arc<AtomicU64>,
     recv_transfers: Arc<AtomicU64>,
@@ -470,6 +474,10 @@ impl RldpNode {
         let allocated = RldpAlloc {
             #[cfg(test)]
             response_lifecycle: Arc::new((AtomicU64::new(0), AtomicU64::new(0))),
+            #[cfg(test)]
+            query_receiver_finished: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            query_receiver_cleanup_gate: std::sync::Mutex::new(None),
             peers: Arc::new(AtomicU64::new(0)),
             recv_transfers: Arc::new(AtomicU64::new(0)),
             send_transfers: Arc::new(AtomicU64::new(0)),
@@ -1915,6 +1923,10 @@ impl RldpNode {
             } else {
                 self.adnl.tasks().enter()?
             };
+            #[cfg(test)]
+            let receiver_finished = self.allocated.query_receiver_finished.clone();
+            #[cfg(test)]
+            let cleanup_gate = self.allocated.query_receiver_cleanup_gate.lock().unwrap().take();
             self.adnl.tasks().spawn_admitted("RLDP outbound receiver", token, async move {
                 let _registration = registration;
                 let _permit = permit;
@@ -1930,6 +1942,17 @@ impl RldpNode {
                 let _ = ping.send(recv_context.recv_transfer);
                 if let Some(scope) = bounded {
                     let _ = scope.done.send(());
+                }
+                #[cfg(test)]
+                {
+                    if let Some(gate) = cleanup_gate {
+                        let _ = gate.acquire().await;
+                    }
+                    // A delivered answer and zero allocation counters do not
+                    // prove the receiver's registration has been dropped.
+                    drop(_permit);
+                    drop(_registration);
+                    receiver_finished.fetch_add(1, Ordering::Release);
                 }
             });
             Some((recv_state, pong))
