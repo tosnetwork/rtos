@@ -64,6 +64,8 @@ pub(super) struct NativeConnection {
     waiters: Arc<Mutex<Waiters>>,
     #[cfg(test)]
     pub(super) completed_sends: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(super) completed_send_ids: Arc<Mutex<Vec<TransferId>>>,
 }
 impl NativeConnection {
     pub(super) fn start(
@@ -92,9 +94,13 @@ impl NativeConnection {
             waiters: waiters.clone(),
             #[cfg(test)]
             completed_sends: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            completed_send_ids: Arc::new(Mutex::new(Vec::new())),
         });
         #[cfg(test)]
         let completed_sends = ret.completed_sends.clone();
+        #[cfg(test)]
+        let completed_send_ids = ret.completed_send_ids.clone();
         let lifetime = owner.clone();
         owner.spawn_admitted("RLDP2 Connection events", token, async move {
             // Keep this entry's capacity until actual transport work ends.
@@ -111,6 +117,7 @@ impl NativeConnection {
                 for (id, result) in event.sent {
                     #[cfg(test)]
                     if result.is_ok() {
+                        completed_send_ids.lock().unwrap().push(id);
                         completed_sends.fetch_add(1, Ordering::Release);
                     }
                     if let Some(reply) = waiters.lock().unwrap().sent.remove(&id) {

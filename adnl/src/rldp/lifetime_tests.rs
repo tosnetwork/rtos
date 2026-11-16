@@ -3805,7 +3805,7 @@ async fn check_unsolicited_mtu(name: &str, use_driver: bool) {
                 }
             })
             .await
-            .expect("native accepted message must be delivered and replay acknowledged");
+            .unwrap_or_else(|_| panic!("{name}: native accepted message must be delivered and replay acknowledged: deliveries={}, complete={}, expected_complete={}, processed={}", reply.messages.load(Ordering::Acquire), remote.complete_packets.load(Ordering::Acquire), expected["complete_packets"], packets.processed_parts.load(Ordering::Acquire)));
             assert_eq!(
                 reply.message_hash.lock().unwrap().as_deref().unwrap(),
                 expected["payload_sha256"].as_str().unwrap()
@@ -3952,7 +3952,7 @@ async fn native_peer_reopen_waits_for_actual_fec_owner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_application_answer_reacquires_evicted_connection() {
-    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    let (reply, packets, nodes, rldps, peers) = pair().await;
     rldps[0].peers.enable_native_for_tests();
     reply.hold.store(true, Ordering::Release);
     let remote = rldps[1].clone();
@@ -3975,6 +3975,12 @@ async fn native_application_answer_reacquires_evicted_connection() {
     });
     let outcome = std::panic::AssertUnwindSafe(async {
         tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+        let expected_response: [u8; 32] = {
+            let transfers = packets.transfers.lock().unwrap();
+            assert_eq!(transfers.len(), 1);
+            let request: [u8; 32] = transfers.iter().next().unwrap().as_slice().try_into().unwrap();
+            request.map(|byte| byte ^ 0xff)
+        };
         let retired = rldps[0].peers.evict_for_test(&peers);
         tokio::time::timeout(Duration::from_millis(500), retired.drained.cancelled())
             .await
@@ -3991,19 +3997,26 @@ async fn native_application_answer_reacquires_evicted_connection() {
             .unwrap();
         assert_eq!(answer.unwrap(), vec![42; 64]);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while replacement.native.get().unwrap().completed_sends.load(Ordering::Acquire) != 1 {
+            // Native completion caches belong to a Connection. A request replay
+            // after eviction can reach the application again and send the same
+            // response twice. Require this response's completion on the new
+            // owner, not a global exactly-once count across destroyed caches.
+            while !replacement.native.get().unwrap().completed_send_ids.lock().unwrap().contains(&expected_response) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "response completion missing on replacement: sent={}, closed={}, drained={}",
+                "response completion missing on replacement: sent={}, closed={}, drained={}, calls={}, ids={:?}",
                 replacement.native.get().unwrap().completed_sends.load(Ordering::Acquire),
                 replacement.closed.is_cancelled(),
                 replacement.drained.is_cancelled(),
+                reply.calls.load(Ordering::Acquire),
+                replacement.native.get().unwrap().completed_send_ids.lock().unwrap(),
             )
         });
+        assert!(replacement.native.get().unwrap().completed_send_ids.lock().unwrap().iter().all(|id| *id == expected_response));
         assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire), 0);
     })
     .catch_unwind()
