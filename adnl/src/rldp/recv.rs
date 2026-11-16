@@ -459,7 +459,13 @@ impl RecvTransfer {
                     // Symbols outside the acknowledgement window are not new.
                     return Ok(None);
                 }
-                part.core.get_decoder(fec_type)?
+                // Native InboundTransfer::get_part retains the decoder chosen
+                // by the first packet. Later valid FEC declarations do not
+                // replace it; outer packet geometry is checked before enqueue.
+                if part.core.decoder.is_none() {
+                    part.core.get_decoder(fec_type)?;
+                }
+                part.core.decoder.as_mut().expect("decoder initialized above")
             }
         };
         if v2 && chunk.data.len() != decoder.params().symbol_size as usize {
@@ -913,5 +919,80 @@ mod transfer_size_change_tests {
             expected.push(serde_json::json!({"id":row["id"],"errors":native_error,"received":if native_error==0{Some(row["max_received"].clone())}else{None},"completes":if native_error==0{Some(row["complete_packets"].clone())}else{None}}));
         }
         assert_eq!(actual, expected, "native total-size mutation effects");
+    }
+}
+
+#[cfg(test)]
+mod existing_part_fec_tests {
+    use super::*;
+    use rtos_api::IntoBoxed;
+
+    #[test]
+    fn rldp2_existing_part_keeps_original_fec_decoder() {
+        let native = super::super::lifetime_tests::checked_ack_native_effects(
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_context.tsv"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_effects.jsonl"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_reference.cpp"),
+            include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_metadata.json"),
+        );
+        assert_eq!(native.len(), 5, "all declared size-change cases must be present");
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (line, row) in
+            include_str!("../../../ci/conformance/rldp2_existing_part_fec_context.tsv")
+                .lines()
+                .zip(native)
+        {
+            // Invalid geometry is rejected by consume_chunk_message, before
+            // this processor. This row is outside the processor comparison.
+            if row["id"] == "invalid_geometry" {
+                continue;
+            }
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let values: Vec<usize> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            let (original, changed, bytes, seq) = (values[0], values[1], values[2], values[3]);
+            let mut receiver = RecvTransfer::new(
+                [0; 32],
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                true,
+                Some(4_000_001),
+                #[cfg(feature = "debug")]
+                Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())),
+            );
+            let mut errors = 0;
+            let mut completes = 0;
+            for (total, index, size, sequence) in
+                [(original, 0, original, 0), (changed, 0, bytes, seq), (changed, 0, bytes, seq)]
+            {
+                let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                let mut number = sequence as u32;
+                let chunk = Chunk::V2(Rldp2MessagePart(rtos_api::RldpChunk {
+                    transfer_id: UInt256::default(),
+                    fec_type: encoder.params().clone().into_boxed(),
+                    part: index as i32,
+                    total_size: total as i64,
+                    data: encoder.encode(&mut number).unwrap(),
+                    seqno: sequence as i32,
+                }));
+                match receiver.process_chunk(chunk) {
+                    Ok(reply) => completes += usize::from(reply.is_some()),
+                    Err(_) => {
+                        errors += 1;
+                        break;
+                    }
+                }
+            }
+            let RecvParts::V2(parts) = &receiver.parts else { unreachable!() };
+            let received = parts
+                .iter()
+                .filter(|p| p.data.is_none())
+                .map(|p| p.received_count)
+                .max()
+                .unwrap_or(0);
+            actual.push(serde_json::json!({"id":fields[0],"errors":errors,"received":if errors==0 {Some(received)}else{None},"completes":if errors==0{Some(completes)}else{None}}));
+            let native_error = row["errors"].as_u64().unwrap();
+            expected.push(serde_json::json!({"id":row["id"],"errors":native_error,"received":if native_error==0{Some(row["max_received"].clone())}else{None},"completes":if native_error==0{Some(row["complete_packets"].clone())}else{None}}));
+        }
+        assert_eq!(actual, expected, "native existing-part FEC mutation effects");
     }
 }

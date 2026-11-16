@@ -1,0 +1,5 @@
+{"id":"same","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":2}
+{"id":"changed_grow","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":2}
+{"id":"changed_shrink","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":2}
+{"id":"changed_duplicate","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":1}
+{"id":"invalid_geometry","active":1,"completed":0,"errors":0,"deliveries":0,"complete_packets":0,"max_received":1}

@@ -63,6 +63,7 @@ impl Subscriber for HeldReply {
 #[derive(Default)]
 struct ResponsePackets {
     confirm_packets: std::sync::atomic::AtomicUsize,
+    confirm_received: Mutex<Option<(Vec<u8>, i32)>>,
     complete_packets: std::sync::atomic::AtomicUsize,
     part_one_completions: std::sync::atomic::AtomicUsize,
     part_two_completions: std::sync::atomic::AtomicUsize,
@@ -88,7 +89,12 @@ impl Subscriber for ResponsePackets {
                             return Ok(true);
                         }
                     }
-                    rldp2::MessagePart::Rldp2_Confirm(_) => {
+                    rldp2::MessagePart::Rldp2_Confirm(confirm) => {
+                        if let Some((id, received)) = &mut *self.confirm_received.lock().unwrap() {
+                            if confirm.transfer_id.as_slice() == id.as_slice() {
+                                *received = (*received).max(confirm.received_count);
+                            }
+                        }
                         self.confirm_packets.fetch_add(1, Ordering::Release);
                     }
                     rldp2::MessagePart::Rldp2_Complete(part) => {
@@ -3555,5 +3561,122 @@ async fn rldp2_changed_total_overruns_original_receive_and_recovers() {
     }
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rldp2_existing_part_fec_changes_continue_through_adnl() {
+    use rtos_api::IntoBoxed;
+    let native = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_existing_part_fec_metadata.json"),
+    );
+    for (name, original, changed) in [("changed_grow", 2048, 3072), ("changed_shrink", 3072, 2048)]
+    {
+        let effect = native.iter().find(|row| row["id"] == name).unwrap();
+        assert_eq!(effect["errors"], 0);
+        assert_eq!(effect["active"], 1);
+        let expected = effect["max_received"].as_i64().unwrap() as i32;
+        let remote = Arc::new(ResponsePackets::default());
+        let (reply, packets, nodes, rldps, peers) =
+            topology_with_remote_observer(2, Some(remote.clone())).await;
+        *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
+        let outcome = std::panic::AssertUnwindSafe(async {
+            reply.hold.store(true, Ordering::Release);
+            let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+            let query = TaggedByteSlice {
+                object: &bytes,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            };
+            let inject = async {
+                tokio::time::timeout(Duration::from_secs(2), reply.entered.notified())
+                    .await
+                    .unwrap();
+                let peer =
+                    rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+                let id = *peer
+                    .inbound_transfers
+                    .iter()
+                    .find(|e| matches!(e.val(), super::RldpTransfer::Recv(_)))
+                    .expect("held query registers answer transfer")
+                    .key();
+                *remote.confirm_received.lock().unwrap() = Some((id.to_vec(), 0));
+                let route = AdnlPeers::with_keys(peers.other().clone(), peers.local().clone());
+                for (size, sequence) in [(original, 0), (changed, 1), (changed, 1)] {
+                    let mut encoder = crate::RaptorqEncoder::with_data(&vec![42; size], Some(768));
+                    let mut seq = sequence;
+                    let chunk = rtos_api::RldpChunk {
+                        transfer_id: id.into(),
+                        fec_type: encoder.params().clone().into_boxed(),
+                        part: 0,
+                        total_size: size as i64,
+                        data: encoder.encode(&mut seq).unwrap(),
+                        seqno: sequence as i32,
+                    };
+                    let wire =
+                        serialize_boxed(&rldp2::messagepart::MessagePart(chunk).into_boxed())
+                            .unwrap();
+                    let before = packets.processed_parts.load(Ordering::Acquire);
+                    nodes[1]
+                        .send_custom(
+                            &TaggedByteSlice {
+                                object: &wire,
+                                #[cfg(feature = "telemetry")]
+                                tag: 0,
+                            },
+                            &route,
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while packets.processed_parts.load(Ordering::Acquire) == before {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .expect("authenticated handler enqueues packets in order");
+                }
+                // This ACK is a decoder-processing witness, not merely enqueue observation.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while remote.confirm_received.lock().unwrap().as_ref().unwrap().1 < expected {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("native-equivalent ACK must reach authenticated remote peer");
+                assert_eq!(remote.confirm_received.lock().unwrap().as_ref().unwrap().1, expected);
+                assert!(peer.inbound_active.lock().unwrap().contains(&id));
+            };
+            tokio::select! {
+                result = rldps[0].query(&query, Some(4_000_001), &peers, true, None) =>
+                    panic!("{name}: incomplete native transfer must not resolve query: {result:?}"),
+                () = inject => {}
+            }
+            reply.hold.store(false, Ordering::Release);
+            reply.release.notify_one();
+            let (answer, _) = tokio::time::timeout(
+                Duration::from_secs(3),
+                rldps[0].query(&query, Some(1024), &peers, true, None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(answer.unwrap(), vec![42; 64]);
+        })
+        .catch_unwind()
+        .await;
+        reply.hold.store(false, Ordering::Release);
+        reply.release.notify_waiters();
+        reply.release.notify_one();
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

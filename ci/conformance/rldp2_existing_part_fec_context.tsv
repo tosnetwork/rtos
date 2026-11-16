@@ -1,0 +1,5 @@
+same 2048 2048 2048 1
+changed_grow 2048 3072 3072 1
+changed_shrink 3072 2048 2048 1
+changed_duplicate 2048 3072 3072 0
+invalid_geometry 2048 3072 2048 1
