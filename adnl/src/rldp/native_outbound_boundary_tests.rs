@@ -649,3 +649,6 @@ async fn native_duplicate_outbound_id_preserves_original_payload() {
         "joined receive events must deliver exactly once"
     );
 }
+
+#[path = "native_saturated_fairness_cycles_tests.rs"]
+mod fairness_cycles;
