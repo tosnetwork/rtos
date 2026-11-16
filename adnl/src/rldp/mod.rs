@@ -1482,7 +1482,7 @@ impl RldpNode {
             let message = RldpMessage { id: UInt256::rand(), data }.into_boxed();
             (None::<QueryId>, message)
         };
-        let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
+        let data = serialize_boxed(&message)?;
         // This counts queries waiting for answers, including those queued for
         // a sender. Native RldpIn refuses these independently of transfer capacity.
         let query_admission =
@@ -1503,9 +1503,6 @@ impl RldpNode {
             Err(_) if query_deadline.is_some() => return Err(RldpQueryTimeout.into()),
             Err(_) => return Err(SendCancelled::Deadline.into()),
         };
-        if peer.native.get().is_some() {
-            fail!("Connection active query/message routing is not wired yet")
-        }
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
@@ -1530,6 +1527,29 @@ impl RldpNode {
             },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
+        if let Some(native) = peer.native.get() {
+            let answer = native
+                .outbound(
+                    data,
+                    max_answer_size,
+                    transfer_deadline.expect("V2 transfer deadline"),
+                    query_admission,
+                    bounded,
+                    control.clone(),
+                    permit,
+                )
+                .await?;
+            peer.stats.v1.update(self.min_timeout_ms);
+            return self.decode_outbound_answer(
+                answer,
+                query_id,
+                max_answer_size,
+                true,
+                response_limits,
+                peer.stats.v1.roundtrip(),
+            );
+        }
+        let data: Arc<[u8]> = Arc::from(data);
         #[cfg(feature = "telemetry")]
         log::trace!(
             target: TARGET,
@@ -1741,7 +1761,25 @@ impl RldpNode {
         #[cfg(feature = "debug")]
         self.check_time("Outbound end");
         // _permit drops here, releasing the outbound slot.
-        let answer = res?;
+        self.decode_outbound_answer(
+            res?,
+            query_id,
+            max_answer_size,
+            v2,
+            response_limits,
+            peer.stats.v1.roundtrip(),
+        )
+    }
+
+    fn decode_outbound_answer(
+        &self,
+        answer: Option<Vec<u8>>,
+        query_id: Option<QueryId>,
+        max_answer_size: Option<u64>,
+        v2: bool,
+        response_limits: Option<QueryResponseLimits>,
+        roundtrip: u64,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
         if let Some(answer) = answer {
             let Some(query_id) = query_id else {
                 fail!("Unexpected answer {answer:?} to RLDP message");
@@ -1813,14 +1851,14 @@ impl RldpNode {
                                 data[0], data[1], data[2], data[3]
                             )
                         }
-                        Ok((Some(data), peer.stats.v1.roundtrip()))
+                        Ok((Some(data), roundtrip))
                     }
                 }
                 Ok(answer) => fail!("Unexpected answer to RLDP query: {:?}", answer),
                 Err(answer) => fail!("Unexpected answer to RLDP query: {:?}", answer),
             }
         } else {
-            Ok((None, peer.stats.v1.roundtrip()))
+            Ok((None, roundtrip))
         }
     }
 

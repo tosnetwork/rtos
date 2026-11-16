@@ -23,6 +23,7 @@ pub(super) enum Command {
     Send { id: TransferId, data: Vec<u8>, deadline: Option<Instant>, answer: bool },
     ReceiveLimit { id: TransferId, deadline: Instant, max_size: u64 },
     Mtu(u64),
+    Cancel { send: TransferId, receive: Option<TransferId> },
 }
 impl Command {
     fn bytes(&self) -> usize {
@@ -34,9 +35,10 @@ impl Command {
         }
     }
     fn apply(self, connection: &mut Connection) -> Result<bool> {
+        // Sample wall time first so conversion cannot shorten an absolute deadline.
+        let wall_now = Instant::now();
         let now = connection.now();
-        let deadline =
-            |at: Instant| now + at.saturating_duration_since(Instant::now()).as_secs_f64();
+        let deadline = |at: Instant| now + at.saturating_duration_since(wall_now).as_secs_f64();
         match self {
             Self::Packet { data, mtu } => {
                 connection.set_default_mtu(mtu);
@@ -55,6 +57,13 @@ impl Command {
             }
             Self::ReceiveLimit { id, deadline: at, max_size } => {
                 Ok(connection.set_receive_limits(id, deadline(at), max_size))
+            }
+            Self::Cancel { send, receive } => {
+                connection.cancel_transfer(send, false);
+                if let Some(id) = receive {
+                    connection.cancel_transfer(id, true);
+                }
+                Ok(true)
             }
             Self::Mtu(value) => {
                 connection.set_default_mtu(value);
@@ -122,14 +131,14 @@ impl ConnectionDriver {
                 let work = fec_limited(
                     connection, worker_control.clone(), worker_owner.clone(), fec_slots.clone(),
                     move |connection| {
-                        if let Some(request) = request {
+                        let reply = request.map(|request| {
                             let result = request.command.apply(connection);
-                            let _ = request.reply.send(result);
-                        }
-                        connection.run()
+                            (request.reply, result)
+                        });
+                        Ok((reply, connection.run()?))
                     },
                 ).await;
-                let (next, output) = match work {
+                let (next, (reply, output)) = match work {
                     Ok(value) => value,
                     Err(error) => {
                         if !worker_owner.is_closed() && worker_control.check().is_ok() {
@@ -138,6 +147,11 @@ impl ConnectionDriver {
                         break;
                     }
                 };
+                // A cancellation receipt certifies that the actual blocking work
+                // has joined, not just that its closure applied a command.
+                if let Some((reply, result)) = reply {
+                    let _ = reply.send(result);
+                }
                 wakeup = output.wakeup.map(|at| {
                     Instant::now() + Duration::from_secs_f64((at - next.now()).max(0.0))
                 });

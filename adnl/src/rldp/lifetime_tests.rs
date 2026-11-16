@@ -3991,7 +3991,14 @@ async fn native_application_answer_reacquires_evicted_connection() {
             }
         })
         .await
-        .expect("response completed on the replacement Connection");
+        .unwrap_or_else(|_| {
+            panic!(
+                "response completion missing on replacement: sent={}, closed={}, drained={}",
+                replacement.native.get().unwrap().completed_sends.load(Ordering::Acquire),
+                replacement.closed.is_cancelled(),
+                replacement.drained.is_cancelled(),
+            )
+        });
         assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire), 0);
     })
     .catch_unwind()
@@ -4135,6 +4142,244 @@ async fn rldp2_answer_envelope_id_does_not_override_authenticated_transfer() {
     }).catch_unwind().await;
     reply.hold.store(false, Ordering::Release);
     reply.release.notify_one();
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_active_query_uses_connection_for_both_peer_modes() {
+    for native_responder in [false, true] {
+        let (_reply, _packets, nodes, rldps, peers) = pair().await;
+        rldps[0].peers.enable_native_for_tests();
+        if native_responder {
+            rldps[1].peers.enable_native_for_tests();
+        }
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+            let data = TaggedByteSlice {
+                object: &bytes,
+                #[cfg(feature = "telemetry")]
+                tag: 0,
+            };
+            let before = rldps[0].query_budget.remaining(&peers);
+            for _ in 0..2 {
+                let (answer, _) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    rldps[0].query(&data, Some(1024), &peers, true, None),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(answer.unwrap(), vec![42; 64]);
+                assert_eq!(
+                    rldps[0].query_budget.remaining(&peers),
+                    before,
+                    "completed query must return logical admission before its caller resumes"
+                );
+            }
+            assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire), 0);
+            assert_eq!(rldps[0].allocated.recv_transfers.load(Ordering::Acquire), 0);
+        })
+        .catch_unwind()
+        .await;
+        for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await
+        {
+            result.unwrap();
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_active_query_wire_limit_keeps_deadline_and_recovers() {
+    let (_reply, _packets, nodes, rldps, peers) = pair().await;
+    rldps[0].peers.enable_native_for_tests();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let data = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let before = rldps[0].query_budget.remaining(&peers);
+        let started = std::time::Instant::now();
+        let error = rldps[0].query(&data, Some(64), &peers, true, None).await.unwrap_err();
+        assert!(error.downcast_ref::<RldpQueryTimeout>().is_some(), "{error:#}");
+        assert!(started.elapsed() >= Duration::from_millis(9500));
+        assert_eq!(rldps[0].query_budget.remaining(&peers), before);
+        let (answer, _) = rldps[0].query(&data, Some(1024), &peers, true, None).await.unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        assert_eq!(rldps[0].allocated.send_transfers.load(Ordering::Acquire), 0);
+        assert_eq!(rldps[0].allocated.recv_transfers.load(Ordering::Acquire), 0);
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_active_bounded_query_limits_expansion_and_message_recovers() {
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    for rldp in &rldps {
+        rldp.peers.enable_native_for_tests();
+    }
+    nodes[0].set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        let data = TaggedByteSlice {
+            object: &bytes,
+            #[cfg(feature = "telemetry")]
+            tag: 0,
+        };
+        let error = rldps[0]
+            .query_bounded(
+                &data,
+                super::QueryResponseLimits { wire_bytes: 1024, decoded_bytes: 32 },
+                &peers,
+                true,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::ResponseLimitExceeded>().is_some(), "{error:#}");
+        let (answer, _) = rldps[0]
+            .query_bounded(
+                &data,
+                super::QueryResponseLimits { wire_bytes: 1024, decoded_bytes: 128 },
+                &peers,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer.unwrap(), vec![42; 64]);
+        rldps[0]
+            .message(
+                &TaggedByteSlice {
+                    object: b"churn",
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                &peers,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reply.messages.load(Ordering::Acquire) != 1 {
+                reply.message_received.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        for rldp in &rldps {
+            assert_eq!(rldp.allocated.send_transfers.load(Ordering::Acquire), 0);
+            assert_eq!(rldp.allocated.recv_transfers.load(Ordering::Acquire), 0);
+        }
+    })
+    .catch_unwind()
+    .await;
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_active_cancellation_retains_bounded_scope_through_actual_fec_join() {
+    let (reply, _packets, nodes, rldps, peers) = pair().await;
+    rldps[0].peers.enable_native_for_tests();
+    reply.hold.store(true, Ordering::Release);
+    let control = super::SendControl::new();
+    let (done, mut joined) = tokio::sync::oneshot::channel();
+    let permit = Arc::new(Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap());
+    let bounded = super::BoundedReceive {
+        limits: super::QueryResponseLimits { wire_bytes: 1024, decoded_bytes: 1024 },
+        token: nodes[0].tasks().enter().unwrap(),
+        done,
+        permit,
+    };
+    let client = rldps[0].clone();
+    let route = peers.clone();
+    let caller_control = control.clone();
+    let mut query = tokio::spawn(async move {
+        let bytes = serialize_boxed(&Query { overlay: UInt256::default() }).unwrap();
+        client
+            .outbound(
+                &TaggedByteSlice {
+                    object: &bytes,
+                    #[cfg(feature = "telemetry")]
+                    tag: 0,
+                },
+                Some(1024),
+                &route,
+                true,
+                None,
+                Some(bounded),
+                Some(caller_control),
+            )
+            .await
+    });
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocked = Arc::new(Mutex::new(blocked));
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(2), reply.entered.notified()).await.unwrap();
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let native = peer.native.get().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while native.completed_sends.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        *native.driver.test_control().test_after_fec.lock().unwrap() = Some(Arc::new(move || {
+            if let Some(started) = started.lock().unwrap().take() {
+                let _ = started.send(());
+                blocked.lock().unwrap().recv().unwrap();
+            }
+        }));
+        control.cancel(super::SendCancelled::CallerDropped);
+        tokio::time::timeout(Duration::from_secs(2), entered).await.unwrap().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut query)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::SendCancelled>().is_some());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            matches!(joined.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "bounded receive scope must remain owned until the real FEC worker joins"
+        );
+        release.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut joined).await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+    let _ = release.send(());
+    reply.hold.store(false, Ordering::Release);
+    reply.release.notify_one();
+    if !query.is_finished() {
+        query.abort();
+        let _ = query.await;
+    }
     for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
         result.unwrap();
     }

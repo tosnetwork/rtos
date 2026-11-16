@@ -267,6 +267,21 @@ impl Connection {
         self.outstanding += 1;
         true
     }
+    /// Local API cancellation is serialized with decoding by the owned driver.
+    /// An unknown ID must not create a completed-cache entry.
+    pub(crate) fn cancel_transfer(&mut self, id: TransferId, inbound: bool) {
+        if inbound {
+            if self.limits.contains_key(&id) || self.inbound.contains_key(&id) {
+                self.complete(id, self.now());
+                self.drop_limit(&id);
+                self.pending.received.push((id, Err(Refusal("cancelled"))));
+            }
+        } else if self.outbound.remove(id) {
+            self.timers.erase(&(id, false));
+            self.pending.sent.push((id, Err("cancelled".into())));
+        }
+    }
+
     fn drop_limit(&mut self, id: &TransferId) {
         self.timers.erase(&(*id, true));
         if let Some(limit) = self.limits.remove(id) {
