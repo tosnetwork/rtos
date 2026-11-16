@@ -1,0 +1,1 @@
+[{"id":"negative_seqno","errors":0,"deliveries":0,"inbound":0,"completed":0},{"id":"last_valid_seqno","errors":0,"deliveries":0,"inbound":1,"completed":0},{"id":"first_invalid_seqno","errors":1,"deliveries":0,"inbound":0,"completed":1},{"id":"max_signed_seqno","errors":1,"deliveries":0,"inbound":0,"completed":1}]

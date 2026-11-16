@@ -5,6 +5,7 @@ use crate::{
     node::AdnlNodeConfig,
     QuicRateLimitConfig,
 };
+use futures::{future::LocalBoxFuture, FutureExt};
 use rtos_api::{
     ton::{
         rpc::ton_node::DownloadBlock,
@@ -129,117 +130,190 @@ async fn endpoint(seed: u8, profile: WireProfile) -> Endpoint {
     Endpoint { adnl, overlay, quic, key, udp, quic_addr, token, rejected }
 }
 
+// Keep successfully started endpoints outside the unwinding scenario so an
+// assertion failure cannot strand ADNL OS threads during Tokio runtime drop.
+async fn with_endpoints(
+    profile: WireProfile,
+    run: impl for<'a> FnOnce(&'a Endpoint, &'a mut Endpoint) -> LocalBoxFuture<'a, ()>,
+) {
+    let mut endpoints = Vec::new();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        endpoints.push(endpoint(111, profile).await);
+        endpoints.push(endpoint(112, profile).await);
+        let (a, b) = endpoints.split_at_mut(1);
+        run(&a[0], &mut b[0]).await;
+    })
+    .catch_unwind()
+    .await;
+    for endpoint in &endpoints {
+        endpoint.token.cancel();
+    }
+    // Poll both shutdowns even if one returns an error, then report failures.
+    let stopped =
+        futures::future::join_all(endpoints.iter().map(|endpoint| endpoint.adnl.stop_checked()))
+            .await;
+    if let Err(panic) = outcome {
+        for error in stopped.into_iter().filter_map(Result::err) {
+            eprintln!("wire profile cleanup also failed: {error:#}");
+        }
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.expect("wire profile ADNL cleanup");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn target_namespace_fixture_panic_drains_both_adnl_nodes() {
+    for profile in [WireProfile::Legacy, WireProfile::T0] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let capture = observed.clone();
+        let outcome = std::panic::AssertUnwindSafe(with_endpoints(profile, move |a, b| {
+            Box::pin(async move {
+                for endpoint in [a, &*b] {
+                    capture.lock().unwrap().push((endpoint.adnl.clone(), endpoint.token.clone()));
+                }
+                std::panic::panic_any("wire profile injected assertion failure");
+            })
+        }))
+        .catch_unwind()
+        .await;
+        let nodes = std::mem::take(&mut *observed.lock().unwrap());
+        let before_rescue: Vec<_> = nodes
+            .iter()
+            .map(|(node, token)| (node.tasks().drained(), token.is_cancelled()))
+            .collect();
+        // Rescue even a broken helper before asserting: the negative control
+        // must fail normally rather than hang the test runtime itself.
+        for (node, token) in &nodes {
+            token.cancel();
+            node.stop_checked().await.unwrap();
+        }
+        let panic = outcome.expect_err("scenario panic must propagate after cleanup");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"wire profile injected assertion failure"));
+        assert_eq!(before_rescue, [(true, true), (true, true)]);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn target_namespace_real_adnl_quic_rldp_ready_pending_and_rejections() {
     for profile in [WireProfile::Legacy, WireProfile::T0] {
-        let a = endpoint(111, profile).await;
-        let mut b = endpoint(112, profile).await;
-        let id = OverlayShortId::from_data([113; 32]);
-        for (local, remote) in [(&a, &b), (&b, &a)] {
-            local.quic.add_peer_key(remote.key.id().clone(), remote.quic_addr).unwrap();
-            let udp = IpAddress::from_versioned_string(&remote.udp.to_string(), None).unwrap();
-            let quic =
-                IpAddress::from_versioned_string(&remote.quic_addr.to_string(), None).unwrap();
-            local.adnl.add_peer(local.key.id(), &udp, Some(&quic), &remote.key).unwrap();
-            local
-                .overlay
-                .add_private_overlay(
-                    OverlayParams::with_id_only(&id),
-                    &local.key,
-                    &[remote.key.id().clone()],
-                    true,
-                    None,
-                )
-                .unwrap();
-        }
-        let consumer = Arc::new(DownloadConsumer(Mutex::new(Vec::new())));
-        b.overlay.add_consumer(&id, consumer.clone()).unwrap();
-        let block = rtos_block::BlockIdExt::with_params(
-            rtos_block::ShardIdent::masterchain(),
-            17,
-            UInt256::from([21; 32]),
-            UInt256::from([22; 32]),
-        );
-        for seqno in [17, 18] {
-            for transport in 0..4 {
-                let mut block = block.clone();
-                block.seq_no = seqno + transport * 2;
-                let expected = block.seq_no.to_le_bytes().to_vec();
-                let request: TaggedTlObject = DownloadBlock { block }.into_tl_object().into();
-                let result = tokio::time::timeout(Duration::from_secs(20), async {
-                    match transport {
-                        0 => a
-                            .overlay
-                            .query(b.key.id(), &request, &id, Some(3000))
-                            .await?
-                            .ok_or_else(|| error!("ADNL answer missing")),
-                        1 => a
-                            .overlay
-                            .query_via_quic(b.key.id(), &request, &id, Some(3000))
-                            .await?
-                            .ok_or_else(|| error!("QUIC answer missing")),
-                        _ => {
-                            let mut wire = a.overlay.get_query_prefix(&id)?;
-                            profile.serialize_append(&mut wire, &request.object)?;
-                            let (raw, _) = a
-                                .overlay
-                                .query_via_rldp(
-                                    b.key.id(),
-                                    &TaggedByteSlice {
-                                        object: &wire,
-                                        #[cfg(feature = "telemetry")]
-                                        tag: 0,
-                                    },
-                                    &id,
-                                    Some(1 << 20),
-                                    transport == 3,
-                                    None,
-                                )
-                                .await?;
-                            profile.deserialize(&raw.ok_or_else(|| error!("RLDP answer missing"))?)
-                        }
-                    }
-                })
-                .await
-                .expect("bounded actual transport query")
-                .unwrap();
-                assert_eq!(result.downcast::<DataBoxed>().unwrap().data(), &expected);
-            }
-        }
-        // ADNL backup retries may deliver a request more than once.
-        for seqno in 17..25 {
-            assert!(consumer.0.lock().unwrap().contains(&seqno));
-        }
-        if profile == WireProfile::T0 {
-            let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
-            let mut invalid_block = block;
-            invalid_block.seq_no = 99;
-            let request = DownloadBlock { block: invalid_block }.into_tl_object();
-            for malformed in 0..3 {
-                let overlay_id =
-                    if malformed == 2 { OverlayShortId::from_data([114; 32]) } else { id.clone() };
-                let mut wire =
-                    serialize_boxed(&OverlayQuery { overlay: UInt256::from(*overlay_id.data()) })
+        with_endpoints(profile, |a, b| {
+            Box::pin(async move {
+                let id = OverlayShortId::from_data([113; 32]);
+                for (local, remote) in [(a, &*b), (&*b, a)] {
+                    local.quic.add_peer_key(remote.key.id().clone(), remote.quic_addr).unwrap();
+                    let udp =
+                        IpAddress::from_versioned_string(&remote.udp.to_string(), None).unwrap();
+                    let quic =
+                        IpAddress::from_versioned_string(&remote.quic_addr.to_string(), None)
+                            .unwrap();
+                    local.adnl.add_peer(local.key.id(), &udp, Some(&quic), &remote.key).unwrap();
+                    local
+                        .overlay
+                        .add_private_overlay(
+                            OverlayParams::with_id_only(&id),
+                            &local.key,
+                            &[remote.key.id().clone()],
+                            true,
+                            None,
+                        )
                         .unwrap();
-                (if malformed == 0 { WireProfile::Legacy } else { profile })
-                    .serialize_append(&mut wire, &request)
-                    .unwrap();
-                if malformed == 1 {
-                    wire.push(7);
                 }
-                // Observe a real dispatcher rejection, not absence after a sleep.
-                let (reply, rejected) = tokio::join!(
-                    a.quic.query(wire, Some(&a.adnl), &peers, Some(500)),
-                    tokio::time::timeout(Duration::from_secs(5), b.rejected.recv()),
+                let consumer = Arc::new(DownloadConsumer(Mutex::new(Vec::new())));
+                b.overlay.add_consumer(&id, consumer.clone()).unwrap();
+                let block = rtos_block::BlockIdExt::with_params(
+                    rtos_block::ShardIdent::masterchain(),
+                    17,
+                    UInt256::from([21; 32]),
+                    UInt256::from([22; 32]),
                 );
-                assert!(reply.is_err() || reply.unwrap().is_none());
-                assert_eq!(rejected.unwrap(), Some(()));
-                assert!(!consumer.0.lock().unwrap().contains(&99));
-            }
-        }
-        a.token.cancel();
-        b.token.cancel();
-        a.adnl.stop().await;
-        b.adnl.stop().await;
+                for seqno in [17, 18] {
+                    for transport in 0..4 {
+                        let mut block = block.clone();
+                        block.seq_no = seqno + transport * 2;
+                        let expected = block.seq_no.to_le_bytes().to_vec();
+                        let request: TaggedTlObject =
+                            DownloadBlock { block }.into_tl_object().into();
+                        let result = tokio::time::timeout(Duration::from_secs(20), async {
+                            match transport {
+                                0 => a
+                                    .overlay
+                                    .query(b.key.id(), &request, &id, Some(3000))
+                                    .await?
+                                    .ok_or_else(|| error!("ADNL answer missing")),
+                                1 => a
+                                    .overlay
+                                    .query_via_quic(b.key.id(), &request, &id, Some(3000))
+                                    .await?
+                                    .ok_or_else(|| error!("QUIC answer missing")),
+                                _ => {
+                                    let mut wire = a.overlay.get_query_prefix(&id)?;
+                                    profile.serialize_append(&mut wire, &request.object)?;
+                                    let (raw, _) = a
+                                        .overlay
+                                        .query_via_rldp(
+                                            b.key.id(),
+                                            &TaggedByteSlice {
+                                                object: &wire,
+                                                #[cfg(feature = "telemetry")]
+                                                tag: 0,
+                                            },
+                                            &id,
+                                            Some(1 << 20),
+                                            transport == 3,
+                                            None,
+                                        )
+                                        .await?;
+                                    profile.deserialize(
+                                        &raw.ok_or_else(|| error!("RLDP answer missing"))?,
+                                    )
+                                }
+                            }
+                        })
+                        .await
+                        .expect("bounded actual transport query")
+                        .unwrap();
+                        assert_eq!(result.downcast::<DataBoxed>().unwrap().data(), &expected);
+                    }
+                }
+                // ADNL backup retries may deliver a request more than once.
+                for seqno in 17..25 {
+                    assert!(consumer.0.lock().unwrap().contains(&seqno));
+                }
+                if profile == WireProfile::T0 {
+                    let peers = AdnlPeers::with_keys(a.key.id().clone(), b.key.id().clone());
+                    let mut invalid_block = block;
+                    invalid_block.seq_no = 99;
+                    let request = DownloadBlock { block: invalid_block }.into_tl_object();
+                    for malformed in 0..3 {
+                        let overlay_id = if malformed == 2 {
+                            OverlayShortId::from_data([114; 32])
+                        } else {
+                            id.clone()
+                        };
+                        let mut wire = serialize_boxed(&OverlayQuery {
+                            overlay: UInt256::from(*overlay_id.data()),
+                        })
+                        .unwrap();
+                        (if malformed == 0 { WireProfile::Legacy } else { profile })
+                            .serialize_append(&mut wire, &request)
+                            .unwrap();
+                        if malformed == 1 {
+                            wire.push(7);
+                        }
+                        // Observe a real dispatcher rejection, not absence after a sleep.
+                        let (reply, rejected) = tokio::join!(
+                            a.quic.query(wire, Some(&a.adnl), &peers, Some(500)),
+                            tokio::time::timeout(Duration::from_secs(5), b.rejected.recv()),
+                        );
+                        assert!(reply.is_err() || reply.unwrap().is_none());
+                        assert_eq!(rejected.unwrap(), Some(()));
+                        assert!(!consumer.0.lock().unwrap().contains(&99));
+                    }
+                }
+            })
+        })
+        .await;
     }
 }

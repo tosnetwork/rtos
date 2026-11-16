@@ -123,6 +123,13 @@ impl Constraints {
                     fail!("Bad RaptorQ symbol size: {}", fec_type.symbol_size)
                 }
                 self.check_data_size(fec_type.data_size)?;
+                let expected = (fec_type.data_size as usize).div_ceil(Self::SYMBOL);
+                if usize::try_from(fec_type.symbols_count).ok() != Some(expected) {
+                    fail!(
+                        "Bad RaptorQ symbol count: {}, expected {expected}",
+                        fec_type.symbols_count
+                    )
+                }
             }
             x => fail!("Bad FEC type {:?}", x),
         }
@@ -699,14 +706,25 @@ impl RldpNode {
             Chunk::V2(Rldp2MessagePart(chunk)) => (true, chunk.part, chunk.seqno),
         };
         let peer = self.get_peer(peers.local(), peers.other(), v2, None).await?;
+        let valid_packet = match &chunk {
+            Chunk::V1(_) => true,
+            Chunk::V2(Rldp2MessagePart(part)) => {
+                const CONSTRAINTS: Constraints = Constraints { data_size: Constraints::SLICE };
+                // Native rejects negative wire integers here, but a nonnegative
+                // ID beyond the decoder's 24-bit range terminates the transfer.
+                part.seqno >= 0 && CONSTRAINTS.check_fec_type(&part.fec_type).is_ok()
+            }
+        };
         // Explicit bounded queries report a declared wire-limit violation
         // before decoding. This notification must not claim an inbound slot.
         if let Chunk::V2(Rldp2MessagePart(part)) = &chunk {
             if let Some(entry) = peer.inbound_transfers.get(transfer_id) {
                 if let RldpTransfer::Recv(registration) = entry.val() {
-                    if registration.bounded_wire_limit.is_some_and(|limit| {
-                        usize::try_from(part.total_size).is_ok_and(|total| total > limit)
-                    }) {
+                    if valid_packet
+                        && registration.bounded_wire_limit.is_some_and(|limit| {
+                            usize::try_from(part.total_size).is_ok_and(|total| total > limit)
+                        })
+                    {
                         let _ = registration.sender.send(chunk);
                         return Ok(());
                     }
@@ -719,7 +737,8 @@ impl RldpNode {
                 let total = chunk.total_size as u64;
                 let part = chunk.part as u64;
                 let width = Constraints::SLICE as u64;
-                chunk.total_size > 0
+                valid_packet
+                    && chunk.total_size > 0
                     && chunk.part >= 0
                     && part < total.div_ceil(width)
                     && matches!(&chunk.fec_type, FecType::Fec_RaptorQ(fec)
@@ -798,10 +817,9 @@ impl RldpNode {
                 let RldpMessagePart(part) = part;
                 (Self::check_message(Some(&part.fec_type), part.seqno), false)
             }
-            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(part)) => {
-                let Rldp2MessagePart(part) = part;
-                (Self::check_message(Some(&part.fec_type), part.seqno), true)
-            }
+            // V2 checks completed IDs before validating packet parameters.
+            // The chunk path validates live/new transfers before admission.
+            MessagePart::V2(Rldp2MessagePartBoxed::Rldp2_MessagePart(_)) => (Ok(()), true),
             MessagePart::V1(RldpMessagePartBoxed::Rldp_Confirm(confirm)) => {
                 (Self::check_message(None, confirm.seqno), false)
             }
@@ -1358,8 +1376,11 @@ impl RldpNode {
         bounded: Option<BoundedReceive>,
         control: Option<Arc<SendControl>>,
     ) -> Result<(Option<Vec<u8>>, u64)> {
-        let query_deadline = (v2 && max_answer_size.is_some())
-            .then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
+        // Native gives both send_message and send_query a transfer deadline;
+        // the same deadline includes peer admission and queued sender work.
+        let transfer_deadline =
+            v2.then(|| tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS));
+        let query_deadline = transfer_deadline.filter(|_| max_answer_size.is_some());
         let response_limits = bounded.as_ref().map(|scope| scope.limits);
         let retained_permit = bounded.as_ref().map(|scope| scope.permit.clone());
         #[cfg(feature = "telemetry")]
@@ -1390,14 +1411,10 @@ impl RldpNode {
             if v2 && query_id.is_some() { Some(self.query_budget.acquire(peers)?) } else { None };
         // Native send_message also supplies a ten-second transfer deadline;
         // connection retention is that deadline plus the 120-second idle span.
-        let connection_deadline = v2.then(|| {
-            query_deadline.unwrap_or_else(|| {
-                tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_MAX_MS)
-            })
-        });
+        let connection_deadline = transfer_deadline;
         let get_peer = self.get_peer(peers.local(), peers.other(), v2, connection_deadline);
         let peer = match tokio::time::timeout_at(
-            query_deadline.unwrap_or_else(|| {
+            transfer_deadline.unwrap_or_else(|| {
                 tokio::time::Instant::now() + Duration::from_millis(Self::TIMEOUT_OUTBOUND_HARD_MS)
             }),
             get_peer,
@@ -1417,14 +1434,18 @@ impl RldpNode {
             _ = control.cancelled() => { control.check()?; unreachable!() },
             _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
             _ = async {
-                if let Some(deadline) = query_deadline {
+                if let Some(deadline) = transfer_deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             } => {
                 control.cancel(SendCancelled::Deadline);
-                return Err(RldpQueryTimeout.into());
+                return if query_deadline.is_some() {
+                    Err(RldpQueryTimeout.into())
+                } else {
+                    Err(SendCancelled::Deadline.into())
+                };
             },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
@@ -1578,7 +1599,8 @@ impl RldpNode {
             query_id.is_some(),
         );
         let hard_deadline = tokio::time::Instant::now() + control.deadline();
-        let deadline = query_deadline.map_or(hard_deadline, |query| query.min(hard_deadline));
+        let deadline =
+            transfer_deadline.map_or(hard_deadline, |transfer| transfer.min(hard_deadline));
         let res = match tokio::time::timeout_at(
             deadline,
             async {
@@ -1825,12 +1847,10 @@ impl RldpNode {
                     log::trace!(target: TARGET, "Got reply in {transfer_str}");
                     peer.stats.v1.update(self.min_timeout_ms);
                     if let Some(error) = reply.failure {
-                        if propagate_failure {
+                        // Native RLDP2 forwards a decoder failure to the query
+                        // promise; it is not a successful empty answer.
+                        if propagate_failure || v2 {
                             return Err(error);
-                        }
-                        if v2 {
-                            // A rejected transfer has no complete answer to decode.
-                            return Ok(None);
                         }
                     }
                     return Ok(Some(reply.data));
@@ -2368,12 +2388,10 @@ impl RldpNode {
                 );
                 context.peer.stats.v1.update(min_timeout_ms);
                 updates += new_received
-            } else if control.protocol_deadline.is_none()
-                && context.peer.stats.v1.try_timeout(start_ms)
-            {
-                transfer.state().set_finished(false);
-                continue;
             }
+            // V2 ends at its native absolute transfer deadline, enforced by
+            // the outbound owner (or the response control). Legacy adaptive
+            // statistics govern pacing, not an additional early failure.
             new_received = 0;
             let peer = context.peer.clone();
             let (returned, prepared) = owned_send::fec_limited(
