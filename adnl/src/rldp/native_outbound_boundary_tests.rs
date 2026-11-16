@@ -267,3 +267,68 @@ async fn native_outbound_refused_query_keeps_deadline_without_retry() {
         result.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_silent_senders_preserve_healthy_peer_progress() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_sender_fairness_context.tsv").trim(),
+        "8 60 10 64 1024"
+    );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_sender_fairness_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_fairness_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_fairness_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_sender_fairness_metadata.json"),
+    );
+    let (reply, packets, nodes, rldps, route) = topology(3).await;
+    for node in &rldps {
+        node.peers.enable_native_for_tests();
+    }
+    let outcome = std::panic::AssertUnwindSafe(async {
+        packets.drop_parts.store(true, Ordering::Release);
+        reply.response_bytes.store(64, Ordering::Release);
+        let silent_peer = rldps[1].get_peer(route.other(), route.local(), true, None).await.unwrap();
+        let silent = silent_peer.native.get().expect("silent sender must use actual native Connection");
+        let mut ids = std::collections::BTreeSet::new();
+        for index in 0u32..8 {
+            feed(&nodes[0], &rldps[1], &route, index, u64::from(index + 1)).await;
+            let mut id = [120;32];
+            id[..4].copy_from_slice(&index.to_le_bytes());
+            ids.insert(id.map(|b| b ^ 0xff).to_vec());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if ids.iter().all(|id|packets.transfers.lock().unwrap().contains(id)) {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("every silent response must emit its exact transfer ID over UDP");
+        assert_eq!(inspect(silent).await.1, 8);
+        let healthy = nodes[2].key_by_tag(0).unwrap();
+        let healthy_route = AdnlPeers::with_keys(healthy.id().clone(),route.other().clone());
+        let bytes = serialize_boxed(&Query {overlay:UInt256::default()}).unwrap();
+        let started = tokio::time::Instant::now();
+        let (answer,_) = rldps[2].query(&TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0},Some(1024),&healthy_route,true,None).await.unwrap();
+        assert_eq!(answer,Some(vec![42;64]));
+        assert!(started.elapsed()<Duration::from_secs(10),"healthy query must retain its original API deadline");
+        let healthy_peer = rldps[1].get_peer(route.other(),healthy.id(),true,None).await.unwrap();
+        let healthy_native = healthy_peer.native.get().expect("healthy sender must use actual native Connection");
+        tokio::time::timeout(Duration::from_secs(5),async {
+            while healthy_native.completed_sends.load(Ordering::Acquire)!=1 {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.expect("healthy answer must actually complete, not only reach its caller");
+        assert_eq!(inspect(healthy_native).await.1,0);
+        assert_eq!(silent.completed_sends.load(Ordering::Acquire),0);
+        assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0,"legacy sender must not satisfy native qualification");
+        let actual = serde_json::json!({"silent_live":inspect(silent).await.1,"healthy_answer_bytes":answer.unwrap().len(),"healthy_completed":true});
+        assert_eq!(vec![actual.clone()],expected);
+        assert_eq!(reply.calls.load(Ordering::Acquire),9);
+        eprintln!("NATIVE_SENDER_FAIRNESS: {actual} healthy_elapsed_ms={}",started.elapsed().as_millis());
+    }).catch_unwind().await;
+    packets.drop_parts.store(false, Ordering::Release);
+    let stopped = futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    for result in stopped {
+        result.unwrap();
+    }
+}
