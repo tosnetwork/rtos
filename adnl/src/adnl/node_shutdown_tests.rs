@@ -134,7 +134,7 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
     })
     .await
     .unwrap();
-    assert_eq!(attempts, 2);
+    assert!((2..=8).contains(&attempts), "one forced conflict plus bounded real conflicts");
     assert_ne!(port, first_port);
     assert!(held_tcp.is_some());
     bounded(node.stop_checked()).await.unwrap();
@@ -493,23 +493,59 @@ async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
-    let (node, port) = node(49).await;
-    let result = node
-        .start(
-            |node| {
-                let _resources = udp_tcp_sender_receiver(node)?;
-                fail!("injected failure after TCP listener registration")
-            },
-            Vec::new(),
-        )
-        .await;
-    assert!(result.is_err());
-    bounded(node.stop_checked()).await.unwrap();
-    udp_released(port);
-    tcp_released(port);
-    let weak = Arc::downgrade(&node);
-    drop(node);
-    assert!(weak.upgrade().is_none());
+    let mut previous_owner: Option<std::sync::Weak<AdnlNode>> = None;
+    for attempt in 0..8 {
+        if let Some(previous) = &previous_owner {
+            assert!(previous.upgrade().is_none(), "failed startup owner must be released");
+        }
+        let (udp, tcp, port) = reserve_tcp_udp().unwrap();
+        let node = node_on_port(49, port).await;
+        // The first attempt intentionally cannot reach the injection. It must
+        // be classified as a bind collision, not as successful partial cleanup.
+        let held_tcp = if attempt == 0 {
+            Some(tcp)
+        } else {
+            drop(tcp);
+            None
+        };
+        drop(udp);
+        let registered = AtomicBool::new(false);
+        let result = node
+            .start(
+                |node| {
+                    let _resources = udp_tcp_sender_receiver(node)?;
+                    registered.store(true, Ordering::Release);
+                    fail!("injected failure after TCP listener registration")
+                },
+                Vec::new(),
+            )
+            .await;
+        bounded(node.stop_checked()).await.unwrap();
+        let error = result.expect_err("injected startup must fail");
+        let bind_collision = error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse);
+        if attempt == 0 {
+            assert!(bind_collision, "reserved TCP port must refuse startup: {error:#}");
+            assert!(!registered.load(Ordering::Acquire));
+        }
+        if bind_collision {
+            assert!(!registered.load(Ordering::Acquire));
+            previous_owner = Some(Arc::downgrade(&node.0));
+            drop(node);
+            drop(held_tcp);
+            continue;
+        }
+        assert!(registered.load(Ordering::Acquire), "failed before TCP registration: {error:#}");
+        assert_eq!(error.to_string(), "injected failure after TCP listener registration");
+        udp_released(port);
+        tcp_released(port);
+        let weak = Arc::downgrade(&node);
+        drop(node);
+        assert!(weak.upgrade().is_none());
+        return;
+    }
+    panic!("TCP registration injection was never reached within eight attempts");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
