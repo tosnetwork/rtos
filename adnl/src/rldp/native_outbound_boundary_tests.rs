@@ -21,12 +21,23 @@ async fn native_outbound_ack_returns_exactly_one_slot() {
 // Retransmit the identical request under the original five-second fixture
 // deadline. A completed transfer must not invoke the application twice.
 async fn feed(node: &AdnlNode, responder: &RldpNode, route: &AdnlPeers, index: u32, handled: u64) {
+    feed_with_limit(node, responder, route, index, handled, 1024).await;
+}
+
+async fn feed_with_limit(
+    node: &AdnlNode,
+    responder: &RldpNode,
+    route: &AdnlPeers,
+    index: u32,
+    handled: u64,
+    limit: i64,
+) {
     let mut id = [120; 32];
     id[..4].copy_from_slice(&index.to_le_bytes());
     let request = serialize_boxed(
         &rldp::message::Query {
             query_id: UInt256::from(id),
-            max_answer_size: 1024,
+            max_answer_size: limit,
             timeout: super::super::Version::get() + 60,
             data: serialize_boxed(&Query { overlay: UInt256::default() }).unwrap(),
         }
@@ -280,18 +291,45 @@ async fn native_silent_senders_preserve_healthy_peer_progress() {
         include_bytes!("../../../ci/conformance/rldp2_sender_fairness_reference.cpp"),
         include_bytes!("../../../ci/conformance/rldp2_sender_fairness_metadata.json"),
     );
+    native_sender_progress(8, 64, 1024, expected, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_large_silent_responses_retain_initialized_encoders() {
+    assert_eq!(
+        include_str!("../../../ci/conformance/rldp2_retained_encoder_context.tsv").trim(),
+        "16 60 10 262144 524288"
+    );
+    let expected = checked_ack_native_effects(
+        include_bytes!("../../../ci/conformance/rldp2_retained_encoder_context.tsv"),
+        include_bytes!("../../../ci/conformance/rldp2_retained_encoder_effects.jsonl"),
+        include_bytes!("../../../ci/conformance/rldp2_retained_encoder_reference.cpp"),
+        include_bytes!("../../../ci/conformance/rldp2_retained_encoder_metadata.json"),
+    );
+    native_sender_progress(16, 262144, 524288, expected, true).await;
+}
+
+async fn native_sender_progress(
+    count: u32,
+    payload: usize,
+    limit: i64,
+    expected: Vec<serde_json::Value>,
+    inspect_encoders: bool,
+) {
     let (reply, packets, nodes, rldps, route) = topology(3).await;
     for node in &rldps {
         node.peers.enable_native_for_tests();
     }
+    let mut drain_receipts = Vec::new();
     let outcome = std::panic::AssertUnwindSafe(async {
         packets.drop_parts.store(true, Ordering::Release);
-        reply.response_bytes.store(64, Ordering::Release);
+        reply.response_bytes.store(payload, Ordering::Release);
         let silent_peer = rldps[1].get_peer(route.other(), route.local(), true, None).await.unwrap();
+        drain_receipts.push(silent_peer.drained.clone());
         let silent = silent_peer.native.get().expect("silent sender must use actual native Connection");
         let mut ids = std::collections::BTreeSet::new();
-        for index in 0u32..8 {
-            feed(&nodes[0], &rldps[1], &route, index, u64::from(index + 1)).await;
+        for index in 0u32..count {
+            feed_with_limit(&nodes[0], &rldps[1], &route, index, u64::from(index + 1), limit).await;
             let mut id = [120;32];
             id[..4].copy_from_slice(&index.to_le_bytes());
             ids.insert(id.map(|b| b ^ 0xff).to_vec());
@@ -302,15 +340,16 @@ async fn native_silent_senders_preserve_healthy_peer_progress() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("every silent response must emit its exact transfer ID over UDP");
-        assert_eq!(inspect(silent).await.1, 8);
+        assert_eq!(inspect(silent).await.1, count as usize);
         let healthy = nodes[2].key_by_tag(0).unwrap();
         let healthy_route = AdnlPeers::with_keys(healthy.id().clone(),route.other().clone());
         let bytes = serialize_boxed(&Query {overlay:UInt256::default()}).unwrap();
         let started = tokio::time::Instant::now();
-        let (answer,_) = rldps[2].query(&TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0},Some(1024),&healthy_route,true,None).await.unwrap();
-        assert_eq!(answer,Some(vec![42;64]));
+        let (answer,_) = rldps[2].query(&TaggedByteSlice {object:&bytes,#[cfg(feature="telemetry")]tag:0},Some(u64::try_from(limit).unwrap()),&healthy_route,true,None).await.unwrap();
+        assert_eq!(answer,Some(vec![42;payload]));
         assert!(started.elapsed()<Duration::from_secs(10),"healthy query must retain its original API deadline");
         let healthy_peer = rldps[1].get_peer(route.other(),healthy.id(),true,None).await.unwrap();
+        drain_receipts.push(healthy_peer.drained.clone());
         let healthy_native = healthy_peer.native.get().expect("healthy sender must use actual native Connection");
         tokio::time::timeout(Duration::from_secs(5),async {
             while healthy_native.completed_sends.load(Ordering::Acquire)!=1 {tokio::time::sleep(Duration::from_millis(5)).await;}
@@ -318,9 +357,22 @@ async fn native_silent_senders_preserve_healthy_peer_progress() {
         assert_eq!(inspect(healthy_native).await.1,0);
         assert_eq!(silent.completed_sends.load(Ordering::Acquire),0);
         assert_eq!(rldps[1].allocated.send_transfers.load(Ordering::Acquire),0,"legacy sender must not satisfy native qualification");
+        if inspect_encoders {
+            let (done, receipt) = tokio::sync::oneshot::channel();
+            silent.driver.submit(super::super::connection_driver::Command::InspectEncoders(done)).await.unwrap();
+            let retained = receipt.await.unwrap();
+            assert_eq!(retained.len(),count as usize);
+            let retained_ids = retained.iter().map(|(id,_,_)|id.to_vec()).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(retained_ids,ids,"all original silent responses must remain retained");
+            for (_,bytes,encoders) in &retained {
+                assert!(*bytes > payload,"retained wire data includes the answer envelope");
+                assert_eq!(*encoders,1,"each sub-part-size answer retains its initialized encoder");
+            }
+            eprintln!("NATIVE_RETAINED_ENCODERS count={} wire_bytes={} encoders={}",retained.len(),retained.iter().map(|(_,bytes,_)|bytes).sum::<usize>(),retained.iter().map(|(_,_,encoders)|encoders).sum::<usize>());
+        }
         let actual = serde_json::json!({"silent_live":inspect(silent).await.1,"healthy_answer_bytes":answer.unwrap().len(),"healthy_completed":true});
         assert_eq!(vec![actual.clone()],expected);
-        assert_eq!(reply.calls.load(Ordering::Acquire),9);
+        assert_eq!(reply.calls.load(Ordering::Acquire),count as usize+1);
         eprintln!("NATIVE_SENDER_FAIRNESS: {actual} healthy_elapsed_ms={}",started.elapsed().as_millis());
     }).catch_unwind().await;
     packets.drop_parts.store(false, Ordering::Release);
@@ -331,4 +383,9 @@ async fn native_silent_senders_preserve_healthy_peer_progress() {
     for result in stopped {
         result.unwrap();
     }
+    assert_eq!(drain_receipts.len(), 2);
+    assert!(
+        drain_receipts.iter().all(|receipt| receipt.is_cancelled()),
+        "stop must join both actual native drivers"
+    );
 }
