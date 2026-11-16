@@ -68,6 +68,8 @@ impl State {
 }
 
 pub(super) struct PeerTable {
+    node: std::sync::OnceLock<Weak<RldpNode>>,
+    native_enabled: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     admission: tokio::sync::Mutex<()>,
     capacity: Arc<Semaphore>,
@@ -90,6 +92,8 @@ impl PeerTable {
         min_timeout_ms: u64,
     ) -> Result<Arc<Self>> {
         let ret = Arc::new(Self {
+            node: std::sync::OnceLock::new(),
+            native_enabled: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(State::default()),
             admission: tokio::sync::Mutex::new(()),
             capacity: Arc::new(Semaphore::new(Self::MAX_CONNECTIONS)),
@@ -129,6 +133,17 @@ impl PeerTable {
             }
         });
         Ok(ret)
+    }
+    pub(super) fn attach(&self, node: Weak<RldpNode>) {
+        assert!(self.node.set(node).is_ok());
+    }
+    pub(super) fn native_enabled(&self) -> bool {
+        self.native_enabled.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(super) fn enable_native_for_tests(&self) {
+        assert!(self.state.lock().unwrap().v2.is_empty());
+        self.native_enabled.store(true, Ordering::Release);
     }
     pub(super) fn expire(&self, now: Instant) -> Option<Instant> {
         let mut state = self.state.lock().unwrap();
@@ -174,7 +189,7 @@ impl PeerTable {
                 if let Some(peer) = state.v1.get(&key) {
                     return Ok(peer.clone());
                 }
-                let peer = self.create(None)?;
+                let peer = self.create(None, local, remote)?;
                 state.v1.insert(key, peer.clone());
                 return Ok(peer);
             }
@@ -221,7 +236,7 @@ impl PeerTable {
             _ = self.adnl.tasks().cancelled() => return Err(SendCancelled::OwnerClosed.into()),
             permit = self.capacity.clone().acquire_owned() => permit?,
         };
-        let peer = self.create(Some(permit))?;
+        let peer = self.create(Some(permit), local, remote)?;
         let expires = deadline.unwrap_or_else(Instant::now) + Self::IDLE;
         {
             let mut state = self.state.lock().unwrap();
@@ -244,7 +259,12 @@ impl PeerTable {
             .filter(|entry| !entry.peer.closed.is_cancelled())
             .map(|entry| entry.peer.clone())
     }
-    fn create(&self, permit: Option<OwnedSemaphorePermit>) -> Result<Arc<RldpPeer>> {
+    fn create(
+        &self,
+        permit: Option<OwnedSemaphorePermit>,
+        local: &Arc<KeyId>,
+        remote: &Arc<KeyId>,
+    ) -> Result<Arc<RldpPeer>> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let transfers = if permit.is_some() {
             // Keep the existing node-wide reclamation domain while isolating keys.
@@ -260,6 +280,7 @@ impl PeerTable {
             transfers.clone()
         };
         let peer = Arc::new(RldpPeer {
+            native: std::sync::OnceLock::new(),
             inbound_active: Default::default(),
             inbound_transfers: inbound_transfers.clone(),
             transfers: transfers.clone(),
@@ -275,6 +296,21 @@ impl PeerTable {
             idle: Arc::new(Notify::new()),
             counter: self.counter.clone().into(),
         });
+        if permit.is_some() && self.native_enabled() {
+            let native = native_connection::NativeConnection::start(
+                self.node.get().cloned().ok_or_else(|| error!("RLDP node is not attached"))?,
+                self.adnl.clone(),
+                AdnlPeers::with_keys(local.clone(), remote.clone()),
+                &self.pool,
+                peer.closed.clone(),
+                peer.drained.clone(),
+                permit.unwrap(),
+                self.wake.clone(),
+            )?;
+            assert!(peer.native.set(native).is_ok());
+            drop(rx);
+            return Ok(peer);
+        }
         let weak: Weak<RldpPeer> = Arc::downgrade(&peer);
         let closed = peer.closed.clone();
         let drained = peer.drained.clone();

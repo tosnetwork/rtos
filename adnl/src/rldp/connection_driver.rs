@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) enum Command {
     Receive(Vec<u8>),
+    Packet { data: Vec<u8>, mtu: u64 },
     Send { id: TransferId, data: Vec<u8>, deadline: Option<Instant>, answer: bool },
     ReceiveLimit { id: TransferId, deadline: Instant, max_size: u64 },
     Mtu(u64),
@@ -26,7 +27,9 @@ pub(super) enum Command {
 impl Command {
     fn bytes(&self) -> usize {
         match self {
-            Self::Receive(data) | Self::Send { data, .. } => data.capacity(),
+            Self::Receive(data) | Self::Packet { data, .. } | Self::Send { data, .. } => {
+                data.capacity()
+            }
             _ => 0,
         }
     }
@@ -35,6 +38,11 @@ impl Command {
         let deadline =
             |at: Instant| now + at.saturating_duration_since(Instant::now()).as_secs_f64();
         match self {
+            Self::Packet { data, mtu } => {
+                connection.set_default_mtu(mtu);
+                connection.receive_raw_at(&data, now);
+                Ok(true)
+            }
             Self::Receive(data) => {
                 connection.receive_raw_at(&data, now);
                 Ok(true)
@@ -174,6 +182,10 @@ impl ConnectionDriver {
             sent = self.commands.send(Envelope { command, reply, _bytes: permit }) => sent.map_err(|_| error!("RLDP2 driver closed"))?,
         }
         result.await.map_err(|_| error!("RLDP2 driver closed"))?
+    }
+    #[cfg(test)]
+    pub(super) fn test_control(&self) -> Arc<SendControl> {
+        self.control.clone()
     }
     pub(super) async fn close(&self) {
         self.control.cancel(SendCancelled::PeerEvicted);

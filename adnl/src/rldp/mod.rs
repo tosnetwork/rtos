@@ -70,6 +70,7 @@ use send::{
 };
 
 mod connection_driver;
+mod native_connection;
 mod owned_send;
 mod peers;
 mod query_admission;
@@ -313,6 +314,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        native: std::sync::OnceLock<Arc<native_connection::NativeConnection>>,
         inbound_active: std::sync::Mutex<HashSet<TransferId>>,
         inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
@@ -512,7 +514,9 @@ impl RldpNode {
             #[cfg(feature = "debug")]
             loss_fn,
         };
-        Ok(Arc::new(ret))
+        let ret = Arc::new(ret);
+        ret.peers.attach(Arc::downgrade(&ret));
+        Ok(ret)
     }
 
     /// +1/-1 the extended-inbound-cap counter for all given peers.
@@ -1485,6 +1489,9 @@ impl RldpNode {
             Err(_) if query_deadline.is_some() => return Err(RldpQueryTimeout.into()),
             Err(_) => return Err(SendCancelled::Deadline.into()),
         };
+        if peer.native.get().is_some() {
+            fail!("Connection active query/message routing is not wired yet")
+        }
         if let Some(roundtrip) = roundtrip {
             peer.stats.set_roundtrip(roundtrip)?
         }
@@ -2566,7 +2573,23 @@ impl Subscriber for RldpNode {
             Err(msg) => msg,
         };
         match msg.downcast::<Rldp2MessagePartBoxed>() {
-            Ok(msg) => self.consume_message_part(MessagePart::V2(msg), peers).await,
+            Ok(msg) => {
+                if self.peers.native_enabled() {
+                    let peer = self.get_peer(peers.local(), peers.other(), true, None).await?;
+                    let native =
+                        peer.native.get().ok_or_else(|| error!("Connection mode mismatch"))?;
+                    native
+                        .driver
+                        .submit(connection_driver::Command::Packet {
+                            data: data.to_vec(),
+                            mtu: self.peer_inbound_cap(peers.other(), true) as u64,
+                        })
+                        .await?;
+                    Ok(true)
+                } else {
+                    self.consume_message_part(MessagePart::V2(msg), peers).await
+                }
+            }
             Err(_) => Ok(false),
         }
     }

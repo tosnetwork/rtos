@@ -5,7 +5,7 @@ use crate::{
     node::{AdnlNode, AdnlNodeConfig},
     RldpNode, RldpQueryTimeout,
 };
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use rtos_api::{
     deserialize_boxed, serialize_boxed,
     ton::{rldp2, rpc::overlay::Query},
@@ -73,7 +73,6 @@ struct ResponsePackets {
     transfers: Mutex<HashSet<Vec<u8>>>,
     drop_parts: AtomicBool,
     handler: Mutex<Option<std::sync::Weak<RldpNode>>>,
-    driver: Mutex<Option<Arc<super::connection_driver::ConnectionDriver>>>,
     processed_parts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
@@ -114,14 +113,6 @@ impl Subscriber for ResponsePackets {
         }
         // In tests requiring a negative state assertion, acknowledge processing only
         // after the real handler returns. Consume here to prevent double dispatch.
-        let driver = self.driver.lock().unwrap().clone();
-        if let Some(driver) = driver {
-            driver.submit(super::connection_driver::Command::Receive(bytes.to_vec())).await?;
-            if is_data_part {
-                self.processed_parts.fetch_add(1, Ordering::Release);
-            }
-            return Ok(true);
-        }
         let handler = self.handler.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
         if let Some(handler) = handler {
             let consumed = handler.try_consume_custom(bytes, peers).await?;
@@ -3717,87 +3708,8 @@ async fn check_unsolicited_mtu(name: &str, use_driver: bool) {
     let (reply, packets, nodes, rldps, peers) =
         topology_with_remote_observer(2, Some(remote.clone())).await;
     *packets.handler.lock().unwrap() = Some(Arc::downgrade(&rldps[0]));
-    let driver_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if use_driver {
-        let sent = driver_sent.clone();
-        let node = nodes[0].clone();
-        let rldp = rldps[0].clone();
-        let route = peers.clone();
-        let (driver, mut events) = super::connection_driver::ConnectionDriver::start(
-            *peers.other().data(),
-            node.tasks().clone(),
-            rldp.send_pool.fec_slots(),
-        )
-        .unwrap();
-        let driver = Arc::new(driver);
-        *packets.driver.lock().unwrap() = Some(driver.clone());
-        let owner = node.tasks().clone();
-        let lifetime = owner.clone();
-        owner.spawn("Connection application test route", async move {
-            let mut applications = futures::stream::FuturesUnordered::<
-                futures::future::BoxFuture<'static, Result<()>>,
-            >::new();
-            loop {
-                let event = tokio::select! {
-                    biased;
-                    _ = lifetime.cancelled() => break,
-                    result = applications.next(), if !applications.is_empty() => {
-                        result.unwrap().unwrap();
-                        continue;
-                    },
-                    event = events.recv() => match event { Some(event) => event, None => break },
-                };
-                for (_, result) in event.sent {
-                    result.expect("Connection response completed");
-                    sent.fetch_add(1, Ordering::Release);
-                }
-                for packet in event.packets {
-                    node.send_custom(
-                        &TaggedByteSlice {
-                            object: &packet,
-                            #[cfg(feature = "telemetry")]
-                            tag: 0,
-                        },
-                        &route,
-                    )
-                    .await
-                    .unwrap();
-                }
-                for (id, result) in event.received {
-                    let data = result.expect("native accepted message");
-                    // A callback may submit a response to the same driver. Keep
-                    // draining its output while that command is queued.
-                    assert!(applications.len() < 256, "finite test application bound");
-                    let (driver, node, rldp, route) =
-                        (driver.clone(), node.clone(), rldp.clone(), route.clone());
-                    applications.push(
-                        async move {
-                            RldpNode::process_message(
-                                super::MessageContext {
-                                    driver: Some(&driver),
-                                    adnl: &node,
-                                    peers: &route,
-                                    data: &data,
-                                    transfer_id: id,
-                                    #[cfg(feature = "debug")]
-                                    timestamp: &rldp.timestamp,
-                                },
-                                rldp.subscribers.clone(),
-                                true,
-                                &rldp.peers,
-                                #[cfg(feature = "telemetry")]
-                                rldp.telemetry.send_transfers.clone(),
-                                rldp.allocated.send_transfers.clone(),
-                                &rldp.allocated.response_lifecycle,
-                            )
-                            .await?;
-                            Ok(())
-                        }
-                        .boxed(),
-                    );
-                }
-            }
-        });
+        rldps[0].peers.enable_native_for_tests();
     }
     let outcome = std::panic::AssertUnwindSafe(async {
         assert_eq!(rldps[0].peer_inbound_cap(peers.other(), false), 2048);
@@ -3916,7 +3828,7 @@ async fn check_unsolicited_mtu(name: &str, use_driver: bool) {
             let (answer, _) = rldps[1].query(&query, Some(1024), &route, true, None).await.unwrap();
             assert_eq!(answer.unwrap(), vec![42; 64]);
             tokio::time::timeout(Duration::from_secs(2), async {
-                while driver_sent.load(Ordering::Acquire) != 1 {
+                while peer.native.get().unwrap().completed_sends.load(Ordering::Acquire) != 1 {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
@@ -3974,4 +3886,61 @@ async fn rldp2_connection_driver_mtu_native_exact() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rldp2_connection_driver_mtu_native_above() {
     check_unsolicited_mtu("native_above", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_peer_reopen_waits_for_actual_fec_owner() {
+    let (_reply, _packets, nodes, rldps, peers) = pair().await;
+    rldps[0].peers.enable_native_for_tests();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let peer = rldps[0].get_peer(peers.local(), peers.other(), true, None).await.unwrap();
+        let native = peer.native.get().unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let blocked = Arc::new(Mutex::new(blocked));
+        *native.driver.test_control().test_after_fec.lock().unwrap() = Some(Arc::new(move || {
+            if let Some(started) = started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            blocked.lock().unwrap().recv().unwrap();
+        }));
+        let driver = native.driver.clone();
+        let command = tokio::spawn(async move {
+            driver.submit(super::connection_driver::Command::Mtu(7680)).await
+        });
+        entered.await.unwrap();
+        rldps[0].peers.expire(tokio::time::Instant::now() + Duration::from_secs(121));
+        assert!(peer.closed.is_cancelled());
+        assert!(!peer.drained.is_cancelled());
+        let mut reopen = Box::pin(rldps[0].get_peer(peers.local(), peers.other(), true, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut reopen).await.is_err(),
+            "same authenticated identity reopened before actual Connection work drained"
+        );
+        assert!(!peer.drained.is_cancelled());
+        release.send(()).unwrap();
+        let replacement =
+            tokio::time::timeout(Duration::from_secs(2), reopen).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&peer, &replacement));
+        assert!(peer.drained.is_cancelled());
+        let _ = command.await.unwrap();
+        assert!(replacement
+            .native
+            .get()
+            .unwrap()
+            .driver
+            .submit(super::connection_driver::Command::Mtu(7680))
+            .await
+            .unwrap());
+    })
+    .catch_unwind()
+    .await;
+    let _ = release.send(());
+    for result in futures::future::join_all(nodes.iter().map(|node| node.stop_checked())).await {
+        result.unwrap();
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }

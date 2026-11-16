@@ -924,6 +924,7 @@ mod sibling_wake_tests {
     fn rldp_sibling_wake_real_ack_releases_shared_window() {
         let (tx, _jobs) = tokio::sync::mpsc::unbounded_channel();
         let peer = Arc::new(RldpPeer {
+            native: std::sync::OnceLock::new(),
             inbound_active: Default::default(),
             inbound_transfers: Arc::new(lockfree::map::Map::new()),
             transfers: Arc::new(lockfree::map::Map::new()),
@@ -1075,6 +1076,7 @@ mod owned_ack_tests {
         for panic in [false, true] {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let peer = Arc::new(RldpPeer {
+                native: std::sync::OnceLock::new(),
                 inbound_active: Default::default(),
                 inbound_transfers: Arc::new(lockfree::map::Map::new()),
                 transfers: Arc::new(lockfree::map::Map::new()),
