@@ -240,6 +240,14 @@ async fn topology_with_remote_observer(
     count: usize,
     remote_observer: Option<Arc<ResponsePackets>>,
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    topology_with_observers(count, remote_observer, false).await
+}
+
+async fn topology_with_observers(
+    count: usize,
+    remote_observer: Option<Arc<ResponsePackets>>,
+    observe_all_senders: bool,
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
     let reply = Arc::new(HeldReply::default());
     let packets = Arc::new(ResponsePackets::default());
     let mut nodes = Vec::new();
@@ -275,7 +283,7 @@ async fn topology_with_remote_observer(
             )
             .unwrap();
             let mut subscribers: Vec<Arc<dyn Subscriber>> = Vec::new();
-            if index == 0 {
+            if index == 0 || (observe_all_senders && index != 1) {
                 subscribers.push(packets.clone());
             }
             if index == 1 {
@@ -4750,3 +4758,6 @@ async fn rldp2_completed_receive_preserves_queued_replay_ack() {
 
 #[path = "native_runtime_tests.rs"]
 mod native_runtime_tests;
+
+#[path = "native_identity_tests.rs"]
+mod native_identity_tests;

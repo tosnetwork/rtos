@@ -19,11 +19,28 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) enum Command {
     Receive(Vec<u8>),
-    Packet { data: Vec<u8>, mtu: u64 },
-    Send { id: TransferId, data: Vec<u8>, deadline: Option<Instant>, answer: bool },
-    ReceiveLimit { id: TransferId, deadline: Instant, max_size: u64 },
+    #[cfg(test)]
+    Inspect(oneshot::Sender<(usize, usize, usize)>),
+    Packet {
+        data: Vec<u8>,
+        mtu: u64,
+    },
+    Send {
+        id: TransferId,
+        data: Vec<u8>,
+        deadline: Option<Instant>,
+        answer: bool,
+    },
+    ReceiveLimit {
+        id: TransferId,
+        deadline: Instant,
+        max_size: u64,
+    },
     Mtu(u64),
-    Cancel { send: TransferId, receive: Option<TransferId> },
+    Cancel {
+        send: TransferId,
+        receive: Option<TransferId>,
+    },
 }
 impl Command {
     fn bytes(&self) -> usize {
@@ -40,6 +57,15 @@ impl Command {
         let now = connection.now();
         let deadline = |at: Instant| now + at.saturating_duration_since(wall_now).as_secs_f64();
         match self {
+            #[cfg(test)]
+            Self::Inspect(reply) => {
+                let _ = reply.send((
+                    connection.inbound_transfer_count(),
+                    connection.outbound_transfer_count(),
+                    connection.completed_transfer_count(),
+                ));
+                Ok(true)
+            }
             Self::Packet { data, mtu } => {
                 connection.set_default_mtu(mtu);
                 connection.receive_raw_at(&data, now);
