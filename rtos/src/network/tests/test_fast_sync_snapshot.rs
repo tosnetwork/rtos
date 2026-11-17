@@ -8,6 +8,7 @@ use crate::{
     collator_test_bundle::create_engine_allocated,
     validator::validator_manager::emulator_network_bootstrap::EmulatorNetworkBootstrap,
 };
+use futures::FutureExt;
 use rtos_block::{PqConsensusKey, UInt256};
 use std::sync::atomic::AtomicUsize;
 
@@ -55,8 +56,21 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Result<Self> {
+        Self::with_pq_transport(false).await
+    }
+    async fn with_pq_transport(pq_only: bool) -> Result<Self> {
         let bootstrap = EmulatorNetworkBootstrap::build(2)?;
         isolate_quic(&bootstrap)?;
+        if pq_only {
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&bootstrap.config_path)?)?;
+            config["validator_keys"] = serde_json::json!([]);
+            config["consensus_transport_bindings"] = serde_json::json!([{
+                "validator_id": rtos_block::base64_encode(&[20; 32]),
+                "adnl_key_id": rtos_block::base64_encode(bootstrap.validators[0].adnl_key.id().data()),
+            }]);
+            std::fs::write(&bootstrap.config_path, serde_json::to_vec(&config)?)?;
+        }
         let allocated = create_engine_allocated();
         #[cfg(feature = "telemetry")]
         let telemetry = crate::collator_test_bundle::create_engine_telemetry();
@@ -656,79 +670,136 @@ async fn fast_sync_snapshot_registration_expiring_during_lookup_cannot_publish()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_shard_overlays_follow_the_applied_authority() -> Result<()> {
+    check_public_shard_authority(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_shard_overlays_accept_explicit_pq_transport_authority() -> Result<()> {
+    check_public_shard_authority(true).await
+}
+
+async fn check_public_shard_authority(pq_only: bool) -> Result<()> {
     use crate::network::shard_overlay_certificates::{authority_rules, startup_rules};
     use rtos_block::{ConfigParam32, ConfigParam34, ConfigParamEnum};
-    let f = Fixture::new().await?;
-    let node = f.router.network.context().stack.overlay.clone();
-    let id_of =
-        |client: &FullNodeOverlayClient| KeyId::from_data(*client.overlay_client().id().data());
-    let master = ShardIdent::MASTERCHAIN;
-    let mc_id = id_of(&*f.router.overlay_client(&master).await?);
-    assert_eq!(node.public_privacy_rules(&mc_id)?, Some(startup_rules()));
+    let f = Fixture::with_pq_transport(pq_only).await?;
+    let result = std::panic::AssertUnwindSafe(async {
+        let node = f.router.network.context().stack.overlay.clone();
+        let id_of =
+            |client: &FullNodeOverlayClient| KeyId::from_data(*client.overlay_client().id().data());
+        let master = ShardIdent::MASTERCHAIN;
+        let mc_id = id_of(&*f.router.overlay_client(&master).await?);
+        assert_eq!(node.public_privacy_rules(&mc_id)?, Some(startup_rules()));
 
-    // The applied previous set holds this node's transport root.
-    let transport = f.bootstrap.validators[0].adnl_key.id().clone();
-    let mut remote = f.member(1);
-    remote.adnl_addr = Some(UInt256::from([199; 32]));
-    let mut config = f.bootstrap.config_params().clone();
-    config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(set(
-        vec![f.member(0)],
-    ))))?;
-    config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(set(
-        vec![remote.clone()],
-    ))))?;
-    // Clients are not retained across a refresh, which may recreate overlays.
-    f.router.update_private_overlays(&config).await?;
-    let mc = f.router.overlay_client(&master).await?;
-    assert_eq!(id_of(&mc), mc_id);
-    let authority = |config: &ConfigParams| -> Result<Vec<Arc<KeyId>>> {
-        let mut all = Vec::new();
-        for set in
-            [config.prev_validator_set()?, config.validator_set()?, config.next_validator_set()?]
-        {
-            all.extend_from_slice(set.list());
-        }
-        Ok(fast_sync_transport_authority(&all, rtos_api::WireProfile::T0)?.0)
-    };
-    let rules = authority_rules(&authority(&config)?);
-    assert!(rules.is_authorized_key(transport.data()));
-    assert!(rules.is_authorized_key(&[199; 32]));
-    assert_eq!(node.public_privacy_rules(&id_of(&mc))?, Some(rules.clone()));
-    let certificates = f.router.shard_certificates();
-    assert_eq!(certificates.signer_id()?, Some(transport.clone()));
-    let ephemeral = certificates.local_key(&master).unwrap();
-    let cert = node.local_certificate(&id_of(&mc), ephemeral.id())?.unwrap();
-    assert_eq!(cert.issuer_hash(), transport.data());
-    let now = rtos_block::UnixTime::now() as i32;
-    let adnl = f.router.full_node_adnl_key()?;
-    let source = certificates.choose_outbound_source(&master, &adnl, 4000, true, now)?;
-    assert_eq!(source.id(), ephemeral.id(), "uncertified full-node key is not chosen");
+        // The applied previous set holds this node's transport root.
+        let transport = f.bootstrap.validators[0].adnl_key.id().clone();
+        let mut remote = f.member(1);
+        remote.adnl_addr = Some(UInt256::from([199; 32]));
+        let mut config = f.bootstrap.config_params().clone();
+        config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(
+            set(vec![f.member(0)]),
+        )))?;
+        config.set_config(ConfigParamEnum::ConfigParam34(ConfigParam34::with_validator_set(
+            set(vec![remote.clone()]),
+        )))?;
+        // Clients are not retained across a refresh, which may recreate overlays.
+        f.router.update_private_overlays(&config).await?;
+        let mc = f.router.overlay_client(&master).await?;
+        assert_eq!(id_of(&mc), mc_id);
+        let authority = |config: &ConfigParams| -> Result<Vec<Arc<KeyId>>> {
+            let mut all = Vec::new();
+            for set in [
+                config.prev_validator_set()?,
+                config.validator_set()?,
+                config.next_validator_set()?,
+            ] {
+                all.extend_from_slice(set.list());
+            }
+            Ok(fast_sync_transport_authority(&all, rtos_api::WireProfile::T0)?.0)
+        };
+        let rules = authority_rules(&authority(&config)?);
+        assert!(rules.is_authorized_key(transport.data()));
+        assert!(rules.is_authorized_key(&[199; 32]));
+        assert_eq!(node.public_privacy_rules(&id_of(&mc))?, Some(rules.clone()));
+        let certificates = f.router.shard_certificates();
+        assert_eq!(certificates.signer_id()?, Some(transport.clone()));
+        let ephemeral = certificates.local_key(&master).unwrap();
+        let cert = node.local_certificate(&id_of(&mc), ephemeral.id())?.unwrap();
+        assert_eq!(cert.issuer_hash(), transport.data());
+        let now = rtos_block::UnixTime::now() as i32;
+        let adnl = f.router.full_node_adnl_key()?;
+        let source = certificates.choose_outbound_source(&master, &adnl, 4000, true, now)?;
+        assert_eq!(source.id(), ephemeral.id(), "uncertified full-node key is not chosen");
 
-    // An overlay created later starts with the current rules and a certificate.
-    let base = f.router.overlay_client(&ShardIdent::BASE_WORKCHAIN).await?;
-    assert_eq!(node.public_privacy_rules(&id_of(&base))?, Some(rules.clone()));
-    let base_key = certificates.local_key(&ShardIdent::BASE_WORKCHAIN).unwrap();
-    assert!(node.local_certificate(&id_of(&base), base_key.id())?.is_some());
+        // An overlay created later starts with the current rules and a certificate.
+        let base = f.router.overlay_client(&ShardIdent::BASE_WORKCHAIN).await?;
+        assert_eq!(node.public_privacy_rules(&id_of(&base))?, Some(rules.clone()));
+        let base_key = certificates.local_key(&ShardIdent::BASE_WORKCHAIN).unwrap();
+        assert!(node.local_certificate(&id_of(&base), base_key.id())?.is_some());
 
-    // Recreation keeps the ephemeral identity and reinstalls its certificate,
-    // with rules installed although the propagation configuration is unchanged.
-    mc.stop_and_wait().await?;
-    drop(mc);
-    f.router.public_overlays.remove(&master);
-    let again = f.router.overlay_client(&master).await?;
-    assert_eq!(certificates.local_key(&master).unwrap().id(), ephemeral.id());
-    assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(rules.clone()));
-    assert!(node.local_certificate(&id_of(&again), ephemeral.id())?.is_some());
+        // Recreation keeps the ephemeral identity and reinstalls its certificate,
+        // with rules installed although the propagation configuration is unchanged.
+        mc.stop_and_wait().await?;
+        drop(mc);
+        f.router.public_overlays.remove(&master);
+        let again = f.router.overlay_client(&master).await?;
+        assert_eq!(certificates.local_key(&master).unwrap().id(), ephemeral.id());
+        assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(rules.clone()));
+        assert!(node.local_certificate(&id_of(&again), ephemeral.id())?.is_some());
 
-    // The root leaves the applied sets: its authority and the signer go.
-    config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(set(
-        vec![remote],
-    ))))?;
-    f.router.update_private_overlays(&config).await?;
-    let reduced = authority_rules(&authority(&config)?);
-    assert!(!reduced.is_authorized_key(transport.data()));
-    assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(reduced));
-    assert_eq!(certificates.signer_id()?, None);
+        // The root leaves the applied sets: its authority and the signer go.
+        config.set_config(ConfigParamEnum::ConfigParam32(ConfigParam32::with_validator_set(
+            set(vec![remote]),
+        )))?;
+        f.router.update_private_overlays(&config).await?;
+        let reduced = authority_rules(&authority(&config)?);
+        assert!(!reduced.is_authorized_key(transport.data()));
+        assert_eq!(node.public_privacy_rules(&id_of(&again))?, Some(reduced));
+        assert_eq!(certificates.signer_id()?, None);
+        Ok::<_, anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
     f.stop().await;
-    Ok(())
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_shard_overlays_pq_signer_requires_bound_applied_member() -> Result<()> {
+    let f = Fixture::with_pq_transport(true).await?;
+    let result = std::panic::AssertUnwindSafe(async {
+        let transport = f.bootstrap.validators[0].adnl_key.id().clone();
+        let roots = vec![transport.clone()];
+        let member = f.member(0);
+        assert!(!f.router.network.config_handler().get_validator_status());
+        assert_eq!(
+            f.router.local_transport_signer(&roots, &[member.clone()]).await?.unwrap().id(),
+            &transport
+        );
+        assert!(!f.router.network.config_handler().get_validator_status());
+        // An ADNL match alone does not authenticate the bound validator identity.
+        let mut wrong_validator = f.member(1);
+        wrong_validator.adnl_addr = member.adnl_addr.clone();
+        assert!(f.router.local_transport_signer(&roots, &[wrong_validator]).await?.is_none());
+        // Nor does a validator-ID match authenticate a different transport.
+        let mut wrong_transport = member.clone();
+        wrong_transport.adnl_addr = Some(UInt256::from([199; 32]));
+        assert!(f.router.local_transport_signer(&roots, &[wrong_transport]).await?.is_none());
+        assert!(f.router.local_transport_signer(&roots, &[]).await?.is_none());
+        assert!(f.router.local_transport_signer(&[], &[member]).await?.is_none());
+        // The second private key is held in the fixture keyring but has no
+        // configured binding; membership alone must not activate it.
+        let unbound = f.bootstrap.validators[1].adnl_key.id().clone();
+        assert!(f.router.local_transport_signer(&[unbound], &[f.member(1)]).await?.is_none());
+        Ok::<_, anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+    f.stop().await;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
