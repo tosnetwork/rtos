@@ -338,11 +338,11 @@
     {
       "id": "expired-member-restart",
       "driver": "rotation_fixture.py",
-      "scope": "Expired member returns as nonsigning synchronized observer",
+      "scope": "Expired member returns as nonsigning synchronized observer; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "followup-intent-frontier",
@@ -401,92 +401,92 @@
     {
       "id": "source-retention-after-fsync",
       "driver": "rotation_fixture.py",
-      "scope": "Source retention interruption at after-fsync",
+      "scope": "Source retention interruption at after-fsync; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-intent-after-fsync",
       "driver": "rotation_fixture.py",
-      "scope": "Source ACK interruption then intent cut at after-fsync",
+      "scope": "Source ACK interruption then intent cut at after-fsync; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-retention-before-write",
       "driver": "rotation_fixture.py",
-      "scope": "Source retention interruption at before-write",
+      "scope": "Source retention interruption at before-write; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-intent-before-write",
       "driver": "rotation_fixture.py",
-      "scope": "Source ACK interruption then intent cut at before-write",
+      "scope": "Source ACK interruption then intent cut at before-write; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-retention-after-partial-write",
       "driver": "rotation_fixture.py",
-      "scope": "Source retention interruption at after-partial-write",
+      "scope": "Source retention interruption at after-partial-write; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-intent-after-partial-write",
       "driver": "rotation_fixture.py",
-      "scope": "Source ACK interruption then intent cut at after-partial-write",
+      "scope": "Source ACK interruption then intent cut at after-partial-write; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-sync-eio",
       "driver": "rotation_fixture.py",
-      "scope": "Native ACK storage refusal and original-database recovery",
+      "scope": "Native ACK storage refusal and original-database recovery; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-partition-sync-eio",
       "driver": "rotation_fixture.py",
-      "scope": "ACK storage refusal combined with partitioned restart",
+      "scope": "ACK storage refusal combined with partitioned restart; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-write-enospc",
       "driver": "rotation_fixture.py",
-      "scope": "Native ACK storage refusal and original-database recovery",
+      "scope": "Native ACK storage refusal and original-database recovery; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-ack-partition-write-enospc",
       "driver": "rotation_fixture.py",
-      "scope": "ACK storage refusal combined with partitioned restart",
+      "scope": "ACK storage refusal combined with partitioned restart; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "cpp-bootstrap",

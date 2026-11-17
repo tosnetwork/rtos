@@ -101,11 +101,7 @@ ROTATIONS = (
     | {"restart-member2", "restart-member5", "propagation-receiver", "publication-io"}
     | set(PACKETS)
     | set(RESTARTS)
-    | set(ACKS)
-    | set(ACK_PARTITIONS)
-    | set(INTENTS)
-    | set(RETENTIONS)
-    | EXPIRIES
+    | {"signer-expiry"}
     | set(FIRST_INTENTS)
 )
 
