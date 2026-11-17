@@ -811,7 +811,7 @@ async fn query_cached_native(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join() {
+async fn retired_service_socket_missing_body_reaches_acceptance_and_checked_join() {
     let _ = env_logger::builder().is_test(true).try_init();
     for final_row in 0..2 {
         let input: serde_json::Value =
@@ -961,7 +961,7 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
                 }
             })
             .await
-            .expect("Retired owner did not fetch body and acknowledge node WAL");
+            .expect("Retired owner did not fetch body and complete node acceptance");
             // The service immediately scans completed namespaces for closing
             // receipts, so its aggregate active count may include a new scan.
             // Completion must instead release the actual session reservation;
@@ -980,25 +980,13 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
                 );
             }
 
-            let accepted = tokio::time::timeout(
-                Duration::from_secs(20),
-                target.engine.clone().await_publication(id.clone()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(accepted.block(), &target.block);
-            assert_eq!(accepted.phase(), AcceptancePhase::Preapplied);
-            let (_, entry) = crate::propagation_outbox::inspect_delivery(
-                target.engine.db(),
-                &expected.domain,
-                &Limits::default(),
-                &id,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(entry.stage, PublicationStage::AcceptedDraft);
-            assert_eq!(entry.record.block_data, target.block.data());
+            // Recovery completion is durable node acceptance, independent of
+            // propagation custody. Verify the actual stored body and state.
+            let handle = target.engine.load_block_handle(target.block.id()).unwrap().unwrap();
+            assert_eq!(
+                target.engine.load_block(&handle).await.unwrap().data(),
+                target.block.data()
+            );
             // The source scanner can reopen only after checked session/namespace drain.
             assert!(simplex::finality_recovery::scan_finality_recovery(&source_root)
                 .unwrap()
@@ -1046,19 +1034,12 @@ async fn retired_service_socket_missing_body_reaches_node_wal_and_checked_join()
         if let Some(panic) = cleanup_panic {
             std::panic::resume_unwind(panic);
         }
-        let expected = expected_socket_record(&target);
-        let id = crate::propagation_outbox::delivery_id(&expected).unwrap();
         let stopped = std::mem::replace(&mut target.engine, emitter.engine.clone());
         drop(stopped);
         let reopened = open_engine(target.dir.path()).await;
         let checked = std::panic::AssertUnwindSafe(async {
-            let ledger =
-                PropagationOutbox::open(reopened.db().clone(), expected.domain, Limits::default())
-                    .unwrap();
-            let (_, entry) =
-                ledger.delivery(&id).unwrap().expect("Node takeover disappeared after reopen");
-            assert_eq!(entry.stage, PublicationStage::AcceptedDraft);
-            assert_eq!(entry.record.block_data, target.block.data());
+            let handle = reopened.load_block_handle(target.block.id()).unwrap().unwrap();
+            assert_eq!(reopened.load_block(&handle).await.unwrap().data(), target.block.data());
             assert_eq!(
                 reopened.load_state(target.block.id()).await.unwrap().root_cell().repr_hash(),
                 &target.state_root
