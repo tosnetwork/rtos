@@ -411,14 +411,16 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
             }
             ensure!(matched.len() == 1, "exactly one target certificate per source required");
             let (_, verified) = context.verify_network(&matched[0])?.into_final()?;
-            let validator_ids: Vec<_> = matched[0]
-                .to_lite()?
+            let carrier = matched[0].to_lite()?;
+            let candidate_hash = UInt256::calc_file_hash(&carrier.candidate);
+            let validator_ids: Vec<_> = carrier
                 .signatures
                 .iter()
                 .map(|pair| base64_encode(pair.validator_id.as_slice()))
                 .collect();
             certificates.push(json!({"source":source["name"], "validator_ids":validator_ids, "verified_weight":verified.weight(),
                 "session_id":base64_encode(verified.session_id().as_slice()), "slot":verified.slot(),
+                "candidate_hash":candidate_hash.to_hex_string(),
                 "final_certificate_checked":true}));
         }
     }
