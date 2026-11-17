@@ -12861,7 +12861,7 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     assert!(callbacks.source_namespace_drained());
     assert!(old_handle.source_namespace_drained());
     let recoverable = crate::finality_delivery::scan_pending_finality(temp.path()).unwrap();
-    assert_eq!(recoverable.len(), 1);
+    assert!(recoverable.is_empty(), "a bare live draft creates no persistent propagation debt");
     drop(recoverable);
     let next_worker = callbacks.delivery_lifetime();
     callbacks.initialize_delivery(runtime, std::path::Path::new(&namespace)).unwrap();
@@ -12869,7 +12869,7 @@ fn source_finality_main_worker_release_keeps_only_accepted_node_work_owned() {
     drop(next_worker);
     assert!(callbacks.source_namespace_drained());
     // Both old source/listener handles remain alive; neither retains the lock.
-    assert_eq!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().len(), 1);
+    assert!(crate::finality_delivery::scan_pending_finality(temp.path()).unwrap().is_empty());
     drop(old_handle);
 }
 
@@ -13246,7 +13246,9 @@ fn source_finality_empty_trigger_cold_retry_case(
             }
         }
         let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+            serde_json::from_slice(&crate::finality_recovery::accepted_outputs_for_test(&map))
+                .unwrap();
+        assert!(!map.exists(), "accepted outputs must not accumulate");
         let outputs = value["outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["block_id"], chain[0].1.block_id.to_string());
@@ -13274,9 +13276,14 @@ fn source_finality_empty_trigger_cold_retry_case(
                 break;
             }
         }
-        assert!(map.exists(), "current source still needs its own node handoff before closure");
+        assert!(
+            processor.consensus.finalized_pending_body_is_empty(),
+            "actual node acceptance finishes this source"
+        );
         let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+            serde_json::from_slice(&crate::finality_recovery::accepted_outputs_for_test(&map))
+                .unwrap();
+        assert!(!map.exists(), "accepted outputs must not accumulate");
         assert_eq!(value["outputs"].as_array().unwrap().len(), 1);
         drop(processor);
         db.close(None).unwrap();
@@ -13305,12 +13312,12 @@ fn source_finality_empty_trigger_cold_retry_case(
                 done(Ok(UInt256::from([0x28; 32])));
             }
             processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
-            if map.exists() && completed_path.exists() {
+            if map.exists() && pending_path.exists() {
                 break;
             }
         }
         assert_eq!(warm_handoffs, 2, "both original roles must cross the warm node sink");
-        assert!(pending_path.exists() && completed_path.exists());
+        assert!(pending_path.exists() && !completed_path.exists());
         assert!(processor.consensus.is_finalized_block(&chain[0].0));
         let mut bytes = std::fs::read(&map).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -13354,7 +13361,6 @@ fn source_finality_empty_trigger_cold_retry_case(
     db.close(None).unwrap();
     drop(db);
     let sink = Arc::new(HeldSink::default());
-    *sink.1.lock().unwrap() = Some(Vec::new());
     let (db, mut processor) = make_processor(sink.clone());
     if presealed_cold_plan {
         processor.consensus.insert_finalized_block(chain[0].0.clone());
@@ -13395,7 +13401,7 @@ fn source_finality_empty_trigger_cold_retry_case(
             "a declared role cannot manufacture a node handoff"
         );
         assert!(
-            sink.1.lock().unwrap().as_ref().unwrap().is_empty(),
+            sink.0.lock().unwrap().is_empty(),
             "a declared role cannot seed this boot's node acceptance"
         );
         assert!(pending_path.exists(), "inconsistent original debt must remain pending");
@@ -13505,39 +13511,20 @@ fn source_finality_empty_trigger_cold_retry_case(
                 );
             }
         }
-        for (draft, done) in std::mem::take(&mut *sink.0.lock().unwrap()) {
-            if matches!(draft.finality, consensus_common::SessionFinality::Carrier(_)) {
-                assert!(parent_accepted, "child final cannot precede parent node acceptance");
-                let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
-                    proof,
-                )) = &draft.finality
-                else {
-                    unreachable!()
-                };
-                final_slots.insert(proof.slot);
-            }
-            done(Ok(UInt256::from([2; 32])));
-        }
-        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
-        let acceptance = std::mem::take(sink.1.lock().unwrap().as_mut().unwrap());
-        for (request, done) in acceptance {
-            for _ in 0..3 {
-                processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
-            }
-            if request.block_id == chain[0].1.block_id {
-                assert!(
-                    !parent_accepted,
-                    "replayed children must join one fresh accepted ancestor approval"
-                );
+        let pending_acceptances = std::mem::take(&mut *sink.0.lock().unwrap());
+        for (draft, done) in pending_acceptances {
+            if draft.block_id == chain[0].1.block_id {
+                assert!(!parent_accepted, "children must join one fresh parent acceptance");
+                for _ in 0..3 {
+                    processor
+                        .with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+                }
                 assert!(
                     sink.0.lock().unwrap().is_empty(),
-                    "WAL custody does not release the WC child"
+                    "pending acceptance cannot release a WC child"
                 );
                 if !presealed_cold_plan {
-                    assert!(
-                        !processor.consensus.is_finalized_block(&chain[0].0),
-                        "WAL custody cannot materialize the parent before node acceptance"
-                    );
+                    assert!(!processor.consensus.is_finalized_block(&chain[0].0));
                 }
                 if !rejected_parent_acceptance {
                     done(Err(rtos_block::error!("injected parent node acceptance failure")));
@@ -13545,8 +13532,7 @@ fn source_finality_empty_trigger_cold_retry_case(
                         for id in [&trigger, &chain[4].0] {
                             assert_eq!(
                                 processor.consensus.continuation_cursor_for_test(id),
-                                Some(0),
-                                "failed node acceptance must preserve the exact waiting position"
+                                Some(0)
                             );
                         }
                     }
@@ -13556,20 +13542,26 @@ fn source_finality_empty_trigger_cold_retry_case(
                 }
                 parent_accepted = true;
             }
-            done(Ok(()));
+            if let consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                proof,
+            )) = &draft.finality
+            {
+                assert!(parent_accepted, "child final cannot precede parent node acceptance");
+                final_slots.insert(proof.slot);
+            }
+            done(Ok(UInt256::from([2; 32])));
         }
-        if map.exists()
-            && second_map.as_ref().is_none_or(|p| p.exists())
-            && (!presealed_cold_plan || !pending_path.exists())
-        {
+        processor.with_consensus_backend(|c, b| c.retry_pending_recursive_finalization(b));
+        if processor.consensus.finalized_pending_body_is_empty() {
             break;
         }
     }
     assert!(parent_accepted, "presealed obligations still require this boot's node acceptance");
+    let completed_outputs = crate::finality_recovery::accepted_outputs_for_test(&map);
+    assert!(!map.exists() && !pending_path.exists(), "accepted source metadata must be removed");
     if let Some(original) = presealed_bytes {
         assert_eq!(
-            std::fs::read(&map).unwrap(),
-            original,
+            completed_outputs, original,
             "cold replay must preserve the exact original full output set"
         );
         assert!(!pending_path.exists(), "normal replay must finish the original intent");
@@ -13577,8 +13569,8 @@ fn source_finality_empty_trigger_cold_retry_case(
     if reuse_materialized_plan {
         assert!(ancestor_body_evicted, "regression must remove the already accepted ancestor body");
         assert!(
-            map.exists(),
-            "accepted ancestor reuse must finish the retained source with its complete output set"
+            !map.exists(),
+            "accepted ancestor reuse must finish and release the source output set"
         );
     }
     if prune_after_acceptance {
@@ -13593,7 +13585,7 @@ fn source_finality_empty_trigger_cold_retry_case(
             "unreferenced old receipts must be reclaimed after source completion"
         );
     }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&completed_outputs).unwrap();
     assert_eq!(
         processor.callbacks.finality_retention_attempts(),
         if shared_approvals { 2 } else { 1 },
@@ -13611,9 +13603,11 @@ fn source_finality_empty_trigger_cold_retry_case(
     }
     assert_eq!(value["released"], false, "sealed handoff is not Delivered confirmation");
     if let Some(second_map) = second_map {
-        assert!(second_map.exists(), "both original triggers must seal their complete output sets");
-        let second: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(second_map).unwrap()).unwrap();
+        assert!(!second_map.exists(), "both accepted triggers must release their output sets");
+        let second: serde_json::Value = serde_json::from_slice(
+            &crate::finality_recovery::accepted_outputs_for_test(&second_map),
+        )
+        .unwrap();
         let second_outputs = second["outputs"].as_array().unwrap();
         assert_eq!(
             second_outputs.len(),

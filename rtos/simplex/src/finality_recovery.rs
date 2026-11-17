@@ -428,6 +428,20 @@ pub(crate) struct FinalityIntentStore {
     #[cfg(test)]
     fail_resolve_once: std::sync::atomic::AtomicBool,
 }
+#[cfg(test)]
+std::thread_local! {
+    static ACCEPTED_OUTPUTS: std::cell::RefCell<std::collections::HashMap<PathBuf, Vec<u8>>> = Default::default();
+}
+#[cfg(test)]
+pub(crate) fn accepted_outputs_for_test(path: &std::path::Path) -> Vec<u8> {
+    ACCEPTED_OUTPUTS.with(|values| {
+        values
+            .borrow_mut()
+            .remove(path)
+            .expect("actual output set observed before accepted intent removal")
+    })
+}
+
 impl FinalityIntentStore {
     pub(crate) fn new(namespace: &std::path::Path) -> Self {
         Self {
@@ -887,6 +901,60 @@ impl FinalityIntentStore {
         File::open(&directory)?.sync_all()?;
         Ok(())
     }
+    /// Called only after every output of this trigger completed actual node
+    /// acceptance. No propagation receipt or completed-history quota is involved.
+    pub(crate) fn resolve_accepted(&self, id: &crate::block::RawCandidateId) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        self.invalidate_legacy_output_count();
+        let directory = self.namespace.join(DIRECTORY);
+        let pending =
+            directory.join(format!("{}-{}.json", id.slot.value(), id.hash.to_hex_string()));
+        let was_pending = pending.exists()
+            || self
+                .unresolved
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|paths| paths.contains(&pending));
+        let remove = |path: &std::path::Path| -> Result<()> {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        };
+        // Delete the derived output map first. A crash before intent removal
+        // leaves the authenticated certificate available to reconstruct it.
+        let outputs = self.output_path(id);
+        #[cfg(test)]
+        if self.fail_resolve_once.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            fail!("Injected accepted intent resolution failure before removal");
+        }
+        #[cfg(test)]
+        if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
+            std::process::exit(78);
+        }
+        #[cfg(test)]
+        if outputs.exists() {
+            ACCEPTED_OUTPUTS.with(|values| {
+                values.borrow_mut().insert(outputs.clone(), std::fs::read(&outputs).unwrap());
+            });
+        }
+        remove(&outputs)?;
+        if outputs.parent().unwrap().exists() {
+            File::open(outputs.parent().unwrap())?.sync_all()?;
+        }
+        remove(&pending)?;
+        File::open(&directory)?.sync_all()?;
+        if let Some(paths) = self.unresolved.lock().unwrap().as_mut() {
+            paths.remove(&pending);
+        }
+        if was_pending {
+            self.resolved_intents.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve(&self, id: &crate::block::RawCandidateId) -> Result<()> {
         let _guard = self.mutation.lock().unwrap();
         self.invalidate_legacy_output_count();
@@ -1253,7 +1321,7 @@ mod tests {
         assert_eq!(original_paths.len(), 1);
         let original_bytes = std::fs::read(&original_paths[0]).unwrap();
         let temporary = store.completed_path(&original_paths[0]).with_extension("tmp");
-        assert_eq!(temporary.exists(), completion_interrupted);
+        assert!(!temporary.exists(), "acceptance completion creates no retained-history copy");
         store.prepare(true).unwrap();
         assert!(!temporary.exists());
         assert_eq!(std::fs::read(&original_paths[0]).unwrap(), original_bytes);

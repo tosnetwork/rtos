@@ -331,20 +331,18 @@ impl SessionCallbacks {
             .unwrap()
             .clone()
             .ok_or_else(|| rtos_block::error!("Source delivery not initialized"))?;
-        if source.consumed(&draft)? {
-            return Ok(true);
+        if !source.poll_acceptance(draft.clone())? {
+            return Ok(false);
         }
-        if let Some((id, draft)) = source.poll(draft)? {
+        if source.take_acceptance_notification(&draft)? {
             let listener = self.listener.clone();
             self.invoke(move || {
                 if let Some(listener) = listener.upgrade() {
-                    listener.on_durable_block_finalized(id, draft);
+                    listener.on_accepted_block_finalized(draft);
                 }
             });
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        Ok(true)
     }
 
     /// Clone this callbacks aspect with a different session listener.

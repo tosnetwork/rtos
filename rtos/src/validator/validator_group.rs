@@ -3434,6 +3434,69 @@ impl ValidatorGroup {
     #[allow(clippy::too_many_arguments)]
     /// Observe a node-owned durable handoff. The public ID is only a lookup key;
     /// acceptance and session identity come from the node's authenticated result.
+    /// Observe the node-owned acceptance completion, independently of broadcast.
+    pub async fn on_accepted_block_finalized(
+        &self,
+        draft: consensus_common::finality_delivery::FinalizedDeliveryDraft,
+    ) {
+        let verify = || -> Result<bool> {
+            let runtime = self
+                .authenticated_runtime
+                .as_ref()
+                .ok_or_else(|| error!("Acceptance notification without runtime"))?;
+            if draft.block_id.shard() != runtime.shard() {
+                fail!("Acceptance notification belongs to another shard");
+            }
+            let verifier = runtime
+                .pq_context()
+                .ok_or_else(|| error!("Acceptance notification without PQ context"))?
+                .for_block(draft.block_id.clone())?;
+            match &draft.finality {
+                consensus_common::SessionFinality::Carrier(BlockSignaturesVariant::SimplexPq(
+                    carrier,
+                )) => {
+                    verifier.verify_final(carrier)?;
+                    let handle = self
+                        .engine
+                        .load_block_handle(&draft.block_id)?
+                        .ok_or_else(|| error!("Accepted block handle missing"))?;
+                    if !handle.has_data()
+                        || !handle.has_state()
+                        || (draft.block_id.shard().is_masterchain()
+                            && (!handle.is_applied() || !handle.has_proof()))
+                        || (!draft.block_id.shard().is_masterchain() && !handle.has_proof_link())
+                    {
+                        fail!("Accepted block persistence prerequisites missing");
+                    }
+                    Ok(true)
+                }
+                consensus_common::SessionFinality::PqApproval(approval) => {
+                    verifier.verify_approval(approval)?;
+                    Ok(false)
+                }
+                _ => fail!("Acceptance notification requires PQ finality"),
+            }
+        };
+        match verify() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                log::error!("Rejected acceptance notification: {error}");
+                return;
+            }
+        }
+        self.state_resolver_cache.lock().await.prune_finalized(&draft.block_id);
+        let (seqno, block) = self
+            .group_impl
+            .execute_sync(|group| {
+                sync_last_accepted_mc_head_from_block(group, &draft.block_id);
+                (group.last_accepted_mc_seqno, group.last_accepted_mc_block_id.clone())
+            })
+            .await;
+        self.accepted_mc_seqno_tx.send_replace(seqno);
+        self.accepted_mc_block_tx.send_replace(block);
+    }
+
     pub async fn on_durable_block_finalized(
         &self,
         delivery_id: UInt256,

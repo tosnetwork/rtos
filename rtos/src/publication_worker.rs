@@ -211,6 +211,13 @@ enum Submission {
     RetryBackground {
         response: oneshot::Sender<Result<()>>,
     },
+    LiveAcceptance {
+        record: PublicationRecord,
+        last_mc: u32,
+        candidate_already_sent: bool,
+        origin: RecoveryOrigin,
+        completion: ClosingCompletion<()>,
+    },
     Acceptance {
         request: CanonicalFinalityRequest,
         runtime: Arc<AuthenticatedSessionRuntime>,
@@ -331,7 +338,7 @@ impl Submission {
             Self::SourceDelivered { completion, .. } => {
                 completion.finish(Err(error!("Publication closing shutdown")))
             }
-            Self::Acceptance { completion, .. } => {
+            Self::LiveAcceptance { completion, .. } | Self::Acceptance { completion, .. } => {
                 completion.finish(Err(error!("Publication acceptance shutdown")))
             }
             Self::Canonical { completion, .. } => {
@@ -373,6 +380,9 @@ impl Submission {
             Self::Canonical { runtime, completion, .. } => {
                 hold(&mut completion.0, outstanding.begin(runtime.session_id())?)
             }
+            Self::LiveAcceptance { record, completion, .. } => {
+                hold(&mut completion.0, outstanding.begin(&record.session_id)?)
+            }
             Self::Draft { record, completion, .. } => {
                 hold(&mut completion.0, outstanding.begin(&record.session_id)?)
             }
@@ -403,7 +413,8 @@ impl Submission {
             Self::Draft { mut completion, .. } => {
                 completion.0.take();
             }
-            Self::Acceptance { mut completion, .. } => {
+            Self::LiveAcceptance { mut completion, .. }
+            | Self::Acceptance { mut completion, .. } => {
                 completion.0.take();
             }
             Self::Canonical { mut completion, .. } => {
@@ -419,6 +430,29 @@ struct SessionSink {
     historical: bool,
 }
 impl DurableFinalitySink for SessionSink {
+    fn accept_draft(
+        &self,
+        draft: FinalizedDeliveryDraft,
+        completion: Box<dyn FnOnce(Result<()>) + Send>,
+    ) -> Result<()> {
+        let record = live_record(&self.runtime, &draft, &self.worker.state.limits)?;
+        self.worker.admit_draft(Submission::LiveAcceptance {
+            record,
+            last_mc: draft.last_mc_finalized_seqno,
+            candidate_already_sent: draft.candidate_already_sent,
+            origin: RecoveryOrigin {
+                carrier_version: self.runtime.carrier_version(),
+                local_adnl: UInt256::from(*self.runtime.local_adnl().data()),
+                source_validator: UInt256::from(*draft.source_info.source.id().data()),
+                local_validator_index: match self.runtime.local_role() {
+                    LocalRole::Validator(index) => Some(index),
+                    LocalRole::Observer => None,
+                },
+            },
+            completion: ClosingCompletion(Some(completion)),
+        })
+    }
+
     fn await_accepted(
         &self,
         request: CanonicalFinalityRequest,
@@ -628,6 +662,7 @@ struct State {
     activity: Mutex<WorkerActivity>,
     engine: Weak<Engine>,
     io: Arc<OwnedTasks>,
+    live_propagation: Arc<tokio::sync::Semaphore>,
     enabled: AtomicBool,
     fatal: AtomicBool,
     stop: CancellationToken,
@@ -670,6 +705,7 @@ impl PublicationWorker {
             activity: Mutex::new(WorkerActivity::default()),
             engine: Arc::downgrade(engine),
             io: Arc::new(OwnedTasks::default()),
+            live_propagation: Arc::new(tokio::sync::Semaphore::new(QUEUE_CAPACITY)),
             enabled: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             stop: CancellationToken::new(),
@@ -1096,6 +1132,7 @@ impl State {
         let phase = match &command {
             #[cfg(test)]
             Submission::RetryBackground { .. } => "test_retry_background",
+            Submission::LiveAcceptance { .. } => "accept_live_draft",
             Submission::Acceptance { .. } => "accept_request",
             Submission::HistoryDebt { .. } => "history_debt",
             Submission::Terminal { .. } => "terminal_lookup",
@@ -1126,6 +1163,69 @@ impl State {
             }
             Submission::SourceDelivered { confirmation, runtime, completion } => {
                 completion.finish(self.confirm_delivered(store, &runtime, confirmation).await);
+            }
+            Submission::LiveAcceptance {
+                record,
+                origin,
+                completion,
+                last_mc,
+                candidate_already_sent,
+            } => {
+                let protocol = record.protocol;
+                let locally_generated = record.locally_generated;
+                let result = async {
+                    let engine =
+                        self.engine.upgrade().ok_or_else(|| error!("Engine unavailable"))?;
+                    // A transient envelope for the shared authenticator, never
+                    // inserted into the ledger or returned as a queue receipt.
+                    let probe = UnverifiedRecord {
+                        id: RecordId(1),
+                        stage: PublicationStage::DraftDurable,
+                        record: Arc::new(record),
+                        pending: Vec::new(),
+                    };
+                    let publication = tokio::time::timeout(
+                        HISTORY_TIMEOUT,
+                        authenticate_publication(
+                            &engine.masterchain_proof_verifier,
+                            engine.as_ref(),
+                            probe,
+                            &self.limits,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| error!("Live acceptance history timeout"))??;
+                    let claims = historical_origin(&publication, &origin)?;
+                    validate_creator_claim(&publication, &claims)?;
+                    let activity = self.activity_scope("accept_live_block", None);
+                    // A live draft cannot reuse outbox-ID-based verification.
+                    let (_, accepted) = self
+                        .persist_accepted_publication(store, engine, publication, true, &activity)
+                        .await?;
+                    Ok(accepted)
+                }
+                .await;
+                match result {
+                    Ok(accepted) => {
+                        let mut plan = PropagationPlan::for_event(
+                            protocol,
+                            PropagationEvent::Finalized,
+                            accepted.block().id(),
+                            true,
+                            locally_generated,
+                            last_mc,
+                            candidate_already_sent,
+                        );
+                        if !accepted.is_final() {
+                            plan.block_targets = crate::validator::propagation::TargetSet::NONE;
+                            plan.finality_targets = crate::validator::propagation::TargetSet::NONE;
+                            plan.send_shard_description = false;
+                        }
+                        self.propagate_live(accepted, plan);
+                        completion.finish(Ok(()));
+                    }
+                    Err(error) => completion.finish(Err(error)),
+                }
             }
             Submission::Acceptance { request, runtime, queued_at, completion } => {
                 let started = std::time::Instant::now();
@@ -1267,6 +1367,46 @@ impl State {
             command_started.elapsed().as_millis()
         );
     }
+    /// C++ broadcasts are asynchronous attempts, not prerequisites for accepting
+    /// subsequent blocks. Keep at most one bounded set of owned send attempts;
+    /// overload and transport failures remain observable without inventing Sent.
+    fn propagate_live(&self, accepted: AcceptedSessionBlock, plan: PropagationPlan) {
+        if !self.enabled.load(Ordering::Acquire) || self.stop.is_cancelled() {
+            metrics::counter!("rtos_live_propagation_disabled_total").increment(1);
+            return;
+        }
+        let Ok(permit) = self.live_propagation.clone().try_acquire_owned() else {
+            metrics::counter!("rtos_live_propagation_overload_total").increment(1);
+            log::warn!("Live propagation attempt skipped at capacity: {}", accepted.block().id());
+            return;
+        };
+        let engine = self.engine.clone();
+        let stop = self.stop.clone();
+        if let Err(error) = self.io.spawn("live accepted block propagation", async move {
+            let _permit = permit;
+            let Some(engine) = engine.upgrade() else { return };
+            tokio::select! {
+                _ = stop.cancelled() => {},
+                result = tokio::time::timeout(SEND_TIMEOUT, engine.propagate_accepted_session_block(&accepted, &plan)) => {
+                    match result {
+                        Ok(outcome) => {
+                            for receipt in outcome.receipts {
+                                if !matches!(receipt.status, PropagationStatus::Sent) {
+                                    log::debug!("Live propagation {} {:?}/{:?}: {:?}", accepted.block().id(), receipt.kind, receipt.target, receipt.status);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            metrics::counter!("rtos_live_propagation_timeout_total").increment(1);
+                        }
+                    }
+                }
+            }
+        }) {
+            log::warn!("Live propagation owner refused attempt: {error}");
+        }
+    }
+
     async fn submit_legacy(&self, store: &Arc<PropagationOutbox>, command: LegacySubmission) {
         let result = async {
             if self.fatal.load(Ordering::Acquire) || self.stop.is_cancelled() {
@@ -1438,16 +1578,42 @@ impl State {
             trace_phase("cached_receipt");
             return Ok(receipt);
         }
+        let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
+        let (entry, accepted) = self
+            .persist_accepted_publication(store, engine, publication, needs_verification, &activity)
+            .await?;
+        trace_phase("durability_done");
+        // Queue bookkeeping follows actual acceptance. Keep it here so callers
+        // accepting a live draft can use the same durability barrier without
+        // acquiring a propagation queue record first.
+        self.write(store, move |store| store.mark_accepted(id)).await?;
+        trace_phase("wal_done");
+        self.acceptance_verified.lock().unwrap().insert(id.0);
+        self.accepted_receipts.lock().unwrap().insert(entry.id, record, &accepted, &self.limits);
+        Ok(accepted)
+    }
+
+    /// Persist an authenticated block, proof and state without changing outbox
+    /// stages or manufacturing a delivery receipt. The store is used only by
+    /// fault-injection diagnostics; ordinary acceptance does not write its WAL.
+    async fn persist_accepted_publication(
+        &self,
+        store: &Arc<PropagationOutbox>,
+        engine: Arc<Engine>,
+        publication: crate::propagation_outbox_auth::AuthenticatedPublication,
+        needs_verification: bool,
+        activity: &ActivityScope<'_>,
+    ) -> Result<(UnverifiedRecord, AcceptedSessionBlock)> {
+        // A live draft has no queue ID whose process-local verification could
+        // be reused. Such callers must always request the durability barrier.
+        #[cfg(not(all(target_os = "linux", feature = "isolated-consensus-signing")))]
+        let _ = store;
         activity.phase("accept_block");
-        trace_phase("block_begin");
         // Deliberately not cancelable: this phase can write state/proof data.
         #[cfg(test)]
         self.actual_acceptance_runs.fetch_add(1, Ordering::Relaxed);
         let (entry, accepted) =
             accept_authenticated_publication(publication, engine.clone()).await?;
-        trace_phase("block_done");
-        let id = entry.id;
-        let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         if needs_verification {
             activity.phase("accept_durability");
             let durability = engine.clone().ensure_publication_acceptance_durable(&accepted);
@@ -1486,12 +1652,7 @@ impl State {
                     .await?;
             }
         }
-        trace_phase("durability_done");
-        self.write(store, move |store| store.mark_accepted(id)).await?;
-        trace_phase("wal_done");
-        self.acceptance_verified.lock().unwrap().insert(id.0);
-        self.accepted_receipts.lock().unwrap().insert(id, record, &accepted, &self.limits);
-        Ok(accepted)
+        Ok((entry, accepted))
     }
     async fn routing_ready(
         &self,
@@ -2232,6 +2393,7 @@ mod tests {
             activity: Mutex::new(WorkerActivity::default()),
             engine: Weak::new(),
             io: Arc::new(OwnedTasks::default()),
+            live_propagation: Arc::new(tokio::sync::Semaphore::new(QUEUE_CAPACITY)),
             enabled: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             stop: CancellationToken::new(),
