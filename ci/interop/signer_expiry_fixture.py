@@ -43,11 +43,18 @@ def expiry_plan(profile, args):
             and not args.source_ack_partition_restart
             and args.source_ack_fault is None
         )
+        cleanup_case = (
+            getattr(args, "unsigned_original_recovery", False)
+            and bool(getattr(args, "intent_cleanup_library", None))
+            and getattr(args, "partition_restart", False)
+            and not args.source_ack_partition_restart
+            and args.source_ack_fault is None
+        )
         if (
             member != 5
             or args.interrupt_rust_member != 5
             or args.recovery_below_quorum
-            or not (ack_case or node_io_case)
+            or not (ack_case or node_io_case or cleanup_case)
         ):
             raise ValueError(
                 "Expired member restart requires member5 explicit ACK or node-body IO/partition restart with surviving quorum"
@@ -182,6 +189,10 @@ class SignerExpiry:
             "log_offset": self.offset,
         }
         self.save()
+        if getattr(args, "unsigned_original_recovery", False):
+            (root / "intent-cleanup/selector").write_text(
+                f"{self.pid}\n{runtime.parent / 'finality-intents/outputs-v1'}\n"
+            )
 
     def alive(self):
         if (
@@ -211,6 +222,18 @@ class SignerExpiry:
     ):
         while True:
             self.alive()
+            if getattr(self.args, "unsigned_original_recovery", False):
+                captured = self.root / "intent-cleanup/captured"
+                if (
+                    captured.exists()
+                    and "cleanup_capture_observed_at_unix" not in self.receipt
+                ):
+                    observed = time.time()
+                    self.receipt["cleanup_capture_observed_at_unix"] = observed
+                    self.receipt["cleanup_capture_before_expiry"] = (
+                        observed < self.plan["expire_at"]
+                    )
+                    self.save()
             with self.log.open("rb") as stream:
                 stream.seek(self.offset)
                 text = stream.read().decode(errors="replace")
@@ -338,14 +361,34 @@ class SignerExpiry:
                 raise TimeoutError(
                     "Expired restart exceeded the original recovery deadline"
                 )
-            if any(digest(Path(p)) != h for p, h in self.bindings.items()):
-                raise RuntimeError("Expired restart changed signing authority")
+            unsigned = getattr(self.args, "unsigned_original_recovery", False)
+            expected = dict(self.bindings)
+            if unsigned:
+                configuration = recovered.get("unsigned_configuration", {})
+                if not recovered.get("original_obligations_authenticated_and_cleaned"):
+                    raise RuntimeError(
+                        "Unsigned restart lacks authenticated original obligations"
+                    )
+                config_path = str(self.node["directory"] / "config.json")
+                if config_path not in expected or not configuration.get(
+                    "signing_configuration_removed"
+                ):
+                    raise RuntimeError(
+                        "Unsigned restart lacks the original configuration binding"
+                    )
+                expected[config_path] = configuration["after_sha256"]
+            if any(digest(Path(p)) != h for p, h in expected.items()):
+                raise RuntimeError(
+                    "Expired restart changed signing authority outside the explicit configuration conversion"
+                )
             self.receipt.update(
                 phase="expired_member_restarted_without_signing",
                 new_pid=process.pid,
                 new_start_ticks=ticks,
                 last_checkpoint=recovered["last_checkpoint"],
-                authority_unchanged=True,
+                authority_unchanged=not unsigned,
+                explicit_unsigned_configuration=unsigned,
+                key_files_unchanged=True,
                 old_process_replaced=True,
                 full_node_observation=recovered["expired_full_node"],
             )
