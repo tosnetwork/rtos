@@ -2192,6 +2192,7 @@ def main():
         "recovery_quorum_fixture.py",
         "signer_expiry_fixture.py",
         "custody_expiry_authority.py",
+        "runtime_manifest_observer.py",
         "expired_member_restart_fixture.py",
     ]:
         path = driver.with_name(name)
