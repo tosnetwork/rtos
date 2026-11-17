@@ -5,12 +5,35 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+from bootstrap_control import network_factory
+from cpp_baseline import ACTIVE_CPP_REVISION, DEFAULT_AUTH_NETWORK_TAG
 from mixed_matrix import digest
 from scenario_bootstrap import bootstrap_commands, check_bootstrap_result
 from scenarios import CATALOG, order, validate
 
 
 class BootstrapAdapterTests(unittest.TestCase):
+    def test_native_control_receives_explicit_auth_tag_before_genesis(self):
+        network = SimpleNamespace(config=SimpleNamespace(auth_network_tag=None))
+        received = []
+
+        def constructor(*args, **kwargs):
+            received.append((args, kwargs))
+            return network
+
+        create = network_factory(
+            constructor,
+            {
+                "cpp_revision": ACTIVE_CPP_REVISION,
+                "auth_network_tag": DEFAULT_AUTH_NETWORK_TAG,
+            },
+        )
+        self.assertIs(create("install", base_port=59800), network)
+        self.assertEqual(
+            network.config.auth_network_tag, bytes.fromhex(DEFAULT_AUTH_NETWORK_TAG)
+        )
+        self.assertEqual(received, [(("install",), {"base_port": 59800})])
+
     def test_native_control_precedes_both_mixed_modes(self):
         entries = validate(json.loads(CATALOG.read_text()), CATALOG.parent)
         self.assertEqual(
