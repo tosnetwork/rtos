@@ -580,3 +580,10 @@ accepts explicit WC inputs and retains its common original-DB/config/cleanup
 checks. The default driver still supplies only MC evidence; WC mode must supply
 bound captures, a historical checkpoint and the complete state-source mapping.
 Neither a planned request nor a standalone carrier proof qualifies recovery.
+
+`workchain_recovery_inputs.select_workchain_inputs` selects a checkpoint for the
+complete original frontier with an exact original-PID/session capture binding.
+It bounds checkpoint candidates and bytes, preserves the caller's deadline, and
+can require an original Approval obligation. Its exclusive selection receipt
+records provenance only; it does not grant native proof or recovery qualification.
+The default CLI/catalog is not enabled for WC by this helper alone.
