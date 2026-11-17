@@ -39,6 +39,55 @@ def weighted_receipt(weight=40, members=None):
 
 
 class ExecutionTest(unittest.TestCase):
+    def test_obsolete_custody_scenarios_refused_before_any_launch(self):
+        names = [
+            "source-ack-sync-eio",
+            "source-ack-write-enospc",
+            "source-ack-partition-sync-eio",
+            "source-ack-partition-write-enospc",
+            "source-ack-intent-before-write",
+            "source-ack-intent-after-partial-write",
+            "source-ack-intent-after-fsync",
+            "expired-member-restart",
+            "source-retention-before-write",
+            "source-retention-after-partial-write",
+            "source-retention-after-fsync",
+        ]
+        for name in names:
+            with (
+                self.subTest(name=name),
+                patch("scenario_execution.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "not integrated"):
+                    execute(SimpleNamespace(), ["rotation-control", name], None)
+                run.assert_not_called()
+
+    def test_direct_driver_rejects_inactive_custody_faults(self):
+        from rotation_fixture import reject_inactive_custody_faults
+
+        for option in (
+            "source_ack_fault",
+            "source_ack_partition_restart",
+            "source_ack_intent_stop",
+            "source_retention_cut_library",
+            "expired_member_restart",
+            "followup_intent_frontier",
+            "cold_bootstrap_body",
+        ):
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(SystemExit, "awaits acceptance-path adaptation"),
+            ):
+                reject_inactive_custody_faults(SimpleNamespace(**{option: True}))
+        reject_inactive_custody_faults(
+            SimpleNamespace(first_intent_cut_point="before-write")
+        )
+        reject_inactive_custody_faults(
+            SimpleNamespace(
+                signer_expiry=True, source_retention_cut_point="after-fsync"
+            )
+        )
+
     def test_unknown_adapter_refused_before_any_launch(self):
         with patch("scenario_execution.subprocess.run") as run:
             with self.assertRaisesRegex(ValueError, "not integrated"):

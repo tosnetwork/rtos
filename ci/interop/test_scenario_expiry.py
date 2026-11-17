@@ -365,19 +365,8 @@ class PassiveComponentTests(unittest.TestCase):
             check_result("expired-member-restart", result)
             with self.assertRaises(ValueError):
                 check_result("source-ack-partition-sync-eio", result)
-            profile = make_profile(
-                "expired-member-restart",
-                {
-                    "schema": 1,
-                    "cpp_revision": "ref",
-                    "global_version": 16,
-                    "consensus": {},
-                    "auth_network_tag": "tag",
-                },
-                1000,
-            )
-            self.assertEqual(profile["successor_members"], [0, 2, 4, 5])
-            self.assertNotIn("successor_weights", profile)
+            with self.assertRaisesRegex(ValueError, "no execution adapter"):
+                make_profile("expired-member-restart", {}, 1000)
             with self.assertRaises(ValueError):
                 check_ack_result("source-ack-sync-eio", source, recovery)
             for mutate in [

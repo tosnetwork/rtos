@@ -1853,6 +1853,23 @@ async def run(args, profile, root, artifacts):
                 raise RuntimeError("Owned Rust rotation nodes did not stop normally")
 
 
+def reject_inactive_custody_faults(args):
+    """Refuse obsolete fault boundaries before creating a network."""
+    for option in (
+        "source_ack_fault",
+        "source_ack_partition_restart",
+        "source_ack_intent_stop",
+        "source_retention_cut_library",
+        "expired_member_restart",
+        "followup_intent_frontier",
+        "cold_bootstrap_body",
+    ):
+        if getattr(args, option, None):
+            raise SystemExit(
+                "Recovery scenario awaits acceptance-path adaptation: " + option
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -2075,6 +2092,7 @@ def main():
         raise SystemExit("Recovery requires a live mixed rotation fixture")
     if not 0 < args.recovery_timeout <= 600:
         raise SystemExit("Recovery timeout must be positive and at most 600 seconds")
+    reject_inactive_custody_faults(args)
     args.verify_workchain = args.include_genesis_successor = True
     if args.rust_node:
         args.rust_node, args.validator_preparer = (
