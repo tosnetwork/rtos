@@ -573,5 +573,10 @@ list without dropping Approval entries; `verify_sealed_workchain_requests` then
 runs the existing native request verifier for every declared obligation and the
 exact Final trigger. The sealed digest binds intent metadata, not the output list:
 callers must first bind the original file bytes to the stopped node's capture.
-These helpers do not collect missing states or prove original-DB cleanup, and
-the MC-only recovery driver remains MC-only until that evidence is integrated.
+`workchain_original_evidence.verify_workchain_intent` constructs exact parent
+chains from captures, fetches fresh states from every declared source, and runs
+the native checker under the original deadline. `complete_unsigned_originals`
+accepts explicit WC inputs and retains its common original-DB/config/cleanup
+checks. The default driver still supplies only MC evidence; WC mode must supply
+bound captures, a historical checkpoint and the complete state-source mapping.
+Neither a planned request nor a standalone carrier proof qualifies recovery.

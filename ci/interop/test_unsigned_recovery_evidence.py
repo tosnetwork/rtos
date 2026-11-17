@@ -209,3 +209,41 @@ class UnsignedRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(result["original_sets_checked"], 1)
         self.assertTrue(result["original_pending_and_output_paths_absent"])
+
+    def test_wc_requires_explicit_inputs_and_keeps_common_cleanup_checks(self):
+        self.pending.records[0]["record"]["workchain"] = 0
+        with self.assertRaisesRegex(ValueError, "bound carrier"):
+            self.complete()
+        inputs = {
+            "captures": ["original"],
+            "checkpoint": "anchor",
+            "state_configs": "sources",
+        }
+        deadline = time.monotonic() + 10
+
+        async def verify(record, sealed, **kwargs):
+            self.assertEqual(kwargs["captures"], inputs["captures"])
+            self.assertEqual(kwargs["deadline"], deadline)
+            self.path.write_text("reappeared")
+            return ["verified"]
+
+        with (
+            patch("unsigned_recovery_evidence.verify_workchain_intent", verify),
+            patch("unsigned_recovery_evidence.verify_masterchain_intent") as mc,
+        ):
+            with self.assertRaisesRegex(ValueError, "reappeared"):
+                asyncio.run(
+                    complete_unsigned_originals(
+                        self.pending,
+                        self.state,
+                        deadline=deadline,
+                        workchain=inputs,
+                        snapshot="snapshot",
+                        checker="checker",
+                        directory=self.root / "wc-proofs",
+                    )
+                )
+            mc.assert_not_called()
+        self.assertFalse(
+            (self.root / "wc-proofs/original-obligations-checked.json").exists()
+        )
