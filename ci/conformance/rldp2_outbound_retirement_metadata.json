@@ -1,11 +1,11 @@
 {
-  "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+  "reference_commit": "ed8e0a80bdafede324d97b041fa4174e0a5dce33",
   "cases_sha256": "90d3cd8dcc4da3dfe7dba439871342a4e27e56f1765b81dda31cf3ab5e324c2b",
   "native_source": "/tos/worktrees/tos/rtos-conformance-latest-5af405d",
   "native_build": "/tos/build/rtos-conformance-latest-5af405d",
   "runner_source_sha256": "2855676a32f30eb9d308cff1af6b5a7f10b3dc985a8a31bacd9ca6447fb171a9",
   "probe_source_sha256": "7403c249d20fabcf77c7cb45c965afda626e8e5a1edd0f7f2f648abcd03684b6",
-  "probe_binary_sha256": "e53d2f8bc031d862c7115e4dad7cf0dacfdbb35759760d79cd18a2e0a7ed7993",
+  "probe_binary_sha256": "13048cd9d7fa49913a16c347bd86788073a06b3538db226c75a5d09ac0193c62",
   "exit": 0,
   "compile_command": [
     "/usr/bin/clang++-21",
