@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import struct
 import time
 from pathlib import Path
 
@@ -111,6 +112,55 @@ def bound_intents(namespace, record, selected):
     return {path: raw}
 
 
+def verify_body_artifact(path, selector, artifact):
+    """Verify actual selected body bytes even when the durability fd is a package."""
+    if artifact == "loose_block_body":
+        raw = path.read_bytes()
+        if sha(raw) != selector["block_sha256"]:
+            raise RuntimeError("Loose body differs from selected acceptance")
+        return {"kind": artifact, "bytes": len(raw), "sha256": sha(raw)}
+    if artifact != "archive_package":
+        raise RuntimeError("Unknown publication durability artifact")
+    match = re.fullmatch(
+        r"\((-?[0-9]+):([0-9a-f]{16}), ([0-9]+), rh ([0-9a-f]{64}), fh ([0-9a-f]{64})\)",
+        selector["block_id"],
+    )
+    if match is None:
+        raise RuntimeError("Invalid selected archive block identity")
+    wc, shard, seq, root, file_hash = match.groups()
+    expected = f"block_({wc},{shard},{seq}):{root.upper()}:{file_hash.upper()}".encode()
+    length = path.stat().st_size
+    with path.open("rb") as stream:
+        if stream.read(4) != struct.pack("<I", 0xAE8FDD01):
+            raise RuntimeError("Invalid archive package magic")
+        for _ in range(4096):
+            header = stream.read(8)
+            if len(header) != 8:
+                break
+            magic, name_size, data_size = struct.unpack("<HHI", header)
+            if magic != 0x1E8B or name_size > 4096:
+                raise RuntimeError("Invalid archive entry header")
+            name = stream.read(name_size)
+            offset = stream.tell()
+            if offset + data_size > length:
+                raise RuntimeError("Incomplete archive entry")
+            if name == expected:
+                if data_size > 16 << 20:
+                    raise RuntimeError("Selected archive body exceeds bound")
+                body = stream.read(data_size)
+                if sha(body) != selector["block_sha256"]:
+                    raise RuntimeError("Archive body differs from selected acceptance")
+                return {
+                    "kind": artifact,
+                    "entry": name.decode(),
+                    "offset": offset,
+                    "bytes": data_size,
+                    "sha256": sha(body),
+                }
+            stream.seek(data_size, 1)
+    raise RuntimeError("Selected body absent from bounded archive scan")
+
+
 class LivePublicationIoSource(SourceAckFailure):
     def __init__(self, args, root, node, checkpoint):
         directory = root / "publication-io-source"
@@ -212,14 +262,12 @@ class LivePublicationIoSource(SourceAckFailure):
             or target["selector_sha256"] != sha(selector_raw)
             or target["pid"] != self.node["process"].pid
             or target["publication"] != publication
-            or target["artifact"] != "loose_block_body"
             or path.is_symlink()
             or not path.resolve().is_relative_to(
                 (self.node["directory"] / "node_db").resolve()
             )
             or target["device"] != info.st_dev
             or target["inode"] != info.st_ino
-            or sha(path.read_bytes()) != self.selector["block_sha256"]
             or not re.fullmatch(expected, marker.decode())
             or failed["pid"] != target["pid"]
             or failed["publication"] != publication
@@ -235,9 +283,11 @@ class LivePublicationIoSource(SourceAckFailure):
             raise RuntimeError(
                 "Live EIO evidence does not match the selected real acceptance"
             )
+        body_witness = verify_body_artifact(path, self.selector, target["artifact"])
         self.check_source_snapshot()
         self.receipt.update(
             phase="native_node_body_sync_failure_observed",
+            body_artifact=body_witness,
             node_io_target=target,
             node_observed_error=failed,
             original_intents_preserved=True,

@@ -156,6 +156,7 @@ fn arm(
     selector_sha256: &str,
     proof_sha256: &str,
     publication: &PublicationContext,
+    artifact: &str,
     path: &Path,
 ) -> Result<()> {
     let path = path.canonicalize()?;
@@ -179,7 +180,7 @@ fn arm(
         selector: selector.clone(),
         proof_sha256: proof_sha256.to_owned(),
         publication: publication.clone(),
-        artifact: "loose_block_body".into(),
+        artifact: artifact.into(),
         pid,
         tid,
         device: info.dev(),
@@ -218,11 +219,26 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
     let proof_sha256 = digest(accepted.proof().data());
     let armed = AtomicBool::new(false);
     Ok(Some(Arc::new(move |point, path| {
-        if point == SyncPoint::File
-            && path.file_name().and_then(|part| part.to_str()) == Some(name.as_str())
-            && !armed.swap(true, Ordering::SeqCst)
-        {
-            arm(&control, &selector, &selector_sha256, &proof_sha256, &publication, path)?;
+        let artifact = if path.file_name().and_then(|part| part.to_str()) == Some(name.as_str()) {
+            Some("loose_block_body")
+        } else if path.extension().and_then(|part| part.to_str()) == Some("pack") {
+            // sync_block_artifacts supplies the exact package selected by this
+            // accepted block's handle. The driver independently parses the
+            // selected body entry after the real native failure stops the node.
+            Some("archive_package")
+        } else {
+            None
+        };
+        if point == SyncPoint::File && artifact.is_some() && !armed.swap(true, Ordering::SeqCst) {
+            arm(
+                &control,
+                &selector,
+                &selector_sha256,
+                &proof_sha256,
+                &publication,
+                artifact.unwrap(),
+                path,
+            )?;
         }
         Ok(())
     })))
@@ -280,7 +296,7 @@ pub(crate) fn after_fatal(
         || target.publication != publication
         || target.selector_sha256 != selector_sha256
         || target.pid != std::process::id()
-        || target.artifact != "loose_block_body"
+        || !matches!(target.artifact.as_str(), "loose_block_body" | "archive_package")
         || target.proof_sha256 != digest(accepted.proof().data())
         || (marker_text != expected("fsync") && marker_text != expected("fdatasync"))
         || error.downcast_ref::<crate::internal_db::PublicationDurabilityFailure>().is_none()
@@ -332,7 +348,16 @@ mod tests {
             delivery_id: selector.delivery_id.clone(),
             stage: "DraftDurable".into(),
         };
-        arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &publication, &body).unwrap();
+        arm(
+            &directory,
+            &selector,
+            &"c".repeat(64),
+            &"d".repeat(64),
+            &publication,
+            "loose_block_body",
+            &body,
+        )
+        .unwrap();
         let witness: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("target.json")).unwrap()).unwrap();
         let native = std::fs::read_to_string(directory.join("target.native")).unwrap();
@@ -343,7 +368,9 @@ mod tests {
         assert_eq!(witness["pid"], std::process::id());
         assert!(native.ends_with(&format!("\n{}\n", body.display())));
         assert_eq!(std::fs::read(&body).unwrap(), b"actual body");
-        assert!(arm(&directory, &selector, "c", "d", &publication, &body).is_err());
+        assert!(
+            arm(&directory, &selector, "c", "d", &publication, "loose_block_body", &body).is_err()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

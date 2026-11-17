@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,10 +17,47 @@ from publication_io_live_fixture import (
     bound_intents,
     selected_source,
     sha,
+    verify_body_artifact,
 )
 
 
 class LivePublicationTests(unittest.TestCase):
+    def test_archive_body_identity_and_truncation(self):
+        body = b"selected real body bytes"
+        digest = sha(body)
+        root = "a" * 64
+        selector = {
+            "block_id": f"(-1:8000000000000000, 301, rh {root}, fh {digest})",
+            "block_sha256": digest,
+        }
+        name = (
+            f"block_(-1,8000000000000000,301):{root.upper()}:{digest.upper()}".encode()
+        )
+
+        def entry(name, data):
+            return struct.pack("<HHI", 0x1E8B, len(name), len(data)) + name + data
+
+        prefix = struct.pack("<I", 0xAE8FDD01) + entry(b"unrelated", b"skip")
+        valid = prefix + entry(name, body)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "archive.pack"
+            path.write_bytes(valid)
+            witness = verify_body_artifact(path, selector, "archive_package")
+            self.assertEqual(witness["sha256"], digest)
+            self.assertEqual(witness["offset"], len(valid) - len(body))
+            cases = [
+                (b"bad!" + valid[4:], "Invalid archive package magic"),
+                (prefix + entry(b"wrong", body), "Selected body absent"),
+                (prefix + entry(name, b"wrong"), "Archive body differs"),
+                (valid[:-1], "Incomplete archive entry"),
+                (prefix + struct.pack("<HHI", 0, 0, 0), "Invalid archive entry header"),
+            ]
+            for raw, error in cases:
+                with self.subTest(error=error):
+                    path.write_bytes(raw)
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        verify_body_artifact(path, selector, "archive_package")
+
     def fixture(self, root):
         old, selector, _marker, target, failed = (
             queued.PublicationIoFixtureTests().context(root)
