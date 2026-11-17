@@ -2,15 +2,14 @@
 //! Optional isolated-test capture after successful live acceptance.
 //! Schema-5 is an export envelope, not a persisted outbox row or queue receipt.
 //! Consumers independently authenticate carriers and the complete original frontier.
+#[cfg(feature = "interop-publication-capture")]
+use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::Path,
 };
-
-#[cfg(feature = "interop-publication-capture")]
-use std::sync::{Mutex, OnceLock};
 
 const MAX_FILES: usize = 128;
 const MAX_TOTAL: usize = 64 << 20;
