@@ -212,7 +212,7 @@ class LivePublicationTests(unittest.TestCase):
                     )
 
     def test_recovery_requires_original_intent_removal_and_matching_native_state(self):
-        for change in [None, "pending", "state", "body", "progress"]:
+        for change in [None, "pending", "state", "body", "progress", "finality"]:
             with (
                 self.subTest(change=change),
                 tempfile.TemporaryDirectory() as temporary,
@@ -265,6 +265,15 @@ class LivePublicationTests(unittest.TestCase):
                     "last_checkpoint": {"seqno": 5 if change == "progress" else 6}
                 }
                 with (
+                    patch.object(
+                        source,
+                        "verify_original_finality",
+                        new=AsyncMock(
+                            side_effect=RuntimeError("bad Final")
+                            if change == "finality"
+                            else None
+                        ),
+                    ),
                     patch(
                         "publication_io_live_fixture.cpp_block",
                         new=AsyncMock(return_value=block),

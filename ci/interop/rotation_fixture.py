@@ -2294,6 +2294,7 @@ def main():
         for path in [
             driver.with_name("publication_io_fixture.py"),
             driver.with_name("publication_io_live_fixture.py"),
+            driver.with_name("first_intent_vote.py"),
             driver.parents[2] / "rtos/src/tests/publication_io_fault.c",
         ]:
             artifacts[str(path)] = digest(path)

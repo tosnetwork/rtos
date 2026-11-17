@@ -26,6 +26,12 @@ from scenario_ack_partition import (
     ack_partition_arguments,
     check_ack_partition_result,
 )
+from scenario_bootstrap import (
+    BOOTSTRAPS,
+    bootstrap_commands,
+    check_bootstrap_result,
+    make_bootstrap_profile,
+)
 from scenario_expiry import (
     EXPIRIES,
     check_expired_full_node_witness,
@@ -55,6 +61,12 @@ from scenario_packet import (
     check_packet_result,
     packet_arguments,
     packet_artifacts,
+)
+from scenario_publication_io import (
+    check_publication_io_evidence,
+    check_publication_io_result,
+    publication_io_arguments,
+    publication_io_artifacts,
 )
 from scenario_receiver import (
     RECEIVER_PLAN,
@@ -86,7 +98,7 @@ ROTATIONS = (
         )
         for mode in ("control", "mixed")
     )
-    | {"restart-member2", "restart-member5", "propagation-receiver"}
+    | {"restart-member2", "restart-member5", "propagation-receiver", "publication-io"}
     | set(PACKETS)
     | set(RESTARTS)
     | {"signer-expiry"}
@@ -227,7 +239,9 @@ def check_result(name, result):
     elif result.get("propagation_receiver") is not None:
         raise ValueError("Unexpected propagation receiver receipt")
     recovery = result.get("recovery")
-    if name == "signer-expiry":
+    if name == "publication-io":
+        check_publication_io_result(result)
+    elif name == "signer-expiry":
         if (
             result.get("source_ack_fault") is not None
             or result.get("source_ack_partition_restart") is not None
@@ -305,6 +319,7 @@ def check_result(name, result):
         and name not in ACK_PARTITIONS
         and name not in INTENTS
         and name not in EXPIRIES
+        and name != "publication-io"
         and result.get("partition_restart") is not None
     ):
         raise ValueError("Unexpected restart partition receipt")
@@ -324,6 +339,12 @@ def check_result(name, result):
     ):
         raise ValueError("Unexpected combined ACK partition receipt")
 
+    if name != "publication-io" and (
+        result.get("node_io_source") is not None
+        or result.get("publication_io_restart") is not None
+    ):
+        raise ValueError("Unexpected publication IO receipt")
+
     if name not in RETENTIONS and result.get("source_retention_cut") is not None:
         raise ValueError("Unexpected source retention cut")
 
@@ -334,7 +355,11 @@ def check_result(name, result):
 
 
 def execute(args, names, catalog):
-    missing = [name for name in names if name not in ROTATIONS and name not in MATRICES]
+    missing = [
+        name
+        for name in names
+        if name not in ROTATIONS and name not in MATRICES and name not in BOOTSTRAPS
+    ]
     if missing:
         raise ValueError(f"Execution adapters not integrated: {', '.join(missing)}")
     required = (
@@ -358,7 +383,13 @@ def execute(args, names, catalog):
     require_rust_revision(args.rust_node, args.rust_revision)
     # Materialize no runtime directories until every selected adapter/input is checked.
     for name in names:
-        (make_matrix_profile if name in MATRICES else make_profile)(name, template, 0)
+        (
+            make_bootstrap_profile
+            if name in BOOTSTRAPS
+            else make_matrix_profile
+            if name in MATRICES
+            else make_profile
+        )(name, template, 0)
     inputs = [
         args.rust_node,
         args.validator_preparer,
@@ -374,6 +405,7 @@ def execute(args, names, catalog):
         or name in ACK_PARTITIONS
         or name in INTENTS
         or name in EXPIRIES
+        or name == "publication-io"
         for name in names
     ):
         inputs.extend(packet_artifacts(args, source))
@@ -389,6 +421,8 @@ def execute(args, names, catalog):
         inputs.extend(retention_artifacts(args, source))
     if any(name in FIRST_INTENTS for name in names):
         inputs.extend(first_intent_artifacts(args, source))
+    if "publication-io" in names:
+        inputs.extend(publication_io_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -409,11 +443,17 @@ def execute(args, names, catalog):
                 raise ValueError("A scenario suite input changed")
             case = root / name
             case.mkdir()
-            profile = (make_matrix_profile if name in MATRICES else make_profile)(
-                name, template, time.time()
-            )
+            profile = (
+                make_bootstrap_profile
+                if name in BOOTSTRAPS
+                else make_matrix_profile
+                if name in MATRICES
+                else make_profile
+            )(name, template, time.time())
             write(case / "profile.json", profile)
-            if name in MATRICES:
+            if name in BOOTSTRAPS:
+                prepare, run = bootstrap_commands(args, name, case)
+            elif name in MATRICES:
                 prepare, run = matrix_commands(args, name, case)
             else:
                 common = [
@@ -473,11 +513,17 @@ def execute(args, names, catalog):
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name == "publication-io":
+                run += publication_io_arguments(
+                    args.publication_io_library, args.socket_mark_library
+                )
             if name == "propagation-receiver":
                 run += ["--verify-propagation-receiver"]
             if name in FIRST_INTENTS:
                 run += first_intent_arguments(name, args.first_intent_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
+                if command is None:
+                    continue
                 command = [
                     str(args.cpp_python),
                     str(source / "run_network_namespace.py"),
@@ -493,9 +539,15 @@ def execute(args, names, catalog):
                 write(case / f"{label}-completion.json", invocation)
                 if process.returncode:
                     raise RuntimeError(f"{name} {label} exited {process.returncode}")
-            result_path = case / "runtime/result.json"
+            result_path = (
+                case
+                / "runtime"
+                / ("driver-status.json" if name == "cpp-bootstrap" else "result.json")
+            )
             result = json.loads(result_path.read_text())
-            if name in MATRICES:
+            if name in BOOTSTRAPS:
+                check_bootstrap_result(name, result, profile, case / "runtime")
+            elif name in MATRICES:
                 check_matrix_result(name, result, profile)
             else:
                 check_result(name, result)
@@ -506,6 +558,7 @@ def execute(args, names, catalog):
                     or name in ACK_PARTITIONS
                     or name in INTENTS
                     or name in EXPIRIES
+                    or name == "publication-io"
                 ):
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
                 if (
@@ -515,6 +568,10 @@ def execute(args, names, catalog):
                     or name == "expired-member-restart"
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name == "publication-io":
+                check_publication_io_evidence(
+                    case / "runtime", result, args.block_checker
+                )
             if name == "propagation-receiver":
                 check_receiver_evidence(
                     case / "runtime", result["propagation_receiver"], profile
