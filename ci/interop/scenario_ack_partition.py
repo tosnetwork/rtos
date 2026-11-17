@@ -20,9 +20,18 @@ def ack_partition_arguments(name, ack_library, packet_library):
     )
 
 
-def check_ack_partition_result(name, combined, source, partition, recovery):
+def check_ack_partition_result(
+    name, combined, source, partition, recovery, *, signer_expiry=False
+):
+    if signer_expiry and name != "source-ack-partition-sync-eio":
+        raise ValueError("Signer expiry requires its original sync-eio case")
     check_ack_result(ACK_PARTITIONS[name], source, recovery)
-    check_restart_partition("partition-restart-member2", partition, recovery)
+    check_restart_partition(
+        "below-quorum-restart" if signer_expiry else "partition-restart-member2",
+        partition,
+        recovery,
+        signer_expiry=signer_expiry,
+    )
     if not isinstance(combined, dict):
         raise TypeError("Missing combined ACK partition receipt")
     require_fields(

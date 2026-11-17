@@ -1360,10 +1360,11 @@ impl FullNodeOverlaysRouter {
     async fn local_transport_signer(
         &self,
         roots: &[Arc<KeyId>],
+        members: &[ValidatorDescr],
     ) -> Result<Option<Arc<dyn KeyOption>>> {
         let handler = self.network.config_handler();
         let now = rtos_block::UnixTime::now() as i64;
-        let local = handler
+        let mut local = handler
             .get_actual_validator_keys()?
             .into_iter()
             .filter(|entry| i64::from(entry.expire_at) > now)
@@ -1373,10 +1374,34 @@ impl FullNodeOverlaysRouter {
                 Ok(KeyId::from_data(bytes.as_slice().try_into()?))
             })
             .collect::<Result<HashSet<_>>>()?;
+        // PQ transport bindings grant no voting custody. Require both the
+        // validator and transport identity in the applied authority, just as
+        // fast-sync does, before considering the explicitly held transport key.
+        let bindings = handler.consensus_transport_bindings()?;
+        let mut pq_local = HashSet::new();
+        for binding in &bindings {
+            if members.iter().any(|member| {
+                matches!(member.key, rtos_block::ValidatorKey::Pq(_))
+                    && member.validator_id().ok().as_ref() == Some(&binding.validator_id)
+                    && member.adnl_addr().ok().as_ref() == Some(&binding.adnl_key_id)
+            }) {
+                local.insert(binding.adnl_key_id.clone());
+                pq_local.insert(binding.adnl_key_id.clone());
+            }
+        }
         let Some(id) = crate::network::shard_overlay_certificates::select_signer(roots, &local)
         else {
             return Ok(None);
         };
+        if pq_local.contains(&id) {
+            let key = handler.consensus_transport_key(&id).await?;
+            if self.network.context().stack.adnl.key_by_id(&id)?.id() != key.id() {
+                rtos_block::fail!(
+                    "Configured certificate transport does not match loaded ADNL identity"
+                );
+            }
+            return Ok(Some(key));
+        }
         match handler.get_validator_key(&id).await {
             Some((key, _)) if key.id() == &id => Ok(Some(key)),
             _ => Ok(None),
@@ -1388,12 +1413,16 @@ impl FullNodeOverlaysRouter {
     pub(super) async fn update_public_authorization(
         self: &Arc<Self>,
         roots: &[Arc<KeyId>],
+        members: &[ValidatorDescr],
     ) -> Result<()> {
         if !self.shard_authorization_enabled() {
             return Ok(());
         }
-        let signer =
-            if roots.is_empty() { None } else { self.local_transport_signer(roots).await? };
+        let signer = if roots.is_empty() {
+            None
+        } else {
+            self.local_transport_signer(roots, members).await?
+        };
         let installs = self.shard_certificates.update_authority(
             roots,
             signer,
@@ -1609,7 +1638,7 @@ impl FullNodeOverlaysRouter {
             &all,
             self.network.context().stack.overlay.wire_profile(),
         )?;
-        let Some(signer) = self.local_transport_signer(&roots).await? else {
+        let Some(signer) = self.local_transport_signer(&roots, &all).await? else {
             log::info!(
                 "shard overlay cert issue skipped reason=no-local-validator targets={}",
                 targets.len()

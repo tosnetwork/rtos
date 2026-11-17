@@ -347,7 +347,7 @@ async fn pushed_certificates_cross_the_network_only_where_accepted() -> Result<(
     issuing.add_auto_sign(&hex::encode(d.full_node.id().data()))?;
     let a = node(&bootstrap, 10, true, issuing, &state, &[]).await?;
     for node in [&a, &b, &c, &d] {
-        node.router.update_public_authorization(&roots).await?;
+        node.router.update_public_authorization(&roots, &[]).await?;
     }
     for receiver in [&b, &c, &d] {
         knows(&a, receiver);
@@ -367,7 +367,8 @@ async fn pushed_certificates_cross_the_network_only_where_accepted() -> Result<(
 
     // D, no validator, forwards a validator-issued certificate: C accepts it
     // through `*`, B refuses D as an unconfigured sender.
-    let signer = a.router.local_transport_signer(&roots).await?.expect("the issuer holds a root");
+    let signer =
+        a.router.local_transport_signer(&roots, &[]).await?.expect("the issuer holds a root");
     let forward = |subject: &Node, shard: &ShardIdent| -> ImportShardOverlayCertificate {
         a.router
             .shard_certificates()
@@ -474,7 +475,7 @@ async fn control_queries_reach_the_serving_full_node() -> Result<()> {
     let (state, roots) = applied_state(&bootstrap)?;
     let a =
         node(&bootstrap, 10, true, ShardOverlayCertificatePolicy::default(), &state, &[]).await?;
-    a.router.update_public_authorization(&roots).await?;
+    a.router.update_public_authorization(&roots, &[]).await?;
     let (client_private, client_key) =
         secrets_vault::vault_block::get_key_option_factory().generate_with_json()?;
     let server_config = adnl::server::AdnlServerConfig::from_json_with_permissions(
@@ -583,7 +584,7 @@ async fn the_issuer_scans_as_soon_as_the_full_node_serves() -> Result<()> {
         &[],
     )
     .await?;
-    b.router.update_public_authorization(&roots).await?;
+    b.router.update_public_authorization(&roots, &[]).await?;
     let mut issuing = ShardOverlayCertificatePolicy::default();
     issuing.add_auto_sign(&hex::encode(b.full_node.id().data()))?;
     // No scan is requested: the issuer task started by initialization does

@@ -89,7 +89,7 @@ impl FullNodeOverlaysRouter {
         )?;
         // Shard overlay rules follow every applied refresh, including ones
         // that leave the propagation configuration unchanged.
-        self.update_public_authorization(&public).await?;
+        self.update_public_authorization(&public, &all).await?;
         // T0 current_validators_adnl_ is named historically: it contains the
         // previous/current/next union, not merely ConfigParam34.
         let desired = PropagationConfig {

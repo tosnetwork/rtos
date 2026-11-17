@@ -332,7 +332,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "expired-member-restart",
@@ -386,7 +386,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "first-intent-after-partial-write",
@@ -395,7 +395,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "source-retention-after-fsync",
