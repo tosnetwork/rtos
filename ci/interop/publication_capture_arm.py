@@ -21,7 +21,7 @@ def select_session(node_directory, checked):
     wc = checked.get("workchain_check", {})
     if (
         wc.get("masterchain_anchor_checked") is not True
-        or wc.get("all_four_states_match_block_update") is not True
+        or wc.get("all_declared_states_match_block_update") is not True
         or not checked.get("verified_final_certificates")
         or any(
             c.get("final_certificate_checked") is not True

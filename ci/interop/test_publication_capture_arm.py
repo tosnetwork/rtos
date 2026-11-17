@@ -26,6 +26,7 @@ class CaptureArmTests(unittest.TestCase):
                     "block": block,
                     "masterchain_anchor_checked": True,
                     "all_four_states_match_block_update": True,
+                    "all_declared_states_match_block_update": True,
                     "gen_catchain_seqno": 1,
                 },
             }
@@ -46,7 +47,21 @@ class CaptureArmTests(unittest.TestCase):
             log.write_text(
                 f"SessionCallbacks::notify_candidate_observed session_id={session} block_id={block_text(block)} parent_ready=true\n"
             )
-            self.assertEqual(select_session(root, checked), (session, runtime))
+            for count in (3, 4, 6):
+                checked["workchain_check"]["fixture_validator_count"] = count
+                checked["workchain_check"]["all_four_states_match_block_update"] = (
+                    count == 4
+                )
+                with self.subTest(complete_sources=count):
+                    self.assertEqual(select_session(root, checked), (session, runtime))
+            checked["workchain_check"]["all_four_states_match_block_update"] = True
+            checked["workchain_check"]["all_declared_states_match_block_update"] = False
+            with self.assertRaises(ValueError):
+                select_session(root, checked)
+            del checked["workchain_check"]["all_declared_states_match_block_update"]
+            with self.assertRaises(ValueError):
+                select_session(root, checked)
+            checked["workchain_check"]["all_declared_states_match_block_update"] = True
             self.assertEqual(arm_capture(root, checked, root / "capture", 42), session)
             self.assertEqual(
                 (root / "capture/selector").read_text(), f"42\n{session}\n"
