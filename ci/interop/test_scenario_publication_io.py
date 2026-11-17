@@ -40,6 +40,7 @@ def result_fixture():
         "pending_preserved_before_restart": True,
         "original_intents_resolved": True,
         "original_block_native_state_match": True,
+        "original_final_certificate_checked": True,
         "node_io_original_source_recovered": True,
         "source_canonical_delivery_before_interruption": False,
         "node_io_failure_before_callback": True,

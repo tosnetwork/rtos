@@ -11,6 +11,7 @@ import struct
 import time
 from pathlib import Path
 
+from first_intent_vote import historical_finality_request, matches_final_intent
 from mixed_matrix import child_checked, cpp_block, native_state, write
 from network_faults import marked_environment, require_namespace
 from source_ack_fault_fixture import SourceAckFailure
@@ -316,6 +317,53 @@ class LivePublicationIoSource(SourceAckFailure):
         self.check_source_snapshot()
         return super().environment()
 
+    async def verify_original_finality(self, body, state, state_checked):
+        record = json.loads(self.original)
+        target = self.directory / "recovered-original-block"
+        candidates = self.directory.parent.glob("checks/*/epoch-checked.json")
+        context = None
+        for path in sorted(candidates, key=lambda p: int(p.parent.name), reverse=True):
+            self.check_budget()
+            try:
+                checked = json.loads(path.read_text())
+                if checked["block"]["seqno"] > body["id"]["seqno"]:
+                    continue
+                if not any(
+                    base64.b64decode(c["session_id"], validate=True).hex()
+                    == record["session_id"]
+                    for c in checked.get("verified_final_certificates", [])
+                ):
+                    continue
+                context = json.loads((path.parent / "sample.json").read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+        if context is None:
+            raise RuntimeError("Original Final lacks a captured governing context")
+        request = historical_finality_request(record, body, state, context)
+        write(target / "finality-witness.json", request)
+        args = self.witness_context[0]
+        await asyncio.wait_for(
+            child_checked(
+                [
+                    args.block_checker,
+                    target / "finality-witness.json",
+                    target / "finality-checked.json",
+                ],
+                target / "finality-checker.log",
+            ),
+            self.deadline - time.monotonic(),
+        )
+        checked = json.loads((target / "finality-checked.json").read_text())
+        intent = json.loads((self.directory / "original-0.json").read_text())
+        if (
+            not matches_final_intent(checked, intent, workchain=-1)
+            or checked["block"] != body["id"]
+            or checked.get("state_root_hash") != state_checked.get("state_root_hash")
+        ):
+            raise RuntimeError("Original Final certificate/candidate/state differs")
+        self.check_budget()
+
     async def complete(self, recovered):
         while any(p.exists() for p in self.source_snapshot):
             self.check_budget()
@@ -395,8 +443,10 @@ class LivePublicationIoSource(SourceAckFailure):
             or checked.get("finality_checked") is not False
         ):
             raise RuntimeError("Original state-copy checker scope differs")
+        await self.verify_original_finality(body, states[0], checked)
         self.check_budget()
         self.receipt.update(
+            original_final_certificate_checked=True,
             phase="recovered",
             original_intents_resolved=True,
             original_block_native_state_match=True,

@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from first_intent_vote import historical_finality_request, matches_final_intent
 from mixed_matrix import identity
 from publication_io_fixture import selector_for
 from publication_io_live_fixture import selected_source, verify_body_artifact
@@ -88,6 +89,7 @@ def check_publication_io_result(result):
             "pending_preserved_before_restart": True,
             "original_intents_resolved": True,
             "original_block_native_state_match": True,
+            "original_final_certificate_checked": True,
             "node_io_original_source_recovered": True,
             "source_canonical_delivery_before_interruption": False,
             "node_io_failure_before_callback": True,
@@ -279,3 +281,31 @@ def check_publication_io_evidence(runtime, result, checker):
         )
         if read(output) != checked:
             raise ValueError("Publication IO native state recheck differs")
+
+    finality_path = directory / "recovered-original-block/finality-witness.json"
+    finality = read(finality_path)
+    final_checked = read(directory / "recovered-original-block/finality-checked.json")
+    if finality != historical_finality_request(
+        record, witness["block"], witness["states"][0], finality
+    ):
+        raise ValueError("Publication IO Final witness differs from original carrier")
+    if (
+        not matches_final_intent(
+            final_checked, read(directory / "original-0.json"), workchain=-1
+        )
+        or final_checked["block"] != checked["block"]
+        or final_checked.get("state_root_hash") != checked["state_root_hash"]
+    ):
+        raise ValueError("Publication IO original Final certificate/state differs")
+    with TemporaryDirectory(
+        prefix="publication-finality-recheck-", dir=runtime
+    ) as temp:
+        output = Path(temp) / "checked.json"
+        subprocess.run(
+            [str(checker), str(finality_path), str(output)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if read(output) != final_checked:
+            raise ValueError("Publication IO native Final recheck differs")
