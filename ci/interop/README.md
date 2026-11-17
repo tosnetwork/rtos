@@ -115,7 +115,7 @@ fuzz, review and release gates remain open. `plan` is always `not_executed`.
 
 ## Baseline and bootstrap
 
-The active C++ reference and default version-16 profile are pinned to `5af405dcb1f523be0ff3b812e9f6945275c4945b`. The frozen profile contains the native-generated masterchain/workchain Genesis identities for this commit. Previous `8812403` and `8f083dc` snapshots require explicit matching historical profiles; their results do not qualify the current reference. The baseline selection establishes test inputs; full runtime and release qualification remain separate.
+The active C++ reference and default version-16 profile are pinned to `ed8e0a80bdafede324d97b041fa4174e0a5dce33`. The frozen profile retains the native-generated masterchain/workchain Genesis identities from `5af405d`; the newer reference has identical production and genesis sources, with documentation-only changes. Previous `5af405d`, `8812403` and `8f083dc` snapshots require explicit matching historical profiles; their results do not qualify the current reference. The baseline selection establishes test inputs; full runtime and release qualification remain separate.
 
 The snapshot pins the executable's reported commit, copies the C++ programs,
 checks their SHA-256 values, and exports the matching test sources. Supply a
@@ -152,8 +152,8 @@ validated every candidate, or produced a block; bootstrap does not close the
 mixed-validator gate.
 
 To exercise active signing, build both programs with the explicit isolated
-signing feature and use the default TOS5af405d C++ snapshot. The same
-reference can also be selected explicitly with `--cpp-revision 5af405dcb1f523be0ff3b812e9f6945275c4945b`:
+signing feature and use the default TOSed8e0a80 C++ snapshot. The same
+reference can also be selected explicitly with `--cpp-revision ed8e0a80bdafede324d97b041fa4174e0a5dce33`:
 
 ```sh
 cargo +1.100.0 build -p rtos --bin rtos --bin interop_validator_prepare \

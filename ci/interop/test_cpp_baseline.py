@@ -9,6 +9,7 @@ from pathlib import Path
 from cpp_baseline import (
     ACTIVE_CPP_REVISION,
     HISTORICAL_CPP_REVISIONS,
+    PREVIOUS_ACTIVE_CPP_REVISION,
     PREVIOUS_CPP_REVISION,
     configure_auth_namespace,
     require_cpp_baseline,
@@ -18,7 +19,7 @@ from cpp_baseline import (
 class CppBaselineTests(unittest.TestCase):
     def test_default_profile_and_vectors_pin_current_tos(self):
         self.assertEqual(
-            ACTIVE_CPP_REVISION, "5af405dcb1f523be0ff3b812e9f6945275c4945b"
+            ACTIVE_CPP_REVISION, "ed8e0a80bdafede324d97b041fa4174e0a5dce33"
         )
         profile = json.loads(Path(__file__).with_name("testnet-v16.json").read_text())
         self.assertEqual(profile["cpp_revision"], ACTIVE_CPP_REVISION)
@@ -71,6 +72,52 @@ class CppBaselineTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("C++ snapshot must match", result.stderr)
             self.assertFalse((root / "result" / "network").exists())
+
+    def test_previous_active_cli_requires_explicit_selection_and_keeps_auth(self):
+        old = PREVIOUS_ACTIVE_CPP_REVISION
+        config = types.SimpleNamespace()
+        configure_auth_namespace(
+            config, {"cpp_revision": old, "auth_network_tag": "ab" * 32}
+        )
+        self.assertEqual(config.auth_network_tag, bytes.fromhex("ab" * 32))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "manifest.json").write_text(
+                json.dumps({"cpp_source_commit": old})
+            )
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("mixed_bootstrap.py")),
+                "--snapshot",
+                str(snapshot),
+                "--rust-node",
+                str(root / "missing-node"),
+                "--validator-preparer",
+                str(root / "missing-preparer"),
+            ]
+            default = subprocess.run(
+                command + ["--output", str(root / "default")],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(default.returncode, 0)
+            self.assertIn("C++ snapshot must match", default.stderr)
+            explicit = subprocess.run(
+                command + ["--output", str(root / "explicit"), "--cpp-revision", old],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertNotEqual(explicit.returncode, 0)
+            self.assertIn("FileNotFoundError", explicit.stderr)
+            self.assertIn("missing-node", explicit.stderr)
+            self.assertNotIn("invalid choice", explicit.stderr)
+            self.assertFalse((root / "explicit" / "network").exists())
 
     def test_historical_replay_requires_matching_explicit_profile(self):
         old = PREVIOUS_CPP_REVISION

@@ -18,6 +18,7 @@ from pathlib import Path
 from cpp_baseline import (
     ACTIVE_CPP_REVISION,
     DEFAULT_AUTH_NETWORK_TAG,
+    PREVIOUS_ACTIVE_CPP_REVISION,
     PREVIOUS_CPP_REVISION,
     configure_auth_namespace,
     require_cpp_baseline,
@@ -35,8 +36,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--cpp-revision",
-    choices=[ACTIVE_CPP_REVISION, PREVIOUS_CPP_REVISION],
-    help="Explicit reference selection; active signing defaults to TOS5af405d",
+    choices=[ACTIVE_CPP_REVISION, PREVIOUS_ACTIVE_CPP_REVISION, PREVIOUS_CPP_REVISION],
+    help="Explicit reference selection; active signing defaults to TOSed8e0a80",
 )
 parser.add_argument("--timeout", type=float, default=180)
 parser.add_argument("--block-checker", type=Path)
