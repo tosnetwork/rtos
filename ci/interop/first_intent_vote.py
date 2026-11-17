@@ -35,10 +35,26 @@ def post_restart_successor_vote(checked, member, restarted_at):
 
 def matches_original_intent(checked, record):
     """Match an intended Final to the native checker's authenticated candidate."""
+    return checked.get("block", {}).get("seqno") == 1 and matches_final_intent(
+        checked, record, workchain=-1
+    )
+
+
+def matches_final_intent(checked, record, *, workchain):
+    """Bind a Final intent at any produced height to an already verified candidate.
+
+    This matches native checker output; it does not authenticate JSON by itself or
+    replace the separate original-block full-state witnesses and cleanup checks.
+    """
+    block = checked.get("block", {})
     if (
         checked.get("status") != "block_and_state_match"
-        or checked.get("block", {}).get("workchain") != -1
-        or checked.get("block", {}).get("seqno") != 1
+        or type(workchain) is not int
+        or type(block.get("workchain")) is not int
+        or block["workchain"] != workchain
+        or type(block.get("seqno")) is not int
+        or block["seqno"] <= 0
+        or type(record.get("slot")) is not int
     ):
         return False
     if any(
