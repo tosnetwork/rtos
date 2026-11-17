@@ -20,10 +20,10 @@ async fn check_runtime(corpus: &str, inputs: &str, frozen: &str, count: usize) {
     let effects = expected["effects"].as_array().unwrap();
     assert_eq!(rows.len(), count);
     assert_eq!(effects.len(), count);
-    let (reply, _, nodes, rldps, _) = pair().await;
+    let (reply, _, nodes, rldps, _) = default_pair().await;
     reply.runtime_pattern.store(true, Ordering::Release);
     for node in &rldps {
-        node.peers.enable_native_for_tests();
+        assert!(node.peers.native_enabled(), "ordinary constructors must select native Connection");
     }
     let outcome = std::panic::AssertUnwindSafe(async {
         let keys = [nodes[0].key_by_tag(0).unwrap(), nodes[1].key_by_tag(0).unwrap()];
