@@ -1,9 +1,9 @@
 {
-  "reference_commit": "5af405dcb1f523be0ff3b812e9f6945275c4945b",
+  "reference_commit": "ed8e0a80bdafede324d97b041fa4174e0a5dce33",
   "cases_sha256": "d16a92c0d068ebc26986e9798ed39ae4d8ba1fea66eb4dd50352f7f2a942a4dd",
   "runner_source_sha256": "2855676a32f30eb9d308cff1af6b5a7f10b3dc985a8a31bacd9ca6447fb171a9",
   "probe_source_sha256": "f5dce5744e05f796c5d7b16f58c6559d970b9e2f00b823378695d8c4ad14d1e5",
-  "probe_binary_sha256": "cb2d3af521683310262ec776e86c2f6eea5cbc57b51c2246eb1416b1aebde8c7",
+  "probe_binary_sha256": "cfcd00a7ba7e20b276fb89e8416451745d644578f39c7e2e2ed1aeb0f4d22f73",
   "exit": 0,
   "effects_sha256": "bfe789f78f8294476d6e1fe3d27d4adf940eb440780e2c5009c595a27af41b7e"
 }

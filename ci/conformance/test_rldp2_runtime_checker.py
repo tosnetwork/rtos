@@ -9,6 +9,17 @@ from check_rldp2_runtime import read_frozen
 
 
 class FrozenProvenanceTests(unittest.TestCase):
+    def test_all_rldp_auxiliary_metadata_uses_current_reference(self):
+        root = Path(__file__).parent
+        reference = (root / "REFERENCE").read_text().strip()
+        metadata = sorted(root.glob("rldp*_metadata.json"))
+        self.assertTrue(metadata, "RLDP auxiliary reference metadata is missing")
+        for path in metadata:
+            with self.subTest(metadata=path.name):
+                self.assertEqual(
+                    json.loads(path.read_text())["reference_commit"], reference
+                )
+
     def test_native_reference_and_each_provenance_mutation(self):
         for corpus in ("cases", "boundaries", "multipart"):
             with self.subTest(corpus=corpus):
