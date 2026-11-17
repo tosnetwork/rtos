@@ -1,9 +1,11 @@
 """Scope checks for the actual first-intent process interruption fixture."""
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from first_intent_cut_fixture import FirstIntentCut, validate_first_intent_cut
 
@@ -139,3 +141,73 @@ class IndependentVoteTests(unittest.TestCase):
                 cut.receipt["post_restart_vote"]["check"]["created_by"], member_id(4)
             )
             self.assertTrue(cut.qualify_rotation(result["epochs"], member_id(2)))
+
+
+class FirstIntentStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_manifest_waits_for_original_complete_binding(self):
+        for partial in ("", '{"role":'):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cut = FirstIntentCut(
+                    SimpleNamespace(first_intent_cut_point="before-write"), root
+                )
+                base = root / "node/node_db/catchains/consensus/v2/initial"
+                base.mkdir(parents=True)
+                manifest = base / "session-runtime.json"
+                manifest.write_text(partial)
+                process = SimpleNamespace(returncode=None)
+
+                async def finish_write(_, manifest=manifest, process=process):
+                    manifest.write_text(
+                        json.dumps(
+                            {
+                                "shard_workchain": -1,
+                                "catchain_seqno": 0,
+                                "role": "validator",
+                            }
+                        )
+                    )
+                    process.returncode = 1
+
+                with (
+                    patch(
+                        "first_intent_cut_fixture.asyncio.sleep",
+                        side_effect=finish_write,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "exited before native stop"),
+                ):
+                    await cut.supervise(
+                        {"directory": root / "node", "process": process}, None
+                    )
+                self.assertTrue((cut.directory / "armed").exists())
+                self.assertEqual(
+                    (cut.directory / "selected-directory").read_text().strip(),
+                    str(base / "finality-pending"),
+                )
+
+    async def test_incomplete_manifest_never_arms_and_retains_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cut = FirstIntentCut(
+                SimpleNamespace(first_intent_cut_point="before-write"), root
+            )
+            base = root / "node/node_db/catchains/consensus/v2/initial"
+            base.mkdir(parents=True)
+            (base / "session-runtime.json").write_text("")
+            with (
+                patch(
+                    "first_intent_cut_fixture.time.monotonic",
+                    side_effect=[100.0, 100.0, 280.0],
+                ),
+                patch("first_intent_cut_fixture.asyncio.sleep", new_callable=AsyncMock),
+                self.assertRaisesRegex(TimeoutError, "original 180-second deadline"),
+            ):
+                await cut.supervise(
+                    {
+                        "directory": root / "node",
+                        "process": SimpleNamespace(returncode=None),
+                    },
+                    None,
+                )
+            self.assertEqual(cut.deadline, 280.0)
+            self.assertFalse((cut.directory / "armed").exists())

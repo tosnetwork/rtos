@@ -276,6 +276,52 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args.original_recovery_budget["monotonic"], observer.started)
         observer.complete.assert_awaited_once()
 
+    def test_partial_runtime_waits_without_resetting_budget(self):
+        for partial in ("", '{"session":'):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, node, cp, ns = self.context(root)
+                runtime = ns / "session-runtime.json"
+                original = runtime.read_bytes()
+                runtime.write_text(partial)
+                with (
+                    patch.object(expiry.time, "monotonic", return_value=100.0),
+                    self.assertRaises(expiry.SignerExpiryRuntimePending),
+                ):
+                    expiry.SignerExpiry(args, root, node, cp)
+                self.assertFalse((root / "signer-expiry/receipt.json").exists())
+                runtime.write_bytes(original)
+                with patch.object(expiry.time, "monotonic", return_value=100.5):
+                    ctx = expiry.SignerExpiry(args, root, node, cp)
+                self.assertEqual(ctx.started, 100.0)
+                self.assertEqual(ctx.deadline, 100.0 + args.recovery_timeout)
+
+    def test_partial_runtime_cannot_wait_past_original_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, node, cp, ns = self.context(root)
+            (ns / "session-runtime.json").write_text("")
+            with (
+                patch.object(expiry.time, "monotonic", return_value=100.0),
+                self.assertRaises(expiry.SignerExpiryRuntimePending),
+            ):
+                expiry.SignerExpiry(args, root, node, cp)
+            with (
+                patch.object(expiry.time, "monotonic", return_value=103.0),
+                self.assertRaisesRegex(TimeoutError, "original recovery deadline"),
+            ):
+                expiry.SignerExpiry(args, root, node, cp)
+            self.assertFalse((root / "signer-expiry/receipt.json").exists())
+
+    def test_complete_invalid_manifest_does_not_become_pending(self):
+        for invalid in ("null", "[]", "{}"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args, node, cp, ns = self.context(root)
+                (ns / "session-runtime.json").write_text(invalid)
+                with self.assertRaises((TypeError, KeyError)):
+                    expiry.SignerExpiry(args, root, node, cp)
+
     def test_runtime_start_retry_preserves_first_observation_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

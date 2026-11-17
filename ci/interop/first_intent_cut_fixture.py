@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from network_faults import require_namespace
+from runtime_manifest_observer import read_starting_manifest
 
 
 def validate_first_intent_cut(args):
@@ -94,7 +95,9 @@ class FirstIntentCut:
         while selected is None:
             self.check_budget()
             for manifest in base.glob("*/session-runtime.json"):
-                value = json.loads(manifest.read_text())
+                value = read_starting_manifest(manifest)
+                if value is None:
+                    continue
                 if (
                     value["shard_workchain"],
                     value["catchain_seqno"],
