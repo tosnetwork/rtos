@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from scenario_bootstrap import BOOTSTRAPS
 from scenario_execution import ROTATIONS, execute
 from scenario_matrix import MATRICES
 
@@ -37,7 +38,9 @@ def validate(catalog, source_root):
         if Path(driver).name != driver or not (source_root / driver).is_file():
             raise ValueError("Scenario driver must be an existing local file")
         expected_adapter = (
-            "rotation_v1"
+            "bootstrap_v1"
+            if entry["id"] in BOOTSTRAPS
+            else "rotation_v1"
             if entry["id"] in ROTATIONS
             else "matrix_v1"
             if entry["id"] in MATRICES
@@ -46,6 +49,15 @@ def validate(catalog, source_root):
         if entry["execution"] != expected_adapter or (
             (expected_adapter == "rotation_v1" and driver != "rotation_fixture.py")
             or (expected_adapter == "matrix_v1" and driver != "mixed_matrix.py")
+            or (
+                expected_adapter == "bootstrap_v1"
+                and driver
+                != (
+                    "cpp_control.py"
+                    if entry["id"] == "cpp-bootstrap"
+                    else "mixed_bootstrap.py"
+                )
+            )
         ):
             raise ValueError(
                 "Scenario execution adapter does not match the implementation"

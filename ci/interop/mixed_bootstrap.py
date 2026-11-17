@@ -607,6 +607,9 @@ async def main():
                                 is not None,
                                 "mixed_validator_qualified": False,
                                 "body_state_evidence": evidence,
+                                "config_sha256": hashlib.sha256(
+                                    (rust / "config.json").read_bytes()
+                                ).hexdigest(),
                             }
                     await asyncio.sleep(0.1)
                 raise TimeoutError(

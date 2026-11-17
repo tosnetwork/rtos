@@ -26,6 +26,12 @@ from scenario_ack_partition import (
     ack_partition_arguments,
     check_ack_partition_result,
 )
+from scenario_bootstrap import (
+    BOOTSTRAPS,
+    bootstrap_commands,
+    check_bootstrap_result,
+    make_bootstrap_profile,
+)
 from scenario_expiry import (
     EXPIRIES,
     check_expired_full_node_witness,
@@ -325,7 +331,11 @@ def check_result(name, result):
 
 
 def execute(args, names, catalog):
-    missing = [name for name in names if name not in ROTATIONS and name not in MATRICES]
+    missing = [
+        name
+        for name in names
+        if name not in ROTATIONS and name not in MATRICES and name not in BOOTSTRAPS
+    ]
     if missing:
         raise ValueError(f"Execution adapters not integrated: {', '.join(missing)}")
     required = (
@@ -349,7 +359,13 @@ def execute(args, names, catalog):
     require_rust_revision(args.rust_node, args.rust_revision)
     # Materialize no runtime directories until every selected adapter/input is checked.
     for name in names:
-        (make_matrix_profile if name in MATRICES else make_profile)(name, template, 0)
+        (
+            make_bootstrap_profile
+            if name in BOOTSTRAPS
+            else make_matrix_profile
+            if name in MATRICES
+            else make_profile
+        )(name, template, 0)
     inputs = [
         args.rust_node,
         args.validator_preparer,
@@ -397,11 +413,17 @@ def execute(args, names, catalog):
                 raise ValueError("A scenario suite input changed")
             case = root / name
             case.mkdir()
-            profile = (make_matrix_profile if name in MATRICES else make_profile)(
-                name, template, time.time()
-            )
+            profile = (
+                make_bootstrap_profile
+                if name in BOOTSTRAPS
+                else make_matrix_profile
+                if name in MATRICES
+                else make_profile
+            )(name, template, time.time())
             write(case / "profile.json", profile)
-            if name in MATRICES:
+            if name in BOOTSTRAPS:
+                prepare, run = bootstrap_commands(args, name, case)
+            elif name in MATRICES:
                 prepare, run = matrix_commands(args, name, case)
             else:
                 common = [
@@ -466,6 +488,8 @@ def execute(args, names, catalog):
             if name in FIRST_INTENTS:
                 run += first_intent_arguments(name, args.first_intent_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
+                if command is None:
+                    continue
                 command = [
                     str(args.cpp_python),
                     str(source / "run_network_namespace.py"),
@@ -481,9 +505,15 @@ def execute(args, names, catalog):
                 write(case / f"{label}-completion.json", invocation)
                 if process.returncode:
                     raise RuntimeError(f"{name} {label} exited {process.returncode}")
-            result_path = case / "runtime/result.json"
+            result_path = (
+                case
+                / "runtime"
+                / ("driver-status.json" if name == "cpp-bootstrap" else "result.json")
+            )
             result = json.loads(result_path.read_text())
-            if name in MATRICES:
+            if name in BOOTSTRAPS:
+                check_bootstrap_result(name, result, profile, case / "runtime")
+            elif name in MATRICES:
                 check_matrix_result(name, result, profile)
             else:
                 check_result(name, result)

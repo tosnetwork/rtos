@@ -492,7 +492,7 @@
       "driver": "cpp_control.py",
       "scope": "Pinned native control",
       "depends_on": [],
-      "execution": "unintegrated"
+      "execution": "bootstrap_v1"
     },
     {
       "id": "unsigned-bootstrap",
@@ -501,7 +501,7 @@
       "depends_on": [
         "cpp-bootstrap"
       ],
-      "execution": "unintegrated"
+      "execution": "bootstrap_v1"
     },
     {
       "id": "required-rust-vote",
@@ -510,7 +510,7 @@
       "depends_on": [
         "cpp-bootstrap"
       ],
-      "execution": "unintegrated"
+      "execution": "bootstrap_v1"
     }
   ]
 }
