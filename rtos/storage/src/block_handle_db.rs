@@ -740,6 +740,10 @@ type WriterCompletion = futures::future::Shared<
     futures::future::BoxFuture<'static, std::result::Result<(), Arc<tokio::task::JoinError>>>,
 >;
 
+type WriterShutdown = futures::future::Shared<
+    futures::future::BoxFuture<'static, std::result::Result<(), Arc<String>>>,
+>;
+
 #[cfg(test)]
 struct WriterExitHook {
     entered: tokio::sync::oneshot::Sender<()>,
@@ -757,7 +761,8 @@ pub struct BlockHandleStorage {
     serializer: Arc<WriteSerializer>,
     // First failure of the ordered writer, shared with direct durable writes.
     writer_failure: Arc<std::sync::Mutex<Option<String>>>,
-    storer: tokio::sync::mpsc::UnboundedSender<HandleCommand>,
+    storer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<HandleCommand>>>,
+    shutdown: std::sync::Mutex<Option<WriterShutdown>>,
     writer: Option<WriterCompletion>,
     #[cfg(test)]
     writer_exit_hook: Arc<std::sync::Mutex<Option<WriterExitHook>>>,
@@ -798,7 +803,8 @@ impl BlockHandleStorage {
             tables: tables.clone(),
             serializer: serializer.clone(),
             writer_failure,
-            storer: sender,
+            storer: std::sync::Mutex::new(Some(sender)),
+            shutdown: Default::default(),
             writer: None,
             #[cfg(test)]
             writer_exit_hook: Default::default(),
@@ -941,18 +947,61 @@ impl BlockHandleStorage {
     /// Flush queued writes and wait for the writer to release its database references.
     /// Other provider owners must also be dropped before reopening the database.
     /// Cancelling this wait does not abort the writer or imply that it has exited.
-    pub async fn close_and_wait(mut self) -> Result<()> {
-        let flushed = self.sync_pending().await;
-        let writer = self.writer.take().expect("handle writer is installed by constructor");
+    pub async fn close_and_wait(self) -> Result<()> {
+        let shutdown = self.begin_writer_shutdown();
+        // Consuming close must release this owner's provider references before
+        // waiting, even if another observer independently joins the writer.
         drop(self);
-        match (flushed, writer.await) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(flush), Ok(())) => Err(flush),
-            (Ok(()), Err(join)) => Err(error!("Handle writer failed while closing: {join}")),
-            (Err(flush), Err(join)) => Err(error!(
-                "Handle writer flush failed: {flush:#}; Handle writer failed while closing: {join}"
-            )),
+        shutdown.await.map_err(|error| error!("{error}"))
+    }
+
+    /// Close ordered-write admission, flush accepted work and join the actual writer.
+    /// Call only after producers stop. Direct synchronous writes and other provider
+    /// owners are separate; this does not release their database references.
+    /// The shared receipt survives cancellation and preserves the first close result.
+    pub async fn stop_writer_and_wait(&self) -> Result<()> {
+        self.begin_writer_shutdown().await.map_err(|error| error!("{error}"))
+    }
+
+    fn begin_writer_shutdown(&self) -> WriterShutdown {
+        {
+            let mut slot = self.shutdown.lock().unwrap();
+            slot.get_or_insert_with(|| {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let sender = self.storer.lock().unwrap().take().expect("first writer close");
+                let sent = sender.send(HandleCommand::Barrier(send, None, None)).is_ok();
+                drop(sender);
+                let writer = self.writer.as_ref().expect("handle writer installed").clone();
+                async move {
+                    let flushed = if sent {
+                        receive.await.map_err(|_| error!("Handle writer failed during durability barrier"))
+                            .and_then(|result| result)
+                    } else {
+                        Err(error!("Handle writer stopped"))
+                    };
+                    // Always join, including a poisoned WAL or a panicking callback.
+                    let result = match (flushed, writer.await) {
+                        (Ok(()), Ok(())) => Ok(()),
+                        (Err(flush), Ok(())) => Err(flush),
+                        (Ok(()), Err(join)) => Err(error!("Handle writer failed while closing: {join}")),
+                        (Err(flush), Err(join)) => Err(error!(
+                            "Handle writer flush failed: {flush:#}; Handle writer failed while closing: {join}"
+                        )),
+                    };
+                    result.map_err(|error| Arc::new(format!("{error:#}")))
+                }.boxed().shared()
+            }).clone()
         }
+    }
+
+    fn send_command(&self, command: HandleCommand) -> Result<()> {
+        self.storer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| error!("Handle writer stopped"))?
+            .send(command)
+            .map_err(|_| error!("Handle writer stopped"))
     }
 
     #[cfg(test)]
@@ -1065,8 +1114,7 @@ impl BlockHandleStorage {
         custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
     ) -> Result<()> {
         let (send, receive) = tokio::sync::oneshot::channel();
-        self.storer
-            .send(HandleCommand::Barrier(send, observer, custody))
+        self.send_command(HandleCommand::Barrier(send, observer, custody))
             .map_err(|_| error!("Handle writer stopped"))?;
         receive.await.map_err(|_| error!("Handle writer failed during durability barrier"))?
     }
@@ -1363,8 +1411,7 @@ impl BlockHandleStorage {
         custody: Option<crate::archives::io_owners::ArchiveIoTicket>,
         ack: Option<DurableAck>,
     ) -> Result<()> {
-        self.storer
-            .send(HandleCommand::Work(QueuedWork { job, ops, callback, custody, ack }))
+        self.send_command(HandleCommand::Work(QueuedWork { job, ops, callback, custody, ack }))
             .map_err(|_| error!("Handle storer stopped"))
     }
 

@@ -2938,6 +2938,7 @@ mod handshake_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn quic_cancelled_handshake_releases_peer_for_real_retry() {
+        let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
         let (client, client_id, _) = node(183, "127.0.0.1:0".parse().unwrap());
         // Hold a real UDP address without replying to the initial QUIC handshake.
         let silent = UdpSocket::bind("127.0.0.1:0").unwrap();

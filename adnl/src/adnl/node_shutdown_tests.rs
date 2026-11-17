@@ -104,6 +104,7 @@ async fn started_tcp_node_with(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let mut held_tcp = None;
     let mut first_port = 0;
     let mut first_owner = None;
@@ -125,16 +126,13 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
                 first_owner.as_ref().unwrap().upgrade().is_none(),
                 "failed node must be released before another startup"
             );
-            assert!(
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, first_port)).is_ok(),
-                "partial UDP bind from failed TCP startup must be released"
-            );
+            udp_bind_checked(Ipv4Addr::UNSPECIFIED, first_port, "tcp-failed-owner-released");
         }
         Ok(())
     })
     .await
     .unwrap();
-    assert_eq!(attempts, 2);
+    assert!((2..=8).contains(&attempts), "one forced conflict plus bounded real conflicts");
     assert_ne!(port, first_port);
     assert!(held_tcp.is_some());
     bounded(node.stop_checked()).await.unwrap();
@@ -144,6 +142,7 @@ async fn adnl_tcp_fixture_retries_real_bind_collision_after_owner_release() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_tcp_fixture_does_not_retry_non_bind_startup_failure() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     for close_owner in [true, false] {
         let mut attempts = 0;
         let mut owner = None;
@@ -181,8 +180,80 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
         .await
         .expect("shutdown did not reach actual terminal state")
 }
+fn udp_port_diagnostic(port: u16, stage: &str) {
+    eprintln!(
+        "UDP_PORT_FAILURE stage={stage} port={port} thread={:?}",
+        std::thread::current().name()
+    );
+    #[cfg(target_os = "linux")]
+    for table_path in ["/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(table) = std::fs::read_to_string(table_path) else {
+            eprintln!("UDP_PORT_TABLE_UNAVAILABLE path={table_path}");
+            continue;
+        };
+        let suffix = format!(":{port:04X}");
+        for row in table
+            .lines()
+            .skip(1)
+            .filter(|row| row.split_whitespace().nth(1).is_some_and(|addr| addr.ends_with(&suffix)))
+        {
+            eprintln!("UDP_PORT_ROW stage={stage} port={port} table={table_path} row={row}");
+            if let Some(inode) = row.split_whitespace().nth(9) {
+                let target = format!("socket:[{inode}]");
+                if let Ok(fds) = std::fs::read_dir("/proc/self/fd") {
+                    for fd in fds.flatten() {
+                        if std::fs::read_link(fd.path())
+                            .is_ok_and(|link| link.to_string_lossy() == target)
+                        {
+                            eprintln!(
+                                "UDP_PORT_SELF_FD stage={stage} port={port} fd={} inode={inode}",
+                                fd.file_name().to_string_lossy()
+                            );
+                        }
+                    }
+                }
+                // A forked test child can briefly retain CLOEXEC descriptors
+                // until exec. Capture other process owners before inferring a
+                // node leak from a failed port rebind.
+                if let Ok(processes) = std::fs::read_dir("/proc") {
+                    for process in processes.flatten() {
+                        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+                            continue;
+                        };
+                        if pid == std::process::id() {
+                            continue;
+                        }
+                        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+                            continue;
+                        };
+                        for fd in fds.flatten() {
+                            if std::fs::read_link(fd.path())
+                                .is_ok_and(|link| link.to_string_lossy() == target)
+                            {
+                                let comm = std::fs::read_to_string(process.path().join("comm"))
+                                    .unwrap_or_default();
+                                let status = std::fs::read_to_string(process.path().join("status"))
+                                    .unwrap_or_default();
+                                let parent = status.lines().find(|line| line.starts_with("PPid:"));
+                                eprintln!("UDP_PORT_PROCESS_FD stage={stage} port={port} pid={pid} fd={} inode={inode} comm={comm:?} parent={parent:?}", fd.file_name().to_string_lossy());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn udp_bind_checked(address: Ipv4Addr, port: u16, stage: &str) -> UdpSocket {
+    UdpSocket::bind((address, port)).unwrap_or_else(|error| {
+        udp_port_diagnostic(port, stage);
+        panic!("UDP bind failed: stage={stage} address={address} port={port} error={error}")
+    })
+}
+
 fn udp_released(port: u16) {
-    UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).expect("UDP socket still owned");
+    udp_bind_checked(Ipv4Addr::LOCALHOST, port, "post-stop");
 }
 
 fn tcp_released(port: u16) {
@@ -196,8 +267,12 @@ fn tcp_released(port: u16) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_udp_stop_releases_socket_and_node() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(41).await;
-    node.start_over_udp(Vec::new()).await.unwrap();
+    node.start_over_udp(Vec::new()).await.unwrap_or_else(|error| {
+        udp_port_diagnostic(port, "startup");
+        panic!("UDP startup failed: port={port} error={error:#}");
+    });
     assert!(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_err());
     let weak = Arc::downgrade(&node);
     bounded(node.stop_checked()).await.unwrap();
@@ -223,6 +298,7 @@ impl Subscriber for HeldPoll {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_udp_stop_waiter_cancel_and_concurrent_drain() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(42).await;
     let poll = Arc::new(HeldPoll {
         entered: Notify::new(),
@@ -269,9 +345,13 @@ impl Subscriber for PanicPoll {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_async_panic_closes_transport_and_is_sticky() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(43).await;
     let poll = Arc::new(PanicPoll { release: Notify::new() });
-    node.start_over_udp(vec![poll.clone()]).await.unwrap();
+    node.start_over_udp(vec![poll.clone()]).await.unwrap_or_else(|error| {
+        udp_port_diagnostic(port, "startup");
+        panic!("UDP startup failed: port={port} error={error:#}");
+    });
     poll.release.notify_one();
     bounded(node.tasks.cancelled()).await;
     let error = bounded(node.stop_checked()).await.unwrap_err().to_string();
@@ -293,6 +373,7 @@ impl AdnlReceiver for PanicReceiver {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_receiver_thread_panic_is_joined() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(44).await;
     let started = node
         .start(
@@ -316,6 +397,7 @@ async fn adnl_owned_receiver_thread_panic_is_joined() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_tcp_accept_and_udp_are_joined() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = started_tcp_node(45).await.unwrap();
     let peer = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     bounded(node.stop_checked()).await.unwrap();
@@ -360,6 +442,7 @@ impl Subscriber for PendingSubscriber {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_real_udp_pending_child_after_close_drains() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, port) = node(46).await;
     let (client, _) = node(47).await;
     let pending = Arc::new(PendingSubscriber {
@@ -410,6 +493,7 @@ async fn adnl_owned_real_udp_pending_child_after_close_drains() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_thread_join_survives_all_waiters_cancelled() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let owner = AdnlTasks::new();
     let (release, hold) = std::sync::mpsc::channel();
     let (entered, ready) = oneshot::channel();
@@ -468,6 +552,7 @@ impl AdnlSender for PanicSender {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, port) = node(48).await;
     node.start(
         |node| {
@@ -493,27 +578,65 @@ async fn adnl_owned_sender_panic_wakes_blocking_udp_receiver() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_partial_transport_startup_closes_registered_threads() {
-    let (node, port) = node(49).await;
-    let result = node
-        .start(
-            |node| {
-                let _resources = udp_tcp_sender_receiver(node)?;
-                fail!("injected failure after TCP listener registration")
-            },
-            Vec::new(),
-        )
-        .await;
-    assert!(result.is_err());
-    bounded(node.stop_checked()).await.unwrap();
-    udp_released(port);
-    tcp_released(port);
-    let weak = Arc::downgrade(&node);
-    drop(node);
-    assert!(weak.upgrade().is_none());
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
+    let mut previous_owner: Option<std::sync::Weak<AdnlNode>> = None;
+    for attempt in 0..8 {
+        if let Some(previous) = &previous_owner {
+            assert!(previous.upgrade().is_none(), "failed startup owner must be released");
+        }
+        let (udp, tcp, port) = reserve_tcp_udp().unwrap();
+        let node = node_on_port(49, port).await;
+        // The first attempt intentionally cannot reach the injection. It must
+        // be classified as a bind collision, not as successful partial cleanup.
+        let held_tcp = if attempt == 0 {
+            Some(tcp)
+        } else {
+            drop(tcp);
+            None
+        };
+        drop(udp);
+        let registered = AtomicBool::new(false);
+        let result = node
+            .start(
+                |node| {
+                    let _resources = udp_tcp_sender_receiver(node)?;
+                    registered.store(true, Ordering::Release);
+                    fail!("injected failure after TCP listener registration")
+                },
+                Vec::new(),
+            )
+            .await;
+        bounded(node.stop_checked()).await.unwrap();
+        let error = result.expect_err("injected startup must fail");
+        let bind_collision = error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse);
+        if attempt == 0 {
+            assert!(bind_collision, "reserved TCP port must refuse startup: {error:#}");
+            assert!(!registered.load(Ordering::Acquire));
+        }
+        if bind_collision {
+            assert!(!registered.load(Ordering::Acquire));
+            previous_owner = Some(Arc::downgrade(&node.0));
+            drop(node);
+            drop(held_tcp);
+            continue;
+        }
+        assert!(registered.load(Ordering::Acquire), "failed before TCP registration: {error:#}");
+        assert_eq!(error.to_string(), "injected failure after TCP listener registration");
+        udp_released(port);
+        tcp_released(port);
+        let weak = Arc::downgrade(&node);
+        drop(node);
+        assert!(weak.upgrade().is_none());
+        return;
+    }
+    panic!("TCP registration injection was never reached within eight attempts");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, server_port) = started_tcp_node(50).await.unwrap();
     let (client, client_port) = started_tcp_node(51).await.unwrap();
     let local = client.key_by_tag(0).unwrap();
@@ -558,6 +681,7 @@ async fn adnl_owned_normal_tcp_query_then_transport_owner_release() {
 
 #[tokio::test]
 async fn adnl_owned_pipeline_stop_between_reservation_and_admission() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (node, _) = node(52).await;
     let pipeline = Arc::new(RecvPipeline::with_params(node.clone(), Arc::new(Vec::new())));
     let reservation = pipeline.reserve_worker().unwrap();
@@ -581,6 +705,7 @@ impl Subscriber for PanicCustom {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adnl_owned_pipeline_panic_returns_worker_and_processing_counts() {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     let (server, port) = node(53).await;
     let (client, _) = node(54).await;
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();

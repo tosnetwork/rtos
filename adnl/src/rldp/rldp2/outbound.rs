@@ -233,6 +233,13 @@ impl OutboundConnection {
     pub fn new() -> Self {
         Self::default()
     }
+    #[cfg(test)]
+    pub(crate) fn retained_encoders(&self) -> Vec<(TransferId, usize, usize)> {
+        self.transfers
+            .iter()
+            .map(|(id, transfer)| (*id, transfer.data.len(), transfer.parts.len()))
+            .collect()
+    }
     pub fn transfer_count(&self) -> usize {
         self.transfers.len()
     }

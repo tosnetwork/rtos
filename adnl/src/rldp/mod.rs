@@ -69,6 +69,8 @@ use send::{
     SendPartV2, SendTransfer, SendTransferState,
 };
 
+mod connection_driver;
+mod native_connection;
 mod owned_send;
 mod peers;
 mod query_admission;
@@ -312,6 +314,7 @@ impl SendJob {
 
 declare_counted!(
     struct RldpPeer {
+        native: std::sync::OnceLock<Arc<native_connection::NativeConnection>>,
         inbound_active: std::sync::Mutex<HashSet<TransferId>>,
         inbound_transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
         transfers: Arc<lockfree::map::Map<TransferId, RldpTransfer>>,
@@ -327,6 +330,18 @@ declare_counted!(
         idle: Arc<tokio::sync::Notify>,
     }
 );
+
+// Complete application input, independent of a particular transport decoder.
+// Both the legacy receive wrapper and the Connection event route can borrow it.
+struct MessageContext<'a> {
+    native: bool,
+    adnl: &'a Arc<AdnlNode>,
+    peers: &'a AdnlPeers,
+    data: &'a [u8],
+    transfer_id: TransferId,
+    #[cfg(feature = "debug")]
+    timestamp: &'a Arc<AtomicPtr<Instant>>,
+}
 
 struct RldpAlloc {
     #[cfg(test)]
@@ -507,7 +522,9 @@ impl RldpNode {
             #[cfg(feature = "debug")]
             loss_fn,
         };
-        Ok(Arc::new(ret))
+        let ret = Arc::new(ret);
+        ret.peers.attach(Arc::downgrade(&ret));
+        Ok(ret)
     }
 
     /// +1/-1 the extended-inbound-cap counter for all given peers.
@@ -1114,8 +1131,16 @@ impl RldpNode {
             {
                 return;
             }
-            let send_transfer_id = Self::inbound_loop(
-                &mut context,
+            let send_transfer_id = Self::process_message(
+                MessageContext {
+                    native: false,
+                    adnl: &context.adnl,
+                    peers: &context.peers,
+                    data: &context.recv_transfer.data,
+                    transfer_id: context.transfer_id,
+                    #[cfg(feature = "debug")]
+                    timestamp: &context.recv_transfer.timestamp,
+                },
                 subscribers,
                 v2,
                 &peer_table,
@@ -1183,8 +1208,8 @@ impl RldpNode {
         Ok(InboundRegistration::Created(queue_sender))
     }
 
-    async fn inbound_loop(
-        context: &mut RecvContext,
+    async fn process_message(
+        context: MessageContext<'_>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>,
         v2: bool,
         peer_table: &Arc<peers::PeerTable>,
@@ -1192,31 +1217,29 @@ impl RldpNode {
         send_counter: Arc<AtomicU64>,
         #[cfg(test)] response_lifecycle: &(AtomicU64, AtomicU64),
     ) -> Result<Option<TransferId>> {
-        fn try_decompress(context: &mut RecvContext, data: &mut Vec<u8>) -> bool {
+        fn try_decompress(adnl: &AdnlNode, data: &mut Vec<u8>) -> bool {
             if let Some(decompressed) = DataCompression::decompress_raw(data) {
-                context.adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
+                adnl.set_options(AdnlNode::OPTION_FORCE_COMPRESSION);
                 *data = decompressed;
                 true
             } else {
-                context.adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
+                adnl.check_options(AdnlNode::OPTION_FORCE_COMPRESSION)
             }
         }
 
         let rldp = if v2 { "RLDPv2" } else { "RLDPv1" };
-        let mut query = match deserialize_boxed(&context.recv_transfer.data[..])?
-            .downcast::<RldpMessageBoxed>()
-        {
+        let mut query = match deserialize_boxed(context.data)?.downcast::<RldpMessageBoxed>() {
             Ok(RldpMessageBoxed::Rldp_Query(query)) => query,
             Ok(RldpMessageBoxed::Rldp_Message(mut message)) => {
-                try_decompress(context, &mut message.data);
+                try_decompress(context.adnl, &mut message.data);
                 #[cfg(feature = "debug")]
-                Self::check_timestamp(&context.recv_transfer.timestamp, "Begin message process");
-                if !Custom::process(&subscribers, &message.data, &context.peers).await? {
+                Self::check_timestamp(context.timestamp, "Begin message process");
+                if !Custom::process(&subscribers, &message.data, context.peers).await? {
                     let len = min(16, message.data.len());
                     fail!("No subscribers for message {:?}...", hex::encode(&message.data[..len]));
                 }
                 #[cfg(feature = "debug")]
-                Self::check_timestamp(&context.recv_transfer.timestamp, "End message process");
+                Self::check_timestamp(context.timestamp, "End message process");
                 return Ok(None);
             }
             Ok(message) => fail!("Unexpected {rldp} message: {message:?}"),
@@ -1232,16 +1255,16 @@ impl RldpNode {
                 context.peers.other()
             )
         }
-        let compression = try_decompress(context, &mut query.data);
+        let compression = try_decompress(context.adnl, &mut query.data);
         #[cfg(feature = "debug")]
-        Self::check_timestamp(&context.recv_transfer.timestamp, "Begin query process");
+        Self::check_timestamp(context.timestamp, "Begin query process");
         #[cfg(feature = "telemetry")]
         let query_tag = Self::fetch_tag(&query.data[..]);
-        let Some(answer) = Query::process_rldp(&subscribers, &query, &context.peers).await? else {
+        let Some(answer) = Query::process_rldp(&subscribers, &query, context.peers).await? else {
             fail!("No subscribers for query {:?}", query)
         };
         #[cfg(feature = "debug")]
-        Self::check_timestamp(&context.recv_transfer.timestamp, "End query process");
+        Self::check_timestamp(context.timestamp, "End query process");
         let answer = match answer.try_finalize()? {
             (Some(answer), _) => answer.try_wait().await?,
             (None, answer) => TimedAnswer {
@@ -1269,6 +1292,46 @@ impl RldpNode {
         } else {
             None
         };
+        if context.native {
+            if compression {
+                answer.object.data = DataCompression::compress_raw(&answer.object.data)?;
+            }
+            let (len, max) = (answer.object.data.len(), query.max_answer_size as usize);
+            if len > max {
+                fail!("Exceeded max {rldp} answer size: {} vs {}", len, max)
+            }
+            let mut send_transfer_id = context.transfer_id;
+            for byte in &mut send_transfer_id {
+                *byte ^= 0xff;
+            }
+            // Application work belongs to the node, not the old connection.
+            // Native answer_query reacquires this authenticated pair after the
+            // application finishes, including when its former actor was evicted.
+            let peer = peer_table
+                .get(
+                    context.peers.local(),
+                    context.peers.other(),
+                    true,
+                    response_deadline.map(tokio::time::Instant::from_std),
+                )
+                .await?;
+            let native =
+                peer.native.get().ok_or_else(|| error!("Connection response mode mismatch"))?;
+            let accepted = native
+                .driver
+                .submit(connection_driver::Command::Send {
+                    id: send_transfer_id,
+                    data: serialize_boxed(&answer.object.into_boxed())?,
+                    deadline: response_deadline,
+                    answer: true,
+                })
+                .await?;
+            #[cfg(test)]
+            if accepted {
+                response_lifecycle.0.fetch_add(1, Ordering::Release);
+            }
+            return Ok(accepted.then_some(send_transfer_id));
+        }
         let peer = peer_table
             .get(
                 context.peers.local(),
@@ -1357,7 +1420,7 @@ impl RldpNode {
             pong,
             send_transfer,
             #[cfg(feature = "debug")]
-            timestamp: context.recv_transfer.timestamp.clone(),
+            timestamp: context.timestamp.clone(),
             transfer_id: context.transfer_id,
             #[cfg(feature = "telemetry")]
             tag,
@@ -1441,7 +1504,7 @@ impl RldpNode {
             let message = RldpMessage { id: UInt256::rand(), data }.into_boxed();
             (None::<QueryId>, message)
         };
-        let data: Arc<[u8]> = Arc::from(serialize_boxed(&message)?);
+        let data = serialize_boxed(&message)?;
         // This counts queries waiting for answers, including those queued for
         // a sender. Native RldpIn refuses these independently of transfer capacity.
         let query_admission =
@@ -1486,6 +1549,29 @@ impl RldpNode {
             },
             permit = peer.outbound_semaphore.clone().acquire_owned() => Arc::new(permit?),
         };
+        if let Some(native) = peer.native.get() {
+            let answer = native
+                .outbound(
+                    data,
+                    max_answer_size,
+                    transfer_deadline.expect("V2 transfer deadline"),
+                    query_admission,
+                    bounded,
+                    control.clone(),
+                    permit,
+                )
+                .await?;
+            peer.stats.v1.update(self.min_timeout_ms);
+            return self.decode_outbound_answer(
+                answer,
+                query_id,
+                max_answer_size,
+                true,
+                response_limits,
+                peer.stats.v1.roundtrip(),
+            );
+        }
+        let data: Arc<[u8]> = Arc::from(data);
         #[cfg(feature = "telemetry")]
         log::trace!(
             target: TARGET,
@@ -1697,7 +1783,25 @@ impl RldpNode {
         #[cfg(feature = "debug")]
         self.check_time("Outbound end");
         // _permit drops here, releasing the outbound slot.
-        let answer = res?;
+        self.decode_outbound_answer(
+            res?,
+            query_id,
+            max_answer_size,
+            v2,
+            response_limits,
+            peer.stats.v1.roundtrip(),
+        )
+    }
+
+    fn decode_outbound_answer(
+        &self,
+        answer: Option<Vec<u8>>,
+        query_id: Option<QueryId>,
+        max_answer_size: Option<u64>,
+        v2: bool,
+        response_limits: Option<QueryResponseLimits>,
+        roundtrip: u64,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
         if let Some(answer) = answer {
             let Some(query_id) = query_id else {
                 fail!("Unexpected answer {answer:?} to RLDP message");
@@ -1709,7 +1813,10 @@ impl RldpNode {
             };
             match decoded {
                 Ok(RldpMessageBoxed::Rldp_Answer(answer)) => {
-                    if answer.query_id.as_slice() != &query_id {
+                    // Native V2 correlates answers by the authenticated peer pair
+                    // and response transfer ID, already selected by the receiver.
+                    // The envelope query_id is not an additional acceptance gate.
+                    if !v2 && answer.query_id.as_slice() != &query_id {
                         fail!("Unknown query ID in RLDP answer")
                     } else {
                         // Native RLDP2 checks the original payload limit even
@@ -1766,14 +1873,14 @@ impl RldpNode {
                                 data[0], data[1], data[2], data[3]
                             )
                         }
-                        Ok((Some(data), peer.stats.v1.roundtrip()))
+                        Ok((Some(data), roundtrip))
                     }
                 }
                 Ok(answer) => fail!("Unexpected answer to RLDP query: {:?}", answer),
                 Err(answer) => fail!("Unexpected answer to RLDP query: {:?}", answer),
             }
         } else {
-            Ok((None, peer.stats.v1.roundtrip()))
+            Ok((None, roundtrip))
         }
     }
 
@@ -2598,7 +2705,34 @@ impl Subscriber for RldpNode {
             Err(msg) => msg,
         };
         match msg.downcast::<Rldp2MessagePartBoxed>() {
-            Ok(msg) => self.consume_message_part(MessagePart::V2(msg), peers).await,
+            Ok(msg) => {
+                if self.peers.native_enabled() {
+                    let peer = self.get_peer(peers.local(), peers.other(), true, None).await?;
+                    let native =
+                        peer.native.get().ok_or_else(|| error!("Connection mode mismatch"))?;
+                    native
+                        .driver
+                        .submit(connection_driver::Command::Packet {
+                            data: data.to_vec(),
+                            mtu: self.peer_inbound_cap(peers.other(), true) as u64,
+                        })
+                        .await?;
+                    #[cfg(test)]
+                    if let Rldp2MessagePartBoxed::Rldp2_MessagePart(part) = msg {
+                        *native
+                            .data_receipts
+                            .lock()
+                            .unwrap()
+                            .entry((*part.0.transfer_id.as_array(), part.0.part, part.0.seqno))
+                            .or_default() += 1;
+                        native.processed_data_packets.fetch_add(1, Ordering::Release);
+                        native.data_processed.notify_one();
+                    }
+                    Ok(true)
+                } else {
+                    self.consume_message_part(MessagePart::V2(msg), peers).await
+                }
+            }
             Err(_) => Ok(false),
         }
     }
