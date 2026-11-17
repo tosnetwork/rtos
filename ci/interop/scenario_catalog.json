@@ -359,7 +359,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "publication-io",

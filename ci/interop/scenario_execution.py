@@ -56,6 +56,11 @@ from scenario_packet import (
     packet_arguments,
     packet_artifacts,
 )
+from scenario_receiver import (
+    RECEIVER_PLAN,
+    check_receiver_evidence,
+    check_receiver_result,
+)
 from scenario_restart import (
     RESTARTS,
     check_restart_cleanup,
@@ -81,7 +86,7 @@ ROTATIONS = (
         )
         for mode in ("control", "mixed")
     )
-    | {"restart-member2", "restart-member5"}
+    | {"restart-member2", "restart-member5", "propagation-receiver"}
     | set(PACKETS)
     | set(RESTARTS)
     | set(ACKS)
@@ -137,6 +142,8 @@ def make_profile(name, template, now):
             initial_weights={"0": 29, "1": 11, "2": 10, "3": 10},
             initial_probe_pause=[1],
         )
+    if name == "propagation-receiver":
+        profile["propagation_receiver"] = RECEIVER_PLAN.copy()
     if name == "below-quorum-restart":
         profile["successor_weights"] = {"0": 10, "2": 30, "4": 10, "5": 10}
     if name.startswith("observer-budget-"):
@@ -219,6 +226,10 @@ def check_result(name, result):
         check_first_intent_result(name, result)
     elif result.get("first_intent_cut") is not None:
         raise ValueError("Unexpected first-intent cut receipt")
+    if name == "propagation-receiver":
+        check_receiver_result(result.get("propagation_receiver"))
+    elif result.get("propagation_receiver") is not None:
+        raise ValueError("Unexpected propagation receiver receipt")
     recovery = result.get("recovery")
     if name == "signer-expiry":
         check_ack_partition_result(
@@ -450,6 +461,8 @@ def execute(args, names, catalog):
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name == "propagation-receiver":
+                run += ["--verify-propagation-receiver"]
             if name in FIRST_INTENTS:
                 run += first_intent_arguments(name, args.first_intent_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
@@ -490,6 +503,10 @@ def execute(args, names, catalog):
                     or name in EXPIRIES
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name == "propagation-receiver":
+                check_receiver_evidence(
+                    case / "runtime", result["propagation_receiver"], profile
+                )
             if name in FIRST_INTENTS:
                 check_first_intent_evidence(
                     case / "runtime", result["first_intent_cut"], FIRST_INTENTS[name]
