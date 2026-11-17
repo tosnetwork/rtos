@@ -40,6 +40,7 @@ parser.add_argument(
 )
 parser.add_argument("--timeout", type=float, default=180)
 parser.add_argument("--block-checker", type=Path)
+parser.add_argument("--verify-full-state", action="store_true")
 parser.add_argument("--require-leadership", action="store_true")
 parser.add_argument("--min-height", type=int, default=4)
 parser.add_argument(
@@ -49,6 +50,10 @@ parser.add_argument(
     help="Active mode: two C++ nodes require Rust for quorum; three exercise the full topology",
 )
 args = parser.parse_args()
+if args.verify_full_state and (not args.block_checker or args.validator_preparer):
+    parser.error(
+        "--verify-full-state currently requires an unsigned node and --block-checker"
+    )
 if args.require_leadership and not (args.validator_preparer and args.block_checker):
     parser.error(
         "--require-leadership requires --validator-preparer and --block-checker"
@@ -72,6 +77,11 @@ require_cpp_baseline(manifest["cpp_source_commit"], reference_profile)
 with args.rust_node.open("rb") as stream:
     rust_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
 preparer_sha256 = None
+evidence_inputs = {}
+if args.verify_full_state:
+    for name in ("bootstrap_evidence.py", "receiver_evidence.py", "mixed_matrix.py"):
+        path = Path(__file__).with_name(name)
+        evidence_inputs[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
 if args.validator_preparer:
     with args.validator_preparer.open("rb") as stream:
         preparer_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -92,6 +102,7 @@ if args.validator_preparer:
             "command": sys.argv,
             "initial_rust_signing": args.validator_preparer is not None,
             "validator_preparer_sha256": preparer_sha256,
+            "full_state_evidence_inputs": evidence_inputs,
         },
         indent=2,
     )
@@ -106,6 +117,7 @@ from sync_observation import SyncObservation
 from tostester.install import Install
 from tostester.key import Key
 from tostester.network import Network, StartOptions
+from tosapi import tos_api
 
 
 def rpc(url, method, params=None):
@@ -201,6 +213,8 @@ async def main():
             "validation_countdown_mode": "except-zerostate",
             "json_rpc_server": {"address": f"127.0.0.1:{free_tcp_port()}"},
         }
+        if args.verify_full_state:
+            default["lite_server_port"] = free_tcp_port()
         rust_rpc = "http://" + default["json_rpc_server"]["address"] + "/jsonRPC"
         (root / "rpc-endpoints.json").write_text(
             json.dumps({"cpp": cpp_rpc, "rust": rust_rpc})
@@ -505,6 +519,63 @@ async def main():
                             (root / "sync-sample.json").write_text(
                                 json.dumps(sample, indent=2) + "\n"
                             )
+                            evidence = None
+                            if args.verify_full_state:
+                                from bootstrap_evidence import (
+                                    collect_bootstrap_evidence,
+                                )
+
+                                client = json.loads(
+                                    (rust / "lite_client_config.json").read_text()
+                                )
+                                config = tos_api.Liteclient_config_global(
+                                    liteservers=[
+                                        tos_api.Liteserver_desc(
+                                            id=tos_api.Pub_ed25519(
+                                                key=base64.b64decode(
+                                                    client["server_key"]["pub_key"]
+                                                )
+                                            ),
+                                            ip=2130706433,
+                                            port=int(
+                                                client["server_address"].rsplit(":", 1)[
+                                                    1
+                                                ]
+                                            ),
+                                        )
+                                    ],
+                                    validator=network.zerostate.as_validator_config(),
+                                )
+                                evidence = await asyncio.wait_for(
+                                    collect_bootstrap_evidence(
+                                        args,
+                                        sample,
+                                        rust_rpc,
+                                        rpc,
+                                        config,
+                                        cpp_members[0],
+                                        network.zerostate.masterchain.file.read_bytes(),
+                                        root / "bootstrap-evidence",
+                                    ),
+                                    max(0, deadline - time.monotonic()),
+                                )
+                                if (
+                                    hashlib.sha256(
+                                        args.block_checker.read_bytes()
+                                    ).hexdigest()
+                                    != checker_sha
+                                ):
+                                    raise RuntimeError(
+                                        "Block checker changed during the run"
+                                    )
+                                if any(
+                                    hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                    != expected
+                                    for path, expected in evidence_inputs.items()
+                                ):
+                                    raise RuntimeError(
+                                        "Bootstrap evidence helper changed during the run"
+                                    )
                             return {
                                 "status": (
                                     "rust_required_for_quorum_chain_progress"
@@ -518,6 +589,7 @@ async def main():
                                 "active_rust_signing": args.validator_preparer
                                 is not None,
                                 "mixed_validator_qualified": False,
+                                "body_state_evidence": evidence,
                             }
                     await asyncio.sleep(0.1)
                 raise TimeoutError(
