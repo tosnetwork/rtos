@@ -136,6 +136,25 @@ fn main() -> Result<()> {
     let value: Value = serde_json::from_slice(&std::fs::read(request)?)?;
     let result = match value.get("mode").and_then(Value::as_str) {
         Some("state-copies") => check_state_copies(&value)?,
+        Some("finality-witness") => {
+            ensure!(
+                value.get("reference").is_none()
+                    && value.get("comparison").is_none()
+                    && value.get("rust").is_none(),
+                "historical witness must not claim live endpoint heads"
+            );
+            ensure!(
+                value.get("masterchain_state").is_some()
+                    && value["certificates"].as_array().is_some_and(|v| !v.is_empty()),
+                "historical witness needs full state and final certificates"
+            );
+            let mut checked = check_request(&value, 1)?;
+            checked.as_object_mut().unwrap().remove("state_update_matches_both");
+            checked["mode"] = json!("finality-witness");
+            checked["rpc_heads_checked"] = json!(false);
+            checked["state_update_matches_full_state"] = json!(true);
+            checked
+        }
         None => check_request(&value, 0)?,
         Some(_) => anyhow::bail!("unknown checker mode"),
     };
@@ -380,6 +399,23 @@ fn check_request(value: &Value, depth: u8) -> Result<Value> {
                         .into(),
                     },
                 )?);
+            } else if source["kind"] == "node" {
+                let bytes = base64_decode(
+                    source["signature_set"].as_str().context("node signature bytes required")?,
+                )?;
+                ensure!(bytes.len() <= 16 * 1024 * 1024, "node signature set too large");
+                let wire: rtos_api::ton::ton_node::SignatureSet =
+                    rtos_api::WireProfile::T0.deserialize_typed(&bytes)?;
+                ensure!(
+                    rtos_api::WireProfile::T0.serialize(&wire)? == bytes,
+                    "noncanonical node signature set"
+                );
+                let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(wire) =
+                    wire
+                else {
+                    anyhow::bail!("node PQ final certificate required");
+                };
+                matched.push(rtos_api::pq_finality::PqNetworkSignatureSet::from_node(wire)?);
             } else {
                 ensure!(source["kind"] == "cpp_lite", "unknown certificate source");
                 for response in

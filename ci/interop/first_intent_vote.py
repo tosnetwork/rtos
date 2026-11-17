@@ -35,8 +35,10 @@ def post_restart_successor_vote(checked, member, restarted_at):
 
 def matches_original_intent(checked, record):
     """Match an intended Final to the native checker's authenticated candidate."""
-    return checked.get("block", {}).get("seqno") == 1 and matches_final_intent(
-        checked, record, workchain=-1
+    return (
+        checked.get("mode") is None
+        and checked.get("block", {}).get("seqno") == 1
+        and matches_final_intent(checked, record, workchain=-1)
     )
 
 
@@ -63,8 +65,18 @@ def matches_final_intent(checked, record, *, workchain):
             "file_hash_checked",
             "cell_hash_checked",
             "header_identity_checked",
-            "state_update_matches_both",
         )
+    ):
+        return False
+    if checked.get("mode") == "finality-witness":
+        if (
+            checked.get("rpc_heads_checked") is not False
+            or checked.get("state_update_matches_full_state") is not True
+        ):
+            return False
+    elif (
+        checked.get("mode") is not None
+        or checked.get("state_update_matches_both") is not True
     ):
         return False
     for cert in checked.get("verified_final_certificates", []):

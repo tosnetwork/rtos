@@ -31,6 +31,22 @@ def fixture(height=300):
 
 
 class FinalIntentMatchTest(unittest.TestCase):
+    def test_historical_finality_never_claims_live_head_agreement(self):
+        record, checked = fixture(height=1)
+        checked.pop("state_update_matches_both")
+        checked.update(
+            mode="finality-witness",
+            rpc_heads_checked=False,
+            state_update_matches_full_state=True,
+        )
+        self.assertTrue(matches_final_intent(checked, record, workchain=-1))
+        self.assertFalse(matches_original_intent(checked, record))
+        checked["rpc_heads_checked"] = True
+        self.assertFalse(matches_final_intent(checked, record, workchain=-1))
+        checked["rpc_heads_checked"] = False
+        checked["state_update_matches_full_state"] = False
+        self.assertFalse(matches_final_intent(checked, record, workchain=-1))
+
     def test_later_candidate_does_not_qualify_first_intent(self):
         record, checked = fixture()
         self.assertTrue(matches_final_intent(checked, record, workchain=-1))
