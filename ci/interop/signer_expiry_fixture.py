@@ -376,6 +376,10 @@ class SignerExpiry:
                     raise RuntimeError(
                         "Unsigned restart lacks the original configuration binding"
                     )
+                if configuration.get("before_sha256") != expected[config_path]:
+                    raise RuntimeError(
+                        "Unsigned conversion changed the original configuration binding"
+                    )
                 expected[config_path] = configuration["after_sha256"]
             if any(digest(Path(p)) != h for p, h in expected.items()):
                 raise RuntimeError(

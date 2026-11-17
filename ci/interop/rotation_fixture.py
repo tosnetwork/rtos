@@ -566,7 +566,11 @@ async def _recover_rotation_member(
         from unsigned_recovery_evidence import UnsignedConfiguration
 
         unsigned_configuration = UnsignedConfiguration(
-            node["directory"], directory / "unsigned-configuration"
+            node["directory"],
+            directory / "unsigned-configuration",
+            expected_before_sha256=args.signer_expiry_observer.bindings[
+                str(node["directory"] / "config.json")
+            ],
         )
     node.update(
         await start_rotation_node(

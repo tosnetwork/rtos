@@ -19,7 +19,7 @@ def sha(raw):
 
 
 class UnsignedConfiguration:
-    def __init__(self, node_directory, evidence):
+    def __init__(self, node_directory, evidence, *, expected_before_sha256):
         self.node = Path(node_directory)
         self.directory = Path(evidence)
         self.config = self.node / "config.json"
@@ -31,8 +31,12 @@ class UnsignedConfiguration:
             raise ValueError("Original database directory is absent")
         self.database_identity = (stat.st_dev, stat.st_ino)
         before_raw = self.config.read_bytes()
+        if sha(before_raw) != expected_before_sha256:
+            raise ValueError(
+                "Configuration changed since original natural expiry binding"
+            )
         before = json.loads(before_raw)
-        if not before.get("pq_consensus") or not before.get("validator_keys"):
+        if not before.get("pq_consensus"):
             raise ValueError("Expected an explicitly provisioned signing configuration")
         self.after = {
             key: value

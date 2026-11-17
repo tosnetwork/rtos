@@ -34,7 +34,11 @@ class UnsignedRecoveryTests(unittest.TestCase):
         }
         self.config = self.node / "config.json"
         self.config.write_text(json.dumps(self.before))
-        self.state = UnsignedConfiguration(self.node, self.root / "configuration")
+        self.state = UnsignedConfiguration(
+            self.node,
+            self.root / "configuration",
+            expected_before_sha256=sha(self.config.read_bytes()),
+        )
         self.pending = SimpleNamespace(
             namespaces=self.node / "node_db",
             records=[
@@ -105,6 +109,29 @@ class UnsignedRecoveryTests(unittest.TestCase):
         args.unsigned_original_recovery = False
         with self.assertRaises(SystemExit):
             reject_inactive_custody_faults(args)
+
+    def test_transport_change_after_expiry_is_rejected_before_conversion(self):
+        self.config.write_text(json.dumps(self.before))
+        original_hash = sha(self.config.read_bytes())
+        changed = dict(self.before, transport="different identity")
+        self.config.write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, "natural expiry binding"):
+            UnsignedConfiguration(
+                self.node, self.root / "changed", expected_before_sha256=original_hash
+            )
+        self.assertEqual(json.loads(self.config.read_text()), changed)
+        self.assertFalse((self.root / "changed").exists())
+
+    def test_pq_only_config_with_null_classical_keys_is_valid(self):
+        before = dict(self.before, validator_keys=None)
+        self.config.write_text(json.dumps(before))
+        state = UnsignedConfiguration(
+            self.node,
+            self.root / "pq-only",
+            expected_before_sha256=sha(self.config.read_bytes()),
+        )
+        state.check()
+        self.assertNotIn("validator_keys", json.loads(self.config.read_text()))
 
     def test_conversion_preserves_transport_and_original_bytes(self):
         expected = dict(self.before)
