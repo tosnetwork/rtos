@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cpp_baseline import ACTIVE_CPP_REVISION
+from cpp_baseline import ACTIVE_CPP_REVISION, PREVIOUS_ACTIVE_CPP_REVISION
 from successor_ledger_fixture import prepare_successor_ledgers
 
 
@@ -69,6 +69,10 @@ class SuccessorLedgerTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.run_ceremony()
             self.assertEqual(run.call_count, 1)
+
+    def test_previous_active_profile_provisions_once_and_refuses_reuse(self):
+        self.profile["cpp_revision"] = PREVIOUS_ACTIVE_CPP_REVISION
+        self.test_only_fresh_cpp_successor_and_second_invocation_refused()
 
     def test_existing_state_or_running_process_refused_before_command(self):
         with patch("successor_ledger_fixture.subprocess.run") as run:
