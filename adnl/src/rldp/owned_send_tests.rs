@@ -272,6 +272,7 @@ async fn rldp_owned_query_capacity_is_not_tombstone_capacity() {
 }
 
 async fn node() -> Arc<crate::adnl::node::AdnlNode> {
+    let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
     use crate::adnl::node::{AdnlNode, AdnlNodeConfig};
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();

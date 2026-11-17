@@ -134,7 +134,7 @@ async fn archive_gc_refuses_after_a_failed_write() -> Result<()> {
     assert!(handle.is_ok(), "admission succeeds; the commit fails");
     assert!(db.archive_gc(&mc(30)).await.is_err());
     assert!(db.full_node_state_db.try_get_raw(LAST_UNNEEDED_KEY_BLOCK.as_bytes())?.is_none());
-    let _ = db.stop_states_db().await;
+    let _ = db.stop_storage().await;
     Ok(())
 }
 
@@ -290,7 +290,7 @@ async fn interrupted_recovery_keeps_its_beacon_and_is_repeated() -> Result<()> {
         let interrupted = restore::check_db(&db, 0, true, false, &|| Ok(()), None).await;
         assert!(interrupted.is_err(), "recovery completed over a failed metadata barrier");
         assert!(beacon.exists(), "recovery beacon removed before its metadata was durable");
-        let _ = db.stop_states_db().await;
+        let _ = db.stop_storage().await;
     }
     assert!(beacon.exists(), "recovery beacon lost across restart");
     // Without repair an interrupted restore refuses the start; with repair
@@ -313,5 +313,52 @@ async fn dynamic_state_is_reported_saved_only_after_durable_flag() -> Result<()>
     let probe = report_saved_state(db.clone()).await?;
     assert_eq!(*probe.stored_saved.lock().unwrap(), Some(true), "saved flag not stored at report");
     db.stop_states_db().await?;
+    Ok(())
+}
+
+/// Complete storage shutdown must wait for the actual metadata callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_shutdown_joins_held_metadata_writer_before_reopen() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("node_db");
+    let db = open_db(&root).await?;
+    let held = hold_writer(&db).await?;
+    // Finish the inherited state/archive drain first. A pending full close must
+    // then come from metadata shutdown, not an unrelated state worker join.
+    let state_result = db.stop_states_db().await;
+    if let Err(error) = state_result {
+        held.release.notify_one();
+        let _ = db.stop_handle_writer().await;
+        return Err(error);
+    }
+    let mut states_again = Box::pin(db.stop_states_db());
+    let states_ready = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(states_again.as_mut(), cx))
+    })
+    .await;
+    drop(states_again);
+    let mut closing = Box::pin(db.stop_storage());
+    let observed = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(closing.as_mut(), cx))
+    })
+    .await;
+    let pending = observed.is_pending();
+    held.release.notify_one();
+    let result = match observed {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => closing.as_mut().await,
+    };
+    drop(closing);
+    // Independent rescue also joins the writer if the shutdown path regresses.
+    db.stop_handle_writer().await?;
+    result?;
+    drop(db);
+    let reopened = open_db(&root).await?;
+    reopened.stop_storage().await?;
+    assert!(
+        matches!(states_ready, std::task::Poll::Ready(Ok(()))),
+        "state drain itself was still pending"
+    );
+    assert!(pending, "storage shutdown returned with a callback still held");
     Ok(())
 }

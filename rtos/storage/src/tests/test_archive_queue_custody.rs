@@ -184,7 +184,7 @@ async fn no_cache_and_enqueue_failure_release_supplied_ticket() {
     storage.no_cache = false;
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(receiver);
-    storage.storer = sender;
+    storage.storer = std::sync::Mutex::new(Some(sender));
     assert!(storage
         .save_handle_with_archive_custody(&handle, None, owners.enter().unwrap())
         .is_err());
@@ -424,4 +424,52 @@ async fn close_waits_at_actual_post_drain_writer_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_close_observer_retains_writer_until_actual_exit() {
     verify_close_at_actual_writer_exit(true).await;
+}
+
+/// Shared close observers can be cancelled without losing the actual writer receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_close_cancellation_retains_admission_and_writer_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite).unwrap();
+    let (storage, handle_db) = create_block_handle_storage(db);
+    let completion = storage.writer_completion_for_test();
+    let (mut entered, release) = storage.hold_writer_exit_for_test();
+    let mut first = Box::pin(storage.stop_writer_and_wait());
+    let mut early = None;
+    let arrived = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                result = &mut first, if early.is_none() => early = Some(result),
+                arrived = &mut entered => break arrived,
+            }
+        }
+    })
+    .await;
+    drop(first);
+    let refused = storage.sync_pending().await.is_err();
+    let mut second = Box::pin(storage.stop_writer_and_wait());
+    let observed = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(second.as_mut(), cx))
+    })
+    .await;
+    let pending = observed.is_pending();
+    // Independently release and join even if either observer returned too early.
+    let released = release.send(()).is_ok();
+    let joined = tokio::time::timeout(Duration::from_secs(20), completion).await;
+    let closed = match observed {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => second.as_mut().await,
+    };
+    drop(second);
+    let repeated = storage.stop_writer_and_wait().await;
+    drop(storage);
+    drop(handle_db);
+    let reopened = RocksDb::new(dir.path(), "db", None, AccessType::ReadWrite);
+    assert!(matches!(arrived, Ok(Ok(()))));
+    assert!(released && matches!(joined, Ok(Ok(()))));
+    assert!(early.is_none() && pending, "shared close bypassed actual writer exit");
+    assert!(refused, "closed ordered queue accepted another barrier");
+    closed.unwrap();
+    repeated.unwrap();
+    reopened.unwrap();
 }

@@ -431,7 +431,7 @@ impl InternalDb {
         match checked {
             Ok(Ok(())) => (),
             Ok(Err(error)) => {
-                if let Err(cleanup) = db.stop_states_db().await {
+                if let Err(cleanup) = db.stop_storage().await {
                     return Err(error!(
                         "DB startup failed: {error:#}; storage cleanup failed: {cleanup:#}"
                     ));
@@ -439,7 +439,7 @@ impl InternalDb {
                 return Err(error);
             }
             Err(panic) => {
-                if let Err(cleanup) = db.stop_states_db().await {
+                if let Err(cleanup) = db.stop_storage().await {
                     log::error!("DB startup panic cleanup failed: {cleanup:#}");
                 }
                 std::panic::resume_unwind(panic);
@@ -723,6 +723,23 @@ impl InternalDb {
                 Some(barrier),
             )
         }
+    }
+
+    /// Complete storage shutdown after all external producers have stopped.
+    pub async fn stop_storage(&self) -> Result<()> {
+        let states = self.stop_states_db().await;
+        let writer = self.stop_handle_writer().await;
+        match (states, writer) {
+            (Err(state), Err(writer)) => {
+                Err(error!("State/archive shutdown: {state:#}; handle writer shutdown: {writer:#}"))
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn stop_handle_writer(&self) -> Result<()> {
+        self.block_handle_storage.stop_writer_and_wait().await
     }
 
     pub async fn stop_states_db(&self) -> Result<()> {

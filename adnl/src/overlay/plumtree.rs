@@ -1709,6 +1709,7 @@ mod transport_tests {
         endpoint_with_profile(seed, rtos_api::WireProfile::Legacy).await
     }
     async fn endpoint_with_profile(seed: u8, profile: rtos_api::WireProfile) -> Endpoint {
+        let _socket_lifecycle = crate::test_process::socket_lifecycle().await;
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         drop(socket);
@@ -2611,9 +2612,45 @@ mod transport_tests {
         assert_eq!(serialize_boxed(&certificate).unwrap().len(), 256);
         let data = vec![17; MAX_PLUMTREE_PAYLOAD];
         let send = a.overlay.broadcast_plumtree(&id, &a.key, certificate, 0, Some([97; 32]), &data);
-        let (left, right, sent) = tokio::time::timeout(Duration::from_secs(20), async {
-            tokio::join!(biased; a.overlay.wait_for_broadcast(&id), b.overlay.wait_for_broadcast(&id), send)
-        }).await.expect("maximum lawful payload traverses real QUIC repair");
+        let completed = AtomicUsize::new(0);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            let local = async {
+                let result = a.overlay.wait_for_broadcast(&id).await;
+                completed.fetch_or(1, Ordering::Release);
+                result
+            };
+            let remote = async {
+                let result = b.overlay.wait_for_broadcast(&id).await;
+                completed.fetch_or(2, Ordering::Release);
+                result
+            };
+            let sending = async {
+                let result = send.await;
+                completed.fetch_or(4, Ordering::Release);
+                result
+            };
+            tokio::join!(biased; local, remote, sending)
+        })
+        .await;
+        if outcome.is_err() {
+            eprintln!("PLUMTREE_MAX_TIMEOUT: completed_mask={} elapsed_ms={} (local=1 remote=2 send=4; completion does not imply success)",
+                completed.load(Ordering::Acquire), started.elapsed().as_millis());
+            for (side, endpoint) in [("local", &a), ("remote", &b)] {
+                let overlay = endpoint.overlay.get_overlay(&id, "timeout diagnostic").unwrap();
+                match overlay.plumtree_engine() {
+                    Ok(engine) => {
+                        let state = engine.states.get(&[97; 32]);
+                        eprintln!("PLUMTREE_MAX_STATE: side={side} states={} retained={} missing={} outstanding={} target={:?}",
+                            engine.states.len(), engine.retained, engine.missing.len(), engine.outstanding.len(),
+                            state.map(|state| (state.parts.len(), state.delivered, state.decode_failed, state.bytes, state.full_size)));
+                    }
+                    Err(error) => eprintln!("PLUMTREE_MAX_STATE: side={side} unavailable={error}"),
+                };
+            }
+        }
+        let (left, right, sent) =
+            outcome.expect("maximum lawful payload traverses real QUIC repair");
         sent.unwrap();
         assert_eq!(left.unwrap().unwrap().data, data);
         assert_eq!(right.unwrap().unwrap().data, data);
@@ -2828,7 +2865,10 @@ mod reference_interop {
         fs::write(dir.join("rust-trailing.tl"), trailing).unwrap();
         manifest.push_str(&format!("rust-trailing.tl {} 0 0 0\n", hex::encode(simple_key.id)));
         fs::write(dir.join("rust-cases.txt"), manifest).unwrap();
-        let output = Command::new(runner).env("RTOS_PLUMTREE_INTEROP_DIR", &dir).output().unwrap();
+        let output = crate::test_process::output(
+            Command::new(runner).env("RTOS_PLUMTREE_INTEROP_DIR", &dir),
+        )
+        .unwrap();
         fs::write(dir.join("reference.stdout"), &output.stdout).unwrap();
         fs::write(dir.join("reference.stderr"), &output.stderr).unwrap();
         assert!(
