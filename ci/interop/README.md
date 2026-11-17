@@ -511,11 +511,32 @@ retained2/new5 are validators. CPP retired members require corresponding MC
 observer startup logs. This legitimate availability/role observation does not
 replace acceptance for invalid old-group votes submitted to a new group.
 
-The `expired-member-restart` scenario naturally expires member5 before an ACK
-sync-EIO and partitioned restart of its original database. It requires recovery
-as a full node with no vote or creator role, unchanged original signing authority,
-and at least three progressing native-checked samples spanning12 seconds.
-Provide both ACK and packet library provenance arguments. Authority copies,
-pre-expiry-process refusal logs and post-expiry survivor certificates are checked
-alongside original ACK bytes and kernel partition counters. The distinct
-`signer-expiry` below-quorum combination remains unintegrated.
+The `expired-member-restart` entry remains **unintegrated**. Its former oracle
+required unchanged, entirely expired signing configuration to restart as a full
+node. That contradicts the reference: TOS `ed8e0a80`
+`crypto/pq/consensus-key-schedule.h:128–153` refuses a load plan with no unexpired
+keys, and `validator-engine/validator-engine.cpp:2553–2573` treats that refusal as
+a startup error. RTOS `pq-consensus/src/schedule.rs` and
+`rtos/src/pq_consensus_config.rs` implement the same rule. Do not renew keys or
+silently disable the validator configuration to make the old oracle pass.
+
+Explicitly switching a stopped node to unsigned configuration is a separate
+recovery case. Record the configuration change; preserve the original database,
+network transport identity, captured intent/output bytes and original recovery
+budget. Transport-only private keys may still be required by explicit ADNL
+bindings and do not grant consensus membership. Full-state synchronization,
+complete authenticated original-output recovery and absence of signing all need
+runtime evidence; deleting pending files or removing the signing configuration
+alone proves none of them. This case is not yet qualified.
+
+The isolated `intent_cleanup_fault.c` library can return EIO for deletion of one
+exact accepted output map while preserving its matching intent. It copies the
+map and intent before the failed deletion and lets the original process continue
+running to natural expiry. The driver must validate complete snapshots and
+identity bindings, not just the existence of `captured`. This cut covers
+accepted-but-not-cleaned work, not an unfinished pre-acceptance walk. It is not
+wired into the scenario catalog yet.
+
+The distinct `signer-expiry` below-quorum scenario is integrated: an expired
+member remains in its original process while another member is restarted. Its
+successful observations do not establish expired-only custody cold startup.
