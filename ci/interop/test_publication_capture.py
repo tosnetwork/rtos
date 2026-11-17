@@ -59,19 +59,25 @@ class CaptureSourceBindingTests(unittest.TestCase):
             receipt = {
                 "pid": 42,
                 "session": "07" * 32,
-                "key": "PropagationOutboxV2/b/0000000000000001",
+                "key": "LiveAcceptance/b/0000000000000001",
                 "sha256": digest,
                 "bytes": len(raw),
-                "after_successful_sync": True,
+                "after_live_acceptance": True,
             }
             path = root / f"{digest}.json"
             path.write_text(json.dumps(receipt))
             self.assertEqual(len(read_capture(root, 42, "07" * 32)), 1)
+            legacy = dict(receipt)
+            del legacy["after_live_acceptance"]
+            legacy["after_successful_sync"] = True
+            path.write_text(json.dumps(legacy))
+            with self.assertRaises(ValueError):
+                read_capture(root, 42, "07" * 32)
             for key, value in [
                 ("pid", 43),
                 ("session", "00" * 32),
                 ("key", "different"),
-                ("after_successful_sync", False),
+                ("after_live_acceptance", False),
                 ("bytes", len(raw) + 1),
             ]:
                 with self.subTest(key=key):

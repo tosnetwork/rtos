@@ -1197,11 +1197,15 @@ impl State {
                     .map_err(|_| error!("Live acceptance history timeout"))??;
                     let claims = historical_origin(&publication, &origin)?;
                     validate_creator_claim(&publication, &claims)?;
+                    #[cfg(feature = "interop-publication-capture")]
+                    let capture_record = publication.entry().record.clone();
                     let activity = self.activity_scope("accept_live_block", None);
                     // A live draft cannot reuse outbox-ID-based verification.
                     let (_, accepted) = self
                         .persist_accepted_publication(None, engine, publication, true, &activity)
                         .await?;
+                    #[cfg(feature = "interop-publication-capture")]
+                    crate::propagation_outbox::capture::observe_live(capture_record, &self.limits);
                     Ok(accepted)
                 }
                 .await;

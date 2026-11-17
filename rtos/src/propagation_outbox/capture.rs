@@ -1,7 +1,7 @@
 // Copyright 2026 RTOS contributors. SPDX-License-Identifier: GPL-3.0-or-later
-//! Optional isolated-test evidence capture after a successful outbox sync.
-//! Synced rows may precede acceptance: consumers must independently authenticate
-//! every captured carrier and bind it to the complete original output frontier.
+//! Optional isolated-test capture after successful live acceptance.
+//! Schema-5 is an export envelope, not a persisted outbox row or queue receipt.
+//! Consumers independently authenticate carriers and the complete original frontier.
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
@@ -24,11 +24,14 @@ struct Budget {
 
 // Explicit test feature only; no error propagates into acceptance or persistence.
 #[cfg(feature = "interop-publication-capture")]
-pub(crate) fn observe(puts: &[(String, Vec<u8>)]) {
+pub(crate) fn observe_live(
+    record: std::sync::Arc<super::PublicationRecord>,
+    limits: &super::Limits,
+) {
     static BUDGET: OnceLock<Mutex<Budget>> = OnceLock::new();
     let Some(directory) = std::env::var_os("RTOS_TEST_PUBLICATION_CAPTURE") else { return };
     let directory = Path::new(&directory);
-    if directory.join("failed").exists() {
+    if directory.join("failed").exists() || !directory.join("selector").exists() {
         return;
     }
     let result = (|| {
@@ -36,7 +39,21 @@ pub(crate) fn observe(puts: &[(String, Vec<u8>)]) {
             .get_or_init(Default::default)
             .lock()
             .map_err(|_| io::Error::other("publication capture lock poisoned"))?;
-        capture(directory, std::process::id(), puts, &mut budget)
+        // ID 1 is only a schema envelope field; no outbox record is created.
+        let entry = super::UnverifiedRecord {
+            id: super::RecordId(1),
+            stage: super::PublicationStage::DraftDurable,
+            record,
+            pending: Vec::new(),
+        };
+        let digest = super::domain_digest(&entry.record.domain).map_err(io::Error::other)?;
+        let row = super::encode_body(&digest, &entry, limits).map_err(io::Error::other)?;
+        capture(
+            directory,
+            std::process::id(),
+            &[("LiveAcceptance/b/0000000000000001".into(), row)],
+            &mut budget,
+        )
     })();
     if let Err(error) = result {
         if let Ok(mut file) =
@@ -76,7 +93,7 @@ fn capture(
         return Err(io::Error::other("capture requires an exact WC session"));
     }
     for (key, row) in puts {
-        if !key.starts_with("PropagationOutboxV2/b/") {
+        if !key.starts_with("LiveAcceptance/b/") {
             continue;
         }
         // Schema 5: magic(8), schema(2), domain(32), id(8), protocol(1),
@@ -108,8 +125,8 @@ fn capture(
         fs::rename(&temporary, destination)?;
         let receipt = serde_json::json!({
             "pid":pid, "session":fields[1], "key":key, "sha256":digest,
-            "bytes":row.len(), "after_successful_sync":true,
-            "scope":"Raw WC outbox body; not acceptance or finality proof"
+            "bytes":row.len(), "after_live_acceptance":true,
+            "scope":"Live WC acceptance export; synthetic envelope ID, not an outbox receipt or independent finality proof"
         });
         let receipt_path = directory.join(format!("{digest}.json"));
         let mut file = OpenOptions::new().write(true).create_new(true).open(receipt_path)?;
@@ -131,7 +148,7 @@ mod tests {
         row[..8].copy_from_slice(b"RTOSPBXB");
         row[8..10].copy_from_slice(&5u16.to_le_bytes());
         row[83..115].fill(7);
-        ("PropagationOutboxV2/b/1".into(), row)
+        ("LiveAcceptance/b/1".into(), row)
     }
 
     #[test]

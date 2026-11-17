@@ -112,12 +112,12 @@ def read_capture(directory, pid, session):
             or receipt.get("pid") != pid
             or receipt.get("session") != session
             or receipt.get("bytes") != len(raw)
-            or receipt.get("after_successful_sync") is not True
+            or receipt.get("after_live_acceptance") is not True
         ):
             raise ValueError("Captured publication source binding differs")
         value = decode_body(raw)
         if value["session"] != session or receipt.get("key") != (
-            f"PropagationOutboxV2/b/{value['record_id']:016x}"
+            f"LiveAcceptance/b/{value['record_id']:016x}"
         ):
             raise ValueError("Captured publication record identity differs")
         result.append(value)
