@@ -111,6 +111,8 @@ def main():
         "source-ack-fault-build-record",
         "source-retention-cut-library",
         "source-retention-cut-build-record",
+        "publication-io-library",
+        "publication-io-build-record",
         "first-intent-cut-library",
         "first-intent-cut-build-record",
     ):

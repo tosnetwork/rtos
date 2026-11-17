@@ -62,6 +62,12 @@ from scenario_packet import (
     packet_arguments,
     packet_artifacts,
 )
+from scenario_publication_io import (
+    check_publication_io_evidence,
+    check_publication_io_result,
+    publication_io_arguments,
+    publication_io_artifacts,
+)
 from scenario_receiver import (
     RECEIVER_PLAN,
     check_receiver_evidence,
@@ -92,7 +98,7 @@ ROTATIONS = (
         )
         for mode in ("control", "mixed")
     )
-    | {"restart-member2", "restart-member5", "propagation-receiver"}
+    | {"restart-member2", "restart-member5", "propagation-receiver", "publication-io"}
     | set(PACKETS)
     | set(RESTARTS)
     | set(ACKS)
@@ -237,7 +243,9 @@ def check_result(name, result):
     elif result.get("propagation_receiver") is not None:
         raise ValueError("Unexpected propagation receiver receipt")
     recovery = result.get("recovery")
-    if name == "signer-expiry":
+    if name == "publication-io":
+        check_publication_io_result(result)
+    elif name == "signer-expiry":
         if (
             result.get("source_ack_fault") is not None
             or result.get("source_ack_partition_restart") is not None
@@ -315,6 +323,7 @@ def check_result(name, result):
         and name not in ACK_PARTITIONS
         and name not in INTENTS
         and name not in EXPIRIES
+        and name != "publication-io"
         and result.get("partition_restart") is not None
     ):
         raise ValueError("Unexpected restart partition receipt")
@@ -333,6 +342,12 @@ def check_result(name, result):
         and result.get("source_ack_partition_restart") is not None
     ):
         raise ValueError("Unexpected combined ACK partition receipt")
+
+    if name != "publication-io" and (
+        result.get("node_io_source") is not None
+        or result.get("publication_io_restart") is not None
+    ):
+        raise ValueError("Unexpected publication IO receipt")
 
     if name not in RETENTIONS and result.get("source_retention_cut") is not None:
         raise ValueError("Unexpected source retention cut")
@@ -394,6 +409,7 @@ def execute(args, names, catalog):
         or name in ACK_PARTITIONS
         or name in INTENTS
         or name in EXPIRIES
+        or name == "publication-io"
         for name in names
     ):
         inputs.extend(packet_artifacts(args, source))
@@ -409,6 +425,8 @@ def execute(args, names, catalog):
         inputs.extend(retention_artifacts(args, source))
     if any(name in FIRST_INTENTS for name in names):
         inputs.extend(first_intent_artifacts(args, source))
+    if "publication-io" in names:
+        inputs.extend(publication_io_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -499,6 +517,10 @@ def execute(args, names, catalog):
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name == "publication-io":
+                run += publication_io_arguments(
+                    args.publication_io_library, args.socket_mark_library
+                )
             if name == "propagation-receiver":
                 run += ["--verify-propagation-receiver"]
             if name in FIRST_INTENTS:
@@ -540,6 +562,7 @@ def execute(args, names, catalog):
                     or name in ACK_PARTITIONS
                     or name in INTENTS
                     or name in EXPIRIES
+                    or name == "publication-io"
                 ):
                     check_restart_cleanup(case / "runtime", result["partition_restart"])
                 if (
@@ -549,6 +572,10 @@ def execute(args, names, catalog):
                     or name == "expired-member-restart"
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name == "publication-io":
+                check_publication_io_evidence(
+                    case / "runtime", result, args.block_checker
+                )
             if name == "propagation-receiver":
                 check_receiver_evidence(
                     case / "runtime", result["propagation_receiver"], profile

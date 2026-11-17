@@ -365,11 +365,11 @@
     {
       "id": "publication-io",
       "driver": "rotation_fixture.py",
-      "scope": "Native retained-body fsync EIO and partitioned restart",
+      "scope": "Native acceptance-body fsync EIO and original-database partitioned restart",
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "unintegrated"
+      "execution": "rotation_v1"
     },
     {
       "id": "cold-bootstrap-body",
