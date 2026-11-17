@@ -18,6 +18,7 @@ from mixed_matrix import (
     write,
 )
 from quorum_profile import check_committee_weights
+from runtime_manifest_observer import read_starting_manifest
 
 
 def expiry_plan(profile, args):
@@ -119,7 +120,9 @@ class SignerExpiry:
         for path in (node["directory"] / "node_db/catchains/consensus/v2").glob(
             "*/session-runtime.json"
         ):
-            value = json.loads(path.read_text())
+            value = read_starting_manifest(path)
+            if value is None:
+                continue
             if (
                 value["session"] == session
                 and value["shard_workchain"] == -1
