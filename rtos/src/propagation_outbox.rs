@@ -41,6 +41,8 @@ const CLOSE_MAGIC: &[u8; 8] = b"RTOSPBXC";
 pub const SCHEMA_VERSION: u16 = 5;
 /// Keys read per page while loading; the writer lease is held throughout.
 const LOAD_PAGE_KEYS: usize = 256;
+#[cfg(any(test, feature = "interop-publication-capture"))]
+pub(crate) mod capture;
 pub(crate) mod closing;
 pub(crate) use closing::{canonical_intent_digest, effects_digest, ClosingRecord};
 const DIGEST_BYTES: usize = 32;

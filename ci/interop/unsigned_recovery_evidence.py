@@ -12,6 +12,7 @@ from pathlib import Path
 
 from accepted_intent_evidence import verify_masterchain_intent
 from mixed_matrix import write
+from workchain_original_evidence import verify_workchain_intent
 
 
 def sha(raw):
@@ -136,11 +137,13 @@ def original_paths_removed(pending):
     return True
 
 
-async def complete_unsigned_originals(pending, configuration, *, deadline, **proof):
-    """Authenticate all captured MC outputs, then recheck cleanup/config/DB.
+async def complete_unsigned_originals(
+    pending, configuration, *, deadline, workchain=None, **proof
+):
+    """Authenticate all captured outputs, then recheck cleanup/config/DB.
 
-    Returns False while original paths remain. Unsupported WC/Approval sets and
-    any changed binding fail closed. The caller owns progress and runtime role
+    Returns False while original paths remain. WC sets require explicit bound
+    capture/checkpoint/state-source inputs; absent inputs fail closed. The caller owns progress and runtime role
     evidence; this function does not issue an overall scenario verdict.
     """
     if time.monotonic() >= deadline:
@@ -154,15 +157,32 @@ async def complete_unsigned_originals(pending, configuration, *, deadline, **pro
         sealed = item.get("sealed_outputs")
         if not sealed:
             raise ValueError("Original obligation lacks its complete sealed output set")
-        results.append(
-            await verify_masterchain_intent(
-                item["record"],
-                sealed["record"],
-                directory=directory / str(ordinal),
-                deadline=deadline,
-                **proof,
+        if item["record"].get("workchain") == 0:
+            if workchain is None:
+                raise ValueError(
+                    "Original WC recovery needs bound carrier and state inputs"
+                )
+            results.append(
+                await verify_workchain_intent(
+                    item["record"],
+                    sealed["record"],
+                    snapshot=proof["snapshot"],
+                    checker=proof["checker"],
+                    directory=directory / str(ordinal),
+                    deadline=deadline,
+                    **workchain,
+                )
             )
-        )
+        else:
+            results.append(
+                await verify_masterchain_intent(
+                    item["record"],
+                    sealed["record"],
+                    directory=directory / str(ordinal),
+                    deadline=deadline,
+                    **proof,
+                )
+            )
     configuration.check()
     if not original_paths_removed(pending):
         raise ValueError("Original obligations reappeared during proof verification")
@@ -176,7 +196,7 @@ async def complete_unsigned_originals(pending, configuration, *, deadline, **pro
             "original_pending_and_output_paths_absent": True,
             "unsigned_configuration_unchanged": True,
             "original_database_directory_unchanged": True,
-            "scope": "MC Final original obligations; caller must verify runtime role and progress",
+            "scope": "Captured original obligations; caller must verify runtime role and progress",
         },
     )
     return True

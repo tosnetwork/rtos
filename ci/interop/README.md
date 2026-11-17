@@ -551,3 +551,32 @@ wired into the scenario catalog yet.
 The distinct `signer-expiry` below-quorum scenario is integrated: an expired
 member remains in its original process while another member is restarted. Its
 successful observations do not establish expired-only custody cold startup.
+
+
+For development of WC output evidence, the default-off
+`interop-publication-capture` feature can export original carrier/body bytes after successful
+live acceptance. Set `RTOS_TEST_PUBLICATION_CAPTURE` to an
+owned evidence directory; arm its `selector` with the exact process PID and WC
+session on separate lines. `publication_capture_arm.py` selects a session by an
+already checked block's exact callback observation and runtime binding. Capture
+is limited to 128 unique rows, 16 MiB per row and 64 MiB total per process.
+A `failed` marker invalidates the capture. The schema-5 decoder preserves the
+original body and carrier bytes and rejects altered checksums/source receipts.
+The schema envelope uses synthetic record ID 1 and is never inserted into the
+outbox; its receipt says `after_live_acceptance`, not database sync. The callback
+is an observation, not independent proof: capturing or decoding does not prove
+Final/Approval validity, complete original obligations, state equality or recovery.
+Those require the native checker and original-frontier checks separately.
+
+`sealed_workchain_outputs` validates the complete captured WC0 full-shard output
+list without dropping Approval entries; `verify_sealed_workchain_requests` then
+runs the existing native request verifier for every declared obligation and the
+exact Final trigger. The sealed digest binds intent metadata, not the output list:
+callers must first bind the original file bytes to the stopped node's capture.
+`workchain_original_evidence.verify_workchain_intent` constructs exact parent
+chains from captures, fetches fresh states from every declared source, and runs
+the native checker under the original deadline. `complete_unsigned_originals`
+accepts explicit WC inputs and retains its common original-DB/config/cleanup
+checks. The default driver still supplies only MC evidence; WC mode must supply
+bound captures, a historical checkpoint and the complete state-source mapping.
+Neither a planned request nor a standalone carrier proof qualifies recovery.
