@@ -291,7 +291,7 @@ async fn node() -> Arc<crate::adnl::node::AdnlNode> {
     .unwrap()
 }
 fn rldp(adnl: &Arc<crate::adnl::node::AdnlNode>) -> Arc<super::super::RldpNode> {
-    super::super::RldpNode::with_params(
+    let rldp = super::super::RldpNode::with_params(
         adnl.clone(),
         Vec::new(),
         None,
@@ -300,7 +300,10 @@ fn rldp(adnl: &Arc<crate::adnl::node::AdnlNode>) -> Arc<super::super::RldpNode> 
         #[cfg(feature = "debug")]
         None,
     )
-    .unwrap()
+    .unwrap();
+    // These tests suspend the legacy sender's FEC worker and inspect its queue.
+    rldp.peers.use_legacy_for_tests();
+    rldp
 }
 
 #[tokio::test]

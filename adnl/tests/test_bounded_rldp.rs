@@ -382,6 +382,7 @@ fn bounded_rldp_real_malicious_wire_total_rejected_before_decode_v1_v2() {
                     tag: 0,
                 };
                 let limits = QueryResponseLimits { wire_bytes: 1024, decoded_bytes: 4096 };
+                let started = std::time::Instant::now();
                 let error = tokio::time::timeout(
                     Duration::from_secs(20),
                     rldps[0].query_bounded(&data, limits, &peers, v2, None),
@@ -389,15 +390,19 @@ fn bounded_rldp_real_malicious_wire_total_rejected_before_decode_v1_v2() {
                 .await
                 .expect("actual malicious response must complete, not time out")
                 .unwrap_err();
-                let exceeded = error
-                    .downcast_ref::<ResponseLimitExceeded>()
-                    .unwrap_or_else(|| panic!("expected peer-declared wire bound, got {error:#}"));
-                // V2 counts the complete response against the advertised limit;
-                // V1 retains its separate allowance for the answer envelope.
-                assert_eq!(
-                    (exceeded.limit, exceeded.actual),
-                    (if v2 { 1024 } else { 1024 + 64 }, 4096)
-                );
+                if v2 {
+                    // TOS RldpConnection drops an oversized packet without
+                    // completing its query; the original deadline still applies.
+                    assert!(error.downcast_ref::<adnl::RldpQueryTimeout>().is_some(), "{error:#}");
+                    assert!(started.elapsed() >= Duration::from_millis(9500));
+                } else {
+                    let exceeded =
+                        error.downcast_ref::<ResponseLimitExceeded>().unwrap_or_else(|| {
+                            panic!("expected peer-declared wire bound, got {error:#}")
+                        });
+                    // V1 retains its separate allowance for the answer envelope.
+                    assert_eq!((exceeded.limit, exceeded.actual), (1024 + 64, 4096));
+                }
                 assert!(hostile.observed.load(Ordering::Acquire) > 0);
                 hostile.armed.store(false, Ordering::Release);
                 let (answer, _) = tokio::time::timeout(

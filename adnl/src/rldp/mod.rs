@@ -2707,6 +2707,12 @@ impl Subscriber for RldpNode {
         match msg.downcast::<Rldp2MessagePartBoxed>() {
             Ok(msg) => {
                 if self.peers.native_enabled() {
+                    #[cfg(feature = "debug")]
+                    if let Rldp2MessagePartBoxed::Rldp2_MessagePart(part) = &msg {
+                        if self.loss_fn.is_some_and(|loss| loss(&Chunk::V2(part.clone()))) {
+                            return Ok(true);
+                        }
+                    }
                     let peer = self.get_peer(peers.local(), peers.other(), true, None).await?;
                     let native =
                         peer.native.get().ok_or_else(|| error!("Connection mode mismatch"))?;

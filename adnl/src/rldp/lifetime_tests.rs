@@ -285,6 +285,11 @@ async fn pair(
     topology(2).await
 }
 
+async fn default_pair(
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    topology_with_mode(2, None, false, false, false).await
+}
+
 async fn topology(
     count: usize,
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
@@ -311,6 +316,18 @@ async fn topology_configured(
     remote_observer: Option<Arc<ResponsePackets>>,
     observe_all_senders: bool,
     unique_keys: bool,
+) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
+    // Legacy tests inspect its private transfer tables and sender hooks. Native
+    // tests explicitly select their driver; default_pair exercises constructors.
+    topology_with_mode(count, remote_observer, observe_all_senders, unique_keys, true).await
+}
+
+async fn topology_with_mode(
+    count: usize,
+    remote_observer: Option<Arc<ResponsePackets>>,
+    observe_all_senders: bool,
+    unique_keys: bool,
+    legacy: bool,
 ) -> (Arc<HeldReply>, Arc<ResponsePackets>, Vec<Arc<AdnlNode>>, Vec<Arc<RldpNode>>, AdnlPeers) {
     let reply = Arc::new(HeldReply::default());
     let packets = Arc::new(ResponsePackets::default());
@@ -349,6 +366,9 @@ async fn topology_configured(
                 None,
             )
             .unwrap();
+            if legacy {
+                rldp.peers.use_legacy_for_tests();
+            }
             let mut subscribers: Vec<Arc<dyn Subscriber>> = Vec::new();
             if index == 0 || (observe_all_senders && index != 1) {
                 subscribers.push(packets.clone());

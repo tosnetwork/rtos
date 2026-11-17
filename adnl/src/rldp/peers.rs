@@ -93,7 +93,7 @@ impl PeerTable {
     ) -> Result<Arc<Self>> {
         let ret = Arc::new(Self {
             node: std::sync::OnceLock::new(),
-            native_enabled: std::sync::atomic::AtomicBool::new(false),
+            native_enabled: std::sync::atomic::AtomicBool::new(true),
             state: Mutex::new(State::default()),
             admission: tokio::sync::Mutex::new(()),
             capacity: Arc::new(Semaphore::new(Self::MAX_CONNECTIONS)),
@@ -139,6 +139,11 @@ impl PeerTable {
     }
     pub(super) fn native_enabled(&self) -> bool {
         self.native_enabled.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(super) fn use_legacy_for_tests(&self) {
+        assert!(self.state.lock().unwrap().v2.is_empty());
+        self.native_enabled.store(false, Ordering::Release);
     }
     #[cfg(test)]
     pub(super) fn enable_native_for_tests(&self) {
