@@ -386,7 +386,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "first-intent-after-partial-write",
@@ -395,7 +395,7 @@
       "depends_on": [
         "rotation-mixed"
       ],
-      "execution": "rotation_v1"
+      "execution": "unintegrated"
     },
     {
       "id": "source-retention-after-fsync",

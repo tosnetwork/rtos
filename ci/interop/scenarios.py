@@ -99,8 +99,6 @@ def main():
         "source-ack-fault-build-record",
         "source-retention-cut-library",
         "source-retention-cut-build-record",
-        "first-intent-cut-library",
-        "first-intent-cut-build-record",
     ):
         parser.add_argument("--" + option, type=absolute_input_path)
     parser.add_argument("--rust-revision")
