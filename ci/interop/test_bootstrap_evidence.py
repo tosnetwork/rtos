@@ -1,11 +1,80 @@
 import json
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bootstrap_evidence as fixture
+
+
+class RequiredVoteTests(unittest.TestCase):
+    def inputs(self):
+        required = {
+            "validator_id": "rust",
+            "cpp_ids": ["cpp0", "cpp1"],
+            "committee": {"cpp0": 17, "cpp1": 17, "absent": 17, "rust": 17},
+        }
+        checked = {
+            "configuration": {
+                "state_root_checked": True,
+                "current": {
+                    "members": [
+                        {"validator_id": member, "weight": weight}
+                        for member, weight in required["committee"].items()
+                    ]
+                },
+            },
+            "verified_final_certificates": [
+                {
+                    "final_certificate_checked": True,
+                    "validator_ids": ["cpp0", "cpp1", "rust"],
+                    "verified_weight": 51,
+                    "session_id": "actual-session",
+                    "slot": 7,
+                }
+            ],
+        }
+        return checked, required
+
+    def test_required_vote_is_bound_to_checked_weight_and_topology(self):
+        checked, required = self.inputs()
+        result = fixture.require_bootstrap_vote(checked, required)
+        self.assertEqual(result["quorum_weight"], 46)
+        self.assertEqual(result["cpp_weight"], 34)
+        self.assertEqual(result["verified_weight"], 51)
+
+    def test_metadata_and_wrong_certificates_cannot_replace_required_vote(self):
+        checked, required = self.inputs()
+        for mutation in (
+            "missing",
+            "unchecked",
+            "duplicate",
+            "absent",
+            "weight",
+            "committee",
+            "state",
+        ):
+            with self.subTest(mutation=mutation):
+                bad = deepcopy(checked)
+                cert = bad["verified_final_certificates"][0]
+                if mutation == "missing":
+                    cert.update(validator_ids=["cpp0", "cpp1"], verified_weight=34)
+                elif mutation == "unchecked":
+                    cert["final_certificate_checked"] = False
+                elif mutation == "duplicate":
+                    cert["validator_ids"] = ["cpp0", "rust", "rust"]
+                elif mutation == "absent":
+                    cert["validator_ids"] = ["cpp0", "absent", "rust"]
+                elif mutation == "weight":
+                    cert["verified_weight"] = 52
+                elif mutation == "committee":
+                    bad["configuration"]["current"]["members"][0]["weight"] = 18
+                else:
+                    bad["configuration"]["state_root_checked"] = False
+                with self.assertRaises(ValueError):
+                    fixture.require_bootstrap_vote(bad, required)
 
 
 class BootstrapEvidenceTests(unittest.IsolatedAsyncioTestCase):

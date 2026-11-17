@@ -50,9 +50,9 @@ parser.add_argument(
     help="Active mode: two C++ nodes require Rust for quorum; three exercise the full topology",
 )
 args = parser.parse_args()
-if args.verify_full_state and (not args.block_checker or args.validator_preparer):
+if args.verify_full_state and (not args.block_checker or args.require_leadership):
     parser.error(
-        "--verify-full-state currently requires an unsigned node and --block-checker"
+        "--verify-full-state requires --block-checker and excludes the leadership diagnostic"
     )
 if args.require_leadership and not (args.validator_preparer and args.block_checker):
     parser.error(
@@ -226,6 +226,7 @@ async def main():
             "appenders:\n  console:\n    kind: console\n    encoder:\n      pattern: '{m}{n}'\n"
             "root:\n  level: info\n  appenders: [console]\n"
         )
+        required_vote = None
         if args.validator_preparer:
             with (root / "validator-prepare.log").open("w") as prepare_log:
                 prepare = await asyncio.create_subprocess_exec(
@@ -271,6 +272,21 @@ async def main():
                 for i in range(len(cpp_members))
             )
             total_weight = sum(weights.values())
+            required_vote = {
+                "validator_id": base64.b64encode(
+                    bytes.fromhex(prepared["validator_id"])
+                ).decode(),
+                "committee": {
+                    base64.b64encode(bytes.fromhex(member)).decode(): weight
+                    for member, weight in weights.items()
+                },
+                "cpp_ids": [
+                    base64.b64encode(
+                        hashlib.sha256(f"n6-validator-id-{i}".encode()).digest()
+                    ).decode()
+                    for i in range(len(cpp_members))
+                ],
+            }
             quorum = total_weight * 2 // 3 + 1
             if (len(cpp_members) == 2 and cpp_weight >= quorum) or cpp_weight + weights[
                 prepared["validator_id"]
@@ -556,6 +572,7 @@ async def main():
                                         cpp_members[0],
                                         network.zerostate.masterchain.file.read_bytes(),
                                         root / "bootstrap-evidence",
+                                        required_vote=required_vote,
                                     ),
                                     max(0, deadline - time.monotonic()),
                                 )
