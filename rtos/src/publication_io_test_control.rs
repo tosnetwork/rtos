@@ -33,7 +33,7 @@ struct Selector {
     block_id: String,
     block_sha256: String,
     source_id: String,
-    node_receipt: String,
+    delivery_id: String,
 }
 #[derive(Deserialize, Serialize)]
 struct Witness {
@@ -81,14 +81,14 @@ pub(crate) async fn acceptance_scope<T>(
     PUBLICATION.scope(PublicationContext::from_entry(entry, queued)?, work).await
 }
 fn matches_publication(selector: &Selector, publication: &PublicationContext) -> bool {
-    publication.delivery_id == selector.node_receipt
+    publication.delivery_id == selector.delivery_id
         && match publication.stage.as_str() {
             "LiveAcceptance" => {
                 publication.record_id.is_none() && publication.node_receipt.is_none()
             }
             "DraftDurable" => {
                 publication.record_id.is_some()
-                    && publication.node_receipt.as_ref() == Some(&selector.node_receipt)
+                    && publication.node_receipt.as_ref() == Some(&selector.delivery_id)
             }
             _ => false,
         }
@@ -124,7 +124,7 @@ fn load(control: &Path) -> Result<Option<(Selector, String)>> {
         || !is_digest(&selector.session_id)
         || !is_digest(&selector.block_sha256)
         || !is_digest(&selector.source_id)
-        || !is_digest(&selector.node_receipt)
+        || !is_digest(&selector.delivery_id)
     {
         fail!("Invalid publication IO selector identity");
     }
@@ -324,12 +324,12 @@ mod tests {
             block_id: "block".into(),
             block_sha256: digest(b"actual body"),
             source_id: "b".repeat(64),
-            node_receipt: "e".repeat(64),
+            delivery_id: "e".repeat(64),
         };
         let publication = PublicationContext {
             record_id: Some(7),
-            node_receipt: Some(selector.node_receipt.clone()),
-            delivery_id: selector.node_receipt.clone(),
+            node_receipt: Some(selector.delivery_id.clone()),
+            delivery_id: selector.delivery_id.clone(),
             stage: "DraftDurable".into(),
         };
         arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &publication, &body).unwrap();
@@ -356,18 +356,18 @@ mod tests {
             block_id: "block".into(),
             block_sha256: digest(b"body"),
             source_id: "b".repeat(64),
-            node_receipt: "c".repeat(64),
+            delivery_id: "c".repeat(64),
         };
         let mut publication = PublicationContext {
             record_id: Some(9),
-            node_receipt: Some(selector.node_receipt.clone()),
-            delivery_id: selector.node_receipt.clone(),
+            node_receipt: Some(selector.delivery_id.clone()),
+            delivery_id: selector.delivery_id.clone(),
             stage: "DraftDurable".into(),
         };
         assert!(matches_publication(&selector, &publication));
         publication.node_receipt = Some("d".repeat(64));
         assert!(!matches_publication(&selector, &publication));
-        publication.node_receipt = Some(selector.node_receipt.clone());
+        publication.node_receipt = Some(selector.delivery_id.clone());
         for stage in ["Prepared", "Ready", "AcceptedDraft", "Completed"] {
             publication.stage = stage.into();
             assert!(!matches_publication(&selector, &publication));
@@ -390,7 +390,7 @@ mod tests {
             block_id: "full block identity".into(),
             block_sha256: digest(b"body"),
             source_id: "b".repeat(64),
-            node_receipt: "e".repeat(64),
+            delivery_id: "e".repeat(64),
         };
         assert!(matches(&selector, 7, &selector.session_id, &selector.block_id, b"body", true));
         assert!(!matches(&selector, 8, &selector.session_id, &selector.block_id, b"body", true));
