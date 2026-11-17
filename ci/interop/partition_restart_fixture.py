@@ -38,8 +38,16 @@ class PartitionRestart:
         self.endpoint = endpoint
         self.member_id = member_id(args.interrupt_rust_member)
         self.old_process = node["process"]
-        self.started = time.monotonic()
+        original_budget = getattr(args, "original_recovery_budget", None)
+        self.started = (
+            original_budget["monotonic"] if original_budget else time.monotonic()
+        )
+        started_unix = original_budget["unix"] if original_budget else time.time()
         self.deadline = self.started + args.recovery_timeout
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError(
+                "Partition restart exceeded the original recovery deadline"
+            )
         config = json.loads((node["directory"] / "default_config.json").read_text())
         ports = [
             int(config[key].rsplit(":", 1)[1])
@@ -57,7 +65,7 @@ class PartitionRestart:
             "settle_after_interruption_seconds": self.seconds,
             "hold_after_restart_seconds": self.seconds,
             "recovery_limit_seconds": args.recovery_timeout,
-            "budget_started_at_unix": time.time(),
+            "budget_started_at_unix": started_unix,
             "old_pid": self.old_process.pid,
         }
         self.save()

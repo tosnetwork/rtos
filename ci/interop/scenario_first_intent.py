@@ -181,17 +181,12 @@ def check_first_intent_evidence(runtime, receipt, point):
         {"path": target.name, "bytes": len(raw), "sha256": receipt["sha256"]}
     ]:
         raise ValueError("First-intent directory had prior/other intents")
-    completed = read_bound("intent-completed.json", "completed_sha256")
-    live = target.parent / "completed-v1" / target.with_suffix(".complete").name
-    if (
-        json.loads(completed) != {"schema": 1, "record": record}
-        or target.exists()
-        or target.with_suffix(".json").exists()
-        or live.read_bytes() != completed
-    ):
-        raise ValueError(
-            "First-intent normal replay did not complete the original record"
-        )
+    from first_intent_vote import verify_original_acceptance
+
+    verify_original_acceptance(directory, receipt, record)
+    outputs = target.parent / "outputs-v1" / target.with_suffix(".outputs").name
+    if any(p.exists() for p in (target, target.with_suffix(".json"), outputs)):
+        raise ValueError("First-intent original intent/output cleanup is incomplete")
     prepared = runtime / "rust-2/validator-prepared.json"
     if hashlib.sha256(prepared.read_bytes()).hexdigest() != receipt["prepared_sha256"]:
         raise ValueError("First-intent restart changed original authority")

@@ -2014,6 +2014,10 @@ pub trait SessionListener: Send + Sync {
     /// Independent PQ candidate authentication evidence; never inferred from observation flags.
     fn on_authenticated_candidate(&self, _evidence: CandidateAuthenticationEvidence) {}
 
+    /// Notification after actual block/proof/state acceptance completed. This
+    /// does not imply propagation delivery or transfer a queue receipt.
+    fn on_accepted_block_finalized(&self, _draft: finality_delivery::FinalizedDeliveryDraft) {}
+
     /// Notification after the node-owned sink confirms a durable record.
     /// The node worker owns acceptance/publication; this callback is observational
     /// and must not regenerate a second intent from the source draft.

@@ -89,11 +89,7 @@ ROTATIONS = (
     | {"restart-member2", "restart-member5", "propagation-receiver"}
     | set(PACKETS)
     | set(RESTARTS)
-    | set(ACKS)
-    | set(ACK_PARTITIONS)
-    | set(INTENTS)
-    | set(RETENTIONS)
-    | EXPIRIES
+    | {"signer-expiry"}
     | set(FIRST_INTENTS)
 )
 
@@ -232,14 +228,27 @@ def check_result(name, result):
         raise ValueError("Unexpected propagation receiver receipt")
     recovery = result.get("recovery")
     if name == "signer-expiry":
-        check_ack_partition_result(
-            "source-ack-partition-sync-eio",
-            result.get("source_ack_partition_restart"),
-            result.get("source_ack_fault"),
+        if (
+            result.get("source_ack_fault") is not None
+            or result.get("source_ack_partition_restart") is not None
+        ):
+            raise ValueError("Signer expiry must not require propagation ACK custody")
+        check_restart_partition(
+            "below-quorum-restart",
             result.get("partition_restart"),
             recovery,
             signer_expiry=True,
         )
+        expiry = result.get("signer_expiry")
+        if not isinstance(expiry, dict):
+            raise TypeError("Missing signer expiry receipt")
+        start = expiry.get("budget_started_at_unix")
+        if (
+            type(start) not in (int, float)
+            or not start > 0
+            or start != result["partition_restart"].get("budget_started_at_unix")
+        ):
+            raise ValueError("Expiry and restart must share the original budget")
     elif name == "expired-member-restart":
         check_passive_recovery_components(
             result.get("source_ack_partition_restart"),
@@ -369,7 +378,10 @@ def execute(args, names, catalog):
     ):
         inputs.extend(packet_artifacts(args, source))
     if any(
-        name in ACKS or name in ACK_PARTITIONS or name in INTENTS or name in EXPIRIES
+        name in ACKS
+        or name in ACK_PARTITIONS
+        or name in INTENTS
+        or name == "expired-member-restart"
         for name in names
     ):
         inputs.extend(ack_artifacts(args, source))
@@ -500,7 +512,7 @@ def execute(args, names, catalog):
                     name in ACKS
                     or name in ACK_PARTITIONS
                     or name in INTENTS
-                    or name in EXPIRIES
+                    or name == "expired-member-restart"
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
             if name == "propagation-receiver":

@@ -33,7 +33,7 @@ struct Selector {
     block_id: String,
     block_sha256: String,
     source_id: String,
-    node_receipt: String,
+    delivery_id: String,
 }
 #[derive(Deserialize, Serialize)]
 struct Witness {
@@ -52,16 +52,19 @@ struct Witness {
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct PublicationContext {
-    record_id: u64,
-    node_receipt: String,
+    record_id: Option<u64>,
+    node_receipt: Option<String>,
+    delivery_id: String,
     stage: String,
 }
 impl PublicationContext {
-    fn from_entry(entry: &UnverifiedRecord) -> Result<Self> {
+    fn from_entry(entry: &UnverifiedRecord, queued: bool) -> Result<Self> {
+        let delivery_id = delivery_id(&entry.record)?.to_hex_string();
         Ok(Self {
-            record_id: entry.id.0,
-            node_receipt: delivery_id(&entry.record)?.to_hex_string(),
-            stage: format!("{:?}", entry.stage),
+            record_id: queued.then_some(entry.id.0),
+            node_receipt: queued.then(|| delivery_id.clone()),
+            delivery_id,
+            stage: if queued { format!("{:?}", entry.stage) } else { "LiveAcceptance".into() },
         })
     }
 }
@@ -69,15 +72,26 @@ tokio::task_local! { static PUBLICATION: PublicationContext; }
 
 pub(crate) async fn acceptance_scope<T>(
     entry: &UnverifiedRecord,
+    queued: bool,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     if std::env::var_os(CONTROL).is_none() {
         return work.await;
     }
-    PUBLICATION.scope(PublicationContext::from_entry(entry)?, work).await
+    PUBLICATION.scope(PublicationContext::from_entry(entry, queued)?, work).await
 }
 fn matches_publication(selector: &Selector, publication: &PublicationContext) -> bool {
-    publication.node_receipt == selector.node_receipt && publication.stage == "DraftDurable"
+    publication.delivery_id == selector.delivery_id
+        && match publication.stage.as_str() {
+            "LiveAcceptance" => {
+                publication.record_id.is_none() && publication.node_receipt.is_none()
+            }
+            "DraftDurable" => {
+                publication.record_id.is_some()
+                    && publication.node_receipt.as_ref() == Some(&selector.delivery_id)
+            }
+            _ => false,
+        }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -110,7 +124,7 @@ fn load(control: &Path) -> Result<Option<(Selector, String)>> {
         || !is_digest(&selector.session_id)
         || !is_digest(&selector.block_sha256)
         || !is_digest(&selector.source_id)
-        || !is_digest(&selector.node_receipt)
+        || !is_digest(&selector.delivery_id)
     {
         fail!("Invalid publication IO selector identity");
     }
@@ -142,6 +156,7 @@ fn arm(
     selector_sha256: &str,
     proof_sha256: &str,
     publication: &PublicationContext,
+    artifact: &str,
     path: &Path,
 ) -> Result<()> {
     let path = path.canonicalize()?;
@@ -165,7 +180,7 @@ fn arm(
         selector: selector.clone(),
         proof_sha256: proof_sha256.to_owned(),
         publication: publication.clone(),
-        artifact: "loose_block_body".into(),
+        artifact: artifact.into(),
         pid,
         tid,
         device: info.dev(),
@@ -204,11 +219,26 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
     let proof_sha256 = digest(accepted.proof().data());
     let armed = AtomicBool::new(false);
     Ok(Some(Arc::new(move |point, path| {
-        if point == SyncPoint::File
-            && path.file_name().and_then(|part| part.to_str()) == Some(name.as_str())
-            && !armed.swap(true, Ordering::SeqCst)
-        {
-            arm(&control, &selector, &selector_sha256, &proof_sha256, &publication, path)?;
+        let artifact = if path.file_name().and_then(|part| part.to_str()) == Some(name.as_str()) {
+            Some("loose_block_body")
+        } else if path.extension().and_then(|part| part.to_str()) == Some("pack") {
+            // sync_block_artifacts supplies the exact package selected by this
+            // accepted block's handle. The driver independently parses the
+            // selected body entry after the real native failure stops the node.
+            Some("archive_package")
+        } else {
+            None
+        };
+        if point == SyncPoint::File && artifact.is_some() && !armed.swap(true, Ordering::SeqCst) {
+            arm(
+                &control,
+                &selector,
+                &selector_sha256,
+                &proof_sha256,
+                &publication,
+                artifact.unwrap(),
+                path,
+            )?;
         }
         Ok(())
     })))
@@ -218,7 +248,7 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
 /// durability failure fatal, before it returns an unsuccessful acceptance.
 pub(crate) fn after_fatal(
     entry: &UnverifiedRecord,
-    store: &PropagationOutbox,
+    store: Option<&PropagationOutbox>,
     accepted: &AcceptedSessionBlock,
     error: &anyhow::Error,
 ) -> Result<()> {
@@ -235,16 +265,19 @@ pub(crate) fn after_fatal(
     ) {
         return Ok(());
     }
-    let publication = PublicationContext::from_entry(entry)?;
+    let publication = PublicationContext::from_entry(entry, store.is_some())?;
     if !matches_publication(&selector, &publication) {
         return Ok(());
     }
-    let (_, retained) = store
-        .delivery(&delivery_id(&entry.record)?)?
-        .ok_or_else(|| rtos_block::error!("Failed publication lost its full WAL draft"))?;
-    if PublicationContext::from_entry(&retained)? != publication || retained.record != entry.record
-    {
-        fail!("Failed publication advanced or changed its durable draft");
+    if let Some(store) = store {
+        let (_, retained) = store
+            .delivery(&delivery_id(&entry.record)?)?
+            .ok_or_else(|| rtos_block::error!("Failed publication lost its full WAL draft"))?;
+        if PublicationContext::from_entry(&retained, true)? != publication
+            || retained.record != entry.record
+        {
+            fail!("Failed publication advanced or changed its durable draft");
+        }
     }
     let target_bytes = std::fs::read(control.join("target.json"))?;
     let target: Witness = serde_json::from_slice(&target_bytes)?;
@@ -263,7 +296,7 @@ pub(crate) fn after_fatal(
         || target.publication != publication
         || target.selector_sha256 != selector_sha256
         || target.pid != std::process::id()
-        || target.artifact != "loose_block_body"
+        || !matches!(target.artifact.as_str(), "loose_block_body" | "archive_package")
         || target.proof_sha256 != digest(accepted.proof().data())
         || (marker_text != expected("fsync") && marker_text != expected("fdatasync"))
         || error.downcast_ref::<crate::internal_db::PublicationDurabilityFailure>().is_none()
@@ -276,7 +309,7 @@ pub(crate) fn after_fatal(
         "target_sha256":digest(&target_bytes), "native_marker_sha256":digest(&marker),
         "error":error.to_string(), "typed_durability_failure":true,
         "publication_owner_marked_fatal":true, "accepted_callback_returned":false,
-        "retained_draft_verified":true, "publication":publication,
+        "retained_draft_verified":store.is_some(), "publication":publication,
     });
     write_new(&control.join("failed.json"), &serde_json::to_vec(&failed)?)?;
     File::open(&control)?.sync_all()?;
@@ -307,14 +340,24 @@ mod tests {
             block_id: "block".into(),
             block_sha256: digest(b"actual body"),
             source_id: "b".repeat(64),
-            node_receipt: "e".repeat(64),
+            delivery_id: "e".repeat(64),
         };
         let publication = PublicationContext {
-            record_id: 7,
-            node_receipt: selector.node_receipt.clone(),
+            record_id: Some(7),
+            node_receipt: Some(selector.delivery_id.clone()),
+            delivery_id: selector.delivery_id.clone(),
             stage: "DraftDurable".into(),
         };
-        arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &publication, &body).unwrap();
+        arm(
+            &directory,
+            &selector,
+            &"c".repeat(64),
+            &"d".repeat(64),
+            &publication,
+            "loose_block_body",
+            &body,
+        )
+        .unwrap();
         let witness: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("target.json")).unwrap()).unwrap();
         let native = std::fs::read_to_string(directory.join("target.native")).unwrap();
@@ -325,7 +368,9 @@ mod tests {
         assert_eq!(witness["pid"], std::process::id());
         assert!(native.ends_with(&format!("\n{}\n", body.display())));
         assert_eq!(std::fs::read(&body).unwrap(), b"actual body");
-        assert!(arm(&directory, &selector, "c", "d", &publication, &body).is_err());
+        assert!(
+            arm(&directory, &selector, "c", "d", &publication, "loose_block_body", &body).is_err()
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -338,21 +383,29 @@ mod tests {
             block_id: "block".into(),
             block_sha256: digest(b"body"),
             source_id: "b".repeat(64),
-            node_receipt: "c".repeat(64),
+            delivery_id: "c".repeat(64),
         };
         let mut publication = PublicationContext {
-            record_id: 9,
-            node_receipt: selector.node_receipt.clone(),
+            record_id: Some(9),
+            node_receipt: Some(selector.delivery_id.clone()),
+            delivery_id: selector.delivery_id.clone(),
             stage: "DraftDurable".into(),
         };
         assert!(matches_publication(&selector, &publication));
-        publication.node_receipt = "d".repeat(64);
+        publication.node_receipt = Some("d".repeat(64));
         assert!(!matches_publication(&selector, &publication));
-        publication.node_receipt = selector.node_receipt.clone();
+        publication.node_receipt = Some(selector.delivery_id.clone());
         for stage in ["Prepared", "Ready", "AcceptedDraft", "Completed"] {
             publication.stage = stage.into();
             assert!(!matches_publication(&selector, &publication));
         }
+        publication.stage = "LiveAcceptance".into();
+        assert!(!matches_publication(&selector, &publication));
+        publication.record_id = None;
+        publication.node_receipt = None;
+        assert!(matches_publication(&selector, &publication));
+        publication.delivery_id = "f".repeat(64);
+        assert!(!matches_publication(&selector, &publication));
     }
 
     #[test]
@@ -364,7 +417,7 @@ mod tests {
             block_id: "full block identity".into(),
             block_sha256: digest(b"body"),
             source_id: "b".repeat(64),
-            node_receipt: "e".repeat(64),
+            delivery_id: "e".repeat(64),
         };
         assert!(matches(&selector, 7, &selector.session_id, &selector.block_id, b"body", true));
         assert!(!matches(&selector, 8, &selector.session_id, &selector.block_id, b"body", true));

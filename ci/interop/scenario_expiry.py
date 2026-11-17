@@ -217,14 +217,17 @@ def expiry_arguments(name, ack_library, packet_library):
         "12",
         "--socket-mark-library",
         str(packet_library),
-        "--source-ack-fault",
-        "sync-eio",
-        "--source-ack-fault-library",
-        str(ack_library),
-        "--source-ack-partition-restart",
         "--signer-expiry-member",
         "5",
     ]
+    if name == "expired-member-restart":
+        args += [
+            "--source-ack-fault",
+            "sync-eio",
+            "--source-ack-fault-library",
+            str(ack_library),
+            "--source-ack-partition-restart",
+        ]
     args += (
         ["--expired-member-restart"]
         if name == "expired-member-restart"

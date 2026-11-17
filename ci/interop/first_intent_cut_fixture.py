@@ -83,7 +83,7 @@ class FirstIntentCut:
                 "First-intent recovery exceeded its original 180-second deadline"
             )
 
-    async def supervise(self, node, start_node):
+    async def supervise(self, node, start_node, lite_configs=None):
         self.started = time.monotonic()
         self.deadline = self.started + 180
         self.receipt.update(
@@ -266,23 +266,88 @@ class FirstIntentCut:
             self.save()
         finally:
             node["first_intent_restarting"] = False
-        proof = intent_directory / "completed-v1" / target.with_suffix(".complete").name
-        while not proof.exists():
+        from first_intent_vote import matches_original_intent
+        from mixed_matrix import child_checked, native_state, write
+
+        # Cleanup alone is not acceptance: an incomplete .tmp is also removed
+        # during restart. Require an independently verified original candidate.
+        selected_sample = None
+        outputs = intent_directory / "outputs-v1" / target.with_suffix(".outputs").name
+        while selected_sample is None:
             self.check_budget()
             if node["process"].returncode is not None:
                 raise RuntimeError(
-                    "Restarted first-intent target exited before normal completion"
+                    "Restarted first-intent target exited before acceptance"
                 )
-            await asyncio.sleep(0.05)
-        completed = proof.read_bytes()
-        if (
-            json.loads(completed) != {"schema": 1, "record": record}
-            or target.exists()
-            or target.with_suffix(".json").exists()
-        ):
+            if not any(
+                p.exists() for p in (target, target.with_suffix(".json"), outputs)
+            ):
+                for proof in (self.root / "checks").glob("*/epoch-checked.json"):
+                    try:
+                        checked = json.loads(proof.read_bytes())
+                    except json.JSONDecodeError:
+                        continue  # The producer may still be writing this observation.
+                    if matches_original_intent(checked, record):
+                        selected_sample = proof.parent / "sample.json"
+                        break
+            if selected_sample is None:
+                await asyncio.sleep(0.05)
+        sample_path = self.directory / "accepted-sample.json"
+        sample_path.write_bytes(selected_sample.read_bytes())
+        checked_path = self.directory / "accepted-checked.json"
+        await asyncio.wait_for(
+            child_checked(
+                [self.args.block_checker, sample_path, checked_path],
+                self.directory / "accepted-checker.log",
+            ),
+            self.deadline - time.monotonic(),
+        )
+        checked = json.loads(checked_path.read_bytes())
+        if not matches_original_intent(checked, record):
             raise RuntimeError(
-                "First-intent normal completion differs from original intended record"
+                "Copied first-intent sample differs from original candidate"
             )
+        sample = json.loads(sample_path.read_bytes())
+        states = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    native_state(
+                        self.args.snapshot,
+                        lite_configs[index],
+                        name,
+                        checked["block"],
+                        self.directory / name,
+                    )
+                    for index, name in [(0, "cpp-reference"), (2, "restarted-rust")]
+                )
+            ),
+            self.deadline - time.monotonic(),
+        )
+        states_path = self.directory / "accepted-states.json"
+        states_checked = self.directory / "accepted-states-checked.json"
+        write(
+            states_path,
+            {"mode": "state-copies", "block": sample["block"], "states": states},
+        )
+        await asyncio.wait_for(
+            child_checked(
+                [self.args.block_checker, states_path, states_checked],
+                self.directory / "accepted-states-checker.log",
+            ),
+            self.deadline - time.monotonic(),
+        )
+        self.receipt.update(
+            original_candidate_accepted=True,
+            acceptance_sample_sha256=sha(sample_path.read_bytes()),
+            acceptance_checked_sha256=sha(checked_path.read_bytes()),
+            acceptance_states_sha256=sha(states_path.read_bytes()),
+            acceptance_states_checked_sha256=sha(states_checked.read_bytes()),
+        )
+        from first_intent_vote import verify_original_acceptance
+
+        verify_original_acceptance(self.directory, self.receipt, record)
+        if any(p.exists() for p in (target, target.with_suffix(".json"), outputs)):
+            raise RuntimeError("Original intent/output cleanup is incomplete")
         if (
             prepared.read_bytes() != prepared_bytes
             or context.read_bytes()
@@ -292,12 +357,10 @@ class FirstIntentCut:
                 "First-intent restart changed authority or session start"
             )
         self.check_budget()
-        (self.directory / "intent-completed.json").write_bytes(completed)
         self.receipt.update(
             phase="normal_replay_completed",
             normal_replay_completed=True,
             elapsed_seconds=time.monotonic() - self.started,
-            completed_sha256=sha(completed),
         )
         self.save()
 

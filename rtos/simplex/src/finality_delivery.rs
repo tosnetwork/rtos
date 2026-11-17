@@ -1318,7 +1318,11 @@ fn scan_pending_finality_inner(
 /// cancellation cannot drop the retention lock or turn an outstanding stage
 /// into an acknowledged delivery.
 pub(crate) type SourceReadyCallback = Arc<dyn Fn() + Send + Sync>;
+#[path = "finality_acceptance.rs"]
+mod acceptance;
+
 pub(crate) struct SourceFinalityDelivery {
+    acceptance: Mutex<acceptance::AcceptanceRequests>,
     ready_callback: Option<SourceReadyCallback>,
     #[cfg(test)]
     pub(crate) retain_intent_attempts: std::sync::atomic::AtomicUsize,
@@ -1429,6 +1433,7 @@ impl SourceFinalityDelivery {
             runtime.recovery_binding().map(delivered::DiskRecoveryBinding::from_binding);
         let intents = store.intents.clone();
         Ok(Arc::new(Self {
+            acceptance: Mutex::new(Default::default()),
             #[cfg(test)]
             retain_intent_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1512,7 +1517,7 @@ impl SourceFinalityDelivery {
     }
     pub(crate) fn resolve_intent(&self, id: &crate::block::RawCandidateId) -> Result<()> {
         let _timing = self.operation_timer("resolve_intent");
-        self.intents.resolve(id)
+        self.intents.resolve_accepted(id)
     }
     pub(crate) fn resolved_intent_count(&self) -> u64 {
         self.intents.resolved_intent_count()
@@ -1899,6 +1904,16 @@ pub(crate) mod tests {
         pub(crate) Mutex<Option<HeldAcceptances>>,
     );
     impl DurableFinalitySink for HeldSink {
+        fn accept_draft(
+            &self,
+            draft: FinalizedDeliveryDraft,
+            done: Box<dyn FnOnce(Result<()>) + Send>,
+        ) -> Result<()> {
+            // Reuse the fixture's held operation slot. The synthetic value is
+            // discarded: direct acceptance returns no propagation receipt.
+            self.0.lock().unwrap().push((draft, Box::new(move |result| done(result.map(|_| ())))));
+            Ok(())
+        }
         fn await_accepted(
             &self,
             request: CanonicalFinalityRequest,

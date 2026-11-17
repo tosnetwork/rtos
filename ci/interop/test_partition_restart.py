@@ -35,7 +35,7 @@ class FakeFault:
 
 
 class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
-    def context(self, root):
+    def context(self, root, *, original_budget=None):
         directory = root / "node"
         directory.mkdir()
         (directory / "default_config.json").write_text(
@@ -53,6 +53,7 @@ class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
             socket_mark_library=Path("mark.so"),
             interrupt_rust_member=2,
             recovery_timeout=5,
+            original_recovery_budget=original_budget,
         )
         node = {
             "directory": directory,
@@ -63,6 +64,21 @@ class PartitionRestartTests(unittest.IsolatedAsyncioTestCase):
                 args, root, node, "http://127.0.0.1:10003", str
             )
         return context, node
+
+    def test_expiry_partition_keeps_original_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            start = time.monotonic() - 2
+            context, _ = self.context(
+                Path(tmp), original_budget={"monotonic": start, "unix": 100.0}
+            )
+            self.assertEqual(context.started, start)
+            self.assertEqual(context.deadline, start + 5)
+            self.assertEqual(context.receipt["budget_started_at_unix"], 100.0)
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(TimeoutError):
+            self.context(
+                Path(tmp),
+                original_budget={"monotonic": time.monotonic() - 10, "unix": 100.0},
+            )
 
     def proof(self):
         return {
