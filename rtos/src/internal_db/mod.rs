@@ -2425,6 +2425,8 @@ impl InternalDb {
             observer(OutboxSyncBoundary::BeforeWrite, puts, deletes)?;
         }
         self.block_handle_storage.write_validator_state_batch_sync(puts, deletes)?;
+        #[cfg(feature = "interop-publication-capture")]
+        crate::propagation_outbox::capture::observe(puts);
         #[cfg(test)]
         if let Some(observer) = &observer {
             observer(OutboxSyncBoundary::AfterSuccessfulSync, puts, deletes)?;
