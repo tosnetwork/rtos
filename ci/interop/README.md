@@ -551,3 +551,17 @@ wired into the scenario catalog yet.
 The distinct `signer-expiry` below-quorum scenario is integrated: an expired
 member remains in its original process while another member is restarted. Its
 successful observations do not establish expired-only custody cold startup.
+
+
+For development of WC output evidence, the default-off
+`interop-publication-capture` feature can copy raw outbox body rows after a
+successful synchronous database write. Set `RTOS_TEST_PUBLICATION_CAPTURE` to an
+owned evidence directory; arm its `selector` with the exact process PID and WC
+session on separate lines. `publication_capture_arm.py` selects a session by an
+already checked block's exact callback observation and runtime binding. Capture
+is limited to 128 unique rows, 16 MiB per row and 64 MiB total per process.
+A `failed` marker invalidates the capture. The schema-5 decoder preserves the
+original body and carrier bytes and rejects altered checksums/source receipts.
+These rows can precede acceptance: capturing or decoding them does not prove
+Final/Approval validity, complete original obligations, state equality or recovery.
+Those require the native checker and original-frontier checks separately.
