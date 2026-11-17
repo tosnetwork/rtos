@@ -441,10 +441,16 @@ fn test_rldp_session_with_loss(
 #[test]
 fn test_rldp_session() {
     #[cfg(feature = "debug")]
-    fn loss_fn(_chunk: &Chunk) -> bool {
+    static V2_DROPPED: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "debug")]
+    fn loss_fn(chunk: &Chunk) -> bool {
         static CNT: AtomicU32 = AtomicU32::new(0);
         let cnt = CNT.fetch_add(1, Ordering::Relaxed);
-        (cnt % 2) != 0 // 50% loss
+        let dropped = (cnt % 2) != 0; // 50% loss
+        if dropped && matches!(chunk, Chunk::V2(_)) {
+            V2_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        dropped
     }
     test_rldp_session_with_loss(
         #[cfg(feature = "debug")]
@@ -453,5 +459,8 @@ fn test_rldp_session() {
         None,
     );
     #[cfg(feature = "debug")]
-    test_rldp_session_with_loss(Some(loss_fn), Some(1000));
+    {
+        test_rldp_session_with_loss(Some(loss_fn), Some(1000));
+        assert!(V2_DROPPED.load(Ordering::Relaxed) > 0, "V2 must exercise real packet loss");
+    }
 }
