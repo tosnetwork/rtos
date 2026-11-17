@@ -10,13 +10,17 @@ from check_rldp2_runtime import read_frozen
 
 class FrozenProvenanceTests(unittest.TestCase):
     def test_native_reference_and_each_provenance_mutation(self):
-        for corpus in ("cases", "boundaries"):
+        for corpus in ("cases", "boundaries", "multipart"):
             with self.subTest(corpus=corpus):
                 self.check_corpus(corpus)
 
     def check_corpus(self, corpus):
         root = Path(__file__).parent
-        cases = root / f"rldp2_runtime_{corpus}.tsv"
+        cases = root / (
+            "rldp2_multipart_live_context.tsv"
+            if corpus == "multipart"
+            else f"rldp2_runtime_{corpus}.tsv"
+        )
         ids = [
             line.split()[0]
             for line in cases.read_text().splitlines()
@@ -25,6 +29,8 @@ class FrozenProvenanceTests(unittest.TestCase):
         reference = root / (
             "rldp2_runtime_expected.json"
             if corpus == "cases"
+            else "rldp2_multipart_live_expected.json"
+            if corpus == "multipart"
             else "rldp2_runtime_boundaries_expected.json"
         )
         self.assertEqual(len(read_frozen(reference, cases, ids)), len(ids))
