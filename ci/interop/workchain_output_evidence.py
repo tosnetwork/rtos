@@ -74,3 +74,57 @@ def matches_workchain_outputs(intent, outputs, witnesses):
         ):
             trigger = True
     return covered == expected and trigger
+
+
+def verify_workchain_output_requests(
+    intent, outputs, requests, checker, evidence, deadline
+):
+    """Re-run original native requests within the caller's existing deadline.
+
+    The caller must separately verify original-DB cleanup and the provenance and
+    completeness of the captured obligations. No new recovery budget is created.
+    """
+    import json
+    import subprocess
+    import time
+    from pathlib import Path
+
+    if not outputs or not 1 <= len(requests) <= len(outputs) <= 1024:
+        raise ValueError("Expected bounded native requests for original outputs")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Original output verification deadline expired")
+    evidence = Path(evidence)
+    evidence.mkdir(parents=True, exist_ok=False)
+    checked = []
+    for index, source in enumerate(requests):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Original output verification deadline expired")
+        raw = Path(source).read_bytes()
+        if json.loads(raw).get("mode") != "workchain-carrier":
+            raise ValueError(
+                "Original output requires a native workchain carrier request"
+            )
+        request, result = evidence / f"{index}.json", evidence / f"{index}-checked.json"
+        with request.open("xb") as stream:
+            stream.write(raw)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Original output verification deadline expired")
+        run = subprocess.run(
+            [str(checker), str(request), str(result)],
+            check=False,
+            capture_output=True,
+            timeout=remaining,
+        )
+        (evidence / f"{index}.log").write_bytes(run.stdout + run.stderr)
+        if run.returncode:
+            raise RuntimeError("Native original output verification failed")
+        checked.append(json.loads(result.read_text()))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Original output verification deadline expired")
+    if not matches_workchain_outputs(intent, outputs, checked):
+        raise ValueError(
+            "Native witnesses do not cover the complete original output set"
+        )
+    return checked

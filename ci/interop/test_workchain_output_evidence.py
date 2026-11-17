@@ -2,9 +2,18 @@
 
 import base64
 import copy
+import json
+import tempfile
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from workchain_output_evidence import block_text, matches_workchain_outputs
+from workchain_output_evidence import (
+    block_text,
+    matches_workchain_outputs,
+    verify_workchain_output_requests,
+)
 
 
 def fixture():
@@ -98,3 +107,39 @@ class WorkchainOutputEvidenceTests(unittest.TestCase):
             changed = copy.deepcopy(proofs)
             mutate(changed)
             self.assertFalse(matches_workchain_outputs(intent, outputs, changed))
+
+
+class WorkchainRequestExecutionTests(unittest.TestCase):
+    def test_expired_deadline_does_not_launch_or_create_evidence(self):
+        intent, outputs, _ = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence"
+            with patch("subprocess.run") as run:
+                with self.assertRaisesRegex(TimeoutError, "deadline expired"):
+                    verify_workchain_output_requests(
+                        intent,
+                        outputs,
+                        ["missing.json"],
+                        "checker",
+                        evidence,
+                        time.monotonic() - 1,
+                    )
+                run.assert_not_called()
+            self.assertFalse(evidence.exists())
+
+    def test_wrong_mode_does_not_launch_checker(self):
+        intent, outputs, _ = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "request.json"
+            source.write_text(json.dumps({"mode": "state-copies"}))
+            with patch("subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "native workchain carrier"):
+                    verify_workchain_output_requests(
+                        intent,
+                        outputs,
+                        [source],
+                        "checker",
+                        Path(directory) / "evidence",
+                        time.monotonic() + 10,
+                    )
+                run.assert_not_called()
