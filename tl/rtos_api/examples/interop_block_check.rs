@@ -128,6 +128,32 @@ fn check_state_copies(value: &Value) -> Result<Value> {
         "finality_checked":false}))
 }
 
+/// Select only a link traversed by the preceding authenticated MC proof check.
+/// Header predecessor heights, not extra JSON fields, authorize each descent.
+fn historical_governing_state(mut cursor: &Value, mut height: u64, target: u64) -> Result<&Value> {
+    for _ in 0..=16 {
+        ensure!(target <= height, "WC governing key block is absent from authenticated MC history");
+        if height == 0 {
+            return Ok(&cursor["governing_zerostate_boc"]);
+        }
+        let key = &cursor["governing_key_block"];
+        ensure!(
+            identity(&key["block"]["id"])?.2 == height,
+            "authenticated governing chain height differs"
+        );
+        if target == height {
+            return Ok(&key["masterchain_state"]["boc"]);
+        }
+        let bytes = base64_decode(key["block"]["boc"].as_str().context("key block BOC required")?)?;
+        let block = Block::construct_from_cell(read_single_root_boc(&bytes)?)?;
+        let previous = u64::from(block.read_info()?.prev_key_block_seqno());
+        ensure!(previous < height, "authenticated governing chain must decrease");
+        cursor = key;
+        height = previous;
+    }
+    anyhow::bail!("governing key-block chain exceeds fixture bound")
+}
+
 /// Verify a WC carrier only after the existing MC anchor and full-state checks.
 /// A notarization remains an approval, never a Final proof.
 fn check_workchain_carrier(value: &Value) -> Result<Value> {
@@ -145,15 +171,11 @@ fn check_workchain_carrier(value: &Value) -> Result<Value> {
     let bytes = base64_decode(target["boc"].as_str().context("workchain block BOC required")?)?;
     let block = Block::construct_from_cell(read_single_root_boc(&bytes)?)?;
     let info = block.read_info()?;
-    ensure!(
-        Some(u64::from(info.prev_key_block_seqno())) == checked["prev_key_block_seqno"].as_u64(),
-        "workchain carrier requires the same authenticated governing key block"
-    );
-    let state_boc = if info.prev_key_block_seqno() == 0 {
-        &value["governing_zerostate_boc"]
-    } else {
-        &value["governing_key_block"]["masterchain_state"]["boc"]
-    };
+    let state_boc = historical_governing_state(
+        value,
+        checked["prev_key_block_seqno"].as_u64().context("checked MC key-block height required")?,
+        u64::from(info.prev_key_block_seqno()),
+    )?;
     let state_bytes =
         base64_decode(state_boc.as_str().context("authenticated governing state required")?)?;
     let state = ShardStateUnsplit::construct_from_cell(read_single_root_boc(&state_bytes)?)?;
