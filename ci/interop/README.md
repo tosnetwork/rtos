@@ -529,6 +529,17 @@ complete authenticated original-output recovery and absence of signing all need
 runtime evidence; deleting pending files or removing the signing configuration
 alone proves none of them. This case is not yet qualified.
 
+The rotation driver now exposes this separate case with
+`--unsigned-original-recovery --intent-cleanup-library <owned-test-library>`,
+alongside member5 expiry, member5 interruption, `--expired-member-restart` and
+`--partition-restart`. It records byte-exact before/after configuration, preserves
+transport-only keys, checks the pre-expiry capture against the stopped node, and
+executes native historical proof/full-state checks for every captured MC Final.
+It rechecks the original DB directory, unsigned configuration and pending/output
+path removal after those proofs. WC/Approval obligations fail closed. This is a
+new explicit conversion, not automatic startup fallback; catalog qualification
+remains pending real integrated execution and review.
+
 The isolated `intent_cleanup_fault.c` library can return EIO for deletion of one
 exact accepted output map while preserving its matching intent. It copies the
 map and intent before the failed deletion and lets the original process continue
