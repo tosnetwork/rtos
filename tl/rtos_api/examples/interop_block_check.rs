@@ -128,6 +128,85 @@ fn check_state_copies(value: &Value) -> Result<Value> {
         "finality_checked":false}))
 }
 
+/// Verify a WC carrier only after the existing MC anchor and full-state checks.
+/// A notarization remains an approval, never a Final proof.
+fn check_workchain_carrier(value: &Value) -> Result<Value> {
+    let mut checked = check_request(value, 0)?;
+    ensure!(
+        checked["verified_final_certificates"].as_array().is_some_and(|v| !v.is_empty()),
+        "workchain carrier requires authenticated masterchain finality"
+    );
+    ensure!(
+        checked["workchain_check"]["masterchain_anchor_checked"] == true,
+        "workchain carrier requires a checked masterchain anchor"
+    );
+    let target = &value["workchain"]["block"];
+    let expected = identity(&target["id"])?;
+    let bytes = base64_decode(target["boc"].as_str().context("workchain block BOC required")?)?;
+    let block = Block::construct_from_cell(read_single_root_boc(&bytes)?)?;
+    let info = block.read_info()?;
+    ensure!(
+        Some(u64::from(info.prev_key_block_seqno())) == checked["prev_key_block_seqno"].as_u64(),
+        "workchain carrier requires the same authenticated governing key block"
+    );
+    let state_boc = if info.prev_key_block_seqno() == 0 {
+        &value["governing_zerostate_boc"]
+    } else {
+        &value["governing_key_block"]["masterchain_state"]["boc"]
+    };
+    let state_bytes =
+        base64_decode(state_boc.as_str().context("authenticated governing state required")?)?;
+    let state = ShardStateUnsplit::construct_from_cell(read_single_root_boc(&state_bytes)?)?;
+    let extra = state.read_custom()?.context("governing configuration required")?;
+    let id = BlockIdExt::with_params(
+        info.shard().clone(),
+        expected.2.try_into()?,
+        expected.3,
+        expected.4,
+    );
+    let context = rtos_api::pq_finality::PqVerificationContext::from_governing_config(
+        block.global_id(),
+        &extra.config,
+        id,
+        info.vert_seq_no(),
+        info.prev_key_block_seqno(),
+        info.gen_catchain_seqno(),
+    )?;
+    let source = &value["workchain_certificate"];
+    let role = source["is_final"].as_bool().context("explicit workchain carrier role required")?;
+    let bytes =
+        base64_decode(source["signature_set"].as_str().context("node signature set required")?)?;
+    ensure!(bytes.len() <= 16 * 1024 * 1024, "node signature set too large");
+    let wire: rtos_api::ton::ton_node::SignatureSet =
+        rtos_api::WireProfile::T0.deserialize_typed(&bytes)?;
+    ensure!(
+        rtos_api::WireProfile::T0.serialize(&wire)? == bytes,
+        "noncanonical node signature set"
+    );
+    let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(wire) = wire else {
+        anyhow::bail!("node PQ workchain carrier required");
+    };
+    let carrier = rtos_api::pq_finality::PqNetworkSignatureSet::from_node(wire)?;
+    let verified = context.verify_network(&carrier)?;
+    ensure!(verified.is_final() == role, "workchain carrier role differs from requested role");
+    let (session, slot, weight) = if role {
+        let (_, proof) = verified.into_final()?;
+        (proof.session_id().clone(), proof.slot(), proof.weight())
+    } else {
+        let (_, proof) = verified.into_approval()?;
+        (proof.session_id().clone(), proof.slot(), proof.weight())
+    };
+    let candidate = carrier.to_node().candidate;
+    let candidate_hash = UInt256::calc_file_hash(&rtos_api::WireProfile::T0.serialize(&candidate)?);
+    checked["mode"] = json!("workchain-carrier");
+    checked["workchain_check"]["verified_carrier"] = json!({
+        "is_final":role, "final_certificate_checked":role, "approval_checked":!role,
+        "session_id":base64_encode(session.as_slice()), "slot":slot,
+        "candidate_hash":candidate_hash.to_hex_string(), "verified_weight":weight,
+    });
+    Ok(checked)
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let request = PathBuf::from(args.next().context("usage: interop_block_check REQUEST OUTPUT")?);
@@ -136,6 +215,7 @@ fn main() -> Result<()> {
     let value: Value = serde_json::from_slice(&std::fs::read(request)?)?;
     let result = match value.get("mode").and_then(Value::as_str) {
         Some("state-copies") => check_state_copies(&value)?,
+        Some("workchain-carrier") => check_workchain_carrier(&value)?,
         Some("finality-witness") => {
             ensure!(
                 value.get("reference").is_none()
