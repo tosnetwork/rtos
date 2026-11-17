@@ -114,10 +114,10 @@ for item in manifest["binaries"]:
 sys.path.insert(0, str(snapshot / "source/test/tostester/src"))
 from nacl.signing import SigningKey
 from sync_observation import SyncObservation
+from tosapi import tos_api
 from tostester.install import Install
 from tostester.key import Key
 from tostester.network import Network, StartOptions
-from tosapi import tos_api
 
 
 def rpc(url, method, params=None):

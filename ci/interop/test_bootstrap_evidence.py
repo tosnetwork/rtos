@@ -1,8 +1,8 @@
 import json
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, patch
 
 import bootstrap_evidence as fixture
@@ -10,26 +10,28 @@ import bootstrap_evidence as fixture
 
 class BootstrapEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def collect(self, root, *, wrong_body=False, unchecked=False):
-        target = dict(
-            workchain=-1,
-            shard=str(-(1 << 63)),
-            seqno=4,
-            root_hash="root",
-            file_hash="file",
-        )
-        observed = dict(last=target, state_root_hash="state")
-        observation = dict(
-            zerostate=dict(target, seqno=0), references=[observed], rust=observed
-        )
-        checked = dict(
-            block=target,
-            state_root_hash="state",
-            cell_hash_checked=True,
-            file_hash_checked=True,
-            header_identity_checked=True,
-            state_update_matches_both=True,
-            verified_final_certificates=[dict(final_certificate_checked=True)],
-        )
+        target = {
+            "workchain": -1,
+            "shard": str(-(1 << 63)),
+            "seqno": 4,
+            "root_hash": "root",
+            "file_hash": "file",
+        }
+        observed = {"last": target, "state_root_hash": "state"}
+        observation = {
+            "zerostate": dict(target, seqno=0),
+            "references": [observed],
+            "rust": observed,
+        }
+        checked = {
+            "block": target,
+            "state_root_hash": "state",
+            "cell_hash_checked": True,
+            "file_hash_checked": True,
+            "header_identity_checked": True,
+            "state_update_matches_both": True,
+            "verified_final_certificates": [{"final_certificate_checked": True}],
+        }
         if unchecked:
             checked["state_update_matches_both"] = False
 
@@ -40,16 +42,19 @@ class BootstrapEvidenceTests(unittest.IsolatedAsyncioTestCase):
             command[2].write_text(json.dumps(checked))
 
         config = object()
-        state = AsyncMock(return_value=dict(name="rust-bootstrap", boc="actual-state"))
-        body = dict(
-            id=dict(target, seqno=5) if wrong_body else target, data="actual-body"
+        state = AsyncMock(
+            return_value={"name": "rust-bootstrap", "boc": "actual-state"}
         )
+        body = {
+            "id": dict(target, seqno=5) if wrong_body else target,
+            "data": "actual-body",
+        }
         with (
             patch.object(fixture, "native_state", state),
             patch.object(
                 fixture,
                 "cpp_certificate",
-                AsyncMock(return_value=dict(kind="cpp_lite")),
+                AsyncMock(return_value={"kind": "cpp_lite"}),
             ),
             patch.object(fixture, "child_checked", checker),
         ):
