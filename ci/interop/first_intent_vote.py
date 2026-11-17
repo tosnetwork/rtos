@@ -125,3 +125,55 @@ def verify_original_acceptance(directory, receipt, record):
     ):
         raise ValueError("First-intent original candidate/state acceptance differs")
     return checked
+
+
+def historical_finality_request(record, block, state, context):
+    """Bind a historical checker request to the captured live node carrier.
+
+    The context only supplies governing-chain inputs; the native checker must
+    authenticate that chain, the original certificate, block and full state.
+    Live endpoint heads from a later sample are deliberately not copied.
+    """
+
+    def block_text(identity):
+        return (
+            f"({identity['workchain']}:{int(identity['shard']) % (1 << 64):016x}, "
+            f"{identity['seqno']}, rh "
+            f"{base64.b64decode(identity['root_hash'], validate=True).hex()}, fh "
+            f"{base64.b64decode(identity['file_hash'], validate=True).hex()})"
+        )
+
+    if (
+        record.get("is_final") is not True
+        or block["id"]["workchain"] != -1
+        or block_text(block["id"]) != record["block_id"]
+        or state["id"] != block["id"]
+        or block_text(context["zerostate"]) != record["zerostate"]
+        or base64.b64decode(block["boc"], validate=True)
+        != bytes.fromhex(record["data"])
+    ):
+        raise ValueError("Historical Final request differs from original live source")
+    carrier = bytes.fromhex(record["signature_set"])
+    if not carrier or len(carrier) > 16 * 1024 * 1024:
+        raise ValueError("Historical Final carrier is empty or oversized")
+    governing = {
+        key: context[key]
+        for key in ("governing_key_block", "governing_zerostate_boc")
+        if key in context
+    }
+    if len(governing) != 1:
+        raise ValueError("Historical Final request needs one governing context")
+    return {
+        "mode": "finality-witness",
+        "zerostate": context["zerostate"],
+        **governing,
+        "block": block,
+        "masterchain_state": state,
+        "certificates": [
+            {
+                "kind": "node",
+                "name": "original-live-acceptance",
+                "signature_set": base64.b64encode(carrier).decode(),
+            }
+        ],
+    }
