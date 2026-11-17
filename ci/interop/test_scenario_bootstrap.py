@@ -13,6 +13,42 @@ from scenarios import CATALOG, order, validate
 
 
 class BootstrapAdapterTests(unittest.TestCase):
+    def test_native_control_includes_its_nonvoting_verifier(self):
+        native = {
+            "evidence_class": "DIAGNOSTIC_SCAFFOLDING_ONLY",
+            "release_evidence_eligible": False,
+            "consensus_correctness_verdict": "NOT_MADE_MERKLE_DIAGNOSIS_OPEN",
+            "nodes": [
+                {"name": f"node-{i}", "adnl_identity": str(i), "role": "validator"}
+                for i in range(4)
+            ]
+            + [
+                {
+                    "name": "observer",
+                    "adnl_identity": "other",
+                    "role": "non-validator-verifier",
+                }
+            ],
+        }
+        result = {
+            "cpp_commit": "revision",
+            "status": "passed_cpp_control_only",
+            "mixed_network_qualified": False,
+            "result": native,
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "result.json").write_text(json.dumps(native))
+            check_bootstrap_result(
+                "cpp-bootstrap", result, {"cpp_revision": "revision"}, root
+            )
+            native["nodes"][-1]["role"] = "validator"
+            (root / "result.json").write_text(json.dumps(native))
+            with self.assertRaises(ValueError):
+                check_bootstrap_result(
+                    "cpp-bootstrap", result, {"cpp_revision": "revision"}, root
+                )
+
     def test_native_control_receives_explicit_auth_tag_before_genesis(self):
         network = SimpleNamespace(config=SimpleNamespace(auth_network_tag=None))
         received = []

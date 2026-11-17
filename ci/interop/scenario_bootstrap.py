@@ -83,8 +83,16 @@ def check_bootstrap_result(name, result, profile, runtime):
                 "consensus_correctness_verdict": "NOT_MADE_MERKLE_DIAGNOSIS_OPEN",
             },
         )
-        if len(native["nodes"]) != 4:
-            raise ValueError("Native control must have four nodes")
+        nodes = native["nodes"]
+        if (
+            sorted(node["role"] for node in nodes)
+            != ["non-validator-verifier"] + ["validator"] * 4
+            or len({node["name"] for node in nodes}) != 5
+            or len({node["adnl_identity"] for node in nodes}) != 5
+        ):
+            raise ValueError(
+                "Native control requires four validators and its independent verifier"
+            )
         return
     active = name == "required-rust-vote"
     require_fields(
