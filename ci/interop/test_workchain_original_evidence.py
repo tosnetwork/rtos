@@ -167,3 +167,43 @@ class OriginalWorkchainTests(unittest.TestCase):
                 )
             checker.assert_not_called()
             self.assertFalse((Path(tmp) / "proof/receipt.json").exists())
+
+    def test_first_source_failure_drains_all_sibling_requests(self):
+        intent, sealed, captures, checkpoint, _ = inputs()
+        ended, completed = [], []
+
+        async def state(snapshot, config, name, block, directory):
+            if name == "cpp-0":
+                raise RuntimeError("first source failed")
+            try:
+                await asyncio.sleep(0.05)
+                completed.append(name)
+            finally:
+                ended.append(name)
+
+        async def exercise(directory):
+            with self.assertRaisesRegex(RuntimeError, "first source failed"):
+                await verify_workchain_intent(
+                    intent,
+                    sealed,
+                    captures=captures,
+                    checkpoint=checkpoint,
+                    state_configs={
+                        x["name"]: None for x in checkpoint["workchain"]["states"]
+                    },
+                    snapshot="snapshot",
+                    checker="checker",
+                    directory=directory,
+                    deadline=time.monotonic() + 0.02,
+                )
+            self.assertEqual(set(ended), {"rust-2", "cpp-4", "rust-5"})
+            await asyncio.sleep(0.06)
+            self.assertEqual(completed, [])
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("workchain_original_evidence.native_state", side_effect=state),
+            patch("workchain_original_evidence.child_checked") as checker,
+        ):
+            asyncio.run(exercise(Path(tmp) / "proof"))
+            checker.assert_not_called()

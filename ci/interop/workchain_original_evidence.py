@@ -109,14 +109,23 @@ async def verify_workchain_intent(
             target = directory / str(ordinal)
             target.mkdir()
             block = request["workchain"]["block"]["id"]
-            request["workchain"]["states"] = await asyncio.gather(
-                *(
+            tasks = [
+                asyncio.create_task(
                     native_state(
                         snapshot, state_configs[name], name, block, target / name
                     )
-                    for name in expected
                 )
-            )
+                for name in expected
+            ]
+            try:
+                request["workchain"]["states"] = await asyncio.gather(*tasks)
+            finally:
+                # gather does not cancel siblings when one source fails. Own
+                # every native child until its cancellation cleanup finishes.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             write(target / "request.json", request)
             await child_checked(
                 [checker, target / "request.json", target / "checked.json"],
