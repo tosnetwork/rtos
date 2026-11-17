@@ -35,6 +35,13 @@ from scenario_expiry import (
     check_passive_recovery_components,
     expiry_arguments,
 )
+from scenario_first_intent import (
+    FIRST_INTENTS,
+    check_first_intent_evidence,
+    check_first_intent_result,
+    first_intent_arguments,
+    first_intent_artifacts,
+)
 from scenario_matrix import (
     MATRICES,
     check_matrix_result,
@@ -48,6 +55,11 @@ from scenario_packet import (
     check_packet_result,
     packet_arguments,
     packet_artifacts,
+)
+from scenario_receiver import (
+    RECEIVER_PLAN,
+    check_receiver_evidence,
+    check_receiver_result,
 )
 from scenario_restart import (
     RESTARTS,
@@ -74,7 +86,7 @@ ROTATIONS = (
         )
         for mode in ("control", "mixed")
     )
-    | {"restart-member2", "restart-member5"}
+    | {"restart-member2", "restart-member5", "propagation-receiver"}
     | set(PACKETS)
     | set(RESTARTS)
     | set(ACKS)
@@ -82,6 +94,7 @@ ROTATIONS = (
     | set(INTENTS)
     | set(RETENTIONS)
     | EXPIRIES
+    | set(FIRST_INTENTS)
 )
 
 
@@ -129,6 +142,8 @@ def make_profile(name, template, now):
             initial_weights={"0": 29, "1": 11, "2": 10, "3": 10},
             initial_probe_pause=[1],
         )
+    if name == "propagation-receiver":
+        profile["propagation_receiver"] = RECEIVER_PLAN.copy()
     if name == "below-quorum-restart":
         profile["successor_weights"] = {"0": 10, "2": 30, "4": 10, "5": 10}
     if name.startswith("observer-budget-"):
@@ -207,6 +222,14 @@ def check_result(name, result):
         check_packet_result(name, result.get("network_fault"))
     elif result.get("network_fault") is not None:
         raise ValueError("Unexpected packet fault receipt")
+    if name in FIRST_INTENTS:
+        check_first_intent_result(name, result)
+    elif result.get("first_intent_cut") is not None:
+        raise ValueError("Unexpected first-intent cut receipt")
+    if name == "propagation-receiver":
+        check_receiver_result(result.get("propagation_receiver"))
+    elif result.get("propagation_receiver") is not None:
+        raise ValueError("Unexpected propagation receiver receipt")
     recovery = result.get("recovery")
     if name == "signer-expiry":
         if (
@@ -368,6 +391,8 @@ def execute(args, names, catalog):
         inputs.extend(ack_artifacts(args, source))
     if any(name in RETENTIONS for name in names):
         inputs.extend(retention_artifacts(args, source))
+    if any(name in FIRST_INTENTS for name in names):
+        inputs.extend(first_intent_artifacts(args, source))
     artifacts = {str(path.resolve()): digest(path) for path in inputs}
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -452,6 +477,10 @@ def execute(args, names, catalog):
                 run += expiry_arguments(
                     name, args.source_ack_fault_library, args.socket_mark_library
                 )
+            if name == "propagation-receiver":
+                run += ["--verify-propagation-receiver"]
+            if name in FIRST_INTENTS:
+                run += first_intent_arguments(name, args.first_intent_cut_library)
             for label, command in (("prepare", prepare), ("run", run)):
                 command = [
                     str(args.cpp_python),
@@ -490,6 +519,14 @@ def execute(args, names, catalog):
                     or name == "expired-member-restart"
                 ):
                     check_ack_evidence(case / "runtime", result["source_ack_fault"])
+            if name == "propagation-receiver":
+                check_receiver_evidence(
+                    case / "runtime", result["propagation_receiver"], profile
+                )
+            if name in FIRST_INTENTS:
+                check_first_intent_evidence(
+                    case / "runtime", result["first_intent_cut"], FIRST_INTENTS[name]
+                )
             if name in INTENTS:
                 check_intent_evidence(
                     case / "runtime",

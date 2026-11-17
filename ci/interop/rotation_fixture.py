@@ -1361,6 +1361,8 @@ async def run(args, profile, root, artifacts):
                             # Retry exact matching within the first observation's
                             # budget and original expiry, without arming the fault.
                             continue
+                    if first_intent_cut is not None and phase == "after":
+                        first_intent_cut.observe_vote(checked, directory, member_id(2))
                     if checked["created_by"] not in {member_id(i) for i in committee}:
                         raise RuntimeError(
                             "Non-transition block creator is absent from the current committee"
@@ -1688,7 +1690,10 @@ async def run(args, profile, root, artifacts):
                                 raise RuntimeError("An executable or profile changed")
                         if first_intent_task is not None:
                             await first_intent_task
-                            first_intent_cut.qualify_rotation(epochs, member_id(2))
+                            if not first_intent_cut.qualify_rotation(
+                                epochs, member_id(2)
+                            ):
+                                continue
                         receiver_receipt = None
                         if propagation_receiver is not None:
                             target = (
@@ -1700,6 +1705,12 @@ async def run(args, profile, root, artifacts):
                                 await propagation_receiver.verify_checkpoint(
                                     target, rpc, identity
                                 )
+                            )
+                        if args.verify_propagation_receiver:
+                            from receiver_evidence import collect_receiver_evidence
+
+                            await collect_receiver_evidence(
+                                args, propagation_receiver, target, directory
                             )
                         return {
                             "propagation_receiver": receiver_receipt,
@@ -1940,6 +1951,7 @@ def main():
         choices=["after-fsync", "before-write", "after-partial-write"],
         default="after-fsync",
     )
+    parser.add_argument("--verify-propagation-receiver", action="store_true")
     parser.add_argument("--recovery-timeout", type=float, default=180)
     parser.add_argument("--network-fault", choices=list(MODES))
     parser.add_argument(
@@ -2149,6 +2161,12 @@ def main():
         initial_probe_weights(profile)
     from propagation_receiver_fixture import receiver_plan
 
+    if args.verify_propagation_receiver and (
+        receiver_plan(profile) is None or args.interrupt_rust_member is not None
+    ):
+        raise SystemExit(
+            "Receiver body/state verification requires a receiver and uninterrupted rotation"
+        )
     receiver_plan(profile)
     manifest = json.loads((args.snapshot / "manifest.json").read_text())
     require_cpp_baseline(manifest["cpp_source_commit"], profile)
@@ -2205,6 +2223,7 @@ def main():
         "custody_expiry_authority.py",
         "runtime_manifest_observer.py",
         "expired_member_restart_fixture.py",
+        "receiver_evidence.py",
     ]:
         path = driver.with_name(name)
         artifacts[str(path)] = digest(path)
@@ -2217,6 +2236,7 @@ def main():
         for path in [
             args.first_intent_cut_library,
             driver.with_name("first_intent_cut_fixture.py"),
+            driver.with_name("first_intent_vote.py"),
             driver.with_name("verify_intent_cut_evidence.py"),
             driver.parents[2] / "rtos/src/tests/finality_source_fault.c",
         ]:
