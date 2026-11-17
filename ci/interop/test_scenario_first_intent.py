@@ -87,8 +87,8 @@ def fixture(root, point):
         "all_six_mc_four_wc_states_match": True,
         "path": str(target),
         "namespace": str(namespace),
-        "old_process": {"pid": 100, "start_ticks": 10},
-        "new_process": {"pid": 200, "start_ticks": 20},
+        "old_process": {"pid": 100, "start_ticks": "10"},
+        "new_process": {"pid": 200, "start_ticks": "20"},
         "bytes": len(raw),
         "sha256": sha(raw),
         "intended_bytes": len(intended),
@@ -106,17 +106,69 @@ def fixture(root, point):
         result["epochs"]["after"][kind] = {
             member_id(i): {
                 "local_collation_log": "node-restart.log" if i == 2 else "node.log",
-                "check": {
-                    "verified_final_certificates": [{"validator_ids": [member_id(2)]}]
-                },
+                "check": {"verified_final_certificates": []},
             }
             for i in (0, 2, 4, 5)
         }
+    vote_check = {
+        "block": {"workchain": -1, "seqno": 200},
+        "created_by": member_id(4),
+        "gen_utime": 20,
+        "key_block": False,
+        "verified_governing_key_blocks": [{}],
+        "configuration": {
+            "current": {
+                "members": [{"validator_id": member_id(i)} for i in (0, 2, 4, 5)]
+            }
+        },
+        "verified_final_certificates": [
+            {"validator_ids": [member_id(2)], "final_certificate_checked": True}
+        ],
+    }
+    sample = root / "checks/200"
+    sample.mkdir(parents=True)
+    raw_vote = json.dumps(vote_check).encode()
+    (sample / "epoch-checked.json").write_bytes(raw_vote)
+    receipt["restarted_at_unix"] = 10.5
+    receipt["post_restart_vote"] = {
+        "validator_id": member_id(2),
+        "block": vote_check["block"],
+        "sample_directory": str(sample),
+        "checked_sha256": sha(raw_vote),
+        "check": vote_check,
+    }
     result["first_intent_cut"] = receipt
     return result
 
 
 class FirstIntentAdapterTests(unittest.TestCase):
+    def test_process_starttime_uses_native_decimal_text_and_numeric_order(self):
+        from scenario_first_intent import check_first_intent_result
+
+        with TemporaryDirectory() as tmp:
+            result = fixture(Path(tmp), "before-write")
+            receipt = result["first_intent_cut"]
+            receipt["old_process"]["start_ticks"] = "99"
+            receipt["new_process"]["start_ticks"] = "100"
+            check_first_intent_result("first-intent-before-write", result)
+            for bad in [
+                100,
+                True,
+                None,
+                "",
+                "0",
+                "0100",
+                "-1",
+                "1.0",
+                " 100",
+                "１００",
+                "98",
+            ]:
+                with self.subTest(start_ticks=bad):
+                    receipt["new_process"]["start_ticks"] = bad
+                    with self.assertRaisesRegex(ValueError, "process identity"):
+                        check_first_intent_result("first-intent-before-write", result)
+
     def test_both_cuts_are_wired(self):
         catalog = validate(json.loads(CATALOG.read_text()), CATALOG.parent)
         for point in ("before-write", "after-partial-write"):
@@ -144,7 +196,7 @@ class FirstIntentAdapterTests(unittest.TestCase):
                     lambda r: r["epochs"]["after"]["mc_creators"][member_id(2)].update(
                         local_collation_log="node.log"
                     ),
-                    lambda r: r["epochs"]["after"]["mc_creators"][member_id(2)][
+                    lambda r: r["first_intent_cut"]["post_restart_vote"][
                         "check"
                     ].update(verified_final_certificates=[]),
                 ]

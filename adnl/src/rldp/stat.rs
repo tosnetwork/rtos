@@ -1101,15 +1101,16 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             // A regression can spin before returning: contain it in a process,
             // kill and reap on the deadline instead of leaking a test thread.
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "rldp::stat::tests::rldp_stat_stale_windows_and_zero_cycle",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .spawn()
-                .unwrap();
+            let mut child = crate::test_process::spawn(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "rldp::stat::tests::rldp_stat_stale_windows_and_zero_cycle",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
             let deadline = Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {

@@ -69,31 +69,51 @@ def check_first_intent_result(name, result):
     ):
         raise ValueError("First-intent recovery/rotation exceeded original budget")
     old, new = receipt["old_process"], receipt["new_process"]
+    # /proc starttime is retained as decimal text by the process owner.
+    ticks = [p.get("start_ticks") for p in (old, new)]
     if (
-        any(
-            type(p.get(k)) is not int or p[k] <= 0
-            for p in (old, new)
-            for k in ("pid", "start_ticks")
+        any(type(p.get("pid")) is not int or p["pid"] <= 0 for p in (old, new))
+        or any(
+            type(value) is not str
+            or not value.isascii()
+            or not value.isdecimal()
+            or value.startswith("0")
+            for value in ticks
         )
         or old["pid"] == new["pid"]
-        or new["start_ticks"] < old["start_ticks"]
     ):
+        raise ValueError("First-intent restart process identity differs")
+    if int(ticks[1]) < int(ticks[0]):
         raise ValueError("First-intent restart process identity differs")
     member = member_id(2)
     after = result["epochs"]["after"]
     for kind in ("mc_creators", "wc_creators"):
         if after[kind].get(member, {}).get("local_collation_log") != "node-restart.log":
             raise ValueError("Missing post-restart successor creator")
-    certificates = (
-        after["mc_creators"][member]
-        .get("check", {})
-        .get("verified_final_certificates", [])
-    )
-    if not any(member in c.get("validator_ids", []) for c in certificates):
+    from first_intent_vote import post_restart_successor_vote
+
+    vote = receipt.get("post_restart_vote", {})
+    if (
+        vote.get("validator_id") != member
+        or not post_restart_successor_vote(
+            vote.get("check", {}), member, receipt.get("restarted_at_unix")
+        )
+        or vote.get("block") != vote["check"]["block"]
+    ):
         raise ValueError("Missing verified post-restart vote")
 
 
 def check_first_intent_evidence(runtime, receipt, point):
+    vote = receipt["post_restart_vote"]
+    sample = Path(vote["sample_directory"])
+    if not sample.resolve().is_relative_to((runtime / "checks").resolve()):
+        raise ValueError("First-intent vote sample is outside owned checks")
+    raw_vote = (sample / "epoch-checked.json").read_bytes()
+    if (
+        hashlib.sha256(raw_vote).hexdigest() != vote["checked_sha256"]
+        or json.loads(raw_vote) != vote["check"]
+    ):
+        raise ValueError("First-intent vote differs from raw checked evidence")
     directory = runtime / "first-intent-cut"
     target, namespace = Path(receipt["path"]), Path(receipt["namespace"])
     owned = runtime / "rust-2/node_db/catchains/consensus/v2"

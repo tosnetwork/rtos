@@ -13,6 +13,9 @@ use crate::adnl::node::AdnlNode;
 use rtos_block::Result;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod test_process;
+
 mod adnl;
 pub use crate::adnl::*;
 mod dht;

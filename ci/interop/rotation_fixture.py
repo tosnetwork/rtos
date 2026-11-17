@@ -1354,6 +1354,8 @@ async def run(args, profile, root, artifacts):
                             # Retry exact matching within the first observation's
                             # budget and original expiry, without arming the fault.
                             continue
+                    if first_intent_cut is not None and phase == "after":
+                        first_intent_cut.observe_vote(checked, directory, member_id(2))
                     if checked["created_by"] not in {member_id(i) for i in committee}:
                         raise RuntimeError(
                             "Non-transition block creator is absent from the current committee"
@@ -1681,7 +1683,10 @@ async def run(args, profile, root, artifacts):
                                 raise RuntimeError("An executable or profile changed")
                         if first_intent_task is not None:
                             await first_intent_task
-                            first_intent_cut.qualify_rotation(epochs, member_id(2))
+                            if not first_intent_cut.qualify_rotation(
+                                epochs, member_id(2)
+                            ):
+                                continue
                         receiver_receipt = None
                         if propagation_receiver is not None:
                             target = (
@@ -2199,6 +2204,8 @@ def main():
         "observer_budget_fixture.py",
         "recovery_quorum_fixture.py",
         "signer_expiry_fixture.py",
+        "custody_expiry_authority.py",
+        "runtime_manifest_observer.py",
         "expired_member_restart_fixture.py",
         "receiver_evidence.py",
     ]:
@@ -2213,6 +2220,7 @@ def main():
         for path in [
             args.first_intent_cut_library,
             driver.with_name("first_intent_cut_fixture.py"),
+            driver.with_name("first_intent_vote.py"),
             driver.with_name("verify_intent_cut_evidence.py"),
             driver.parents[2] / "rtos/src/tests/finality_source_fault.c",
         ]:

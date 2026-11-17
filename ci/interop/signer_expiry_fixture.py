@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import hashlib
 import json
 import re
 import time
@@ -19,6 +18,7 @@ from mixed_matrix import (
     write,
 )
 from quorum_profile import check_committee_weights
+from runtime_manifest_observer import read_starting_manifest
 
 
 def expiry_plan(profile, args):
@@ -120,7 +120,9 @@ class SignerExpiry:
         for path in (node["directory"] / "node_db/catchains/consensus/v2").glob(
             "*/session-runtime.json"
         ):
-            value = json.loads(path.read_text())
+            value = read_starting_manifest(path)
+            if value is None:
+                continue
             if (
                 value["session"] == session
                 and value["shard_workchain"] == -1
@@ -136,36 +138,10 @@ class SignerExpiry:
                 "Signer expiry needs the exact current active MC runtime"
             )
         runtime = candidates[0]
-        profile = runtime.with_name("isolated-signing.json")
-        # Runtime metadata can become visible before the async group installs
-        # its exact signing profile. The caller retries within the first
-        # observation's budget; malformed or mismatched authority stays fatal.
-        try:
-            profile_bytes = profile.read_text()
-        except FileNotFoundError as error:
-            raise SignerExpiryRuntimePending(
-                "Current MC signing profile is not installed yet"
-            ) from error
-        value = json.loads(profile_bytes)
-        schedule = profile.parent.parent / "isolated-signing-schedule.json"
-        if (
-            value["validator"] != hashlib.sha256(b"n6-validator-id-5").hexdigest()
-            or value["session"] != session
-        ):
-            raise RuntimeError(
-                "Expiry profile differs from the selected member/session"
-            )
-        if (
-            value["expire_at"] != self.plan["expire_at"]
-            or json.loads(schedule.read_text())["expire_at"] != value["expire_at"]
-        ):
-            raise RuntimeError(
-                "Signer expiry was not provisioned in the original profile and successor schedule"
-            )
-        self.bindings = {
-            str(p): digest(p)
-            for p in [profile, schedule, node["directory"] / "validator-prepared.json"]
-        }
+        from custody_expiry_authority import capture_custody_authority
+
+        authority = capture_custody_authority(node["directory"], self.plan["expire_at"])
+        self.bindings = authority["authority_file_hashes"]
         self.session = session
         self.pid = node["process"].pid
         self.ticks = node["start_ticks"]
@@ -173,11 +149,26 @@ class SignerExpiry:
         self.offset = self.log.stat().st_size
         self.directory.mkdir()
         (self.directory / "selected-runtime.json").write_bytes(runtime.read_bytes())
-        (self.directory / "original-profile.json").write_bytes(profile.read_bytes())
-        # Contains only public authority metadata and local paths, never key bytes.
-        (self.directory / "original-schedule.json").write_bytes(schedule.read_bytes())
+        write(
+            self.directory / "original-custody.json",
+            json.loads((node["directory"] / "config.json").read_text())["pq_consensus"],
+        )
+        (self.directory / "original-validator-prepared.json").write_bytes(
+            (node["directory"] / "validator-prepared.json").read_bytes()
+        )
+        # Public summaries retain the receipt interface; raw authority is the
+        # original config/preparer and loaded custody identity, not these summaries.
+        write(
+            self.directory / "original-profile.json", {**authority, "session": session}
+        )
+        write(
+            self.directory / "original-schedule.json",
+            {"kind": authority["kind"], "expire_at": authority["expire_at"]},
+        )
         self.receipt = {
             "phase": "waiting_for_natural_expiry",
+            "authority_kind": authority["kind"],
+            "custody_loaded_line": authority["loaded_line"],
             "plan": self.plan,
             "session": session,
             "pid": self.pid,
@@ -233,10 +224,15 @@ class SignerExpiry:
             refusal = re.search(
                 r"^Session "
                 + self.session
-                + r" broadcast_vote: failed to sign vote: (?:signing generation expired and retired|signing journal stopped/retired)$",
+                + r" broadcast_vote: failed to sign vote: (?:signing generation expired and retired|signing journal stopped/retired|Retired recovery has no signing or voting authority)$",
                 text,
                 re.MULTILINE,
             )
+            if refusal and not expiry:
+                # Production custody can retire the group before another signer
+                # call. Its exact-session refusal, after the original finite
+                # deadline, is checked with unchanged authority and finality below.
+                expiry = refusal.group(0)
             if time.time() >= self.plan["expire_at"] and expiry and refusal:
                 self.receipt.update(
                     phase="refusal_observed",

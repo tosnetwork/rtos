@@ -111,11 +111,11 @@ jobs:
             --actual "$task_runtime_out/multipart.jsonl" \
             > "$task_runtime_out/multipart-comparison.json"
 
-      - name: Check RLDP response lifetime and ownership
+      - name: Check ADNL transports, RLDP lifetime and test process ownership
         timeout-minutes: 15
         run: |
           mkdir -p "$RUNNER_TEMP/conformance/rldp2-lifetime"
-          cargo test --release --package adnl --lib --jobs 2 rldp:: -- --nocapture \
+          cargo test --release --package adnl --lib --jobs 2 -- --nocapture \
             > "$RUNNER_TEMP/conformance/rldp2-lifetime/tests.log" 2>&1
 
       - name: Retain conformance evidence

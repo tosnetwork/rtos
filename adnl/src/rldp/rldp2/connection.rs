@@ -212,6 +212,14 @@ impl Connection {
     pub fn inbound_transfer_count(&self) -> usize {
         self.inbound.len()
     }
+    #[cfg(test)]
+    pub(crate) fn retained_encoders(&self) -> Vec<(TransferId, usize, usize)> {
+        self.outbound.retained_encoders()
+    }
+    #[cfg(test)]
+    pub(crate) fn outbound_started(&self) -> u64 {
+        self.outbound.started_count()
+    }
     pub fn outbound_transfer_count(&self) -> usize {
         self.outbound.transfer_count()
     }
@@ -242,6 +250,10 @@ impl Connection {
         }
         Ok(true)
     }
+    #[cfg(test)]
+    pub(crate) fn completed_ids(&self) -> Vec<TransferId> {
+        self.completed.iter().copied().collect()
+    }
     pub fn completed_transfer_count(&self) -> usize {
         self.completed.len()
     }
@@ -267,6 +279,21 @@ impl Connection {
         self.outstanding += 1;
         true
     }
+    /// Local API cancellation is serialized with decoding by the owned driver.
+    /// An unknown ID must not create a completed-cache entry.
+    pub(crate) fn cancel_transfer(&mut self, id: TransferId, inbound: bool) {
+        if inbound {
+            if self.limits.contains_key(&id) || self.inbound.contains_key(&id) {
+                self.complete(id, self.now());
+                self.drop_limit(&id);
+                self.pending.received.push((id, Err(Refusal("cancelled"))));
+            }
+        } else if self.outbound.remove(id) {
+            self.timers.erase(&(id, false));
+            self.pending.sent.push((id, Err("cancelled".into())));
+        }
+    }
+
     fn drop_limit(&mut self, id: &TransferId) {
         self.timers.erase(&(*id, true));
         if let Some(limit) = self.limits.remove(id) {
