@@ -20,9 +20,10 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             signer_expiry_member=5,
             interrupt_rust_member=2,
-            source_ack_partition_restart=True,
+            source_ack_partition_restart=False,
+            partition_restart=True,
             recovery_below_quorum=True,
-            source_ack_fault="sync-eio",
+            source_ack_fault=None,
             recovery_timeout=2,
         )
 
@@ -241,6 +242,8 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
             complete=AsyncMock(),
         )
         args.signer_expiry_observer = observer
+        args.source_ack_partition_restart = True
+        args.source_ack_fault = "sync-eio"
 
         class Context:
             async def complete(self, recovered):

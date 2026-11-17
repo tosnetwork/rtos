@@ -72,7 +72,7 @@ impl OutputSet {
     }
 }
 impl FinalityIntentStore {
-    fn output_path(&self, id: &crate::block::RawCandidateId) -> PathBuf {
+    pub(super) fn output_path(&self, id: &crate::block::RawCandidateId) -> PathBuf {
         self.namespace.join(DIRECTORY).join(OUTPUT_DIRECTORY).join(format!(
             "{}-{}.outputs",
             id.slot.value(),

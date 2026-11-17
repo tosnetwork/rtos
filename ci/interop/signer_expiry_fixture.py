@@ -55,12 +55,13 @@ def expiry_plan(profile, args):
     elif (
         member != 5
         or args.interrupt_rust_member != 2
-        or not args.source_ack_partition_restart
+        or not getattr(args, "partition_restart", False)
+        or args.source_ack_partition_restart
         or not args.recovery_below_quorum
-        or args.source_ack_fault != "sync-eio"
+        or args.source_ack_fault is not None
     ):
         raise ValueError(
-            "Signer expiry requires the declared member5 plus member2 ACK/partition restart combination"
+            "Signer expiry requires member5 expiry and member2 partition restart without propagation ACK injection"
         )
     if any(
         profile.get(k)

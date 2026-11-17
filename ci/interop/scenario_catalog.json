@@ -9,6 +9,7 @@
     "partition_restart_fixture.py",
     "propagation_receiver_fixture.py",
     "publication_io_fixture.py",
+    "publication_io_live_fixture.py",
     "recovery_quorum_fixture.py",
     "rotation_fixture.py",
     "signer_expiry_fixture.py",

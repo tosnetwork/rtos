@@ -104,6 +104,18 @@ pub type FinalityTerminalCompletion = Box<dyn FnOnce(Result<FinalityTerminalLook
 pub type FinalityCloseCompletion = Box<dyn FnOnce(Result<CloseOffer>) + Send>;
 
 pub trait DurableFinalitySink: Send + Sync {
+    /// Accept a live authenticated Final or Approval independently of propagation
+    /// retention. Success means block/proof/state acceptance is durable, not that
+    /// any peer received a broadcast. After admission the node owns completion,
+    /// including when the originating session stops.
+    fn accept_draft(
+        &self,
+        _draft: FinalizedDeliveryDraft,
+        _completion: Box<dyn FnOnce(Result<()>) + Send>,
+    ) -> Result<()> {
+        rtos_block::fail!("Direct finality acceptance is unsupported")
+    }
+
     /// C++ FinalizeBlock waits for node acceptance, independently of WAL custody.
     /// The authenticated source coordinates must match the accepted record.
     fn await_accepted(

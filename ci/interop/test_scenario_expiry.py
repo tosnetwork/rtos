@@ -219,8 +219,9 @@ class ExpiryArgumentTests(unittest.TestCase):
                 signer_expiry_member=5,
                 expired_member_restart="--expired-member-restart" in args,
                 interrupt_rust_member=member,
-                source_ack_partition_restart=True,
-                source_ack_fault="sync-eio",
+                partition_restart="--partition-restart" in args,
+                source_ack_partition_restart="--source-ack-partition-restart" in args,
+                source_ack_fault="sync-eio" if "--source-ack-fault" in args else None,
                 recovery_below_quorum="--recovery-below-quorum" in args,
             )
             plan = expiry_plan(profile, namespace)
