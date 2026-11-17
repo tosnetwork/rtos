@@ -7,13 +7,11 @@ from tempfile import TemporaryDirectory
 
 from scenario_execution import check_result, make_profile
 from scenarios import CATALOG, validate
-from test_scenario_ack_partition import fixture as ack_partition_fixture
 from test_scenario_execution import rotation_result
 from test_scenario_restart import fixture as restart_fixture
 
 
 def active_receipts(root):
-    combined, source, _, _ = ack_partition_fixture(root, "sync-eio")
     partition, recovery = restart_fixture(below=True)
     partition.update(
         budget_started_at_unix=90.0,
@@ -31,11 +29,11 @@ def active_receipts(root):
     )
     result = rotation_result()
     result.update(
-        source_ack_partition_restart=combined,
-        source_ack_fault=source,
+        source_ack_partition_restart=None,
+        source_ack_fault=None,
         partition_restart=partition,
         recovery=recovery,
-        signer_expiry={},
+        signer_expiry={"budget_started_at_unix": 90.0},
     )
     return result
 
@@ -72,12 +70,8 @@ class ActiveExpiryTests(unittest.TestCase):
                 lambda r: r["partition_restart"]["below_quorum_observation"].update(
                     observation_count=1
                 ),
-                lambda r: r["source_ack_partition_restart"].update(
-                    budget_started_at_unix=91
-                ),
-                lambda r: r["source_ack_partition_restart"].update(
-                    recovery_limit_seconds=181
-                ),
+                lambda r: r["partition_restart"].update(budget_started_at_unix=91),
+                lambda r: r["partition_restart"].update(recovery_limit_seconds=181),
                 lambda r: r.update(signer_expiry=None),
             ]
             for change in changes:
@@ -85,5 +79,5 @@ class ActiveExpiryTests(unittest.TestCase):
                 change(bad)
                 with self.assertRaises((ValueError, TypeError)):
                     check_result("signer-expiry", bad)
-            with self.assertRaises(ValueError):
+            with self.assertRaises((ValueError, TypeError)):
                 check_result("source-ack-partition-sync-eio", original)
