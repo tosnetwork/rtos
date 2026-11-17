@@ -1200,7 +1200,7 @@ impl State {
                     let activity = self.activity_scope("accept_live_block", None);
                     // A live draft cannot reuse outbox-ID-based verification.
                     let (_, accepted) = self
-                        .persist_accepted_publication(store, engine, publication, true, &activity)
+                        .persist_accepted_publication(None, engine, publication, true, &activity)
                         .await?;
                     Ok(accepted)
                 }
@@ -1580,7 +1580,13 @@ impl State {
         }
         let needs_verification = !self.acceptance_verified.lock().unwrap().contains(&id.0);
         let (entry, accepted) = self
-            .persist_accepted_publication(store, engine, publication, needs_verification, &activity)
+            .persist_accepted_publication(
+                Some(store),
+                engine,
+                publication,
+                needs_verification,
+                &activity,
+            )
             .await?;
         trace_phase("durability_done");
         // Queue bookkeeping follows actual acceptance. Keep it here so callers
@@ -1598,7 +1604,7 @@ impl State {
     /// fault-injection diagnostics; ordinary acceptance does not write its WAL.
     async fn persist_accepted_publication(
         &self,
-        store: &Arc<PropagationOutbox>,
+        store: Option<&Arc<PropagationOutbox>>,
         engine: Arc<Engine>,
         publication: crate::propagation_outbox_auth::AuthenticatedPublication,
         needs_verification: bool,
@@ -1618,8 +1624,12 @@ impl State {
             activity.phase("accept_durability");
             let durability = engine.clone().ensure_publication_acceptance_durable(&accepted);
             #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
-            let durability =
-                crate::publication_io_test_control::acceptance_scope(&entry, durability).await;
+            let durability = crate::publication_io_test_control::acceptance_scope(
+                &entry,
+                store.is_some(),
+                durability,
+            )
+            .await;
             #[cfg(not(all(target_os = "linux", feature = "isolated-consensus-signing")))]
             let durability = durability.await;
             if let Err(error) = durability {
@@ -1631,7 +1641,7 @@ impl State {
                     #[cfg(all(target_os = "linux", feature = "isolated-consensus-signing"))]
                     crate::publication_io_test_control::after_fatal(
                         &entry,
-                        store.as_ref(),
+                        store.map(Arc::as_ref),
                         &accepted,
                         &error,
                     )?;

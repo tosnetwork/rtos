@@ -52,16 +52,19 @@ struct Witness {
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct PublicationContext {
-    record_id: u64,
-    node_receipt: String,
+    record_id: Option<u64>,
+    node_receipt: Option<String>,
+    delivery_id: String,
     stage: String,
 }
 impl PublicationContext {
-    fn from_entry(entry: &UnverifiedRecord) -> Result<Self> {
+    fn from_entry(entry: &UnverifiedRecord, queued: bool) -> Result<Self> {
+        let delivery_id = delivery_id(&entry.record)?.to_hex_string();
         Ok(Self {
-            record_id: entry.id.0,
-            node_receipt: delivery_id(&entry.record)?.to_hex_string(),
-            stage: format!("{:?}", entry.stage),
+            record_id: queued.then_some(entry.id.0),
+            node_receipt: queued.then(|| delivery_id.clone()),
+            delivery_id,
+            stage: if queued { format!("{:?}", entry.stage) } else { "LiveAcceptance".into() },
         })
     }
 }
@@ -69,15 +72,26 @@ tokio::task_local! { static PUBLICATION: PublicationContext; }
 
 pub(crate) async fn acceptance_scope<T>(
     entry: &UnverifiedRecord,
+    queued: bool,
     work: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     if std::env::var_os(CONTROL).is_none() {
         return work.await;
     }
-    PUBLICATION.scope(PublicationContext::from_entry(entry)?, work).await
+    PUBLICATION.scope(PublicationContext::from_entry(entry, queued)?, work).await
 }
 fn matches_publication(selector: &Selector, publication: &PublicationContext) -> bool {
-    publication.node_receipt == selector.node_receipt && publication.stage == "DraftDurable"
+    publication.delivery_id == selector.node_receipt
+        && match publication.stage.as_str() {
+            "LiveAcceptance" => {
+                publication.record_id.is_none() && publication.node_receipt.is_none()
+            }
+            "DraftDurable" => {
+                publication.record_id.is_some()
+                    && publication.node_receipt.as_ref() == Some(&selector.node_receipt)
+            }
+            _ => false,
+        }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -218,7 +232,7 @@ pub(crate) fn for_acceptance(accepted: &AcceptedSessionBlock) -> Result<SyncObse
 /// durability failure fatal, before it returns an unsuccessful acceptance.
 pub(crate) fn after_fatal(
     entry: &UnverifiedRecord,
-    store: &PropagationOutbox,
+    store: Option<&PropagationOutbox>,
     accepted: &AcceptedSessionBlock,
     error: &anyhow::Error,
 ) -> Result<()> {
@@ -235,16 +249,19 @@ pub(crate) fn after_fatal(
     ) {
         return Ok(());
     }
-    let publication = PublicationContext::from_entry(entry)?;
+    let publication = PublicationContext::from_entry(entry, store.is_some())?;
     if !matches_publication(&selector, &publication) {
         return Ok(());
     }
-    let (_, retained) = store
-        .delivery(&delivery_id(&entry.record)?)?
-        .ok_or_else(|| rtos_block::error!("Failed publication lost its full WAL draft"))?;
-    if PublicationContext::from_entry(&retained)? != publication || retained.record != entry.record
-    {
-        fail!("Failed publication advanced or changed its durable draft");
+    if let Some(store) = store {
+        let (_, retained) = store
+            .delivery(&delivery_id(&entry.record)?)?
+            .ok_or_else(|| rtos_block::error!("Failed publication lost its full WAL draft"))?;
+        if PublicationContext::from_entry(&retained, true)? != publication
+            || retained.record != entry.record
+        {
+            fail!("Failed publication advanced or changed its durable draft");
+        }
     }
     let target_bytes = std::fs::read(control.join("target.json"))?;
     let target: Witness = serde_json::from_slice(&target_bytes)?;
@@ -276,7 +293,7 @@ pub(crate) fn after_fatal(
         "target_sha256":digest(&target_bytes), "native_marker_sha256":digest(&marker),
         "error":error.to_string(), "typed_durability_failure":true,
         "publication_owner_marked_fatal":true, "accepted_callback_returned":false,
-        "retained_draft_verified":true, "publication":publication,
+        "retained_draft_verified":store.is_some(), "publication":publication,
     });
     write_new(&control.join("failed.json"), &serde_json::to_vec(&failed)?)?;
     File::open(&control)?.sync_all()?;
@@ -310,8 +327,9 @@ mod tests {
             node_receipt: "e".repeat(64),
         };
         let publication = PublicationContext {
-            record_id: 7,
-            node_receipt: selector.node_receipt.clone(),
+            record_id: Some(7),
+            node_receipt: Some(selector.node_receipt.clone()),
+            delivery_id: selector.node_receipt.clone(),
             stage: "DraftDurable".into(),
         };
         arm(&directory, &selector, &"c".repeat(64), &"d".repeat(64), &publication, &body).unwrap();
@@ -341,18 +359,26 @@ mod tests {
             node_receipt: "c".repeat(64),
         };
         let mut publication = PublicationContext {
-            record_id: 9,
-            node_receipt: selector.node_receipt.clone(),
+            record_id: Some(9),
+            node_receipt: Some(selector.node_receipt.clone()),
+            delivery_id: selector.node_receipt.clone(),
             stage: "DraftDurable".into(),
         };
         assert!(matches_publication(&selector, &publication));
-        publication.node_receipt = "d".repeat(64);
+        publication.node_receipt = Some("d".repeat(64));
         assert!(!matches_publication(&selector, &publication));
-        publication.node_receipt = selector.node_receipt.clone();
+        publication.node_receipt = Some(selector.node_receipt.clone());
         for stage in ["Prepared", "Ready", "AcceptedDraft", "Completed"] {
             publication.stage = stage.into();
             assert!(!matches_publication(&selector, &publication));
         }
+        publication.stage = "LiveAcceptance".into();
+        assert!(!matches_publication(&selector, &publication));
+        publication.record_id = None;
+        publication.node_receipt = None;
+        assert!(matches_publication(&selector, &publication));
+        publication.delivery_id = "f".repeat(64);
+        assert!(!matches_publication(&selector, &publication));
     }
 
     #[test]
