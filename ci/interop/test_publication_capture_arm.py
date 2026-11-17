@@ -54,6 +54,9 @@ class CaptureArmTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 arm_capture(root, checked, root / "capture", 42)
             runtime.write_text(json.dumps(dict(manifest, role="observer")))
+            with self.assertRaises(CaptureSessionPending):
+                select_session(root, checked)
+            runtime.write_text(json.dumps(dict(manifest, catchain_seqno=2)))
             with self.assertRaises(ValueError):
                 select_session(root, checked)
             runtime.write_text(json.dumps(manifest))

@@ -60,12 +60,16 @@ def select_session(node_directory, checked):
         if manifest is None or manifest.get("session") != session:
             continue
         if (
-            manifest.get("role") != "validator"
+            manifest.get("role") not in ("validator", "observer")
             or manifest.get("shard_workchain") != 0
             or manifest.get("shard_prefix") != int(block["shard"]) % (1 << 64)
             or manifest.get("catchain_seqno") != wc["gen_catchain_seqno"]
         ):
             raise ValueError("WC capture runtime does not match the exact active block")
+        if manifest["role"] == "observer":
+            raise CaptureSessionPending(
+                "Exact WC block still belongs to this node's observer committee"
+            )
         matches.append(path)
     if not matches:
         raise CaptureSessionPending("Exact WC validator runtime is still starting")
