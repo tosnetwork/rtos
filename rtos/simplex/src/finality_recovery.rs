@@ -931,7 +931,7 @@ impl FinalityIntentStore {
             fail!("Injected accepted intent resolution failure before removal");
         }
         #[cfg(test)]
-        if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
+        if std::env::var("RTOS_CERT_COMPLETION_CRASH").as_deref() == Ok("before_outputs") {
             std::process::exit(78);
         }
         #[cfg(test)]
@@ -943,6 +943,10 @@ impl FinalityIntentStore {
         remove(&outputs)?;
         if outputs.parent().unwrap().exists() {
             File::open(outputs.parent().unwrap())?.sync_all()?;
+        }
+        #[cfg(test)]
+        if std::env::var("RTOS_CERT_COMPLETION_CRASH").as_deref() == Ok("after_outputs") {
+            std::process::exit(79);
         }
         remove(&pending)?;
         File::open(&directory)?.sync_all()?;
@@ -1269,12 +1273,20 @@ mod tests {
         source.bind_start(runtime.pin().zerostate.clone()).unwrap();
         source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
         if std::env::var_os("RTOS_CERT_COMPLETION_CRASH").is_some() {
+            let id =
+                crate::block::RawCandidateId { slot: event.slot, hash: event.block_hash.clone() };
             source
-                .resolve_intent(&crate::block::RawCandidateId {
-                    slot: event.slot,
-                    hash: event.block_hash.clone(),
-                })
+                .seal_outputs(
+                    &id,
+                    vec![ExpectedFinalityOutput::new(
+                        &draft.block_id,
+                        true,
+                        &draft.source_info.source.block_creator().unwrap(),
+                    )],
+                )
                 .unwrap();
+            assert!(source.sealed_output_requirements(&id).unwrap().is_some());
+            source.resolve_intent(&id).unwrap();
             panic!("completion crash point was not reached");
         }
         // Exit without Drop, candidate body, source Draft, node stage or receipt.
@@ -1282,14 +1294,15 @@ mod tests {
     }
     #[test]
     fn source_finality_cert_only_process_exit_retains_authentic_recovery_debt() {
-        check_source_finality_process_exit(false);
-        check_source_finality_process_exit(true);
+        check_source_finality_process_exit(None);
+        check_source_finality_process_exit(Some("before_outputs"));
+        check_source_finality_process_exit(Some("after_outputs"));
     }
-    fn check_source_finality_process_exit(completion_interrupted: bool) {
+    fn check_source_finality_process_exit(completion_interrupted: Option<&str>) {
         let directory = crate::authenticated_fixture::TestDirectory::new();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        if completion_interrupted {
-            child.env("RTOS_CERT_COMPLETION_CRASH", "1");
+        if let Some(cut) = completion_interrupted {
+            child.env("RTOS_CERT_COMPLETION_CRASH", cut);
         }
         let result = child
             .args([
@@ -1302,7 +1315,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.status.code(),
-            Some(if completion_interrupted { 78 } else { 77 }),
+            Some(match completion_interrupted {
+                Some("after_outputs") => 79,
+                Some(_) => 78,
+                None => 77,
+            }),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
@@ -1320,6 +1337,13 @@ mod tests {
         let original_paths = store.paths().unwrap();
         assert_eq!(original_paths.len(), 1);
         let original_bytes = std::fs::read(&original_paths[0]).unwrap();
+        if let Some(cut) = completion_interrupted {
+            let output_count =
+                std::fs::read_dir(records[0].namespace.join(DIRECTORY).join("outputs-v1"))
+                    .unwrap()
+                    .count();
+            assert_eq!(output_count, usize::from(cut == "before_outputs"));
+        }
         let temporary = store.completed_path(&original_paths[0]).with_extension("tmp");
         assert!(!temporary.exists(), "acceptance completion creates no retained-history copy");
         store.prepare(true).unwrap();
@@ -1375,6 +1399,44 @@ mod tests {
                 .all(|entry| entry.unwrap().file_name() == ".lock"),
             "this window must precede any full Draft or node custody"
         );
+        if completion_interrupted == Some("after_outputs") {
+            let (_, draft) = crate::finality_delivery::tests::fixture();
+            let consensus_common::SessionFinality::Carrier(
+                rtos_block::BlockSignaturesVariant::SimplexPq(proof),
+            ) = &draft.finality
+            else {
+                unreachable!()
+            };
+            let candidate = rtos_api::pq_finality::PqNetworkSignatureSet::from_final_fields(proof)
+                .unwrap()
+                .to_node()
+                .candidate;
+            let id = crate::block::RawCandidateId {
+                slot: crate::block::SlotIndex::new(proof.slot),
+                hash: UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate).unwrap()),
+            };
+            assert!(store.sealed_output_requirements(&runtime, &id).unwrap().is_none());
+            // Regenerate the derived requirements after authenticating the retained certificate.
+            store
+                .seal_outputs(
+                    &id,
+                    vec![ExpectedFinalityOutput::new(
+                        &draft.block_id,
+                        true,
+                        &draft.source_info.source.block_creator().unwrap(),
+                    )],
+                )
+                .unwrap();
+            let requirements = store.sealed_output_requirements(&runtime, &id).unwrap().unwrap();
+            assert_eq!(requirements.len(), 1);
+            assert_eq!(requirements[0].block_id, draft.block_id.to_string());
+            store.resolve_accepted(&id).unwrap();
+            store.resolve_accepted(&id).unwrap();
+            let reopened = FinalityIntentStore::new(&records[0].namespace);
+            reopened.prepare(true).unwrap();
+            assert_eq!(reopened.pending_count().unwrap(), 0);
+            assert!(!reopened.output_path(&id).exists());
+        }
         drop(owner);
     }
     pub(super) fn signed_fixture_event(
