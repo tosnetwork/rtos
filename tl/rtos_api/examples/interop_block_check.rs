@@ -84,13 +84,61 @@ fn check_workchain_anchor(workchain: &Value, tops: &[Value], global_id: i32) -> 
     Ok(chain.len())
 }
 
+/// Compare native historical state bodies without claiming endpoint-head or
+/// finality evidence. BOC flags/layout may differ; consensus cell roots may not.
+fn check_state_copies(value: &Value) -> Result<Value> {
+    let expected = identity(&value["block"]["id"])?;
+    let bytes = base64_decode(value["block"]["boc"].as_str().context("block BOC required")?)?;
+    ensure!(UInt256::calc_file_hash(&bytes) == expected.4, "block file hash differs");
+    let root = read_single_root_boc(&bytes)?;
+    ensure!(root.repr_hash() == &expected.3, "block root differs");
+    let block = Block::construct_from_cell(root)?;
+    let info = block.read_info()?;
+    ensure!(
+        u64::from(info.seq_no()) == expected.2
+            && i64::from(info.shard().workchain_id()) == expected.0
+            && info.shard().shard_prefix_with_tag() == expected.1 as u64,
+        "block header identity differs"
+    );
+    let state_root = block.read_state_update()?.new_hash;
+    let states = value["states"].as_array().context("state copies required")?;
+    ensure!((2..=6).contains(&states.len()), "expected two to six native state copies");
+    let mut names = std::collections::BTreeSet::new();
+    for source in states {
+        let name = source["name"].as_str().context("state source name required")?;
+        ensure!(names.insert(name), "duplicate state source");
+        ensure!(identity(&source["id"])? == expected, "state identity differs");
+        let data = base64_decode(source["boc"].as_str().context("state BOC required")?)?;
+        ensure!(
+            UInt256::calc_file_hash(&data) == hash(&source["file_hash"])?,
+            "state file hash differs"
+        );
+        let cell = read_single_root_boc(&data)?;
+        ensure!(cell.repr_hash() == &state_root, "state root differs from block state update");
+        let state = ShardStateUnsplit::construct_from_cell(cell)?;
+        ensure!(
+            state.shard() == info.shard()
+                && u64::from(state.seq_no()) == expected.2
+                && state.global_id() == block.global_id(),
+            "state header differs"
+        );
+    }
+    Ok(json!({"mode":"state-copies", "block":value["block"]["id"],
+        "state_root_hash":base64_encode(state_root.as_slice()), "sources":names,
+        "finality_checked":false}))
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let request = PathBuf::from(args.next().context("usage: interop_block_check REQUEST OUTPUT")?);
     let output = PathBuf::from(args.next().context("output argument required")?);
     ensure!(args.next().is_none(), "unexpected argument");
     let value: Value = serde_json::from_slice(&std::fs::read(request)?)?;
-    let result = check_request(&value, 0)?;
+    let result = match value.get("mode").and_then(Value::as_str) {
+        Some("state-copies") => check_state_copies(&value)?,
+        None => check_request(&value, 0)?,
+        Some(_) => anyhow::bail!("unknown checker mode"),
+    };
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output)?;
     file.write_all(&serde_json::to_vec_pretty(&result)?)?;
     println!("{result}");

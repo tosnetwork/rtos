@@ -10,7 +10,7 @@ import signal
 import time
 from pathlib import Path
 
-from mixed_matrix import cpp_block, native_state, write
+from mixed_matrix import child_checked, cpp_block, native_state, write
 from network_faults import marked_environment, require_namespace
 from source_ack_fault_fixture import SourceAckFailure
 
@@ -82,47 +82,33 @@ def selected_source(observed, *, pid, session, namespace):
     return record, source_id
 
 
-def bound_intents(namespace, record):
-    """Find the actual original certificates whose sealed outputs name this request."""
+def bound_intents(namespace, record, selected):
+    """Bind the pending Final certificate; MC outputs do not exist before accept."""
     directory = namespace / "finality-intents"
-    if directory.is_symlink() or (directory / "outputs-v1").is_symlink():
-        raise RuntimeError(
-            "Live intent directories must remain inside the original namespace"
-        )
-    snapshots = {}
-    for output in sorted((directory / "outputs-v1").glob("*.outputs")):
-        if output.is_symlink() or output.stat().st_size > 256 << 10:
-            raise RuntimeError("Unsafe or oversized output map")
-        raw = output.read_bytes()
-        value = json.loads(raw)
-        expected = {
-            "block_id": record["block_id"],
-            "is_final": True,
-            "source_validator": record["source_validator"],
-        }
-        if expected not in value["outputs"]:
-            continue
-        intent = directory / (output.stem + ".json")
-        if intent.is_symlink() or intent.stat().st_size > 16 << 20:
-            raise RuntimeError("Unsafe or oversized retained intent")
-        original = intent.read_bytes()
-        cert = json.loads(original)
-        if (
-            value["schema"] != 1
-            or value["released"] is not False
-            or value["digest"] != sha(original)
-            or value["metadata"] != {**cert, "certificate": ""}
-            or cert["session_id"] != record["session_id"]
-            or not cert["certificate"]
-        ):
-            raise RuntimeError(
-                "Output map does not bind the original retained certificate"
-            )
-        snapshots[intent] = original
-        snapshots[output] = raw
-    if not snapshots:
-        raise RuntimeError("Live request lacks an original intent and sealed output")
-    return snapshots
+    path = Path(selected["path"])
+    candidate = selected["candidate_hash"]
+    slot = selected["slot"]
+    if (
+        type(slot) is not int
+        or not 0 <= slot < 1 << 32
+        or not re.fullmatch("[0-9a-f]{64}", candidate)
+        or directory.is_symlink()
+        or path.is_symlink()
+        or path != directory / f"{slot}-{candidate}.json"
+        or path.stat().st_size > 16 << 20
+    ):
+        raise RuntimeError("Unsafe selected pending Final intent")
+    raw = path.read_bytes()
+    cert = json.loads(raw)
+    if (
+        sha(raw) != selected["sha256"]
+        or cert["slot"] != slot
+        or cert["candidate_hash"] != candidate
+        or cert["session_id"] != record["session_id"]
+        or not cert["certificate"]
+    ):
+        raise RuntimeError("Live request does not bind its original Final certificate")
+    return {path: raw}
 
 
 class LivePublicationIoSource(SourceAckFailure):
@@ -174,10 +160,12 @@ class LivePublicationIoSource(SourceAckFailure):
             namespace=namespace,
         )
         self.original = json.dumps(record, separators=(",", ":")).encode()
-        self.source_snapshot = bound_intents(namespace, record)
+        self.source_snapshot = bound_intents(
+            namespace, record, observed["finality_intent"]
+        )
         for i, (source, raw) in enumerate(self.source_snapshot.items()):
             (self.directory / f"original-{i}.json").write_bytes(raw)
-        self.receipt["original_intents_and_outputs"] = [
+        self.receipt["original_intents"] = [
             {"path": str(p), "sha256": sha(raw), "bytes": len(raw)}
             for p, raw in self.source_snapshot.items()
         ]
@@ -263,9 +251,7 @@ class LivePublicationIoSource(SourceAckFailure):
 
     def check_source_snapshot(self):
         if any(p.read_bytes() != raw for p, raw in self.source_snapshot.items()):
-            raise RuntimeError(
-                "Original live intent/output changed before database restart"
-            )
+            raise RuntimeError("Original live intent changed before database restart")
 
     def disarm(self):
         path = self.io_directory / "live-source-arm.json"
@@ -334,16 +320,31 @@ class LivePublicationIoSource(SourceAckFailure):
         body, states = await asyncio.wait_for(
             witness(), self.deadline - time.monotonic()
         )
-        if (
-            sha(base64.b64decode(body["boc"], validate=True))
-            != self.selector["block_sha256"]
-            or states[0]["boc"] != states[1]["boc"]
-            or recovered["last_checkpoint"]["seqno"] <= int(seqno)
-        ):
+        if sha(base64.b64decode(body["boc"], validate=True)) != self.selector[
+            "block_sha256"
+        ] or recovered["last_checkpoint"]["seqno"] <= int(seqno):
             raise RuntimeError(
                 "Original block/state recovery differs from native reference"
             )
-        write(target / "witness.json", {"block": body, "states": states})
+        write(
+            target / "witness.json",
+            {"mode": "state-copies", "block": body, "states": states},
+        )
+        await asyncio.wait_for(
+            child_checked(
+                [args.block_checker, target / "witness.json", target / "checked.json"],
+                target / "checker.log",
+            ),
+            self.deadline - time.monotonic(),
+        )
+        checked = json.loads((target / "checked.json").read_text())
+        if (
+            checked.get("mode") != "state-copies"
+            or checked.get("block") != block
+            or set(checked.get("sources", [])) != {"cpp-reference", "restarted-rust"}
+            or checked.get("finality_checked") is not False
+        ):
+            raise RuntimeError("Original state-copy checker scope differs")
         self.check_budget()
         self.receipt.update(
             phase="recovered",

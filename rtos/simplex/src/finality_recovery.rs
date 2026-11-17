@@ -1222,7 +1222,7 @@ pub use history_debt::{
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn source_finality_cert_intent_process_child() {
@@ -1439,7 +1439,7 @@ mod tests {
         }
         drop(owner);
     }
-    pub(super) fn signed_fixture_event(
+    pub(crate) fn signed_fixture_event(
         slot: u32,
     ) -> (std::sync::Arc<AuthenticatedSessionRuntime>, crate::simplex_state::BlockFinalizedEvent)
     {

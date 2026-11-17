@@ -37,28 +37,24 @@ class LivePublicationTests(unittest.TestCase):
         )
         namespace = source.pending_directory.parent
         intent_dir = namespace / "finality-intents"
-        output_dir = intent_dir / "outputs-v1"
-        output_dir.mkdir(parents=True)
-        cert = {"session_id": record["session_id"], "certificate": "deadbeef"}
+        intent_dir.mkdir(parents=True)
+        cert = {
+            "session_id": record["session_id"],
+            "certificate": "deadbeef",
+            "slot": 7,
+            "candidate_hash": "f" * 64,
+        }
         raw = json.dumps(cert, separators=(",", ":")).encode()
         intent = intent_dir / ("7-" + "f" * 64 + ".json")
         intent.write_bytes(raw)
-        output = output_dir / (intent.stem + ".outputs")
-        write_output = {
-            "schema": 1,
-            "digest": sha(raw),
-            "metadata": {**cert, "certificate": ""},
-            "outputs": [
-                {
-                    "block_id": record["block_id"],
-                    "is_final": True,
-                    "source_validator": record["source_validator"],
-                }
-            ],
-            "released": False,
+        output = {
+            "path": str(intent),
+            "slot": 7,
+            "candidate_hash": "f" * 64,
+            "sha256": sha(raw),
         }
-        output.write_text(json.dumps(write_output))
-        source.source_snapshot = bound_intents(namespace, record)
+        source.source_snapshot = bound_intents(namespace, record, output)
+        self.assertFalse((intent_dir / "outputs-v1").exists())
         publication = {
             "record_id": None,
             "node_receipt": None,
@@ -105,29 +101,31 @@ class LivePublicationTests(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             source.capture_failure()
 
-    def test_output_map_must_bind_actual_pending_certificate(self):
-        for change in ["digest", "certificate", "released", "role", "creator"]:
+    def test_pending_final_identity_does_not_require_later_output_map(self):
+        for change in ["digest", "certificate", "slot", "candidate", "session"]:
             with (
                 self.subTest(change=change),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                _, record, namespace, intent, output, _, _ = self.fixture(
+                _, record, namespace, intent, selected, _, _ = self.fixture(
                     Path(temporary)
                 )
-                value = json.loads(output.read_text())
+                cert = json.loads(intent.read_text())
                 if change == "digest":
-                    value["digest"] = "0" * 64
+                    selected["sha256"] = "0" * 64
                 if change == "certificate":
-                    intent.write_text("{}")
-                if change == "released":
-                    value["released"] = True
-                if change == "role":
-                    value["outputs"][0]["is_final"] = False
-                if change == "creator":
-                    value["outputs"][0]["source_validator"] = "0" * 64
-                output.write_text(json.dumps(value))
+                    cert["certificate"] = ""
+                if change == "slot":
+                    cert["slot"] = 8
+                if change == "candidate":
+                    cert["candidate_hash"] = "0" * 64
+                if change == "session":
+                    cert["session_id"] = "0" * 64
+                if change != "digest":
+                    intent.write_text(json.dumps(cert))
+                    selected["sha256"] = sha(intent.read_bytes())
                 with self.assertRaises(RuntimeError):
-                    bound_intents(namespace, record)
+                    bound_intents(namespace, record, selected)
 
     def test_observation_identity_and_non_custody_are_checked(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -186,7 +184,9 @@ class LivePublicationTests(unittest.TestCase):
                     for path in source.source_snapshot:
                         path.unlink()
                 source.witness_context = (
-                    SimpleNamespace(snapshot=Path(temporary)),
+                    SimpleNamespace(
+                        snapshot=Path(temporary), block_checker=Path("checker")
+                    ),
                     None,
                     None,
                     None,
@@ -197,10 +197,32 @@ class LivePublicationTests(unittest.TestCase):
                     if change != "body"
                     else base64.b64encode(b"wrong").decode()
                 }
-                states = [
-                    {"boc": "same"},
-                    {"boc": "different" if change == "state" else "same"},
-                ]
+                block["id"] = {
+                    "@type": "tos.blockIdExt",
+                    "workchain": -1,
+                    "shard": str(-(1 << 63)),
+                    "seqno": 5,
+                    "root_hash": base64.b64encode(bytes.fromhex("1" * 64)).decode(),
+                    "file_hash": base64.b64encode(
+                        bytes.fromhex(sha(bytes.fromhex(record["data"])))
+                    ).decode(),
+                }
+                states = [{"boc": "cpp-layout"}, {"boc": "rust-layout"}]
+
+                async def native_check(command, _log, change=change, block=block):
+                    if change == "state":
+                        raise RuntimeError("state root differs")
+                    Path(command[2]).write_text(
+                        json.dumps(
+                            {
+                                "mode": "state-copies",
+                                "block": block["id"],
+                                "sources": ["cpp-reference", "restarted-rust"],
+                                "finality_checked": False,
+                            }
+                        )
+                    )
+
                 recovered = {
                     "last_checkpoint": {"seqno": 5 if change == "progress" else 6}
                 }
@@ -212,6 +234,9 @@ class LivePublicationTests(unittest.TestCase):
                     patch(
                         "publication_io_live_fixture.native_state",
                         new=AsyncMock(side_effect=states),
+                    ),
+                    patch(
+                        "publication_io_live_fixture.child_checked", new=native_check
                     ),
                     patch(
                         "publication_io_live_fixture.asyncio.sleep",

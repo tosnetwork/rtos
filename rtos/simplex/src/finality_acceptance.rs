@@ -58,6 +58,33 @@ impl SourceFinalityDelivery {
         {
             return Ok(());
         }
+        let wire: rtos_api::ton::ton_node::SignatureSet =
+            record.wire_profile.deserialize_typed(&record.signature_set)?;
+        let rtos_api::ton::ton_node::SignatureSet::TonNode_SignatureSet_SimplexPq(value) = wire
+        else {
+            fail!("Live IO request requires PQ finality");
+        };
+        let signatures = PqNetworkSignatureSet::from_node(value)?;
+        let candidate = signatures.to_node().candidate;
+        let candidate_hash = UInt256::calc_file_hash(&rtos_api::serialize_boxed(&candidate)?);
+        let intent_path =
+            self.store.directory.parent().unwrap().join("finality-intents").join(format!(
+                "{}-{}.json",
+                signatures.slot(),
+                candidate_hash.to_hex_string()
+            ));
+        // MC sealed outputs are written only after acceptance. Select an actual
+        // still-pending Final trigger, never demand that later derived map here.
+        let intent_file = match File::open(&intent_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut intent_bytes = Vec::new();
+        intent_file.take((16 << 20) + 1).read_to_end(&mut intent_bytes)?;
+        if intent_bytes.len() > 16 << 20 {
+            fail!("Live IO intent exceeds bound");
+        }
         // Claim once across concurrent sessions/callbacks. No existing evidence
         // is overwritten, and only the driver resumes this owned test process.
         let claimed = control.join("live-source-claimed");
@@ -75,6 +102,12 @@ impl SourceFinalityDelivery {
             "source_id": record.id()?.to_hex_string(),
             "record": record.disk_record(),
             "is_custody_receipt": false,
+            "finality_intent": {
+                "path": intent_path,
+                "slot": signatures.slot(),
+                "candidate_hash": candidate_hash.to_hex_string(),
+                "sha256": UInt256::calc_file_hash(&intent_bytes).to_hex_string(),
+            },
         });
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -197,6 +230,9 @@ mod tests {
         let source =
             SourceFinalityDelivery::open(runtime.clone(), &namespace, sink.clone()).unwrap();
         let record = PendingFinalityRecord::from_draft(&runtime, &draft).unwrap();
+        let (_, event) = crate::finality_recovery::tests::signed_fixture_event(0);
+        source.bind_start(runtime.pin().zerostate.clone()).unwrap();
+        source.retain_intent(vec![runtime.pin().zerostate.clone()], &event).unwrap();
         let selector = root.join("live-source-arm.json");
         std::fs::write(
             &selector,
@@ -278,6 +314,16 @@ mod tests {
         assert_eq!(observed["source_id"], record.id().unwrap().to_hex_string());
         let namespace = PathBuf::from(observed["namespace"].as_str().unwrap());
         assert!(namespace.starts_with(root.path()));
+        let intent = PathBuf::from(observed["finality_intent"]["path"].as_str().unwrap());
+        assert!(intent.starts_with(namespace.join("finality-intents")));
+        assert_eq!(
+            observed["finality_intent"]["sha256"],
+            UInt256::calc_file_hash(&std::fs::read(intent).unwrap()).to_hex_string()
+        );
+        assert!(
+            !namespace.join("finality-intents/outputs-v1").exists(),
+            "the selected MC request must not need post-acceptance sealed outputs"
+        );
         assert!(std::fs::read_dir(namespace.join("finality-pending"))
             .unwrap()
             .all(|entry| entry.unwrap().file_name() == ".lock"));
