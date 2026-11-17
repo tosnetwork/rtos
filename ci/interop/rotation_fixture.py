@@ -980,7 +980,7 @@ async def run(args, profile, root, artifacts):
                     if first_intent_cut is not None and index == 2:
                         first_intent_task = asyncio.create_task(
                             first_intent_cut.supervise(
-                                rust_nodes[-1], start_rotation_node
+                                rust_nodes[-1], start_rotation_node, lite_configs
                             )
                         )
                     client = json.loads(

@@ -1,5 +1,6 @@
 """First-intent qualification requires physical recovery and successor evidence."""
 
+import base64
 import copy
 import hashlib
 import json
@@ -18,10 +19,10 @@ def fixture(root, point):
     directory.mkdir()
     namespace = root / "rust-2/node_db/catchains/consensus/v2/session"
     intents = namespace / "finality-intents"
-    (intents / "completed-v1").mkdir(parents=True)
+    intents.mkdir(parents=True)
     record = {
         "schema": 1,
-        "session_id": "session",
+        "session_id": "b" * 64,
         "slot": 1,
         "candidate_hash": "a" * 64,
         "certificate": "certificate",
@@ -29,7 +30,39 @@ def fixture(root, point):
     intended = json.dumps(record).encode()
     raw = b"" if point == "before-write" else intended[: len(intended) // 2]
     target = intents / ("1-" + "a" * 64 + ".tmp")
-    completed = json.dumps({"schema": 1, "record": record}).encode()
+    checked = {
+        "status": "block_and_state_match",
+        "block": {"workchain": -1, "seqno": 1},
+        "file_hash_checked": True,
+        "cell_hash_checked": True,
+        "header_identity_checked": True,
+        "state_update_matches_both": True,
+        "state_root_hash": "state",
+        "verified_final_certificates": [
+            {
+                "final_certificate_checked": True,
+                "session_id": base64.b64encode(
+                    bytes.fromhex(record["session_id"])
+                ).decode(),
+                "slot": 1,
+                "candidate_hash": "a" * 64,
+            }
+        ],
+    }
+    acceptance = json.dumps(checked).encode()
+    sample = json.dumps({"block": {"id": checked["block"]}}).encode()
+    states = json.dumps(
+        {"mode": "state-copies", "block": {"id": checked["block"]}}
+    ).encode()
+    state_check = json.dumps(
+        {
+            "mode": "state-copies",
+            "block": checked["block"],
+            "state_root_hash": "state",
+            "sources": ["cpp-reference", "restarted-rust"],
+            "finality_checked": False,
+        }
+    ).encode()
     start = json.dumps(
         {
             k: v
@@ -42,16 +75,13 @@ def fixture(root, point):
     (namespace / "finality-session-start.json").write_bytes(start)
     manifest = json.dumps(
         {
-            "session": "session",
+            "session": "b" * 64,
             "role": "validator",
             "shard_workchain": -1,
             "catchain_seqno": 0,
         }
     ).encode()
     (namespace / "session-runtime.json").write_bytes(manifest)
-    (intents / "completed-v1" / target.with_suffix(".complete").name).write_bytes(
-        completed
-    )
     sha = lambda data: hashlib.sha256(data).hexdigest()
     inventory = json.dumps(
         [{"path": target.name, "bytes": len(raw), "sha256": sha(raw)}]
@@ -59,7 +89,10 @@ def fixture(root, point):
     files = {
         "intent-before.json": raw,
         "intended.json": intended,
-        "intent-completed.json": completed,
+        "accepted-sample.json": sample,
+        "accepted-checked.json": acceptance,
+        "accepted-states.json": states,
+        "accepted-states-checked.json": state_check,
         "session-start.json": start,
         "intent-directory-at-stop.json": inventory,
         "stopped-process.txt": b"State:\tT (stopped)\nPid:\t100\n",
@@ -94,7 +127,11 @@ def fixture(root, point):
         "intended_bytes": len(intended),
         "intended_sha256": sha(intended),
         "session_start_sha256": sha(start),
-        "completed_sha256": sha(completed),
+        "acceptance_sample_sha256": sha(sample),
+        "acceptance_checked_sha256": sha(acceptance),
+        "acceptance_states_sha256": sha(states),
+        "acceptance_states_checked_sha256": sha(state_check),
+        "original_candidate_accepted": True,
         "stopped_directory_inventory_sha256": sha(inventory),
         "prepared_sha256": sha(prepared.read_bytes()),
         "session": record["session_id"],
@@ -169,6 +206,88 @@ class FirstIntentAdapterTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "process identity"):
                         check_first_intent_result("first-intent-before-write", result)
 
+    def test_original_candidate_and_complete_state_cannot_be_substituted(self):
+        from scenario_first_intent import check_first_intent_evidence
+
+        for mutation in [
+            "candidate",
+            "session",
+            "slot",
+            "height",
+            "finality",
+            "state",
+            "sources",
+            "outputs",
+        ]:
+            with self.subTest(mutation=mutation), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                receipt = fixture(root, "before-write")["first_intent_cut"]
+                directory = root / "first-intent-cut"
+                if mutation == "outputs":
+                    target = Path(receipt["path"])
+                    output = (
+                        target.parent
+                        / "outputs-v1"
+                        / target.with_suffix(".outputs").name
+                    )
+                    output.parent.mkdir()
+                    output.write_text("retained output")
+                else:
+                    state = mutation in ["state", "sources"]
+                    path = directory / (
+                        "accepted-states-checked.json"
+                        if state
+                        else "accepted-checked.json"
+                    )
+                    checked = json.loads(path.read_text())
+                    certificate = checked.get("verified_final_certificates", [{}])[0]
+                    if mutation == "candidate":
+                        certificate["candidate_hash"] = "c" * 64
+                    if mutation == "session":
+                        certificate["session_id"] = base64.b64encode(bytes(32)).decode()
+                    if mutation == "slot":
+                        certificate["slot"] = 2
+                    if mutation == "height":
+                        checked["block"]["seqno"] = 2
+                    if mutation == "finality":
+                        certificate["final_certificate_checked"] = False
+                    if mutation == "state":
+                        checked["state_root_hash"] = "wrong state"
+                    if mutation == "sources":
+                        checked["sources"] = ["cpp-reference"]
+                    raw = json.dumps(checked).encode()
+                    path.write_bytes(raw)
+                    receipt[
+                        "acceptance_states_checked_sha256"
+                        if state
+                        else "acceptance_checked_sha256"
+                    ] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises(ValueError):
+                    check_first_intent_evidence(root, receipt, "before-write")
+
+    def test_offline_verifier_uses_independent_native_checked_vote(self):
+        from verify_first_intent_evidence import verify_post_restart_vote
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = fixture(root, "before-write")
+            receipt = result["first_intent_cut"]
+            # Own creator has no self vote; the independently checked other creator does.
+            self.assertEqual(
+                result["epochs"]["after"]["mc_creators"][member_id(2)]["check"][
+                    "verified_final_certificates"
+                ],
+                [],
+            )
+            verified = {"200": receipt["post_restart_vote"]["check"]}
+            verify_post_restart_vote(root, root, receipt, verified, member_id(2))
+            wrong = copy.deepcopy(verified)
+            wrong["200"]["verified_final_certificates"][0]["validator_ids"] = []
+            with self.assertRaisesRegex(
+                ValueError, "Independent post-restart vote failed"
+            ):
+                verify_post_restart_vote(root, root, receipt, wrong, member_id(2))
+
     def test_both_cuts_are_wired(self):
         catalog = validate(json.loads(CATALOG.read_text()), CATALOG.parent)
         for point in ("before-write", "after-partial-write"):
@@ -211,7 +330,10 @@ class FirstIntentAdapterTests(unittest.TestCase):
                     "intent-before.json",
                     "intended.json",
                     "session-start.json",
-                    "intent-completed.json",
+                    "accepted-sample.json",
+                    "accepted-checked.json",
+                    "accepted-states.json",
+                    "accepted-states-checked.json",
                     "intent-directory-at-stop.json",
                     "native-stop.marker",
                     "stopped-process.txt",
