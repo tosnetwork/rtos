@@ -118,6 +118,48 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "authority changed"):
                 await ctx.complete({"last_checkpoint": {}})
 
+    async def test_unsigned_completion_allows_only_explicit_config_delta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, node, cp, _ns = self.context(root)
+            ctx = expiry.SignerExpiry(args, root, node, cp)
+            args.expired_member_restart = True
+            args.unsigned_original_recovery = True
+            ctx.pid = os.getpid() + 100000
+            ctx.receipt["phase"] = "qualified_before_interruption"
+            config_path = node["directory"] / "config.json"
+            config = json.loads(config_path.read_text())
+            config.pop("pq_consensus")
+            config.pop("validator_keys", None)
+            config_path.write_text(json.dumps(config))
+            recovered = {
+                "last_checkpoint": {},
+                "expired_full_node": {},
+                "original_obligations_authenticated_and_cleaned": True,
+                "unsigned_configuration": {
+                    "signing_configuration_removed": True,
+                    "after_sha256": expiry.digest(config_path),
+                    "before_sha256": ctx.bindings[str(config_path)],
+                },
+            }
+            await ctx.complete(recovered)
+            self.assertFalse(ctx.receipt["authority_unchanged"])
+            self.assertTrue(ctx.receipt["key_files_unchanged"])
+            ctx.receipt["phase"] = "qualified_before_interruption"
+            recovered["original_obligations_authenticated_and_cleaned"] = False
+            with self.assertRaisesRegex(RuntimeError, "original obligations"):
+                await ctx.complete(recovered)
+            recovered["original_obligations_authenticated_and_cleaned"] = True
+            original_hash = recovered["unsigned_configuration"]["before_sha256"]
+            recovered["unsigned_configuration"]["before_sha256"] = "wrong"
+            with self.assertRaisesRegex(RuntimeError, "original configuration binding"):
+                await ctx.complete(recovered)
+            recovered["unsigned_configuration"]["before_sha256"] = original_hash
+            prepared = node["directory"] / "validator-prepared.json"
+            prepared.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "outside the explicit"):
+                await ctx.complete(recovered)
+
     async def test_expiry_wait_is_charged_to_original_source_ack_deadline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

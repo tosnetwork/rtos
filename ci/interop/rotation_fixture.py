@@ -375,6 +375,15 @@ async def _recover_rotation_member(
             node["directory"] / "node_db/catchains/consensus/v2",
             directory / "original-intents",
         )
+        if getattr(args, "unsigned_original_recovery", False):
+            from unsigned_recovery_evidence import check_cleanup_capture
+
+            check_cleanup_capture(
+                pending_intents,
+                root / "intent-cleanup",
+                args.signer_expiry_observer.receipt,
+                old_process.pid,
+            )
         receipt["pre_restart_pending_intent_count"] = len(pending_intents.records)
         write(directory / "recovery.json", receipt)
     histories = [{} for _ in nodes]
@@ -552,6 +561,17 @@ async def _recover_rotation_member(
             raise RuntimeError("An executable or profile changed before restart")
     if digest(prepared) != prepared_hash:
         raise RuntimeError("Prepared authority changed before restart")
+    unsigned_configuration = None
+    if getattr(args, "unsigned_original_recovery", False):
+        from unsigned_recovery_evidence import UnsignedConfiguration
+
+        unsigned_configuration = UnsignedConfiguration(
+            node["directory"],
+            directory / "unsigned-configuration",
+            expected_before_sha256=args.signer_expiry_observer.bindings[
+                str(node["directory"] / "config.json")
+            ],
+        )
     node.update(
         await start_rotation_node(
             args.rust_node,
@@ -609,6 +629,37 @@ async def _recover_rotation_member(
                 },
             )
             write(directory / "recovery.json", receipt)
+            if done and unsigned_configuration is not None:
+                from unsigned_recovery_evidence import complete_unsigned_originals
+
+                completed = await complete_unsigned_originals(
+                    pending_intents,
+                    unsigned_configuration,
+                    deadline=deadline,
+                    snapshot=args.snapshot,
+                    checker=args.block_checker,
+                    cpp_node=nodes[0],
+                    cpp_config=lite_configs[0],
+                    rust_config=lite_configs[index],
+                    zero=zero,
+                    governing=governing,
+                    directory=directory / "original-accepted",
+                )
+                if not completed:
+                    continue
+                log = (node["directory"] / "node-restart.log").read_text(
+                    errors="replace"
+                )
+                if any(
+                    "ValidatorGroup::on_generate_slot:" in line
+                    and "Collation successful" in line
+                    for line in log.splitlines()
+                ):
+                    raise RuntimeError("Unsigned recovered member collated a candidate")
+                receipt["original_obligations_authenticated_and_cleaned"] = True
+                receipt["unsigned_configuration"] = unsigned_configuration.receipt
+                receipt["expired_full_node"]["signing_authority_restored"] = False
+                break
             if done and pending_intents.complete():
                 receipt["all_original_pending_intents_completed"] = True
                 log = (node["directory"] / "node-restart.log").read_text(
@@ -966,6 +1017,24 @@ async def run(args, profile, root, artifacts):
                         from publication_io_fixture import publication_io_environment
 
                         environment = publication_io_environment(args, root)
+                    if (
+                        getattr(args, "unsigned_original_recovery", False)
+                        and index == 5
+                    ):
+                        import os
+
+                        control = root / "intent-cleanup"
+                        control.mkdir()
+                        environment = dict(
+                            os.environ if environment is None else environment
+                        )
+                        environment["RTOS_TEST_INTENT_CLEANUP_CONTROL"] = str(control)
+                        library = str(args.intent_cleanup_library.resolve())
+                        environment["LD_PRELOAD"] = library + (
+                            ":" + environment["LD_PRELOAD"]
+                            if environment.get("LD_PRELOAD")
+                            else ""
+                        )
                     if first_intent_cut is not None and index == 2:
                         environment = first_intent_cut.environment()
                     rust_nodes.append(
@@ -1855,6 +1924,24 @@ async def run(args, profile, root, artifacts):
 
 def reject_inactive_custody_faults(args):
     """Refuse obsolete fault boundaries before creating a network."""
+    unsigned = getattr(args, "unsigned_original_recovery", False)
+    library = getattr(args, "intent_cleanup_library", None)
+    if unsigned and not (
+        getattr(args, "expired_member_restart", False)
+        and library
+        and Path(library).is_file()
+        and getattr(args, "partition_restart", False)
+        and getattr(args, "signer_expiry_member", None) == 5
+        and getattr(args, "interrupt_rust_member", None) == 5
+        and not getattr(args, "publication_io_library", None)
+    ):
+        raise SystemExit(
+            "Unsigned original recovery requires member5 expiry, cleanup library and partition restart"
+        )
+    if library and not unsigned:
+        raise SystemExit(
+            "Intent cleanup library requires explicit unsigned original recovery"
+        )
     for option in (
         "source_ack_fault",
         "source_ack_partition_restart",
@@ -1864,6 +1951,8 @@ def reject_inactive_custody_faults(args):
         "followup_intent_frontier",
         "cold_bootstrap_body",
     ):
+        if option == "expired_member_restart" and unsigned:
+            continue
         if getattr(args, option, None):
             raise SystemExit(
                 "Recovery scenario awaits acceptance-path adaptation: " + option
@@ -1876,6 +1965,16 @@ def main():
     parser.add_argument("--block-checker", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--unsigned-original-recovery",
+        action="store_true",
+        help="Explicitly remove signing configuration and authenticate original MC obligations after same-DB restart",
+    )
+    parser.add_argument(
+        "--intent-cleanup-library",
+        type=Path,
+        help="Owned test library retaining one accepted output before natural expiry",
+    )
     parser.add_argument("--base-port", type=int, default=55900)
     parser.add_argument("--timeout", type=float, default=240)
     parser.add_argument("--prepare-genesis-only", action="store_true")
@@ -2213,6 +2312,10 @@ def main():
         artifacts[str(args.source_retention_cut_library)] = digest(
             args.source_retention_cut_library
         )
+    if args.intent_cleanup_library:
+        artifacts[str(args.intent_cleanup_library)] = digest(
+            args.intent_cleanup_library
+        )
     if args.publication_io_library:
         artifacts[str(args.publication_io_library)] = digest(
             args.publication_io_library
@@ -2241,6 +2344,9 @@ def main():
         "custody_expiry_authority.py",
         "runtime_manifest_observer.py",
         "expired_member_restart_fixture.py",
+        "unsigned_recovery_evidence.py",
+        "accepted_intent_evidence.py",
+        "first_intent_vote.py",
         "receiver_evidence.py",
     ]:
         path = driver.with_name(name)

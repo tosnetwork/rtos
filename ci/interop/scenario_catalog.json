@@ -338,7 +338,7 @@
     {
       "id": "expired-member-restart",
       "driver": "rotation_fixture.py",
-      "scope": "Expired member returns as nonsigning synchronized observer; awaiting acceptance-path adaptation: legacy source custody trigger is inactive",
+      "scope": "Expired-only configured custody must refuse startup as TOS does; original automatic-observer oracle conflicts with reference. Explicit unsigned-configuration original-DB recovery needs separate qualification",
       "depends_on": [
         "rotation-mixed"
       ],
