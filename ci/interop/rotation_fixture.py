@@ -225,6 +225,12 @@ async def recover_rotation_member(
             member_id,
             checkpoint,
         )
+        recovery_fault.source.witness_context = (
+            args,
+            nodes[0],
+            lite_configs[0],
+            lite_configs[args.interrupt_rust_member],
+        )
     elif getattr(args, "source_ack_partition_restart", False):
         from source_ack_partition_fixture import SourceAckPartitionRestart
 
@@ -953,12 +959,13 @@ async def run(args, profile, root, artifacts):
                         )
 
                         environment = retention_cut_environment(args, root)
-                        if args.publication_io_library:
-                            from publication_io_fixture import (
-                                publication_io_environment,
-                            )
+                    if (
+                        args.publication_io_library
+                        and index == args.interrupt_rust_member
+                    ):
+                        from publication_io_fixture import publication_io_environment
 
-                            environment = publication_io_environment(args, root)
+                        environment = publication_io_environment(args, root)
                     if first_intent_cut is not None and index == 2:
                         environment = first_intent_cut.environment()
                     rust_nodes.append(
@@ -1733,9 +1740,17 @@ async def run(args, profile, root, artifacts):
                                 if args.publication_io_library
                                 else "source_retention_cut"
                             ): json.loads(
-                                (root / "source-retention-cut/receipt.json").read_text()
+                                (
+                                    root
+                                    / (
+                                        "publication-io-source/receipt.json"
+                                        if args.publication_io_library
+                                        else "source-retention-cut/receipt.json"
+                                    )
+                                ).read_text()
                             )
-                            if args.source_retention_cut_library
+                            if args.publication_io_library
+                            or args.source_retention_cut_library
                             else None,
                             "publication_io_restart": json.loads(
                                 (root / "publication-io/receipt.json").read_text()
@@ -1987,14 +2002,15 @@ def main():
         )
     if args.publication_io_library:
         if (
-            not (args.source_retention_cut_library and args.partition_restart)
+            not args.partition_restart
+            or args.source_retention_cut_library
             or args.source_ack_fault
             or args.source_ack_intent_stop
             or args.cold_bootstrap_body
             or args.source_retention_cut_point != "after-fsync"
         ):
             raise SystemExit(
-                "Node publication IO requires explicit synced retain and partition restart without ACK/intent/cold cuts"
+                "Node publication IO requires live acceptance and partition restart without retain/ACK/intent/cold cuts"
             )
         args.publication_io_library = args.publication_io_library.resolve()
     if args.source_retention_cut_library:
@@ -2239,6 +2255,7 @@ def main():
     if args.publication_io_library:
         for path in [
             driver.with_name("publication_io_fixture.py"),
+            driver.with_name("publication_io_live_fixture.py"),
             driver.parents[2] / "rtos/src/tests/publication_io_fault.c",
         ]:
             artifacts[str(path)] = digest(path)

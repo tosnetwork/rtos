@@ -3,7 +3,6 @@
 import asyncio
 import hashlib
 import json
-import os
 import re
 import signal
 import struct
@@ -11,32 +10,16 @@ import time
 from pathlib import Path
 
 from mixed_matrix import write
-from network_faults import marked_environment
 from partition_restart_fixture import PartitionRestart
 from source_ack_fault_fixture import SourceAckFailure
 from source_ack_partition_fixture import join_owned
-from source_retention_cut_fixture import SourceRetentionCut, retention_cut_environment
+from source_retention_cut_fixture import SourceRetentionCut
 
 
 def publication_io_environment(args, root):
-    if any(key.startswith("RTOS_TEST_PUBLICATION_IO_") for key in os.environ):
-        raise RuntimeError("Publication IO refuses inherited controls")
-    environment = retention_cut_environment(args, root)
-    directory = root / "publication-io"
-    directory.mkdir(exist_ok=True)
-    marked = marked_environment(args.socket_mark_library)
-    environment["LD_PRELOAD"] = (
-        str(args.publication_io_library)
-        + ":"
-        + environment["LD_PRELOAD"]
-        + ":"
-        + marked["LD_PRELOAD"]
-    )
-    environment["RTOS_FIXTURE_SOCKET_MARK"] = marked["RTOS_FIXTURE_SOCKET_MARK"]
-    environment["RTOS_TEST_RETAIN_CUT_RESUME_SYNCED"] = "1"
-    environment["RTOS_TEST_PUBLICATION_IO_CONTROL"] = str(directory)
-    environment["RTOS_TEST_PUBLICATION_IO_RETURN_EIO"] = "1"
-    return environment
+    from publication_io_live_fixture import live_environment
+
+    return live_environment(args, root)
 
 
 def delivery_coordinate_id(record):
@@ -314,7 +297,9 @@ class PublicationIoSource(SourceRetentionCut):
 
 class PublicationIoRestart:
     def __init__(self, args, root, node, endpoint, member_id, checkpoint):
-        self.source = PublicationIoSource(args, root, node, checkpoint)
+        from publication_io_live_fixture import LivePublicationIoSource
+
+        self.source = LivePublicationIoSource(args, root, node, checkpoint)
         self.partition = PartitionRestart(args, root, node, endpoint, member_id)
         self.started = self.source.started
         self.deadline = self.source.deadline
