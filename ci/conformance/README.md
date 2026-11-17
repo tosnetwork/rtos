@@ -1,7 +1,7 @@
 # Shared conformance target
 
 The formal conformance reference is pinned by `REFERENCE` to clean TOS
-`5af405dcb1f523be0ff3b812e9f6945275c4945b`. Use the maintained entry point to
+`ed8e0a80bdafede324d97b041fa4174e0a5dce33`. Use the maintained entry point to
 build all 11 adapters and execute the shared vectors plus local regressions:
 
 ```sh
@@ -32,17 +32,20 @@ regressions. Initial-fill provenance is beside the fixtures; effects were genera
 the clean pinned C++ CLI. Use the shared `regenerate` command on the fixture
 and retain updated build/filler provenance when refreshing it.
 
-The shared pin and active interop baseline both use TOS 5af405d. A fixture run
+The shared pin and active interop baseline both use TOS ed8e0a80. Its production sources, shared runner and vectors
+are identical to the previous 5af405d baseline; only documentation changed.
+Retained receipts keep their original commit identities. A fixture run
 does not qualify the runtime scenarios; historical baselines require explicit selection.
 Whole-history native state replay, runtime integration, resource qualification,
-GitHub CI outcomes and independent/external reviews remain separate gates.
+independent/external reviews remain separate gates. During conformance catch-up,
+GitHub CI is asynchronous follow-up, not a wait gate for locally validated merges.
 
 Reproduce the account-storage hint proof controls against a clean, pinned TOS
 Ninja build:
 
 ```sh
 python3 ci/conformance/storage_hint_reference.py \
-  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --cpp-build "$CPP_BUILD" \
   --out /datax/rtos-conformance/storage-hint-reference
 ```
 
@@ -952,7 +955,7 @@ Reproduce the collator proof-budget traversal controls:
 
 ```sh
 python3 ci/conformance/proof_budget_reference.py \
-  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --cpp-build "$CPP_BUILD" \
   --out /datax/rtos-conformance/proof-budget-reference
 ```
 
@@ -984,7 +987,7 @@ Replay the real eight-account proof-selection profile with native TOS:
 
 ```sh
 python3 ci/conformance/proof_selection_reference.py \
-  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --cpp-build "$CPP_BUILD" \
   --out /datax/rtos-conformance/proof-selection-reference
 ```
 
@@ -1103,7 +1106,7 @@ Generate a bounded four-height MC/WC history with three native public test keys:
 
 ```sh
 python3 ci/conformance/generate_gc_history_fixture.py \
-  --cpp-build /tos/build/rtos-conformance-latest-5af405d \
+  --cpp-build "$CPP_BUILD" \
   --target-dir /tos/worktrees/rtos/cpp-alignment/target \
   --out /datax/rtos-conformance/native-gc-history
 ```
