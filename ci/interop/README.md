@@ -567,3 +567,11 @@ outbox; its receipt says `after_live_acceptance`, not database sync. The callbac
 is an observation, not independent proof: capturing or decoding does not prove
 Final/Approval validity, complete original obligations, state equality or recovery.
 Those require the native checker and original-frontier checks separately.
+
+`sealed_workchain_outputs` validates the complete captured WC0 full-shard output
+list without dropping Approval entries; `verify_sealed_workchain_requests` then
+runs the existing native request verifier for every declared obligation and the
+exact Final trigger. The sealed digest binds intent metadata, not the output list:
+callers must first bind the original file bytes to the stopped node's capture.
+These helpers do not collect missing states or prove original-DB cleanup, and
+the MC-only recovery driver remains MC-only until that evidence is integrated.

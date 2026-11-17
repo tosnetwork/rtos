@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import hashlib
 import json
 import tempfile
 import time
@@ -12,6 +13,8 @@ from unittest.mock import patch
 from workchain_output_evidence import (
     block_text,
     matches_workchain_outputs,
+    sealed_workchain_outputs,
+    verify_sealed_workchain_requests,
     verify_workchain_output_requests,
 )
 
@@ -62,6 +65,66 @@ def fixture():
 
 
 class WorkchainOutputEvidenceTests(unittest.TestCase):
+    def test_sealed_original_set_preserves_both_roles_and_binding(self):
+        intent, outputs, _ = fixture()
+        intent.update(workchain=0, shard_prefix=1 << 63, certificate="original")
+        sealed = {
+            "schema": 1,
+            "digest": hashlib.sha256(
+                json.dumps(intent, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "metadata": dict(intent, certificate=""),
+            "released": False,
+            "outputs": outputs,
+        }
+        self.assertEqual(
+            [b["seqno"] for b in sealed_workchain_outputs(intent, sealed)], [5, 4]
+        )
+        for changed in [
+            None,
+            {},
+            dict(sealed, digest="wrong"),
+            dict(sealed, metadata={}),
+            dict(sealed, released=1),
+            dict(sealed, outputs=[]),
+            dict(sealed, outputs=outputs * 2),
+            dict(sealed, outputs=outputs[1:]),
+            dict(sealed, outputs=[dict(outputs[0], is_final=1)]),
+            dict(sealed, outputs=[dict(outputs[0], source_validator="bad")]),
+            dict(
+                sealed,
+                outputs=[
+                    dict(
+                        outputs[0],
+                        block_id=outputs[0]["block_id"].replace("(0:", "(-1:"),
+                    )
+                ],
+            ),
+        ]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                sealed_workchain_outputs(intent, changed)
+        with patch(
+            "workchain_output_evidence.verify_workchain_output_requests",
+            return_value=["verified"],
+        ) as verify:
+            self.assertEqual(
+                verify_sealed_workchain_requests(
+                    intent, sealed, ["request"], "checker", "out", 12
+                ),
+                ["verified"],
+            )
+            verify.assert_called_once_with(
+                intent, outputs, ["request"], "checker", "out", 12
+            )
+        with patch(
+            "workchain_output_evidence.verify_workchain_output_requests"
+        ) as verify:
+            with self.assertRaises(ValueError):
+                verify_sealed_workchain_requests(
+                    intent, dict(sealed, outputs=[]), [], "checker", "out", 12
+                )
+            verify.assert_not_called()
+
     def test_complete_outputs_and_trigger_required(self):
         intent, outputs, proofs = fixture()
         self.assertTrue(matches_workchain_outputs(intent, outputs, proofs))
