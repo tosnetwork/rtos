@@ -521,6 +521,10 @@ impl AdnlServerThread {
                         telemetry.queries_failed.update(1);
                     }
                     if let Err(error) = result {
+                        // No further frame is parsed during ordered close.
+                        // Release potentially large frame buffers before waiting.
+                        thread.recv_buf = Vec::new();
+                        thread.send_buf = Vec::new();
                         thread.stream.close_after_refusal().await;
                         return Err(error);
                     }
@@ -560,6 +564,10 @@ impl AdnlServerThread {
                         telemetry.queries_failed.update(1);
                     }
                     if let Err(error) = result {
+                        // No further frame is parsed during ordered close.
+                        // Release potentially large frame buffers before waiting.
+                        thread.recv_buf = Vec::new();
+                        thread.send_buf = Vec::new();
                         thread.stream.close_after_refusal().await;
                         return Err(error);
                     }

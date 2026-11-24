@@ -338,6 +338,10 @@ impl Subscriber for AdnlPingSubscriber {
     }
 }
 
+#[cfg(feature = "server")]
+#[path = "refusal_close.rs"]
+mod refusal_close;
+
 /// ADNL TCP stream
 pub struct AdnlStream {
     stream: Pin<Box<tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>>>,
@@ -373,26 +377,6 @@ impl AdnlStream {
         self.stream.as_mut().shutdown().await?;
         Ok(())
     }
-    /// Finish already-written replies before closing a refused external query.
-    /// As in TOS AdnlExtConnection::closing_loop, half-close the write side
-    /// and discard unread input without parsing further queries. Closing with
-    /// unread input would reset TCP and can discard earlier answers. A silent
-    /// or continuously writing peer cannot retain the connection past 2 seconds.
-    #[cfg(feature = "server")]
-    pub(crate) async fn close_after_refusal(&mut self) {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            self.stream.as_mut().shutdown().await?;
-            let mut discard = vec![0u8; 64 * 1024];
-            loop {
-                if self.stream.as_mut().read(&mut discard).await? == 0 {
-                    return Ok::<(), std::io::Error>(());
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-    }
-
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         self.stream.as_mut().write_all(&buf[..]).await?;
