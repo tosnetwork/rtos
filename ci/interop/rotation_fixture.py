@@ -613,6 +613,7 @@ async def _recover_rotation_member(
             deadline,
             args.signer_expiry_observer.session,
         )
+        workchain = None
         while True:
             infos = await common_checkpoint(list(range(6)), floor)
             floor = infos[0]["last"]["seqno"]
@@ -632,9 +633,27 @@ async def _recover_rotation_member(
             if done and unsigned_configuration is not None:
                 from unsigned_recovery_evidence import complete_unsigned_originals
 
+                if (
+                    getattr(args, "unsigned_workchain_originals", False)
+                    and workchain is None
+                ):
+                    from workchain_recovery_inputs import select_workchain_inputs
+
+                    workchain = select_workchain_inputs(
+                        root,
+                        pending_intents,
+                        {
+                            ("rust" if i in {n["index"] for n in rust_nodes} else "cpp")
+                            + f"-{i}": lite_configs[i]
+                            for i in SUCCESSOR
+                        },
+                        old_process.pid,
+                        deadline,
+                    )
                 completed = await complete_unsigned_originals(
                     pending_intents,
                     unsigned_configuration,
+                    workchain=workchain,
                     deadline=deadline,
                     snapshot=args.snapshot,
                     checker=args.block_checker,
@@ -1029,6 +1048,10 @@ async def run(args, profile, root, artifacts):
                             os.environ if environment is None else environment
                         )
                         environment["RTOS_TEST_INTENT_CLEANUP_CONTROL"] = str(control)
+                        if getattr(args, "unsigned_workchain_originals", False):
+                            capture = root / "wc-publication-capture"
+                            capture.mkdir()
+                            environment["RTOS_TEST_PUBLICATION_CAPTURE"] = str(capture)
                         library = str(args.intent_cleanup_library.resolve())
                         environment["LD_PRELOAD"] = library + (
                             ":" + environment["LD_PRELOAD"]
@@ -1926,6 +1949,8 @@ def reject_inactive_custody_faults(args):
     """Refuse obsolete fault boundaries before creating a network."""
     unsigned = getattr(args, "unsigned_original_recovery", False)
     library = getattr(args, "intent_cleanup_library", None)
+    if getattr(args, "unsigned_workchain_originals", False) and not unsigned:
+        raise SystemExit("WC original recovery requires unsigned original recovery")
     if unsigned and not (
         getattr(args, "expired_member_restart", False)
         and library
@@ -1969,6 +1994,11 @@ def main():
         "--unsigned-original-recovery",
         action="store_true",
         help="Explicitly remove signing configuration and authenticate original MC obligations after same-DB restart",
+    )
+    parser.add_argument(
+        "--unsigned-workchain-originals",
+        action="store_true",
+        help="Capture and authenticate complete original WC obligations after unsigned restart",
     )
     parser.add_argument(
         "--intent-cleanup-library",

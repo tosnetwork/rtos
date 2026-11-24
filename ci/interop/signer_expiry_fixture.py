@@ -155,6 +155,21 @@ class SignerExpiry:
         self.ticks = node["start_ticks"]
         self.log = node["directory"] / "node.log"
         self.offset = self.log.stat().st_size
+        cleanup_runtime = runtime
+        if getattr(args, "unsigned_workchain_originals", False):
+            from publication_capture_arm import CaptureSessionPending, arm_capture
+
+            try:
+                arm_capture(
+                    node["directory"],
+                    checkpoint,
+                    root / "wc-publication-capture",
+                    self.pid,
+                )
+            except CaptureSessionPending as error:
+                raise SignerExpiryRuntimePending(str(error)) from error
+            armed = json.loads((root / "wc-publication-capture/arm.json").read_text())
+            cleanup_runtime = Path(armed["runtime"])
         self.directory.mkdir()
         (self.directory / "selected-runtime.json").write_bytes(runtime.read_bytes())
         write(
@@ -191,7 +206,7 @@ class SignerExpiry:
         self.save()
         if getattr(args, "unsigned_original_recovery", False):
             (root / "intent-cleanup/selector").write_text(
-                f"{self.pid}\n{runtime.parent / 'finality-intents/outputs-v1'}\n"
+                f"{self.pid}\n{cleanup_runtime.parent / 'finality-intents/outputs-v1'}\n"
             )
 
     def alive(self):
@@ -228,6 +243,8 @@ class SignerExpiry:
                     captured.exists()
                     and "cleanup_capture_observed_at_unix" not in self.receipt
                 ):
+                    if getattr(self.args, "unsigned_workchain_originals", False):
+                        (self.root / "wc-publication-capture/selector").unlink()
                     observed = time.time()
                     self.receipt["cleanup_capture_observed_at_unix"] = observed
                     self.receipt["cleanup_capture_before_expiry"] = (
