@@ -166,9 +166,9 @@ pub struct FullNodeOverlaysRouter {
 pub(crate) enum PublicBroadcastKind {
     /// Blocks, candidates and finality: FEC, any sender.
     Block,
-    /// Shard block descriptions: simple up to 768 bytes, else FEC any sender.
+    /// Shard block descriptions: simple up to `MAX_SIMPLE_BROADCAST_SIZE`, else FEC any sender.
     ShardBlock,
-    /// External messages: simple up to 768 bytes, else FEC to fixed neighbours.
+    /// External messages: simple up to `MAX_SIMPLE_BROADCAST_SIZE`, else FEC to fixed neighbours.
     ExternalMessage,
 }
 

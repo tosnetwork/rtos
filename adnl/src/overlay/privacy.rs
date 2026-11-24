@@ -28,7 +28,7 @@ use std::{
 };
 
 /// Largest payload sent as one simple broadcast; larger payloads use FEC.
-pub const MAX_SIMPLE_BROADCAST_SIZE: u32 = 768;
+pub const MAX_SIMPLE_BROADCAST_SIZE: u32 = 4096;
 /// Largest payload any public broadcast may carry.
 pub const MAX_FEC_BROADCAST_SIZE: u32 = 16 << 20;
 /// Certificate and rule flag: FEC broadcasts are permitted.
@@ -288,7 +288,7 @@ impl OverlayCertificate {
 
     /// Certificate as the console signing command returns it: flags
     /// `Trusted | AllowFec` select the preimage, but the reply is always the
-    /// version-1 wire form. At `max_size <= 768` the preimage is version 2
+    /// version-1 wire form. At `max_size <= MAX_SIMPLE_BROADCAST_SIZE` the preimage is version 2
     /// while the reply implies default flags, so such a reply does not verify
     /// at any receiver; this mirrors the peer implementation unchanged.
     pub fn sign_for_console(
