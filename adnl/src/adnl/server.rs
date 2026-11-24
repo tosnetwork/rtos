@@ -520,7 +520,10 @@ impl AdnlServerThread {
                     if result.is_err() && !processed_ok {
                         telemetry.queries_failed.update(1);
                     }
-                    result?;
+                    if let Err(error) = result {
+                        thread.stream.close_after_refusal().await;
+                        return Err(error);
+                    }
                     continue;
                 }
                 result = thread.recv() => {
@@ -556,7 +559,10 @@ impl AdnlServerThread {
                         telemetry.queries.fetch_sub(1, Ordering::Relaxed);
                         telemetry.queries_failed.update(1);
                     }
-                    result?;
+                    if let Err(error) = result {
+                        thread.stream.close_after_refusal().await;
+                        return Err(error);
+                    }
                     continue;
                 }
                 Err(msg) => msg,
