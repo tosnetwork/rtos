@@ -30,4 +30,4 @@ Evidence is retained at `/datax/rtos-conformance/2026-11-24-resume/`:
 
 The relay normalization test now uses limit+1 to preserve its FEC-default-flag
 purpose. Full ADNL validation, independent review and integration remain pending.
-The global REFERENCE pin is unchanged until the broader latest-TOS delta is audited.
+REFERENCE now pins latest TOS7e61bf80e. Tree audit shows only the three listed network vector files changed since ed8; full latest runtime qualification remains separate.
