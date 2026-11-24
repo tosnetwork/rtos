@@ -63,23 +63,43 @@ pub(crate) fn observe_live(
     }
 }
 
+fn read_selector(
+    directory: &Path,
+    open: impl FnOnce(&Path) -> io::Result<fs::File>,
+) -> io::Result<Option<String>> {
+    let selector = directory.join("selector");
+    if fs::symlink_metadata(directory)?.file_type().is_symlink() {
+        return Err(io::Error::other("capture requires an owned directory"));
+    }
+    let metadata = match fs::symlink_metadata(&selector) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::other("capture requires an owned selector"));
+    }
+    // The controller may disarm after metadata inspection. An already opened
+    // selector can finish this bounded observation; an absent selector is idle.
+    let file = match open(&selector) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut raw = String::new();
+    file.take(129).read_to_string(&mut raw)?;
+    Ok(Some(raw))
+}
+
 fn capture(
     directory: &Path,
     pid: u32,
     puts: &[(String, Vec<u8>)],
     budget: &mut Budget,
 ) -> io::Result<()> {
-    let selector = directory.join("selector");
-    if !selector.exists() {
+    let Some(raw) = read_selector(directory, |path| fs::File::open(path))? else {
         return Ok(());
-    }
-    if fs::symlink_metadata(directory)?.file_type().is_symlink()
-        || fs::symlink_metadata(&selector)?.file_type().is_symlink()
-    {
-        return Err(io::Error::other("capture requires an owned directory and selector"));
-    }
-    let mut raw = String::new();
-    fs::File::open(selector)?.take(129).read_to_string(&mut raw)?;
+    };
     if raw.len() > 128 {
         return Err(io::Error::other("capture selector exceeds bound"));
     }
@@ -148,6 +168,31 @@ mod tests {
         row[8..10].copy_from_slice(&5u16.to_le_bytes());
         row[83..115].fill(7);
         ("LiveAcceptance/b/1".into(), row)
+    }
+
+    #[test]
+    fn selector_removed_after_metadata_is_normal_disarm() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("selector"), "42\nsession\n").unwrap();
+        let result = read_selector(directory.path(), |path| {
+            fs::remove_file(path)?;
+            fs::File::open(path)
+        });
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn disarm_does_not_hide_other_open_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_selector(directory.path(), |_| panic!("absent selector opened"))
+            .unwrap()
+            .is_none());
+        fs::write(directory.path().join("selector"), "42\nsession\n").unwrap();
+        let error = read_selector(directory.path(), |_| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

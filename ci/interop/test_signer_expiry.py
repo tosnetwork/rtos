@@ -27,6 +27,49 @@ class SignerExpiryTests(unittest.IsolatedAsyncioTestCase):
             recovery_timeout=2,
         )
 
+    def test_wc_capture_pending_preserves_budget_and_routes_cleanup_to_wc(self):
+        from publication_capture_arm import CaptureSessionPending
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, node, cp, mc = self.context(root)
+            args.unsigned_original_recovery = True
+            args.unsigned_workchain_originals = True
+            (root / "intent-cleanup").mkdir()
+            with (
+                patch(
+                    "publication_capture_arm.arm_capture",
+                    side_effect=CaptureSessionPending("starting"),
+                ),
+                self.assertRaises(expiry.SignerExpiryRuntimePending),
+            ):
+                expiry.SignerExpiry(args, root, node, cp)
+            anchor = args.signer_expiry_observation_start
+            self.assertFalse((root / "signer-expiry").exists())
+            wc = mc.parent / "wc/session-runtime.json"
+            wc.parent.mkdir()
+            wc.write_text(
+                json.dumps({"session": "wc", "shard_workchain": 0, "role": "validator"})
+            )
+
+            def arm(directory, checked, control, pid):
+                control.mkdir()
+                (control / "arm.json").write_text(json.dumps({"runtime": str(wc)}))
+
+            with patch("publication_capture_arm.arm_capture", side_effect=arm):
+                observer = expiry.SignerExpiry(args, root, node, cp)
+            self.assertEqual(args.signer_expiry_observation_start, anchor)
+            self.assertEqual(observer.deadline, anchor[0] + args.recovery_timeout)
+            selector = (root / "intent-cleanup/selector").read_text().splitlines()
+            self.assertEqual(
+                selector,
+                [
+                    str(node["process"].pid),
+                    str(wc.parent / "finality-intents/outputs-v1"),
+                ],
+            )
+            self.assertEqual(observer.session, bytes([4] * 32).hex())
+
     def test_only_explicit_equal_weight_composition_can_expire_member5(self):
         args = self.args()
         profile = {"genesis_time": 1000, "activation_delay": 90}

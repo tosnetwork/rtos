@@ -577,6 +577,25 @@ callers must first bind the original file bytes to the stopped node's capture.
 chains from captures, fetches fresh states from every declared source, and runs
 the native checker under the original deadline. `complete_unsigned_originals`
 accepts explicit WC inputs and retains its common original-DB/config/cleanup
-checks. The default driver still supplies only MC evidence; WC mode must supply
-bound captures, a historical checkpoint and the complete state-source mapping.
+checks. The default mode supplies MC evidence. Explicit
+`--unsigned-workchain-originals` selects bound captures, a historical checkpoint
+and the complete successor state-source mapping, then supplies WC evidence.
 Neither a planned request nor a standalone carrier proof qualifies recovery.
+
+`workchain_recovery_inputs.select_workchain_inputs` selects a checkpoint for the
+complete original frontier with an exact original-PID/session capture binding.
+It bounds checkpoint candidates and bytes, preserves the caller's deadline, and
+can require an original Approval obligation. Its exclusive selection receipt
+records provenance only; it does not grant native proof or recovery qualification.
+The CLI option requires `--unsigned-original-recovery` and its existing member5
+expiry, cleanup-library and partition-restart prerequisites. The node must be
+built with the default-off `interop-publication-capture` test feature. It arms the
+exact checked WC session before expiry, targets that session's cleanup output,
+and disarms capture when an original obligation has been retained. MC refusal
+observation and the original recovery deadline remain bound to the original
+process. Every capture/proof helper is hashed and frozen with run sources.
+
+The catalog and an Approval-required retention selector remain unintegrated.
+The helper's `require_approval` option is not a CLI qualification. The finite
+93dce run covers one original WC Final on retained ecb Rust/TOS ed8; it does not
+grant current-TOS or all-Approval-set recovery qualification.
