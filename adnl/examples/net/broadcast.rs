@@ -301,9 +301,17 @@ async fn run_async(v: &Value) -> Result<Value> {
         let old_fec = v["mode"] != "plumtree"
             && (v["mode"] != "twostep"
                 || uint(send, "flags")? & OverlayNode::FLAG_BCAST_NO_TWOSTEP != 0);
-        let data = super::bytes(send, "data", if old_fec { 1535 } else { 1 << 20 })?;
         let fec = send["fec"].as_bool().context("fec bool required")?;
-        ensure!(fec || data.len() <= 768, "simple broadcast exceeds768bytes");
+        let simple_limit = adnl::MAX_SIMPLE_BROADCAST_SIZE as usize;
+        let limit = if !fec {
+            simple_limit
+        } else if old_fec {
+            1535
+        } else {
+            1 << 20
+        };
+        let data = super::bytes(send, "data", limit)?;
+        ensure!(fec || data.len() <= simple_limit, "simple broadcast exceeds limit");
         let tagged = TaggedByteSlice {
             object: &data,
             #[cfg(feature = "telemetry")]

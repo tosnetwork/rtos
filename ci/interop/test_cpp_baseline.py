@@ -19,7 +19,7 @@ from cpp_baseline import (
 class CppBaselineTests(unittest.TestCase):
     def test_default_profile_and_vectors_pin_current_tos(self):
         self.assertEqual(
-            ACTIVE_CPP_REVISION, "ed8e0a80bdafede324d97b041fa4174e0a5dce33"
+            ACTIVE_CPP_REVISION, "7e61bf80e2f6cd1f07c2eb6dd4e9a3bcf034b885"
         )
         profile = json.loads(Path(__file__).with_name("testnet-v16.json").read_text())
         self.assertEqual(profile["cpp_revision"], ACTIVE_CPP_REVISION)

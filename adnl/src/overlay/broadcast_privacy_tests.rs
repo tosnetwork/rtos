@@ -13,7 +13,7 @@ use crate::{
     overlay::{
         privacy::{
             OverlayCertificate as SourceCertificate, OverlayPrivacyRules, PublicBroadcastCheck,
-            CERTIFICATE_FLAG_ALLOW_FEC, CERTIFICATE_FLAG_TRUSTED,
+            CERTIFICATE_FLAG_ALLOW_FEC, CERTIFICATE_FLAG_TRUSTED, MAX_SIMPLE_BROADCAST_SIZE,
         },
         BroadcastSubscription, OverlayParams, OverlayShortId,
     },
@@ -488,12 +488,19 @@ fn relayed_simple_envelope_normalizes_the_certificate() {
     let src = seed_key(57);
     let issuer = seed_key(ISSUER);
     let overlay = [5u8; 32];
-    let cert = SourceCertificate::sign(&issuer, &overlay, src.id().data(), 2_000_000_000, 4096, 3)
-        .unwrap();
+    let cert = SourceCertificate::sign(
+        &issuer,
+        &overlay,
+        src.id().data(),
+        2_000_000_000,
+        MAX_SIMPLE_BROADCAST_SIZE + 1,
+        3,
+    )
+    .unwrap();
     let v2 = rtos_api::ton::overlay::certificate::CertificateV2 {
         issued_by: cert.issuer().clone(),
         expire_at: cert.expire_at(),
-        max_size: 4096,
+        max_size: (MAX_SIMPLE_BROADCAST_SIZE + 1) as i32,
         flags: 3,
         signature: cert.signature().to_vec(),
     }
@@ -510,10 +517,16 @@ fn relayed_simple_envelope_normalizes_the_certificate() {
     assert!(matches!(normalized, OverlayCertificate::Overlay_Certificate(_)));
     assert_eq!(normalized, cert.to_tl());
     // A non-default V2 certificate keeps its version.
-    let untrusted =
-        SourceCertificate::sign(&issuer, &overlay, src.id().data(), 2_000_000_000, 4096, 1)
-            .unwrap()
-            .to_tl();
+    let untrusted = SourceCertificate::sign(
+        &issuer,
+        &overlay,
+        src.id().data(),
+        2_000_000_000,
+        MAX_SIMPLE_BROADCAST_SIZE + 1,
+        1,
+    )
+    .unwrap()
+    .to_tl();
     assert!(matches!(
         normalized_certificate(&untrusted).unwrap(),
         OverlayCertificate::Overlay_CertificateV2(_)

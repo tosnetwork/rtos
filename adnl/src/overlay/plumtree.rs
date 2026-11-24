@@ -1612,7 +1612,7 @@ mod tests {
         let now = 1700000000.25;
         let overlay = [9; 32];
         let expiry = now as i32 + 3;
-        let max_size = 1000;
+        let max_size = (crate::MAX_SIMPLE_BROADCAST_SIZE + 1) as i32;
         let preimage = serialize_boxed(
             &CertificateId {
                 overlay_id: overlay.into(),
@@ -1640,7 +1640,7 @@ mod tests {
             };
         authorize(&cfg, &overlay, &cert, 100, now).unwrap();
         assert!(authorize(&cfg, &[8; 32], &cert, 100, now).is_err());
-        assert!(authorize(&cfg, &overlay, &cert, 1001, now).is_err());
+        assert!(authorize(&cfg, &overlay, &cert, max_size as usize + 1, now).is_err());
         assert!(authorize(&cfg, &overlay, &cert, 100, now + 4.0).is_err());
         let mut no_trust = cert.clone();
         if let Certificate::Overlay_CertificateV2(c) = &mut no_trust {

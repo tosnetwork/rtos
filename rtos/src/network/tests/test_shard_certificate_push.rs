@@ -527,7 +527,9 @@ async fn control_queries_reach_the_serving_full_node() -> Result<()> {
         answer.downcast::<rtos_api::ton::overlay::Certificate>().expect("a certificate reply")
     };
     let large = as_certificate(control_query(&mut client, sign(1 << 24, mc)).await);
-    let small = as_certificate(control_query(&mut client, sign(768, mc)).await);
+    let small = as_certificate(
+        control_query(&mut client, sign(adnl::MAX_SIMPLE_BROADCAST_SIZE as i32, mc)).await,
+    );
     let unknown = control_refusal(
         control_query(&mut client, sign(1 << 24, WireShard { workchain: 0, shard: 0 })).await,
     );
@@ -555,14 +557,14 @@ async fn control_queries_reach_the_serving_full_node() -> Result<()> {
     assert!(matches!(large, rtos_api::ton::overlay::Certificate::Overlay_Certificate(_)));
     assert!(
         matches!(small, rtos_api::ton::overlay::Certificate::Overlay_Certificate(_)),
-        "signing at 768 succeeds and replies version 1"
+        "signing at the simple limit succeeds and replies version 1"
     );
     assert_eq!(unknown, Some((602, "failed to import cert: shard not found".to_string())));
     assert!(imported.downcast::<rtos_api::ton::engine::validator::Success>().is_ok());
     assert_eq!(
         refused_small,
         Some((0, "failed to import cert: certificate is not valid for this shard overlay".into())),
-        "the 768-byte reply does not verify"
+        "the simple-limit reply does not verify"
     );
     assert_eq!(refused_empty, Some((0, "failed to import cert: empty certificate".to_string())));
     assert!(disabled.downcast::<rtos_api::ton::engine::validator::Success>().is_ok());
