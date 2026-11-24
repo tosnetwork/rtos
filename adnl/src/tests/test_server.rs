@@ -183,6 +183,15 @@ async fn test_adnl_server_cancel_safe_reply_race() -> Result<()> {
 // handling of a close with unread input. A model of reply() cannot cover this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() -> Result<()> {
+    refusal_preserves_answers(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_adnl_server_delayed_refusal_drains_after_fin() -> Result<()> {
+    refusal_preserves_answers(true).await
+}
+
+async fn refusal_preserves_answers(delayed: bool) -> Result<()> {
     use crate::common::{
         AdnlHandshake, Answer, QueryAnswer, QueryResult, Subscriber, TaggedByteVec,
     };
@@ -193,6 +202,7 @@ async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() ->
     const ANSWER_BYTES: usize = 16 * 1024;
     struct Replies {
         refused: Arc<tokio::sync::Notify>,
+        delayed: bool,
     }
     #[async_trait::async_trait]
     impl Subscriber for Replies {
@@ -202,6 +212,16 @@ async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() ->
                 Err(object) => return Ok(QueryResult::Rejected(object)),
             };
             if query.overlay.as_slice()[0] == 255 {
+                if self.delayed {
+                    let refused = self.refused.clone();
+                    return Ok(QueryResult::Consumed(QueryAnswer::Pending(tokio::spawn(
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            refused.notify_one();
+                            fail!("intentional delayed external query refusal");
+                        },
+                    ))));
+                }
                 self.refused.notify_one();
                 fail!("intentional external query refusal");
             }
@@ -219,7 +239,7 @@ async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() ->
     let refused = Arc::new(tokio::sync::Notify::new());
     let server = super::AdnlServer::listen(
         super::AdnlServerConfig::from_json(&config.to_string())?,
-        vec![Arc::new(Replies { refused: refused.clone() })],
+        vec![Arc::new(Replies { refused: refused.clone(), delayed })],
         #[cfg(feature = "telemetry")]
         "refusal close test",
     )
@@ -255,7 +275,9 @@ async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() ->
         }
         // Already queued behind the refusal; closing must discard it, not parse
         // it or reset the socket while earlier answers remain in flight.
-        stream.write(&mut vec![0x5a; 256 * 1024]).await?;
+        if !delayed {
+            stream.write(&mut vec![0x5a; 256 * 1024]).await?;
+        }
         timeout(Duration::from_secs(5), refused.notified()).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         for i in 0..ANSWERS {
@@ -276,6 +298,21 @@ async fn test_adnl_server_refusal_preserves_prior_answers_with_unread_input() ->
             timeout(Duration::from_secs(1), crypto.receive(&mut buf, &mut stream)).await?.is_err(),
             "refusal must close the write side after prior answers"
         );
+        if delayed {
+            // FIN proves the delayed error was dispatched, avoiding a race
+            // between malformed input and the delayed answer queue. A dropped
+            // socket resets on this late input; an ordered close discards it.
+            stream
+                .write(&mut vec![0x5a; 256 * 1024])
+                .await
+                .map_err(|e| rtos_block::error!("first late input after FIN: {e}"))?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream
+                .write(&mut vec![0x5a; 256 * 1024])
+                .await
+                .map_err(|e| rtos_block::error!("second late input after FIN: {e}"))?;
+            stream.shutdown().await?;
+        }
         Ok(())
     }
     .await;
