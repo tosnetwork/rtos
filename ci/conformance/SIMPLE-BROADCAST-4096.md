@@ -31,3 +31,5 @@ Evidence is retained at `/datax/rtos-conformance/2026-11-24-resume/`:
 The relay normalization test now uses limit+1 to preserve its FEC-default-flag
 purpose. Full ADNL validation, independent review and integration remain pending.
 REFERENCE now pins latest TOS7e61bf80e. Tree audit shows only the three listed network vector files changed since ed8; full latest runtime qualification remains separate.
+
+All45 auxiliary native probes were actually regenerated against exact7e61bf80e; 205 effect rows are byte-identical. Updated receipts bind the new source/build and binary hashes. Evidence: `auxiliaries-latest/index.json` and per-probe receipts under the retained root. Previous release run195pass/78fail/1ignore (including stale reference hashes) remains archived; current release rerun is pending.
