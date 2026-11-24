@@ -547,13 +547,14 @@ fn test_monitor_position_initial_zero_and_conflicting_identity() {
 #[test]
 fn public_broadcast_flags_follow_each_kind() {
     use adnl::{BROADCAST_FLAG_ANY_SENDER as ANY, BROADCAST_FLAG_FIXED_NEIGHBOURS as FIXED};
+    let limit = adnl::MAX_SIMPLE_BROADCAST_SIZE as usize;
     for (kind, small, large) in [
         (PublicBroadcastKind::Block, ANY, ANY),
         (PublicBroadcastKind::ShardBlock, 0, ANY),
         // External messages are never sent as any sender.
         (PublicBroadcastKind::ExternalMessage, 0, FIXED),
     ] {
-        assert_eq!(kind.flags(768), small, "{kind:?} at 768 bytes");
-        assert_eq!(kind.flags(769), large, "{kind:?} above 768 bytes");
+        assert_eq!(kind.flags(limit), small, "{kind:?} at simple limit");
+        assert_eq!(kind.flags(limit + 1), large, "{kind:?} above simple limit");
     }
 }
