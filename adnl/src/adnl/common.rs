@@ -338,6 +338,10 @@ impl Subscriber for AdnlPingSubscriber {
     }
 }
 
+#[cfg(feature = "server")]
+#[path = "refusal_close.rs"]
+mod refusal_close;
+
 /// ADNL TCP stream
 pub struct AdnlStream {
     stream: Pin<Box<tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>>>,

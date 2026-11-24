@@ -520,7 +520,14 @@ impl AdnlServerThread {
                     if result.is_err() && !processed_ok {
                         telemetry.queries_failed.update(1);
                     }
-                    result?;
+                    if let Err(error) = result {
+                        // No further frame is parsed during ordered close.
+                        // Release potentially large frame buffers before waiting.
+                        thread.recv_buf = Vec::new();
+                        thread.send_buf = Vec::new();
+                        thread.stream.close_after_refusal().await;
+                        return Err(error);
+                    }
                     continue;
                 }
                 result = thread.recv() => {
@@ -556,7 +563,14 @@ impl AdnlServerThread {
                         telemetry.queries.fetch_sub(1, Ordering::Relaxed);
                         telemetry.queries_failed.update(1);
                     }
-                    result?;
+                    if let Err(error) = result {
+                        // No further frame is parsed during ordered close.
+                        // Release potentially large frame buffers before waiting.
+                        thread.recv_buf = Vec::new();
+                        thread.send_buf = Vec::new();
+                        thread.stream.close_after_refusal().await;
+                        return Err(error);
+                    }
                     continue;
                 }
                 Err(msg) => msg,
