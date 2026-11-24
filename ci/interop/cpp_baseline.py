@@ -1,12 +1,13 @@
 """Pinned active C++ reference and explicit historical replay selection."""
 
 PREVIOUS_CPP_REVISION = "881240331ee48a291b96d73f8b8b93bae005ace0"
-ACTIVE_CPP_REVISION = "ed8e0a80bdafede324d97b041fa4174e0a5dce33"
-PREVIOUS_ACTIVE_CPP_REVISION = "5af405dcb1f523be0ff3b812e9f6945275c4945b"
+ACTIVE_CPP_REVISION = "7e61bf80e2f6cd1f07c2eb6dd4e9a3bcf034b885"
+PREVIOUS_ACTIVE_CPP_REVISION = "ed8e0a80bdafede324d97b041fa4174e0a5dce33"
 HISTORICAL_CPP_REVISIONS = frozenset(
     {
         PREVIOUS_CPP_REVISION,
         PREVIOUS_ACTIVE_CPP_REVISION,
+        "5af405dcb1f523be0ff3b812e9f6945275c4945b",
         "8f083dc06bff16705710a01de15eb3123d5d696b",
     }
 )
@@ -28,6 +29,7 @@ def configure_auth_namespace(config, profile):
         ACTIVE_CPP_REVISION,
         PREVIOUS_CPP_REVISION,
         PREVIOUS_ACTIVE_CPP_REVISION,
+        "5af405dcb1f523be0ff3b812e9f6945275c4945b",
     }:
         return
     tag = profile.get("auth_network_tag")
